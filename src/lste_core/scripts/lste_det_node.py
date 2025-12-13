@@ -104,9 +104,11 @@ class DetNode:
         self.tmp_image_path = os.path.join(tempfile.gettempdir(), "lste_det_node_latest.png")
 
         # ROS I/O
+        # 允许通过参数配置相机话题，默认用当前仿真中的 Kinect 话题
+        self.image_topic = rospy.get_param("~image_topic", "/kinect/hd/image_color_rect")
         self.sub_task = rospy.Subscriber("/lste/task", LsteTask, self.on_task, queue_size=1)
         self.sub_prompts = rospy.Subscriber("/lste/prompts", LstePrompts, self.on_prompts, queue_size=1)
-        self.sub_image = rospy.Subscriber("/camera/color/image_raw", Image, self.on_image, queue_size=1)
+        self.sub_image = rospy.Subscriber(self.image_topic, Image, self.on_image, queue_size=1)
         self.sub_state = rospy.Subscriber("/lste/state", LsteState, self.on_state, queue_size=1)
 
         self.pub = rospy.Publisher("/lste/detections", LsteDetections, queue_size=5)
