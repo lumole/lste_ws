@@ -1,0 +1,26 @@
+# Catkin build artifacts
+build/
+devel/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# ROS logs
+ros_logs/
+log/
+
+# Local editor / IDE files
+.DS_Store
+.vscode/
+.idea/
+
+# Models & large external data (copied under model/)
+model/MiniCPM/
+model/GroundingDINO/
+model/Data_exchange/
+
+# Scoring visualizations / temp outputs if they appear under model
+model/**/result/
+model/**/weights/
