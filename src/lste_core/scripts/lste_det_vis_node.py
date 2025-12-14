@@ -15,7 +15,7 @@ import rospy
 from cv_bridge import CvBridge, CvBridgeError
 from sensor_msgs.msg import Image
 
-from lste_msgs.msg import LsteDetections, LsteDetection, LsteScores, LsteTask
+from lste_msgs.msg import LsteDetections, LsteDetection, LsteScores, LsteTask, LsteState
 
 
 class DetectionVisualizer:
@@ -27,11 +27,13 @@ class DetectionVisualizer:
         self.latest_detections = None  # type: LsteDetections
         self.latest_scores = None  # type: LsteScores
         self.latest_task = None  # type: LsteTask
+        self.latest_state = None  # type: LsteState
 
         self.image_topic = rospy.get_param("~image_topic", "/kinect/hd/image_color_rect")
         self.detections_topic = rospy.get_param("~detections_topic", "/lste/detections")
         self.output_topic = rospy.get_param("~output_topic", "/lste/det_vis_image")
         self.scores_topic = rospy.get_param("~scores_topic", "/lste/scores")
+        self.state_topic = rospy.get_param("~state_topic", "/lste/state")
         self.draw_labels = bool(rospy.get_param("~draw_labels", True))
         self.font_scale = float(rospy.get_param("~font_scale", 0.5))
         self.line_thickness = int(rospy.get_param("~line_thickness", 2))
@@ -50,6 +52,7 @@ class DetectionVisualizer:
         )
         self.sub_scores = rospy.Subscriber(self.scores_topic, LsteScores, self.on_scores, queue_size=1)
         self.sub_task = rospy.Subscriber("/lste/task", LsteTask, self.on_task, queue_size=1)
+        self.sub_state = rospy.Subscriber(self.state_topic, LsteState, self.on_state, queue_size=1)
         self.pub = rospy.Publisher(self.output_topic, Image, queue_size=1)
 
         rospy.loginfo(
@@ -75,6 +78,9 @@ class DetectionVisualizer:
     def on_task(self, msg: LsteTask):
         self.latest_task = msg
 
+    def on_state(self, msg: LsteState):
+        self.latest_state = msg
+
     # ----------------- Helpers -----------------
     def try_publish(self):
         # 只要有图像，就先转发图像；如果有检测/score，就叠加可视化
@@ -87,7 +93,7 @@ class DetectionVisualizer:
             rospy.logwarn("cv_bridge failed to convert Image: %s", exc)
             return
 
-        annotated = self.draw_detections(cv_img.copy(), self.latest_detections, self.latest_scores)
+        annotated = self.draw_detections(cv_img.copy(), self.latest_detections, self.latest_scores, self.latest_state)
         try:
             out_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
         except CvBridgeError as exc:
@@ -97,7 +103,13 @@ class DetectionVisualizer:
         out_msg.header = self.latest_image.header
         self.pub.publish(out_msg)
 
-    def draw_detections(self, image, detections: Optional[LsteDetections], scores: Optional[LsteScores] = None):
+    def draw_detections(
+        self,
+        image,
+        detections: Optional[LsteDetections],
+        scores: Optional[LsteScores] = None,
+        state: Optional[LsteState] = None,
+    ):
         if image is None:
             return image
 
@@ -108,7 +120,7 @@ class DetectionVisualizer:
         # 没有检测结果时，仅转发原图
         if detections is None:
             if scores is not None:
-                self._draw_scores(image, scores)
+                self._draw_scores(image, scores, state)
             return image
 
         # ==== 1) 基于 task 语义构造 ctx / neg 关键词 ====
@@ -165,7 +177,7 @@ class DetectionVisualizer:
             self._draw_box(image, det, width, height, color)
 
         if scores is not None:
-            self._draw_scores(image, scores)
+            self._draw_scores(image, scores, state)
 
         return image
 
@@ -223,7 +235,7 @@ class DetectionVisualizer:
         )
         cv2.putText(image, text, (x, y), font, scale, color, thickness, lineType=cv2.LINE_AA)
 
-    def _draw_scores(self, image, scores: LsteScores):
+    def _draw_scores(self, image, scores: LsteScores, state: Optional[LsteState] = None):
         # 高级风格条状图：上方深色横幅 + 四条渐变色 bar
         h, w = image.shape[:2]
         panel_margin = 10
@@ -240,8 +252,27 @@ class DetectionVisualizer:
         cv2.addWeighted(overlay, 0.85, image, 0.15, 0, image)
 
         # 标题：S_total 数值 + 状态
-        status = "LOCKED" if scores.detected else "SEARCHING"
-        status_color = (72, 210, 170) if scores.detected else (50, 70, 220)
+        status = "SEARCHING"
+        status_color = (50, 70, 220)  # blue
+        subtype_text = ""
+        if state is not None:
+            if state.state == 1:
+                status = "SUSPICIOUS"
+                status_color = (0, 165, 255)  # orange
+            elif state.state == 2:
+                status = "LOCKED"
+                status_color = (72, 210, 170)  # green
+            elif state.state == 3:
+                status = "EXHAUSTED"
+                status_color = (140, 140, 140)  # gray
+            else:
+                status = "PASS"
+                status_color = (50, 70, 220)
+            subtype_text = state.subtype or ""
+        else:
+            if scores.detected:
+                status = "LOCKED"
+                status_color = (72, 210, 170)
         title = f"S_total {scores.s_total:.2f}"
         cv2.putText(
             image,
@@ -263,6 +294,17 @@ class DetectionVisualizer:
             2,
             cv2.LINE_AA,
         )
+        if subtype_text:
+            cv2.putText(
+                image,
+                subtype_text,
+                (x1 - 120, y0 + 46),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (230, 230, 230),
+                1,
+                cv2.LINE_AA,
+            )
 
         # 条状图参数
         bar_left = x0 + 14

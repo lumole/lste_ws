@@ -23,6 +23,8 @@ rosrun lste_core lste_score_node.py \
     _lambda_neg:=0.7 _pos_midpoint:=0.25 _pos_steepness:=6 \
     _neg_midpoint:=0.15 _neg_steepness:=12
 
+rosrun lste_core lste_state_node.py
+
 roslaunch lste_core lste_det_vis.launch
 
 

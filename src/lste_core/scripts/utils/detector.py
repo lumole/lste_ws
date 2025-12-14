@@ -63,6 +63,28 @@ def extract_color_terms(attributes):
     return colors
 
 
+def safe_predict(model, image, caption: str, box_threshold: float, text_threshold: float, device: str = "cuda", remove_combined: bool = False):
+    """
+    Wrap GroundingDINO predict to treat empty candidates as合法空结果，而不是抛出 max/argmax 异常。
+    """
+    try:
+        return predict(
+            model=model,
+            image=image,
+            caption=caption,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+            device=device,
+            remove_combined=remove_combined,
+        )
+    except RuntimeError as exc:
+        if "no elements" in str(exc):
+            empty_boxes = torch.empty((0, 4))
+            empty_scores = torch.empty((0,))
+            return empty_boxes, empty_scores, []
+        raise
+
+
 def _cxcywh_to_xyxy_norm(box):
     cx, cy, w, h = box
     x1 = cx - 0.5 * w
@@ -263,7 +285,7 @@ def run_grounding_dino_with_caption(
     caption = (caption or "").strip()
     if not caption:
         raise ValueError("Caption for GroundingDINO cannot be empty.")
-    boxes, logits, phrases = predict(
+    boxes, logits, phrases = safe_predict(
         model=model,
         image=image,
         caption=caption,

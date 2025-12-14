@@ -11,6 +11,7 @@ lste_det_node
 
 import os
 import tempfile
+import threading
 import time
 
 import rospy
@@ -98,6 +99,7 @@ class DetNode:
         self.current_prompts = None
         self.current_state = STATE_PASS
         self.last_det_time = 0.0
+        self._infer_lock = threading.Lock()
 
         self.bridge = CvBridge()
         self.latest_image = None  # (header, cv_image_bgr)
@@ -129,11 +131,36 @@ class DetNode:
     def on_image(self, msg: Image):
         try:
             cv_image_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            if cv_image_bgr is None or getattr(cv_image_bgr, "size", 0) == 0:
+                rospy.logwarn_throttle(1.0, "Received empty image frame; publish empty detections.")
+                self.latest_image = (msg.header, None)
+                return
             self.latest_image = (msg.header, cv_image_bgr)
         except Exception as e:
-            rospy.logwarn("Failed to convert Image: %s", e)
+            rospy.logwarn_throttle(1.0, "Failed to convert Image: %s", e)
+            self.latest_image = (msg.header, None)
 
     # ----------------- Helpers -----------------
+    def publish_empty_dets(self, header=None, reason: str = ""):
+        """Publish an empty LsteDetections message with cached metadata."""
+        msg = LsteDetections()
+        if isinstance(header, Header):
+            msg.header = header
+        else:
+            msg.header = Header()
+            msg.header.stamp = rospy.Time.now()
+        if not msg.header.stamp:
+            msg.header.stamp = rospy.Time.now()
+
+        msg.task_id = self.current_task.task_id if self.current_task else ""
+        if self.current_prompts:
+            msg.prompt_a = self.current_prompts.prompt_a
+            msg.prompt_b_terms = list(self.current_prompts.prompt_b_terms)
+
+        self.pub.publish(msg)
+        if reason:
+            rospy.logwarn_throttle(1.0, "Publish empty detections (%s)", reason)
+
     def current_interval(self) -> float:
         if self.current_state == STATE_PASS:
             return self.interval_pass
@@ -168,6 +195,8 @@ class DetNode:
         if self.latest_image is None:
             return None, None, None
         header, cv_bgr = self.latest_image
+        if cv_bgr is None or getattr(cv_bgr, "size", 0) == 0:
+            return header, None, None
         try:
             # GroundingDINO 的 load_image 用 BGR 路径读入即可
             os.makedirs(os.path.dirname(self.tmp_image_path), exist_ok=True)
@@ -178,146 +207,160 @@ class DetNode:
             image_source, image = det_utils.load_image(self.tmp_image_path)
             return header, image_source, image
         except Exception as e:
-            rospy.logwarn("Failed to prepare image for DINO: %s", e)
-            return None, None, None
+            rospy.logwarn_throttle(1.0, "Failed to prepare image for DINO: %s", e)
+            return header, None, None
 
     # ----------------- Core detection -----------------
     def run_detection(self):
-        header, image_source, image = self.prepare_image()
-        if image is None:
+        if not self._infer_lock.acquire(blocking=False):
+            rospy.logwarn_throttle(1.0, "Skip frame: inference busy")
             return
+        try:
+            header, image_source, image = self.prepare_image()
+            if image is None:
+                self.publish_empty_dets(header, reason="empty image frame")
+                return
 
-        prompt_a = self.current_prompts.prompt_a
-        prompt_b_terms = list(self.current_prompts.prompt_b_terms)
-        env_caption = " . ".join(prompt_b_terms).strip()
-        if not prompt_a:
-            rospy.logwarn("Empty prompt_a, skip detection.")
-            return
-        if not env_caption:
-            rospy.logwarn("Empty prompt_b_terms, skip detection.")
-            return
+            prompt_a = self.current_prompts.prompt_a
+            prompt_b_terms = list(self.current_prompts.prompt_b_terms)
+            env_caption = " . ".join(prompt_b_terms).strip()
+            if not prompt_a:
+                self.publish_empty_dets(header, reason="empty prompt_a")
+                return
+            if not env_caption:
+                self.publish_empty_dets(header, reason="empty prompt_b_terms")
+                return
 
-        required_color_terms = det_utils.extract_color_terms(
-            (self.task_parsed.get("target") or {}).get("attributes", [])
-        )
+            required_color_terms = det_utils.extract_color_terms(
+                (self.task_parsed.get("target") or {}).get("attributes", [])
+            )
 
-        # === TARGET (prompt_A) ===
-        target_boxes, target_logits, target_phrases = det_utils.run_grounding_dino_with_caption(
-            model=self.model,
-            image_source=image_source,
-            image=image,
-            caption=prompt_a,
-            run_label="TARGET",
-            box_threshold=self.box_threshold,
-            text_threshold=self.text_threshold,
-            output_path=None,
-        )
-
-        color_filtered = False
-        removed_color_phrases = []
-        if required_color_terms and len(target_boxes) > 0:
-            target_boxes, target_logits, target_phrases, color_filtered, removed_color_phrases = (
-                det_utils.filter_boxes_by_color(
-                    image_source,
-                    target_boxes,
-                    target_logits,
-                    target_phrases,
-                    required_color_terms,
-                    ratio_threshold=0.02,
+            try:
+                # === TARGET (prompt_A) ===
+                target_boxes, target_logits, target_phrases = det_utils.run_grounding_dino_with_caption(
+                    model=self.model,
+                    image_source=image_source,
+                    image=image,
+                    caption=prompt_a,
+                    run_label="TARGET",
+                    box_threshold=self.box_threshold,
+                    text_threshold=self.text_threshold,
+                    output_path=None,
                 )
-            )
-        if len(target_boxes) > 1:
-            target_boxes, target_logits, target_phrases = det_utils.nms_iou(
-                target_boxes, target_logits, target_phrases, threshold=0.9
-            )
-        if len(target_boxes) > 0:
-            target_boxes, target_logits, target_phrases = det_utils.validate_color_by_phrase(
-                image_source, target_boxes, target_logits, target_phrases, ratio_threshold=0.02, blur_ksize=3, dilate_iter=1
-            )
-            target_boxes, target_logits, target_phrases = det_utils.keep_top_confidence_detection(
-                target_boxes, target_logits, target_phrases
-            )
 
-        # === ENV (prompt_B) ===
-        env_boxes, env_logits, env_phrases = det_utils.run_grounding_dino_with_caption(
-            model=self.model,
-            image_source=image_source,
-            image=image,
-            caption=env_caption,
-            run_label="ENV",
-            box_threshold=self.box_threshold,
-            text_threshold=self.text_threshold,
-            output_path=None,
-        )
+                color_filtered = False
+                removed_color_phrases = []
+                if required_color_terms and target_boxes is not None and len(target_boxes) > 0:
+                    target_boxes, target_logits, target_phrases, color_filtered, removed_color_phrases = (
+                        det_utils.filter_boxes_by_color(
+                            image_source,
+                            target_boxes,
+                            target_logits,
+                            target_phrases,
+                            required_color_terms,
+                            ratio_threshold=0.02,
+                        )
+                    )
+                if target_boxes is not None and len(target_boxes) > 1:
+                    target_boxes, target_logits, target_phrases = det_utils.nms_iou(
+                        target_boxes, target_logits, target_phrases, threshold=0.9
+                    )
+                if target_boxes is not None and len(target_boxes) > 0:
+                    target_boxes, target_logits, target_phrases = det_utils.validate_color_by_phrase(
+                        image_source, target_boxes, target_logits, target_phrases, ratio_threshold=0.02, blur_ksize=3, dilate_iter=1
+                    )
+                    target_boxes, target_logits, target_phrases = det_utils.keep_top_confidence_detection(
+                        target_boxes, target_logits, target_phrases
+                    )
 
-        if len(env_boxes) > 0 and len(target_boxes) > 0:
-            env_boxes, env_logits, env_phrases = det_utils.filter_boxes_by_overlap(
-                env_boxes, env_logits, env_phrases, target_boxes, threshold=0.5
-            )
-        if len(env_boxes) > 0:
-            env_boxes, env_logits, env_phrases = det_utils.validate_color_by_phrase(
-                image_source, env_boxes, env_logits, env_phrases, ratio_threshold=0.02, blur_ksize=3, dilate_iter=1
-            )
-        if len(env_boxes) > 1:
-            env_boxes, env_logits, env_phrases = det_utils.nms_iou(
-                env_boxes, env_logits, env_phrases, threshold=0.9
-            )
+                # === ENV (prompt_B) ===
+                env_boxes, env_logits, env_phrases = det_utils.run_grounding_dino_with_caption(
+                    model=self.model,
+                    image_source=image_source,
+                    image=image,
+                    caption=env_caption,
+                    run_label="ENV",
+                    box_threshold=self.box_threshold,
+                    text_threshold=self.text_threshold,
+                    output_path=None,
+                )
 
-        # === Publish /lste/detections ===
-        msg = LsteDetections()
-        if isinstance(header, Header):
-            msg.header = header
-        else:
-            msg.header = Header()
-            msg.header.stamp = rospy.Time.now()
-        msg.task_id = self.current_task.task_id
-        msg.prompt_a = prompt_a
-        msg.prompt_b_terms = prompt_b_terms
+                if env_boxes is not None and target_boxes is not None and len(env_boxes) > 0 and len(target_boxes) > 0:
+                    env_boxes, env_logits, env_phrases = det_utils.filter_boxes_by_overlap(
+                        env_boxes, env_logits, env_phrases, target_boxes, threshold=0.5
+                    )
+                if env_boxes is not None and len(env_boxes) > 0:
+                    env_boxes, env_logits, env_phrases = det_utils.validate_color_by_phrase(
+                        image_source, env_boxes, env_logits, env_phrases, ratio_threshold=0.02, blur_ksize=3, dilate_iter=1
+                    )
+                if env_boxes is not None and len(env_boxes) > 1:
+                    env_boxes, env_logits, env_phrases = det_utils.nms_iou(
+                        env_boxes, env_logits, env_phrases, threshold=0.9
+                    )
+            except Exception as exc:
+                rospy.logerr_throttle(1.0, "Detector exception: %s", exc)
+                self.publish_empty_dets(header, reason=f"exception: {type(exc).__name__}")
+                return
 
-        def to_float_list(tensor_like):
-            try:
-                return tensor_like.cpu().tolist()
-            except Exception:
+            # === Publish /lste/detections ===
+            msg = LsteDetections()
+            if isinstance(header, Header):
+                msg.header = header
+            else:
+                msg.header = Header()
+                msg.header.stamp = rospy.Time.now()
+            if not msg.header.stamp:
+                msg.header.stamp = rospy.Time.now()
+            msg.task_id = self.current_task.task_id if self.current_task else ""
+            msg.prompt_a = prompt_a
+            msg.prompt_b_terms = prompt_b_terms
+
+            def to_float_list(tensor_like):
                 try:
-                    return tensor_like.tolist()
+                    return tensor_like.cpu().tolist()
                 except Exception:
-                    return list(tensor_like)
+                    try:
+                        return tensor_like.tolist()
+                    except Exception:
+                        return list(tensor_like)
 
-        target_boxes_list = to_float_list(target_boxes) if target_boxes is not None else []
-        target_logits_list = to_float_list(target_logits) if target_logits is not None else []
-        target_phrases_list = [str(p) for p in target_phrases] if target_phrases is not None else []
+            target_boxes_list = to_float_list(target_boxes) if target_boxes is not None else []
+            target_logits_list = to_float_list(target_logits) if target_logits is not None else []
+            target_phrases_list = [str(p) for p in target_phrases] if target_phrases is not None else []
 
-        env_boxes_list = to_float_list(env_boxes) if env_boxes is not None else []
-        env_logits_list = to_float_list(env_logits) if env_logits is not None else []
-        env_phrases_list = [str(p) for p in env_phrases] if env_phrases is not None else []
+            env_boxes_list = to_float_list(env_boxes) if env_boxes is not None else []
+            env_logits_list = to_float_list(env_logits) if env_logits is not None else []
+            env_phrases_list = [str(p) for p in env_phrases] if env_phrases is not None else []
 
-        for idx, box in enumerate(target_boxes_list):
-            det = LsteDetection()
-            det.label = target_phrases_list[idx] if idx < len(target_phrases_list) else ""
-            det.score = float(target_logits_list[idx]) if idx < len(target_logits_list) else 0.0
-            try:
-                det.cx, det.cy, det.w, det.h = [float(x) for x in box]
-            except Exception:
-                det.cx = det.cy = det.w = det.h = 0.0
-            msg.target_dets.append(det)
+            for idx, box in enumerate(target_boxes_list):
+                det = LsteDetection()
+                det.label = target_phrases_list[idx] if idx < len(target_phrases_list) else ""
+                det.score = float(target_logits_list[idx]) if idx < len(target_logits_list) else 0.0
+                try:
+                    det.cx, det.cy, det.w, det.h = [float(x) for x in box]
+                except Exception:
+                    det.cx = det.cy = det.w = det.h = 0.0
+                msg.target_dets.append(det)
 
-        for idx, box in enumerate(env_boxes_list):
-            det = LsteDetection()
-            det.label = env_phrases_list[idx] if idx < len(env_phrases_list) else ""
-            det.score = float(env_logits_list[idx]) if idx < len(env_logits_list) else 0.0
-            try:
-                det.cx, det.cy, det.w, det.h = [float(x) for x in box]
-            except Exception:
-                det.cx = det.cy = det.w = det.h = 0.0
-            msg.env_dets.append(det)
+            for idx, box in enumerate(env_boxes_list):
+                det = LsteDetection()
+                det.label = env_phrases_list[idx] if idx < len(env_phrases_list) else ""
+                det.score = float(env_logits_list[idx]) if idx < len(env_logits_list) else 0.0
+                try:
+                    det.cx, det.cy, det.w, det.h = [float(x) for x in box]
+                except Exception:
+                    det.cx = det.cy = det.w = det.h = 0.0
+                msg.env_dets.append(det)
 
-        self.pub.publish(msg)
-        rospy.loginfo(
-            "Published /lste/detections: %d target boxes, %d env boxes (task_id=%s)",
-            len(msg.target_dets),
-            len(msg.env_dets),
-            msg.task_id,
-        )
+            self.pub.publish(msg)
+            rospy.loginfo(
+                "Published /lste/detections: %d target boxes, %d env boxes (task_id=%s)",
+                len(msg.target_dets),
+                len(msg.env_dets),
+                msg.task_id,
+            )
+        finally:
+            self._infer_lock.release()
 
     # ----------------- Spin Loop -----------------
     def spin(self):
