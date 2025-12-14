@@ -2,6 +2,10 @@
   <arg name="gui" default="true"/>
   <arg name="use_sim_time" default="true"/>
   <arg name="robot_name" default="pro3"/>
+
+  <!-- 默认 world，允许从命令行覆盖为任意 .world 路径 -->
+  <arg name="world_name" default="$(find lste_core)/worlds/lab_building.world"/>
+
   <arg name="x" default="0.0"/>
   <arg name="y" default="0.0"/>
   <arg name="z" default="0.1"/>
@@ -10,6 +14,7 @@
   <include file="$(find lste_core)/launch/lab_world.launch">
     <arg name="gui" value="$(arg gui)"/>
     <arg name="use_sim_time" value="$(arg use_sim_time)"/>
+    <arg name="world_name" value="$(arg world_name)"/>
   </include>
 
   <include file="$(find lste_core)/launch/spawn_pro3.launch">

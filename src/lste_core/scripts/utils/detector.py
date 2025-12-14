@@ -14,8 +14,8 @@ from groundingdino.util.inference import load_model, load_image, predict, annota
 
 
 PROJECT_ROOT = Path("/home/zrz/lste_ws/model")
-DEFAULT_DINO_CONFIG_PATH = PROJECT_ROOT / "GroundingDINO" / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py"
-DEFAULT_DINO_WEIGHTS_PATH = PROJECT_ROOT / "GroundingDINO" / "weights" / "groundingdino_swint_ogc.pth"
+DEFAULT_DINO_CONFIG_PATH = PROJECT_ROOT / "GroundingDINO" / "groundingdino" / "config" / "GroundingDINO_SwinB_cfg.py"
+DEFAULT_DINO_WEIGHTS_PATH = PROJECT_ROOT / "GroundingDINO" / "weights" / "groundingdino_swinb_cogcoor.pth"
 
 COLOR_KEYWORDS = {
     "red",
