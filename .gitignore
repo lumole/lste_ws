@@ -16,11 +16,15 @@ log/
 .vscode/
 .idea/
 
-# Models & large external data (copied under model/)
-model/MiniCPM/
-model/GroundingDINO/
-model/Data_exchange/
-
-# Scoring visualizations / temp outputs if they appear under model
-model/**/result/
+# Models: keep code/configs, ignore heavy checkpoints/outputs
 model/**/weights/
+model/**/checkpoints/
+model/**/result/
+model/**/runs/
+model/**/logs/
+model/**/*.pth
+model/**/*.pt
+model/**/*.bin
+model/**/*.ckpt
+model/**/*.safetensors
+model/**/*.onnx
