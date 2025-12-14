@@ -1,6 +1,6 @@
 -###################### -pipeline- ################################-
 roslaunch lste_core lab_with_pro3.launch \
-  world_name:=/home/zrz/building_editor_models/labtest
+  world_name:=/home/zrz/building_editor_models/dooropen
 
 rosrun lste_core lste_task_node.py _json_path:=/home/zrz/lste_ws/model/Data_exchange/vlm_prompt/lab/yellow_cup.json _task_id:=yellow_cup
 

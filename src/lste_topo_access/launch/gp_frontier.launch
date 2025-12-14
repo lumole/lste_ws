@@ -1,0 +1,36 @@
+<launch>
+  <!--
+  GP-based frontier provider for PASS state.
+  - Subscribes: /rbt_pose (geometry_msgs/Pose2D), /sph_pcl (sensor_msgs/PointCloud2)
+  - Publishes: /lste/gp_frontier (PoseStamped, odom), plus gp_nav_var/gp_nav_oc/gp_nav_pts for RViz.
+  -->
+
+  <node pkg="lste_topo_access"
+        type="gp_subgoals_sim_topo.py"
+        name="gp_subgoal"
+        output="screen">
+
+    <!-- Occupancy surface config -->
+    <param name="oc_srfc_rds" value="5.0" />
+    <param name="pcl_skp" value="3" />
+
+    <!-- GP + cost function parameters (copied from pre_ws gp_subgoals_sim.yaml) -->
+    <param name="gp_nav_indpts_sz"   value="400" />
+    <param name="gp_nav_var_thrshld" value="0.03" />
+
+    <param name="gap_k_dir"       value="4.0" />
+    <param name="gap_k_dst"       value="5.0" />
+    <param name="gp_nav_goal_dst" value="5.0" />
+
+    <!-- Visualization parameters -->
+    <param name="gp_nav_var_viz"     value="5.0" />
+    <param name="gp_nav_var_img_viz" value="false" />
+
+    <!-- Default final goal in odom frame (can be overridden by /lste/final_goal topic) -->
+    <param name="gl_x" value="-4.0" />
+    <param name="gl_y" value="-16.0" />
+    <param name="gl_yaw" value="0.0" />
+
+  </node>
+</launch>
+
