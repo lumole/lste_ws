@@ -1,36 +1,43 @@
 <launch>
-  <!--
-  GP-based frontier provider for PASS state.
-  - Subscribes: /rbt_pose (geometry_msgs/Pose2D), /sph_pcl (sensor_msgs/PointCloud2)
-  - Publishes: /lste/gp_frontier (PoseStamped, odom), plus gp_nav_var/gp_nav_oc/gp_nav_pts for RViz.
-  -->
+  <!-- 整体：启动 GP frontier 节点，用于在 PASS 状态下基于 GP 生成探索子目标 -->
 
+  <!-- 启动的节点属于 lste_topo_access 功能包 -->
+  <!-- pkg：包名；type：Python 脚本名；name：节点名；output="screen"：日志打印到终端 -->
   <node pkg="lste_topo_access"
         type="gp_subgoals_sim_topo.py"
         name="gp_subgoal"
         output="screen">
 
-    <!-- Occupancy surface config -->
+    <!-- 占据球面配置：oc_srfc_rds 为占据面半径（激光最大考虑距离，单位 m） -->
     <param name="oc_srfc_rds" value="5.0" />
+    <!-- 点云下采样步长：每隔 pcl_skp 个角度方向保留一个，用于减小 GP 训练点数量 -->
     <param name="pcl_skp" value="3" />
 
-    <!-- GP + cost function parameters (copied from pre_ws gp_subgoals_sim.yaml) -->
+    <!-- GP 相关参数：gp_nav_indpts_sz 为稀疏 GP 的诱导点数量，值越大越准但越慢 -->
     <param name="gp_nav_indpts_sz"   value="400" />
+    <!-- gp_nav_var_thrshld 为方差阈值，用于从方差图中提取“高不确定性”frontier 区域 -->
     <param name="gp_nav_var_thrshld" value="0.03" />
 
+    <!-- 代价函数参数：gap_k_dir 控制方向项权重（越大越偏向机器人前方） -->
     <param name="gap_k_dir"       value="4.0" />
+    <!-- gap_k_dst 控制与全局目标距离项权重（越大越偏向靠近全局目标的 frontier） -->
     <param name="gap_k_dst"       value="5.0" />
+    <!-- gp_nav_goal_dst 为子目标距离机器人中心的标称半径（导航点所在球面的半径，单位 m） -->
     <param name="gp_nav_goal_dst" value="5.0" />
 
-    <!-- Visualization parameters -->
+    <!-- 可视化参数：gp_nav_var_viz 为在 RViz 中绘制方差/占据球壳的半径（单位 m） -->
     <param name="gp_nav_var_viz"     value="5.0" />
+    <!-- gp_nav_var_img_viz 控制是否弹出方差二值图窗口用于调试阈值（true 打开，false 关闭） -->
     <param name="gp_nav_var_img_viz" value="false" />
 
-    <!-- Default final goal in odom frame (can be overridden by /lste/final_goal topic) -->
-    <param name="gl_x" value="-4.0" />
-    <param name="gl_y" value="-16.0" />
+    <!-- 默认全局目标（odom 坐标系）
+         注意：实际运行时，gp_subgoals_sim_topo.py 会在没有收到 /lste/final_goal 时，
+         自动将全局目标重置为“起步位置正前方 10 m”。
+         这里的参数仅作为初始占位。 -->
+    <!-- gl_x：全局目标 x 坐标；gl_y：全局目标 y 坐标；gl_yaw：全局目标朝向（弧度） -->
+    <param name="gl_x" value="0.0" />
+    <param name="gl_y" value="0.0" />
     <param name="gl_yaw" value="0.0" />
 
   </node>
 </launch>
-

@@ -1,7 +1,7 @@
 -###################### -pipeline- ################################-
 roslaunch lste_core lab_with_pro3.launch \
-  world_name:=/home/zrz/building_editor_models/dooropen
-
+  world_name:=/home/zrz/lste_ws/src/lste_core/worlds/room.world
+  
 rosrun lste_core lste_task_node.py _json_path:=/home/zrz/lste_ws/model/Data_exchange/vlm_prompt/lab/yellow_cup.json _task_id:=yellow_cup
 
 conda activate minicpm
@@ -39,3 +39,25 @@ roslaunch lste_core lste_det_vis.launch
 rosrun teleop_twist_keyboard teleop_twist_keyboard.py cmd_vel:=/cmd_vel  #操控车来移动（键盘操控）
 rostopic echo /lste/task  #能看到发布的task
 rostopic echo /lste/prompts  #能看到发布的prompts
+
+
+
+
+
+
+
+
+-####################- access_topo -############################-
+roslaunch lste_core lab_with_pro3.launch \
+  world_name:=/home/zrz/lste_ws/src/lste_core/worlds/room.world
+  
+conda activate vsgp
+roslaunch lste_topo_access gp_frontier.launch
+
+roslaunch lste_oc_srfc oc_srfc_proj.launch
+
+rviz -d /home/zrz/lste_ws/src/lste_topo_access/launch/gp_frontier.rviz
+
+
+
+

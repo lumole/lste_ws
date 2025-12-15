@@ -1,4 +1,6 @@
 <launch>
+  <!-- ensure Gazebo can load custom Velodyne plugin from pre_ws -->
+  <env name="GAZEBO_PLUGIN_PATH" value="/home/zrz/pre_ws/devel/lib:$(optenv GAZEBO_PLUGIN_PATH '')"/>
   <arg name="gui" default="true"/>
   <arg name="use_sim_time" default="true"/>
   <arg name="robot_name" default="pro3"/>

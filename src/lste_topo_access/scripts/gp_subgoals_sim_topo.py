@@ -225,6 +225,16 @@ class VSGPNavGlb:
                                                     PoseStamped,
                                                     queue_size=1)
 
+        # ---- zcy 相关状态先初始化，再注册订阅者，避免回调在属性创建前触发 ----
+        self.visited_positions = []
+        self.int_visited_positions = []
+        self.closed = []
+        self.change_flag = True
+        self.final_goal_received = False
+        # 初始化检测历史记录：用于 interest subgoal 过滤
+        self.detected_interest_points = []
+        self.match_threshold = 0.5  # 例如，0.5米
+
         #zcy
         self.zcyrbt_pose_sub = rospy.Subscriber("rbt_pose",
                                                 Pose2D,
@@ -293,7 +303,12 @@ class VSGPNavGlb:
         self.gp_nav_var_img_viz = rospy.get_param('~gp_nav_var_img_viz', False)
         self.gp_nav_var_viz = rospy.get_param('~gp_nav_var_viz', 5.0)
 
-        ## final goal
+        ## 全局目标动态更新参数（PASS 默认）：每隔 gl_update_period 秒，沿最“空旷”frontier 方向外推 gl_update_forward_dist 米
+        self.gl_update_period = rospy.get_param('~gl_update_period', 10.0)
+        self.gl_update_forward_dist = rospy.get_param('~gl_update_forward_dist', 10.0)
+        self.last_gl_update_time = rospy.Time.now().to_sec()
+
+        ## final goal（默认先用参数，后面根据起始位姿自动调整）
         self.gl_x = rospy.get_param('~gl_x', -4.0)
         self.gl_y = rospy.get_param('~gl_y', -16.0)
         self.gl_yaw = rospy.get_param('~gl_yaw', 0.0)
@@ -337,6 +352,20 @@ class VSGPNavGlb:
         ## waite for robot pose and oc_srfc
         while self.pose is None or self.pcl_arr is None:
             pass
+
+        # 如果还没有收到 /lste/final_goal，则把“默认全局目标”
+        # 设置为【起步位置正前方 10 m】（odom 坐标系）
+        if not self.final_goal_received and self.pose is not None:
+            try:
+                # Pose2D: x, y, theta（theta 为朝向）
+                forward_dist = 10.0
+                self.gl_x = self.pose.x + forward_dist * np.cos(self.pose.theta)
+                self.gl_y = self.pose.y + forward_dist * np.sin(self.pose.theta)
+                self.gl_yaw = self.pose.theta
+                self.gl_wrt_odom = np.array([self.gl_x, self.gl_y, 1], dtype="float32")
+            except Exception as e:
+                rospy.logwarn("Failed to set default final goal from start pose: %s", e)
+
         ## print all params
         self.print_ros_param()
         #rospy.spin()
@@ -655,6 +684,7 @@ class VSGPNavGlb:
         #zcy
         new_gp_nav_actul_xy_gls = []
         new_gp_nav_frntr_cntrs = []
+        new_gp_nav_frntr_areas = []
         closed = []  # 用于存储阻塞的目标点
 
         for idx, subgoal in enumerate(self.gp_nav_actul_xy_gls):
@@ -662,6 +692,9 @@ class VSGPNavGlb:
             if not self.is_visited([x, y], 3):
                 new_gp_nav_actul_xy_gls.append(subgoal)
                 new_gp_nav_frntr_cntrs.append(self.gp_nav_frntr_cntrs[idx])
+                # 保留对应的 frontier 面积，后续用于“最空旷方向”判断
+                if idx < len(self.gp_nav_frntr_areas):
+                    new_gp_nav_frntr_areas.append(self.gp_nav_frntr_areas[idx])
             else:
                 # closed.append(subgoal)
                 # print(f"close_list =  {closed} ")
@@ -673,6 +706,7 @@ class VSGPNavGlb:
         #对齐形状
         self.gp_nav_actul_xy_gls = np.array(new_gp_nav_actul_xy_gls)
         self.gp_nav_frntr_cntrs = np.array(new_gp_nav_frntr_cntrs)
+        self.gp_nav_frntr_areas = np.array(new_gp_nav_frntr_areas)
         self.gp_nav_pts = self.gp_nav_frntr_cntrs
         self.gp_nav_gls_sz = len(new_gp_nav_actul_xy_gls)
 
@@ -702,6 +736,35 @@ class VSGPNavGlb:
         print("recommended subgoal id and direction: ", self.chsn_gl_idx, self.gp_nav_pt[0])
 
         self.closed.extend(closed)
+
+    def update_global_goal_periodic(self):
+        """每隔 gl_update_period 秒，把全局目标朝“最空旷的 frontier 方向”外推 gl_update_forward_dist 米。"""
+        if self.pose is None:
+            return
+        now = rospy.Time.now().to_sec()
+        if now - self.last_gl_update_time < self.gl_update_period:
+            return
+
+        if self.gp_nav_frntr_cntrs is None or len(self.gp_nav_frntr_cntrs) == 0:
+            return
+
+        # 选面积最大的 frontier，作为“最空旷方向”
+        areas = getattr(self, "gp_nav_frntr_areas", None)
+        if areas is not None and len(areas) > 0:
+            idx = int(np.argmax(areas))
+        else:
+            idx = 0
+        idx = min(idx, len(self.gp_nav_frntr_cntrs) - 1)
+
+        theta = float(self.gp_nav_frntr_cntrs[idx][0])  # 相对机器人坐标系的偏航
+        heading = self.pose.theta + theta               # 转成 odom 下的全局朝向
+        self.gl_x = self.pose.x + self.gl_update_forward_dist * np.cos(heading)
+        self.gl_y = self.pose.y + self.gl_update_forward_dist * np.sin(heading)
+        self.gl_yaw = heading
+        self.gl_wrt_odom = np.array([self.gl_x, self.gl_y, 1], dtype="float32")
+        self.last_gl_update_time = now
+
+        rospy.loginfo_throttle(5.0, "Auto-updated global goal: (%.2f, %.2f, %.2f rad)", self.gl_x, self.gl_y, self.gl_yaw)
 
     """ @brief:  publish recommended goal to DRL"""
 
@@ -1014,6 +1077,7 @@ class VSGPNavGlb:
             self.gp_nav_mask_thrshld()
             self.gp_grd_var_img()
             self.gp_nav_pkup_nav_pt()
+            self.update_global_goal_periodic()  # 每隔 gl_update_period 秒基于当前 frontier 更新全局目标
             ####calculate navigation point in world frame zcy topo模式下不发布subgoal及可视化
             # self.gp_nav_xypts_actul_pcl()
             # self.gp_nav_pts_pcl()
