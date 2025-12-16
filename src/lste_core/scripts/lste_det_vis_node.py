@@ -13,7 +13,12 @@ from typing import Iterable, Tuple, Optional, List
 import cv2
 import rospy
 from cv_bridge import CvBridge, CvBridgeError
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo, PointCloud2
+from sensor_msgs import point_cloud2
+from geometry_msgs.msg import Pose2D, PointStamped, PoseStamped
+import tf2_ros
+from tf2_geometry_msgs import do_transform_point
+from image_geometry import PinholeCameraModel
 
 from lste_msgs.msg import LsteDetections, LsteDetection, LsteScores, LsteTask, LsteState
 
@@ -34,9 +39,19 @@ class DetectionVisualizer:
         self.output_topic = rospy.get_param("~output_topic", "/lste/det_vis_image")
         self.scores_topic = rospy.get_param("~scores_topic", "/lste/scores")
         self.state_topic = rospy.get_param("~state_topic", "/lste/state")
+        self.camera_info_topic = rospy.get_param("~camera_info_topic", "")
         self.draw_labels = bool(rospy.get_param("~draw_labels", True))
         self.font_scale = float(rospy.get_param("~font_scale", 0.5))
         self.line_thickness = int(rospy.get_param("~line_thickness", 2))
+        self.camera_fov_deg = float(rospy.get_param("~camera_fov_deg", 60.0))
+
+        if not self.camera_info_topic:
+            # 简单猜测 camera_info 话题：把最后一级替换成 camera_info
+            if "/" in self.image_topic:
+                prefix = self.image_topic.rsplit("/", 1)[0]
+                self.camera_info_topic = f"{prefix}/camera_info"
+            else:
+                self.camera_info_topic = "/camera/camera_info"
 
         # 调色板（BGR），与离线 8B-05B.py 保持一致风格
         self.palette = {
@@ -46,6 +61,15 @@ class DetectionVisualizer:
             "neg": {"edge": (140, 140, 140)},
         }
 
+        # 简化的全局目标可视化：仅依赖全局目标点 + 机器人位姿（odom 坐标系）
+        self.global_goal_point = None  # type: Optional[Tuple[float, float, float]]
+        self.global_goal_frame = "odom"
+        self.robot_pose = None  # type: Optional[Pose2D]
+        self.camera_model = PinholeCameraModel()
+        self.has_camera_info = False
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+
         self.sub_image = rospy.Subscriber(self.image_topic, Image, self.on_image, queue_size=1)
         self.sub_detections = rospy.Subscriber(
             self.detections_topic, LsteDetections, self.on_detections, queue_size=1
@@ -53,6 +77,11 @@ class DetectionVisualizer:
         self.sub_scores = rospy.Subscriber(self.scores_topic, LsteScores, self.on_scores, queue_size=1)
         self.sub_task = rospy.Subscriber("/lste/task", LsteTask, self.on_task, queue_size=1)
         self.sub_state = rospy.Subscriber(self.state_topic, LsteState, self.on_state, queue_size=1)
+        self.sub_robot_pose = rospy.Subscriber("/rbt_pose", Pose2D, self.on_robot_pose, queue_size=1)
+        self.sub_camera_info = rospy.Subscriber(self.camera_info_topic, CameraInfo, self.on_camera_info, queue_size=1)
+        self.sub_global_goal = rospy.Subscriber("/gl_wrt_odom", PointCloud2, self.on_global_goal, queue_size=1)
+        # 备用：如果没有 /gl_wrt_odom，可用 PoseStamped 形式的全局目标
+        self.sub_global_goal_pose = rospy.Subscriber("/lste/final_goal", PoseStamped, self.on_global_goal_pose, queue_size=1)
         self.pub = rospy.Publisher(self.output_topic, Image, queue_size=1)
 
         rospy.loginfo(
@@ -80,6 +109,32 @@ class DetectionVisualizer:
 
     def on_state(self, msg: LsteState):
         self.latest_state = msg
+
+    def on_camera_info(self, msg: CameraInfo):
+        try:
+            self.camera_model.fromCameraInfo(msg)
+            self.has_camera_info = True
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "Failed to load camera info: %s", exc)
+            self.has_camera_info = False
+
+    def on_robot_pose(self, msg: Pose2D):
+        self.robot_pose = msg
+
+    def on_global_goal(self, msg: PointCloud2):
+        # 只取第一个点（gl_wrt_odom 发布的是单点 PointCloud2）
+        for p in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+            self.global_goal_point = (float(p[0]), float(p[1]), float(p[2]))
+            self.global_goal_frame = msg.header.frame_id or "odom"
+            break
+
+    def on_global_goal_pose(self, msg: PoseStamped):
+        self.global_goal_point = (
+            float(msg.pose.position.x),
+            float(msg.pose.position.y),
+            float(msg.pose.position.z),
+        )
+        self.global_goal_frame = msg.header.frame_id or "odom"
 
     # ----------------- Helpers -----------------
     def try_publish(self):
@@ -178,6 +233,11 @@ class DetectionVisualizer:
 
         if scores is not None:
             self._draw_scores(image, scores, state)
+
+        try:
+            self._draw_global_goal_indicator(image)
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "Draw global goal failed: %s", exc)
 
         return image
 
@@ -375,6 +435,91 @@ class DetectionVisualizer:
                 1,
                 cv2.LINE_AA,
             )
+
+    def _draw_goal_hint(self, image, text: str):
+        h, w = image.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.5
+        thickness = 1
+        text_size, baseline = cv2.getTextSize(text, font, scale, thickness)
+        margin = 10
+        x = max(margin, w - text_size[0] - margin)
+        y = h - margin
+        cv2.rectangle(
+            image,
+            (x - 4, y - text_size[1] - baseline - 2),
+            (x + text_size[0] + 4, y + baseline + 2),
+            (0, 0, 0),
+            thickness=-1,
+        )
+        cv2.putText(image, text, (x, y), font, scale, (0, 255, 0), thickness, cv2.LINE_AA)
+
+    def _draw_global_goal_indicator(self, image):
+        """将 /gl_wrt_odom 的全局目标点投影到当前相机画面（需要 TF + camera_info）."""
+        if self.global_goal_point is None:
+            self._draw_goal_hint(image, "Global goal not received")
+            return
+        if self.latest_image is None:
+            return
+        if not self.has_camera_info:
+            self._draw_goal_hint(image, "Camera info missing")
+            return
+
+        camera_frame = self.latest_image.header.frame_id or self.camera_model.tfFrame()
+        if not camera_frame:
+            self._draw_goal_hint(image, "Camera frame missing")
+            return
+
+        goal_pt = PointStamped()
+        goal_pt.header.frame_id = self.global_goal_frame
+        goal_pt.header.stamp = rospy.Time(0)
+        goal_pt.point.x, goal_pt.point.y, goal_pt.point.z = self.global_goal_point
+
+        if not self.tf_buffer.can_transform(
+            camera_frame, goal_pt.header.frame_id, rospy.Time(0), rospy.Duration(0.0)
+        ):
+            self._draw_goal_hint(image, "Global goal TF missing")
+            return
+
+        try:
+            tf_msg = self.tf_buffer.lookup_transform(
+                camera_frame, goal_pt.header.frame_id, rospy.Time(0), rospy.Duration(0.0)
+            )
+            goal_cam = do_transform_point(goal_pt, tf_msg)
+        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException, tf2_ros.ConnectivityException) as exc:
+            rospy.logwarn_throttle(5.0, "TF lookup/transform for global goal failed: %s", exc)
+            return
+
+        if goal_cam.point.z <= 0.05:
+            self._draw_goal_hint(image, "Global goal behind camera")
+            return
+
+        try:
+            u, v = self.camera_model.project3dToPixel(
+                (goal_cam.point.x, goal_cam.point.y, goal_cam.point.z)
+            )
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "Project3dToPixel failed: %s", exc)
+            return
+
+        h, w = image.shape[:2]
+        if 0 <= u < w and 0 <= v < h:
+            center = (int(u), int(v))
+            # 更醒目的绿色标记：外圈粗线 + 大实心点
+            cv2.circle(image, center, 14, (0, 255, 0), 3)
+            cv2.circle(image, center, 8, (0, 255, 0), -1)
+            cv2.putText(
+                image,
+                "GOAL",
+                (center[0] + 12, max(20, center[1] - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+        else:
+            self._draw_goal_hint(image, "Global goal outside camera view")
 
     def spin(self):
         rospy.spin()

@@ -164,18 +164,22 @@ class StateNode:
             self.maybe_publish(now, prev_state, prev_subtype)
             return
 
-        # 2) EXHAUSTED handling (占位版：只看分数+时间)
-        if self.current_state == STATE_EXHAUSTED and self.is_promising(sample):
-            self.current_state = STATE_SUSPICIOUS
-            self.current_subtype = self.pick_suspicious_subtype(sample)
-            self.maybe_publish(now, prev_state, prev_subtype)
-            return
-
-        if self.should_exhaust(now):
-            self.current_state = STATE_EXHAUSTED
-            self.current_subtype = "Exhausted-LowScore"
-            self.maybe_publish(now, prev_state, prev_subtype)
-            return
+        # 2) EXHAUSTED handling
+        # 目前暂时禁用 EXHAUSTED 状态：
+        # - 不再进入 STATE_EXHAUSTED
+        # - 若原本会从 EXHAUSTED 恢复，也直接走后面的 SUSPICIOUS/PASS 逻辑
+        # （后续若要恢复 EXHAUSTED，只需把下面两段逻辑改回原来的判断）
+        # if self.current_state == STATE_EXHAUSTED and self.is_promising(sample):
+        #     self.current_state = STATE_SUSPICIOUS
+        #     self.current_subtype = self.pick_suspicious_subtype(sample)
+        #     self.maybe_publish(now, prev_state, prev_subtype)
+        #     return
+        #
+        # if self.should_exhaust(now):
+        #     self.current_state = STATE_EXHAUSTED
+        #     self.current_subtype = "Exhausted-LowScore"
+        #     self.maybe_publish(now, prev_state, prev_subtype)
+        #     return
 
         # 3) SUSPICIOUS handling
         if self.should_suspicious():
