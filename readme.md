@@ -25,8 +25,8 @@ rosrun lste_core lste_score_node.py \
 
 rosrun lste_core lste_state_node.py
 
-roslaunch lste_core lste_det_vis.launch
 
+roslaunch lste_core lste_det_vis.launch
 
 
 
@@ -40,7 +40,8 @@ rosrun teleop_twist_keyboard teleop_twist_keyboard.py cmd_vel:=/cmd_vel  #操控
 rostopic echo /lste/task  #能看到发布的task
 rostopic echo /lste/prompts  #能看到发布的prompts
 
-
+conda activate vsgp
+rosrun vanish_point_detection vanish_point_detection.py
 
 
 
@@ -50,7 +51,8 @@ rostopic echo /lste/prompts  #能看到发布的prompts
 -####################- access_topo -############################-
 roslaunch lste_core lab_with_pro3.launch \
   world_name:=/home/zrz/lste_ws/src/lste_core/worlds/room.world
-  
+
+
 conda activate vsgp
 roslaunch lste_topo_access gp_frontier.launch
 

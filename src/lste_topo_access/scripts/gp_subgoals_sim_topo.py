@@ -28,7 +28,7 @@ from std_msgs.msg import Header, Bool
 # defined msg
 #from gp_subgoal.msg import PosePcl2
 from geometry_msgs.msg import PoseStamped, PointStamped
-from geometry_msgs.msg import Pose2D, Point
+from geometry_msgs.msg import Pose2D, Point, Pose
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker
 
@@ -231,6 +231,7 @@ class VSGPNavGlb:
         self.closed = []
         self.change_flag = True
         self.final_goal_received = False
+        self.vanish_distance = None  # 由消失点估计的前向距离（当前停用）
         # 初始化检测历史记录：用于 interest subgoal 过滤
         self.detected_interest_points = []
         self.match_threshold = 0.5  # 例如，0.5米
@@ -240,6 +241,11 @@ class VSGPNavGlb:
                                                 Pose2D,
                                                 self.zcypose_cb,
                                                 queue_size=1)
+        # 消失点距离（走廊消失点 → 沿机器人前向的距离）
+        self.vanish_sub = rospy.Subscriber("/vanish_point",
+                                           Pose,
+                                           self.vanish_cb,
+                                           queue_size=1)
 
         ## interest subgoal in odom frame to topo
         self.gp_interest_subgl_pub = rospy.Publisher("interest_subgoal",
@@ -379,6 +385,15 @@ class VSGPNavGlb:
         self.gl_yaw = yaw
         self.gl_wrt_odom = np.array([self.gl_x, self.gl_y, 1], dtype="float32")
         self.final_goal_received = True
+
+    def vanish_cb(self, msg: Pose):
+        """消失点推断的前方距离，单位 m。"""
+        try:
+            dist = float(msg.position.x)
+            if dist > 0:
+                self.vanish_distance = dist
+        except Exception:
+            pass
 
     #zcy
     # 切换模式，true为高斯开启发布，flase为topo，高斯subgoal停止发布
@@ -738,17 +753,16 @@ class VSGPNavGlb:
         self.closed.extend(closed)
 
     def update_global_goal_periodic(self):
-        """每隔 gl_update_period 秒，把全局目标朝“最空旷的 frontier 方向”外推 gl_update_forward_dist 米。"""
+        """基于 frontier 选择全局目标（暂不使用消失点距离）。"""
         if self.pose is None:
             return
         now = rospy.Time.now().to_sec()
+
         if now - self.last_gl_update_time < self.gl_update_period:
             return
-
         if self.gp_nav_frntr_cntrs is None or len(self.gp_nav_frntr_cntrs) == 0:
             return
 
-        # 选面积最大的 frontier，作为“最空旷方向”
         areas = getattr(self, "gp_nav_frntr_areas", None)
         if areas is not None and len(areas) > 0:
             idx = int(np.argmax(areas))
@@ -763,8 +777,7 @@ class VSGPNavGlb:
         self.gl_yaw = heading
         self.gl_wrt_odom = np.array([self.gl_x, self.gl_y, 1], dtype="float32")
         self.last_gl_update_time = now
-
-        rospy.loginfo_throttle(5.0, "Auto-updated global goal: (%.2f, %.2f, %.2f rad)", self.gl_x, self.gl_y, self.gl_yaw)
+        rospy.loginfo_throttle(5.0, "Global goal from frontier: (%.2f, %.2f, %.2f rad)", self.gl_x, self.gl_y, self.gl_yaw)
 
     """ @brief:  publish recommended goal to DRL"""
 
