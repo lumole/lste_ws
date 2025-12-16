@@ -455,71 +455,56 @@ class DetectionVisualizer:
         cv2.putText(image, text, (x, y), font, scale, (0, 255, 0), thickness, cv2.LINE_AA)
 
     def _draw_global_goal_indicator(self, image):
-        """将 /gl_wrt_odom 的全局目标点投影到当前相机画面（需要 TF + camera_info）."""
+        """简化版：根据 rbt_pose + /gl_wrt_odom 在图像顶部画全局目标方位指示，不再依赖 TF 投影。"""
         if self.global_goal_point is None:
             self._draw_goal_hint(image, "Global goal not received")
             return
-        if self.latest_image is None:
-            return
-        if not self.has_camera_info:
-            self._draw_goal_hint(image, "Camera info missing")
-            return
-
-        camera_frame = self.latest_image.header.frame_id or self.camera_model.tfFrame()
-        if not camera_frame:
-            self._draw_goal_hint(image, "Camera frame missing")
-            return
-
-        goal_pt = PointStamped()
-        goal_pt.header.frame_id = self.global_goal_frame
-        goal_pt.header.stamp = rospy.Time(0)
-        goal_pt.point.x, goal_pt.point.y, goal_pt.point.z = self.global_goal_point
-
-        if not self.tf_buffer.can_transform(
-            camera_frame, goal_pt.header.frame_id, rospy.Time(0), rospy.Duration(0.0)
-        ):
-            self._draw_goal_hint(image, "Global goal TF missing")
-            return
-
-        try:
-            tf_msg = self.tf_buffer.lookup_transform(
-                camera_frame, goal_pt.header.frame_id, rospy.Time(0), rospy.Duration(0.0)
-            )
-            goal_cam = do_transform_point(goal_pt, tf_msg)
-        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException, tf2_ros.ConnectivityException) as exc:
-            rospy.logwarn_throttle(5.0, "TF lookup/transform for global goal failed: %s", exc)
-            return
-
-        if goal_cam.point.z <= 0.05:
-            self._draw_goal_hint(image, "Global goal behind camera")
-            return
-
-        try:
-            u, v = self.camera_model.project3dToPixel(
-                (goal_cam.point.x, goal_cam.point.y, goal_cam.point.z)
-            )
-        except Exception as exc:
-            rospy.logwarn_throttle(5.0, "Project3dToPixel failed: %s", exc)
+        if self.robot_pose is None:
+            self._draw_goal_hint(image, "Robot pose not received")
             return
 
         h, w = image.shape[:2]
-        if 0 <= u < w and 0 <= v < h:
-            center = (int(u), int(v))
-            # 更醒目的绿色标记：外圈粗线 + 大实心点
+
+        # 1) 计算目标在 odom 中相对机器人的方位角
+        dx = float(self.global_goal_point[0]) - float(self.robot_pose.x)
+        dy = float(self.global_goal_point[1]) - float(self.robot_pose.y)
+        dist = math.hypot(dx, dy)
+        if dist < 1e-3:
+            return
+
+        # bearing: 目标相对于机器人航向的偏角，[-pi, pi]
+        bearing = math.atan2(dy, dx) - float(self.robot_pose.theta)
+        bearing = math.atan2(math.sin(bearing), math.cos(bearing))
+
+        half_fov = 0.5 * math.radians(self.camera_fov_deg or 60.0)
+        if half_fov < 1e-3:
+            half_fov = math.radians(60.0)
+
+        # 2) 在视野内：映射到图像宽度；在视野外：给出 left/right 提示
+        if abs(bearing) <= half_fov:
+            norm = bearing / half_fov  # -1:最左, 0:正前, +1:最右
+            margin = 20
+            x_center = w // 2
+            x = int(x_center + norm * (x_center - margin))
+            x = max(margin, min(w - margin, x))
+            y = int(h * 0.15)
+
+            center = (x, y)
             cv2.circle(image, center, 14, (0, 255, 0), 3)
             cv2.circle(image, center, 8, (0, 255, 0), -1)
             cv2.putText(
                 image,
-                "GOAL",
-                (center[0] + 12, max(20, center[1] - 10)),
+                f"GOAL {dist:.1f}m",
+                (center[0] - 40, max(20, center[1] - 12)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.55,
                 (0, 255, 0),
                 2,
                 cv2.LINE_AA,
             )
         else:
-            self._draw_goal_hint(image, "Global goal outside camera view")
+            direction = "left" if bearing > 0.0 else "right"
+            self._draw_goal_hint(image, f"Global goal outside view ({direction})")
 
     def spin(self):
         rospy.spin()
