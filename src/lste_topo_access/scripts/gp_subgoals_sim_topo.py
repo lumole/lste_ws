@@ -27,7 +27,7 @@ from sensor_msgs import point_cloud2
 from std_msgs.msg import Header, Bool
 # defined msg
 #from gp_subgoal.msg import PosePcl2
-from geometry_msgs.msg import PoseStamped, PointStamped
+from geometry_msgs.msg import PoseStamped, PointStamped, Vector3Stamped
 from geometry_msgs.msg import Pose2D, Point, Pose
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker
@@ -55,6 +55,11 @@ import gpflow
 from gpflow import set_trainable
 
 #from gpflow.utilities import print_summary
+
+# -------- helper --------
+def wrap_angle(x: float) -> float:
+    """Wrap angle to [-pi, pi]."""
+    return (x + np.pi) % (2 * np.pi) - np.pi
 
 
 #### configurations
@@ -203,9 +208,6 @@ class VSGPNavGlb:
                                                       PointCloud2,
                                                       queue_size=1)
 
-        ## final goal 
-        self.gl_pub = rospy.Publisher("gl_wrt_odom", PointCloud2, queue_size=1)
-
         ## recommended subgoal in odom frame to DRL
         self.gp_rcmndd_subgl_pub = rospy.Publisher("gp_subgoal",
                                                    PoseStamped,
@@ -232,6 +234,18 @@ class VSGPNavGlb:
         self.change_flag = True
         self.final_goal_received = False
         self.vanish_distance = None  # 由消失点估计的前向距离（当前停用）
+        # PASS 全局目标 4-方向锚定骨架
+        self.origin_set = False
+        self.origin_x = 0.0
+        self.origin_y = 0.0
+        self.origin_yaw = 0.0
+        self.headings = []  # H0..H3
+        self.dir_idx = 0
+        self.last_switch_xy = None
+        # 分叉 commit
+        self.commit_active = False
+        self.commit_heading = 0.0
+        self.commit_start_xy = (0.0, 0.0)
         # 初始化检测历史记录：用于 interest subgoal 过滤
         self.detected_interest_points = []
         self.match_threshold = 0.5  # 例如，0.5米
@@ -261,6 +275,10 @@ class VSGPNavGlb:
                                                PoseStamped,
                                                self.final_goal_cb,
                                                queue_size=1)
+        # 对外发布 frontier 最大方向（给 Goal Manager 使用），vector.x=theta_rel(rad)，vector.y=area
+        self.frontier_dir_pub = rospy.Publisher("/lste/gp_frontier_dir",
+                                                Vector3Stamped,
+                                                queue_size=1)
 
         ## variables to store data for GP training and prediction
         # 使用私有参数（~names）并提供默认值，避免未设置参数时直接抛异常
@@ -310,9 +328,11 @@ class VSGPNavGlb:
         self.gp_nav_var_viz = rospy.get_param('~gp_nav_var_viz', 5.0)
 
         ## 全局目标动态更新参数（PASS 默认）：每隔 gl_update_period 秒，沿最“空旷”frontier 方向外推 gl_update_forward_dist 米
-        self.gl_update_period = rospy.get_param('~gl_update_period', 10.0)
+        # 默认 5s 更新一次（可通过 ~gl_update_period 覆盖）
+        self.gl_update_period = rospy.get_param('~gl_update_period', 5.0)
         self.gl_update_forward_dist = rospy.get_param('~gl_update_forward_dist', 10.0)
-        self.last_gl_update_time = rospy.Time.now().to_sec()
+        # 让第一次调用时立即可以更新（而不是再等待 gl_update_period）
+        self.last_gl_update_time = rospy.Time.now().to_sec() - self.gl_update_period
 
         ## final goal（默认先用参数，后面根据起始位姿自动调整）
         self.gl_x = rospy.get_param('~gl_x', -4.0)
@@ -403,6 +423,21 @@ class VSGPNavGlb:
 
     def zcypose_cb(self, rbt_pose_msg):
         self.pose = rbt_pose_msg
+        # 初始化全局方向骨架：记录起始位姿，定义 4 个固定世界方向
+        if not self.origin_set:
+            self.origin_x = self.pose.x
+            self.origin_y = self.pose.y
+            self.origin_yaw = wrap_angle(self.pose.theta)
+            self.headings = [
+                self.origin_yaw,
+                wrap_angle(self.origin_yaw + np.pi * 0.5),
+                wrap_angle(self.origin_yaw + np.pi),
+                wrap_angle(self.origin_yaw + np.pi * 1.5),
+            ]
+            self.dir_idx = 0
+            self.last_switch_xy = (self.origin_x, self.origin_y)
+            self.origin_set = True
+
         int_position = [int(self.pose.x), int(self.pose.y)]
         real_position = [self.pose.x, self.pose.y]
         if int_position not in self.int_visited_positions:
@@ -491,7 +526,6 @@ class VSGPNavGlb:
         self.tf_odom_2_rbt()
         self.rbt2gl_error()
 
-        self.publish_goal()  # publish final goal as a point for rviz visualization
 
         ## retrieve th, al, rds points from pointcloud
         pcl_arr = ros_numpy.point_cloud2.pointcloud2_to_array(
@@ -753,31 +787,141 @@ class VSGPNavGlb:
         self.closed.extend(closed)
 
     def update_global_goal_periodic(self):
-        """基于 frontier 选择全局目标（暂不使用消失点距离）。"""
-        if self.pose is None:
+        """
+        基于 4-方向锚定 + 分叉 commit 的全局目标更新。
+        - commit_active=True: 沿 commit_heading 前推固定距离 D。
+        - 否则用 frontier 按四个骨架方向聚合投票，满足门槛后切换。
+        """
+        if self.pose is None or not self.origin_set:
             return
         now = rospy.Time.now().to_sec()
 
-        if now - self.last_gl_update_time < self.gl_update_period:
+        # 非 commit 状态下：按照 gl_update_period 节流更新频率
+        # （commit 阶段仍然每帧更新，方向固定，只是沿既定方向前推）
+        if (not self.commit_active) and (now - self.last_gl_update_time < self.gl_update_period):
             return
+
+        # 1) 分叉检测 + commit 触发
+        if (not self.commit_active) and self.gp_nav_frntr_cntrs is not None and len(self.gp_nav_frntr_cntrs) > 0:
+            thetas = np.array(self.gp_nav_frntr_cntrs).reshape(-1, 2)[:, 0]
+            areas = np.array(getattr(self, "gp_nav_frntr_areas", []))
+            if len(areas) != len(thetas):
+                areas = np.ones_like(thetas)
+            thr_angle = np.deg2rad(25.0)
+            sep_angle = np.deg2rad(60.0)
+            left_mask = thetas < -thr_angle
+            right_mask = thetas > thr_angle
+            if np.any(left_mask) and np.any(right_mask):
+                theta_L = thetas[left_mask]
+                theta_R = thetas[right_mask]
+                area_L = areas[left_mask]
+                area_R = areas[right_mask]
+                idx_L = int(np.argmax(area_L))
+                idx_R = int(np.argmax(area_R))
+                best_theta_L = theta_L[idx_L]
+                best_theta_R = theta_R[idx_R]
+                best_area_L = area_L[idx_L]
+                best_area_R = area_R[idx_R]
+                if abs(best_theta_R - best_theta_L) > sep_angle and abs(best_theta_L) > thr_angle and abs(best_theta_R) > thr_angle:
+                    if max(best_area_L, best_area_R) >= 1.25 * min(best_area_L, best_area_R):
+                        theta_best = best_theta_L if best_area_L >= best_area_R else best_theta_R
+                        # 将 commit 方向也投射到 4 个固定世界方向，保证全局目标始终落在骨架射线上
+                        heading_world = wrap_angle(self.pose.theta + theta_best)
+                        diffs_commit = [abs(wrap_angle(heading_world - h)) for h in self.headings]
+                        k_commit = int(np.argmin(diffs_commit))
+                        self.commit_active = True
+                        self.commit_heading = self.headings[k_commit]
+                        self.commit_start_xy = (self.pose.x, self.pose.y)
+                        rospy.loginfo_throttle(5.0, "Commit to heading %.2f rad (dir %d)", self.commit_heading, k_commit)
+
+        # 2) commit 模式：沿 commit_heading 前推
+        D = 6.0
+        if self.commit_active:
+            dx = self.pose.x - self.commit_start_xy[0]
+            dy = self.pose.y - self.commit_start_xy[1]
+            progress = dx * np.cos(self.commit_heading) + dy * np.sin(self.commit_heading)
+            if progress >= 3.0:
+                self.commit_active = False
+            else:
+                self.gl_x = self.pose.x + D * np.cos(self.commit_heading)
+                self.gl_y = self.pose.y + D * np.sin(self.commit_heading)
+                self.gl_yaw = self.commit_heading
+                self.gl_wrt_odom = np.array([self.gl_x, self.gl_y, 1], dtype="float32")
+                self.last_switch_xy = (self.pose.x, self.pose.y)
+                self.last_gl_update_time = now
+                return
+
+        # 3) 非 commit：frontier → 骨架方向选择
         if self.gp_nav_frntr_cntrs is None or len(self.gp_nav_frntr_cntrs) == 0:
             return
+        areas = np.array(getattr(self, "gp_nav_frntr_areas", []))
+        if areas.size == 0:
+            areas = np.ones(len(self.gp_nav_frntr_cntrs))
 
-        areas = getattr(self, "gp_nav_frntr_areas", None)
-        if areas is not None and len(areas) > 0:
-            idx = int(np.argmax(areas))
+        # 对外发布“最大 frontier 方向”供 Goal Manager 使用（相对机器人角度）
+        try:
+            best_idx = int(np.argmax(areas))
+            if best_idx >= 0 and best_idx < len(self.gp_nav_frntr_cntrs):
+                theta_best = float(self.gp_nav_frntr_cntrs[best_idx][0])
+                area_best = float(areas[best_idx]) if best_idx < len(areas) else 0.0
+                msg = Vector3Stamped()
+                msg.header.stamp = rospy.Time.now()
+                msg.header.frame_id = "base_footprint"
+                msg.vector.x = theta_best  # rad，相对机器人
+                msg.vector.y = area_best
+                msg.vector.z = 0.0
+                self.frontier_dir_pub.publish(msg)
+        except Exception:
+            pass
+
+        # 将所有 frontier 按最近的骨架方向聚合（只接受在扇区范围内的）
+        sector_half = np.deg2rad(30.0)  # 扇区半宽，控制哪些 frontiers 参与投票
+        sum_area = np.zeros(4, dtype=float)
+        max_area = np.zeros(4, dtype=float)
+        heading_weighted = np.zeros(4, dtype=float)
+
+        for i, f in enumerate(self.gp_nav_frntr_cntrs):
+            theta_rel = float(f[0])  # 相对机器人角
+            heading_world = wrap_angle(self.pose.theta + theta_rel)
+            diffs = [abs(wrap_angle(heading_world - h)) for h in self.headings]
+            k = int(np.argmin(diffs))
+            if diffs[k] > sector_half:
+                continue  # 超出扇区范围的 frontiers 不参与该方向投票
+            a = float(areas[i]) if i < len(areas) else 1.0
+            sum_area[k] += a
+            heading_weighted[k] += a * heading_world
+            if a > max_area[k]:
+                max_area[k] = a
+
+        # 选票最多的骨架方向
+        k_star = int(np.argmax(sum_area))
+        if sum_area[k_star] <= 0:
+            k_star = self.dir_idx  # 没有有效投票则保持当前方向
+        # 该方向的加权平均朝向，用于一致性判断
+        if sum_area[k_star] > 0:
+            heading_f = wrap_angle(heading_weighted[k_star] / sum_area[k_star])
         else:
-            idx = 0
-        idx = min(idx, len(self.gp_nav_frntr_cntrs) - 1)
+            heading_f = self.headings[k_star]
 
-        theta = float(self.gp_nav_frntr_cntrs[idx][0])  # 相对机器人坐标系的偏航
-        heading = self.pose.theta + theta               # 转成 odom 下的全局朝向
-        self.gl_x = self.pose.x + self.gl_update_forward_dist * np.cos(heading)
-        self.gl_y = self.pose.y + self.gl_update_forward_dist * np.sin(heading)
+        # 门槛：角度一致性 + 行进距离
+        diff_heading = abs(wrap_angle(heading_f - self.headings[k_star]))
+        allow_switch = diff_heading < np.deg2rad(25.0)
+        if self.last_switch_xy is None:
+            traveled = 0.0
+        else:
+            dx = self.pose.x - self.last_switch_xy[0]
+            dy = self.pose.y - self.last_switch_xy[1]
+            traveled = np.hypot(dx, dy)
+        if allow_switch and traveled >= 2.0 and k_star != self.dir_idx:
+            self.dir_idx = k_star
+            self.last_switch_xy = (self.pose.x, self.pose.y)
+
+        heading = self.headings[self.dir_idx]
+        self.gl_x = self.pose.x + D * np.cos(heading)
+        self.gl_y = self.pose.y + D * np.sin(heading)
         self.gl_yaw = heading
         self.gl_wrt_odom = np.array([self.gl_x, self.gl_y, 1], dtype="float32")
         self.last_gl_update_time = now
-        rospy.loginfo_throttle(5.0, "Global goal from frontier: (%.2f, %.2f, %.2f rad)", self.gl_x, self.gl_y, self.gl_yaw)
 
     """ @brief:  publish recommended goal to DRL"""
 
@@ -968,16 +1112,6 @@ class VSGPNavGlb:
         pc2 = point_cloud2.create_cloud(self.header, self.fields, nav_pts_pcl)
         self.gp_actul_xy_subgls_pub.publish(pc2)
 
-    """ @brief:  publish final goal for visualization"""
-
-    def publish_goal(self):
-        # print(">> publish_goal:: ")
-        nav_pts_pcl = np.column_stack((self.gl_x, self.gl_y, 0, 1))
-        self.header.frame_id = "odom"
-        pc2 = point_cloud2.create_cloud(self.header, self.fields, nav_pts_pcl)
-        self.gl_pub.publish(pc2)
-
-
     #zcy
     def clear_points(self):
         # 创建一个空的 PointCloud2 消息
@@ -1070,7 +1204,6 @@ class VSGPNavGlb:
             self.tf_odom_2_rbt()
             self.rbt2gl_error()
 
-            self.publish_goal()  # publish final goal as a point for rviz visualization
 
             ## Downsample and assign thetas, alphas, occs, rds variables
             self.downsample_pcl(self.pcl_arr)
