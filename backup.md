@@ -1,19 +1,4 @@
 -###################### -pipeline- ################################-
-推荐一键启动（用 tmux 分窗，不用手动开多终端）：
-
-```
-tmux kill-session -t lste 2>/dev/null || true
-cd /home/zrz/lste_ws
-WS=/home/zrz/lste_ws TASK_JSON=/home/zrz/lste_ws/model/Data_exchange/vlm_prompt/lab/yellow_cup.json TASK_ID=yellow_cup ./scripts/run_pipeline_tmux.sh
-
-```
-
-
-
-
-
-
-传统分步（仅保留以备查阅）：
 roslaunch lste_core lab_with_pro3.launch \
   world_name:=/home/zrz/lste_ws/src/lste_core/worlds/room.world
   

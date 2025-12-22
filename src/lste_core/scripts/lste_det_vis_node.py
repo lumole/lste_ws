@@ -13,11 +13,10 @@ from typing import Iterable, Tuple, Optional, List
 import cv2
 import rospy
 from cv_bridge import CvBridge, CvBridgeError
-from sensor_msgs.msg import Image, CameraInfo, PointCloud2
-from sensor_msgs import point_cloud2
+from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import Pose2D, PointStamped, PoseStamped
 import tf2_ros
-from tf2_geometry_msgs import do_transform_point
+import tf2_geometry_msgs  # noqa: F401  # 注册 Point/PointStamped 的 TF 转换
 from image_geometry import PinholeCameraModel
 
 from lste_msgs.msg import LsteDetections, LsteDetection, LsteScores, LsteTask, LsteState
@@ -84,8 +83,7 @@ class DetectionVisualizer:
         self.sub_state = rospy.Subscriber(self.state_topic, LsteState, self.on_state, queue_size=1)
         self.sub_robot_pose = rospy.Subscriber("/rbt_pose", Pose2D, self.on_robot_pose, queue_size=1)
         self.sub_camera_info = rospy.Subscriber(self.camera_info_topic, CameraInfo, self.on_camera_info, queue_size=1)
-        self.sub_global_goal = rospy.Subscriber("/gl_wrt_odom", PointCloud2, self.on_global_goal, queue_size=1)
-        # 备用：如果没有 /gl_wrt_odom，可用 PoseStamped 形式的全局目标
+        # 只订阅 /lste/final_goal 作为全局目标
         self.sub_global_goal_pose = rospy.Subscriber("/lste/final_goal", PoseStamped, self.on_global_goal_pose, queue_size=1)
 
         rospy.loginfo(
@@ -125,13 +123,6 @@ class DetectionVisualizer:
 
     def on_robot_pose(self, msg: Pose2D):
         self.robot_pose = msg
-
-    def on_global_goal(self, msg: PointCloud2):
-        # 只取第一个点（gl_wrt_odom 发布的是单点 PointCloud2）
-        for p in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
-            self.global_goal_point = (float(p[0]), float(p[1]), float(p[2]))
-            self.global_goal_frame = msg.header.frame_id or "odom"
-            break
 
     def on_global_goal_pose(self, msg: PoseStamped):
         self.global_goal_point = (
@@ -463,7 +454,7 @@ class DetectionVisualizer:
         cv2.putText(image, text, (x, y), font, scale, (0, 255, 0), thickness, cv2.LINE_AA)
 
     def _draw_global_goal_indicator(self, image):
-        """在图像上显示 /gl_wrt_odom 的 (x,y)，并尝试将该点投影到相机图像上绘制固定大小的绿色标记。"""
+        """显示 /lste/final_goal 的 (x,y)，并尝试将该点投影到相机图像上绘制固定大小的绿色标记。"""
         if self.global_goal_point is None:
             self._draw_goal_hint(image, "Global goal not received")
             return

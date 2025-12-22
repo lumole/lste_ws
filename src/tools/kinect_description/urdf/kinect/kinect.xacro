@@ -3,7 +3,7 @@
 <robot name="kinect_sensor" xmlns:xacro="http://www.ros.org/wiki/xacro">
     <xacro:macro name="sensor_kinect" params="prefix name parent cam_px cam_py cam_pz cam_or cam_op cam_oy">
         <!-- Kinect sensor URDF part, cf. https://github.com/turtlebot/turtlebot
-        and there turtlebot_description/urdf/sensors/kinect.xacro -->
+    and there turtlebot_description/urdf/sensors/kinect.xacro -->
         <joint name="${name}_rgb_joint" type="fixed">
             <parent link="${parent}"/>
             <child link="${name}_rgb_frame"/>
@@ -15,7 +15,8 @@
         <joint name="${name}_rgb_optical_joint" type="fixed">
             <parent link="${name}_rgb_frame"/>
             <child link="${name}_rgb_optical_frame"/>
-            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <!-- Rotate into REP103 optical frame: roll=-90deg, yaw=-90deg -->
+            <origin xyz="0 0 0" rpy="-1.57 0 -1.57"/>
         </joint>
 
         <link name="${name}_rgb_optical_frame"/>
