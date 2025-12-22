@@ -7,7 +7,7 @@ set -euo pipefail
 
 WS=${WS:-/home/zrz/lste_ws}
 SESSION=${SESSION:-lste}
-WORLD=${WORLD:-$WS/src/lste_core/worlds/room.world}
+WORLD=${WORLD:-$WS/src/lste_core/worlds/test.world}
 TASK_JSON=${TASK_JSON:-$WS/model/Data_exchange/vlm_prompt/lab/yellow_cup.json}
 TASK_ID=${TASK_ID:-yellow_cup}
 VLLM_URL=${VLLM_URL:-http://localhost:8000/v1}
@@ -97,5 +97,9 @@ tmux_new_window 9 "$WS" "vis" \
 # 10: oc_srfc（提供 /rbt_pose 等；goal_manager 依赖 /rbt_pose 才会发布 /lste/final_goal）
 tmux_new_window 10 "$WS" "oc_srfc" \
   "$WAIT_ROSCORE; roslaunch lste_oc_srfc oc_srfc_proj.launch"
+
+# 11: topo frontier（需 vsgp 环境）
+tmux_new_window 11 "$WS" "gp_frontier" \
+  "$WAIT_ROSCORE; conda activate vsgp; roslaunch lste_topo_access gp_frontier.launch"
 
 tmux attach -t "$SESSION"
