@@ -21,6 +21,35 @@ TASK_ID=yellow_cup \
 ```
 
 ---
+## 🛠️ Tools & Debugging
+
+辅助工具与调试指令。
+
+### 键盘控制与话题监控
+
+```bash
+# 操控车来移动（键盘操控）
+rosrun teleop_twist_keyboard teleop_twist_keyboard.py cmd_vel:=/cmd_vel
+
+# 能看到发布的 task
+rostopic echo /lste/task
+
+# 能看到发布的 prompts
+rostopic echo /lste/prompts
+
+```
+
+### 消失点检测
+
+**注意环境切换：** `vsgp`
+
+```bash
+conda activate vsgp
+rosrun vanish_point_detection vanish_point_detection.py
+
+```
+
+---
 
 ## 🧬 Pipeline Steps (Manual Launch)
 
@@ -94,37 +123,6 @@ roslaunch lste_core lste_det_vis.launch
 ```
 
 ---
-
-## 🛠️ Tools & Debugging
-
-辅助工具与调试指令。
-
-### 键盘控制与话题监控
-
-```bash
-# 操控车来移动（键盘操控）
-rosrun teleop_twist_keyboard teleop_twist_keyboard.py cmd_vel:=/cmd_vel
-
-# 能看到发布的 task
-rostopic echo /lste/task
-
-# 能看到发布的 prompts
-rostopic echo /lste/prompts
-
-```
-
-### 消失点检测
-
-**注意环境切换：** `vsgp`
-
-```bash
-conda activate vsgp
-rosrun vanish_point_detection vanish_point_detection.py
-
-```
-
----
-
 ## 🗺️ Access Topo (Topological Exploration)
 
 拓扑访问与探索相关的模块。

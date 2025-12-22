@@ -13,13 +13,13 @@ from typing import Optional, Tuple, List
 import numpy as np
 import rospy
 from cv_bridge import CvBridge, CvBridgeError
-from geometry_msgs.msg import Pose2D, PoseStamped, PointStamped, Vector3Stamped, TransformStamped
+from geometry_msgs.msg import Pose2D, PoseStamped, PointStamped, Vector3Stamped, TransformStamped, Twist
 from sensor_msgs.msg import Image, CameraInfo, LaserScan
 from image_geometry import PinholeCameraModel
 import tf2_ros
 from tf.transformations import quaternion_matrix, quaternion_from_euler
 
-from lste_msgs.msg import LsteState, LsteDetections, LsteDetection, LsteTask
+from lste_msgs.msg import LsteState, LsteDetections, LsteDetection, LsteTask, LsteFrontiers
 
 
 STATE_PASS = 0
@@ -42,6 +42,7 @@ class GoalManager:
         self.forward_dist = float(gp("~forward_dist", 10.0))
         self.goal_dist_det = float(gp("~goal_dist_det", 5.0))  # 无深度：检测方向前推距离
         self.frontier_topic = gp("~frontier_topic", "/lste/gp_frontier_dir")
+        self.frontiers_topic = gp("~frontiers_topic", "/lste/gp_frontiers")
         self.depth_topic = gp("~depth_topic", "/kinect/hd/image_depth_rect")
         self.image_topic = gp("~image_topic", "/kinect/hd/image_color_rect")
         self.use_depth = bool(gp("~use_depth", False))  # 默认关闭深度，当前环境无 depth
@@ -50,6 +51,19 @@ class GoalManager:
         self.scan_frame = gp("~scan_frame", "")  # 留空则使用 scan.header.frame_id
         self.safety_margin = float(gp("~safety_margin", 0.6))
         self.scan_window_bins = int(gp("~scan_window_bins", 2))
+        # 前进优先/投票相关参数
+        self.front_sigma = math.radians(float(gp("~front_sigma_deg", 25.0)))
+        self.area_power = float(gp("~area_power", 1.0))
+        self.v_min = float(gp("~v_min", 0.05))
+        self.v_scale = float(gp("~v_scale", 0.3))
+        self.front_deg = math.radians(float(gp("~front_deg", 60.0)))
+        self.back_deg = math.radians(float(gp("~back_deg", 60.0)))
+        self.w_front_max = float(gp("~w_front_max", 1.5))
+        self.w_back_min = float(gp("~w_back_min", 0.2))
+        self.forward_only = bool(gp("~forward_only", True))
+        self.v_gate = float(gp("~v_gate", 0.08))
+        self.min_allowed_score = float(gp("~min_allowed_score", 0.05))
+        self.switch_margin = float(gp("~switch_margin", 0.15))
 
         # --- 状态缓存 ---
         self.current_state = STATE_PASS
@@ -63,8 +77,12 @@ class GoalManager:
         self.latest_state_msg: Optional[LsteState] = None
         self.latest_task: Optional[LsteTask] = None
         self.latest_dets: Optional[LsteDetections] = None
+        self.latest_frontiers: Optional[LsteFrontiers] = None
         self.latest_frontier: Optional[Vector3Stamped] = None
         self.latest_scan: Optional[LaserScan] = None
+        self.latest_cmd_vel: Optional[Twist] = None
+        self.headings: Optional[List[float]] = None
+        self.last_dir_idx: Optional[int] = None
 
         # 深度/相机
         self.bridge = CvBridge()
@@ -90,7 +108,9 @@ class GoalManager:
         if self.use_depth:
             self.sub_depth = rospy.Subscriber(self.depth_topic, Image, self.on_depth, queue_size=1)
         self.sub_frontier = rospy.Subscriber(self.frontier_topic, Vector3Stamped, self.on_frontier, queue_size=1)
+        self.sub_frontiers = rospy.Subscriber(self.frontiers_topic, LsteFrontiers, self.on_frontiers, queue_size=1)
         self.sub_scan = rospy.Subscriber(self.scan_topic, LaserScan, self.on_scan, queue_size=1)
+        self.sub_cmd_vel = rospy.Subscriber("/cmd_vel", Twist, self.on_cmd_vel, queue_size=1)
 
         self.timer = rospy.Timer(rospy.Duration(0.2), self.on_timer)  # 5Hz
         rospy.loginfo("Goal Manager started: publishes /lste/final_goal")
@@ -117,6 +137,9 @@ class GoalManager:
         self.latest_pose = msg
         if self.start_pose is None:
             self.start_pose = msg
+            self.init_headings(msg)
+        elif self.headings is None:
+            self.init_headings(msg)
 
     def on_cam_info(self, msg: CameraInfo):
         try:
@@ -133,8 +156,14 @@ class GoalManager:
     def on_frontier(self, msg: Vector3Stamped):
         self.latest_frontier = msg
 
+    def on_frontiers(self, msg: LsteFrontiers):
+        self.latest_frontiers = msg
+
     def on_scan(self, msg: LaserScan):
         self.latest_scan = msg
+
+    def on_cmd_vel(self, msg: Twist):
+        self.latest_cmd_vel = msg
 
     # -------------------- Timer --------------------
     def on_timer(self, _event):
@@ -169,6 +198,16 @@ class GoalManager:
         # 如果 state/subtype 发生变化则强制更新（在 on_state 已经 next_update_time=0）
         return False
 
+    def init_headings(self, pose: Pose2D):
+        base = wrap_angle(pose.theta)
+        self.headings = [
+            base,
+            wrap_angle(base + math.pi * 0.5),
+            wrap_angle(base + math.pi),
+            wrap_angle(base + math.pi * 1.5),
+        ]
+        self.last_dir_idx = 0
+
     # -------------------- Goal computation --------------------
     def state_period(self) -> float:
         if self.current_state == STATE_LOCKED:
@@ -191,11 +230,11 @@ class GoalManager:
             if self.current_subtype == "Sus-B":
                 return self.goal_from_ctx_mid()
             if self.current_subtype == "Sus-C":
-                return self.goal_from_frontier(period_mode="sus_c")
+                return self.goal_from_frontiers_prior()
             # 未知 subtype：保持现状
             return None
         # PASS 默认
-        return self.goal_from_frontier(period_mode="pass")
+        return self.goal_from_frontiers_prior()
 
     def goal_from_target(self) -> Optional[PoseStamped]:
         det = self.pick_best_target()
@@ -242,6 +281,112 @@ class GoalManager:
             return None
         theta_rel = float(self.latest_frontier.vector.x)
         heading_world = float(self.latest_pose.theta) + theta_rel
+        dist = self.clip_distance(heading_world, self.forward_dist)
+        if dist is None:
+            return None
+        x = self.latest_pose.x + dist * math.cos(heading_world)
+        y = self.latest_pose.y + dist * math.sin(heading_world)
+        return self.make_goal_pose((x, y, 0.0), heading_world)
+
+    def goal_from_frontiers_prior(self) -> Optional[PoseStamped]:
+        """PASS/Sus-C：使用全量 frontier + 运动先验投影到 4 固定方向后选取目标。"""
+        if self.headings is None:
+            if self.start_pose:
+                self.init_headings(self.start_pose)
+            elif self.latest_pose:
+                self.init_headings(self.latest_pose)
+        if self.headings is None:
+            rospy.logwarn_throttle(5.0, "GoalManager: headings not initialized")
+            return None
+        if self.latest_pose is None:
+            return None
+        msg = self.latest_frontiers
+        if msg is None or len(msg.theta_rel) == 0:
+            rospy.logwarn_throttle(5.0, "GoalManager: gp_frontiers not available")
+            return None
+
+        thetas_rel = list(msg.theta_rel)
+        areas_raw = list(msg.area) if msg.area else [1.0] * len(thetas_rel)
+        if len(areas_raw) < len(thetas_rel):
+            areas_raw += [1.0] * (len(thetas_rel) - len(areas_raw))
+        areas = [max(0.0, float(a)) for a in areas_raw[: len(thetas_rel)]]
+
+        total_area = sum(areas)
+        if total_area <= 0:
+            return None
+        # 运动方向（世界系）
+        dir_move = None
+        prior_strength = 0.0
+        if self.latest_cmd_vel is not None:
+            vx = float(self.latest_cmd_vel.linear.x)
+            speed = abs(vx)
+            if speed >= self.v_min and self.latest_pose is not None:
+                dir_move = wrap_angle(self.latest_pose.theta if vx >= 0 else self.latest_pose.theta + math.pi)
+                if self.v_scale > 1e-3:
+                    prior_strength = min(1.0, max(0.0, (speed - self.v_min) / self.v_scale))
+                else:
+                    prior_strength = 1.0
+
+        scores = [0.0, 0.0, 0.0, 0.0]
+        sigma = self.front_sigma if self.front_sigma > 1e-3 else 0.35
+        front_thr = self.front_deg
+        back_thr = math.pi - self.back_deg
+        base_heading = float(self.latest_pose.theta)
+
+        for theta_rel, area in zip(thetas_rel, areas):
+            heading_world = wrap_angle(base_heading + float(theta_rel))
+            a_norm = area / total_area
+            weight = math.pow(a_norm, self.area_power)
+            # 运动先验权重（投影前）
+            if dir_move is not None:
+                delta = abs(wrap_angle(heading_world - dir_move))
+                if delta <= front_thr:
+                    w_move = 1.0 + prior_strength * (self.w_front_max - 1.0)
+                elif delta >= back_thr:
+                    w_move = 1.0 - prior_strength * (1.0 - self.w_back_min)
+                else:
+                    w_move = 1.0
+            else:
+                w_move = 1.0
+            vote = weight * w_move
+            for idx, Hk in enumerate(self.headings):
+                diff = abs(wrap_angle(heading_world - Hk))
+                proj = math.exp(-0.5 * (diff / sigma) ** 2)
+                scores[idx] += vote * proj
+
+        # 前进时限制后半平面（可选）
+        allow_mask = [True] * 4
+        if self.forward_only and dir_move is not None and abs(float(self.latest_cmd_vel.linear.x)) > self.v_gate:
+            for idx, Hk in enumerate(self.headings):
+                if math.cos(wrap_angle(Hk - base_heading)) < 0:
+                    allow_mask[idx] = False
+            if not any(allow_mask) and any(s > self.min_allowed_score for s in scores):
+                allow_mask = [True if s > self.min_allowed_score else False for s in scores]
+
+        best_idx = None
+        best_val = -1.0
+        second_val = -1.0
+        for idx, s in enumerate(scores):
+            if not allow_mask[idx]:
+                continue
+            if s > best_val:
+                second_val = best_val
+                best_val = s
+                best_idx = idx
+            elif s > second_val:
+                second_val = s
+        if best_idx is None:
+            return None
+
+        # 滞回：优势不够则保持上次方向
+        if self.last_dir_idx is not None and best_idx != self.last_dir_idx:
+            margin = second_val * (1.0 + self.switch_margin)
+            if best_val < margin:
+                best_idx = self.last_dir_idx
+                best_val = scores[best_idx]
+        self.last_dir_idx = best_idx
+
+        heading_world = self.headings[best_idx]
         dist = self.clip_distance(heading_world, self.forward_dist)
         if dist is None:
             return None

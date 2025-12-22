@@ -31,6 +31,7 @@ from geometry_msgs.msg import PoseStamped, PointStamped, Vector3Stamped
 from geometry_msgs.msg import Pose2D, Point, Pose
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker
+from lste_msgs.msg import LsteFrontiers
 
 ### import opencv
 import cv2
@@ -279,6 +280,10 @@ class VSGPNavGlb:
         self.frontier_dir_pub = rospy.Publisher("/lste/gp_frontier_dir",
                                                 Vector3Stamped,
                                                 queue_size=1)
+        # 对外发布全量 frontier 列表（theta_rel + area）
+        self.frontiers_pub = rospy.Publisher("/lste/gp_frontiers",
+                                             LsteFrontiers,
+                                             queue_size=1)
 
         ## variables to store data for GP training and prediction
         # 使用私有参数（~names）并提供默认值，避免未设置参数时直接抛异常
@@ -786,6 +791,35 @@ class VSGPNavGlb:
 
         self.closed.extend(closed)
 
+    def publish_frontiers(self):
+        """发布全量 frontier（theta_rel + area）供 GoalManager 聚合使用。"""
+        if self.gp_nav_frntr_cntrs is None:
+            return
+        try:
+            thetas = np.array(self.gp_nav_frntr_cntrs).reshape(-1, 2)[:, 0]
+        except Exception:
+            return
+        if thetas.size == 0:
+            return
+        areas_raw = getattr(self, "gp_nav_frntr_areas", None)
+        if areas_raw is None:
+            areas = np.ones_like(thetas, dtype=float)
+        else:
+            areas_raw = np.array(areas_raw).reshape(-1)
+            if areas_raw.size != thetas.size:
+                areas = np.ones_like(thetas, dtype=float)
+                m = min(len(areas_raw), len(areas))
+                areas[:m] = areas_raw[:m]
+            else:
+                areas = areas_raw
+
+        msg = LsteFrontiers()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "base_footprint"
+        msg.theta_rel = [float(t) for t in thetas]
+        msg.area = [float(a) for a in areas]
+        self.frontiers_pub.publish(msg)
+
     def update_global_goal_periodic(self):
         """
         基于 4-方向锚定 + 分叉 commit 的全局目标更新。
@@ -1223,6 +1257,7 @@ class VSGPNavGlb:
             self.gp_nav_mask_thrshld()
             self.gp_grd_var_img()
             self.gp_nav_pkup_nav_pt()
+            self.publish_frontiers()
             self.update_global_goal_periodic()  # 每隔 gl_update_period 秒基于当前 frontier 更新全局目标
             ####calculate navigation point in world frame zcy topo模式下不发布subgoal及可视化
             # self.gp_nav_xypts_actul_pcl()

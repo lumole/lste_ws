@@ -24,6 +24,7 @@ add_message_files(
   LsteScores.msg
   LsteState.msg
   LstePrompts.msg
+  LsteFrontiers.msg
   # 如果你后面加了这些 msg，就取消注释并确保文件存在：
   # LsteSubGoal.msg
   # LsteAccessTopo.msg
