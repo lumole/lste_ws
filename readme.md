@@ -31,11 +31,19 @@ TASK_ID=yellow_cup \
 # 操控车来移动（键盘操控）
 rosrun teleop_twist_keyboard teleop_twist_keyboard.py cmd_vel:=/cmd_vel
 
+#强制给直行
+rostopic pub -r 10 /cmd_vel geometry_msgs/Twist \
+'{linear: {x: 0.2, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}'
+
+
 # 能看到发布的 task
 rostopic echo /lste/task
 
 # 能看到发布的 prompts
 rostopic echo /lste/prompts
+
+#rviz看frontier可视化
+rviz -d /home/zrz/lste_ws/src/lste_topo_access/launch/gp_frontier.rviz
 
 ```
 

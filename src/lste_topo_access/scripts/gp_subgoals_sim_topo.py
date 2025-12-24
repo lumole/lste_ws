@@ -24,7 +24,7 @@ from tf.transformations import quaternion_from_euler, euler_from_quaternion
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs.msg import PointField
 from sensor_msgs import point_cloud2
-from std_msgs.msg import Header, Bool
+from std_msgs.msg import Header, Bool, UInt8
 # defined msg
 #from gp_subgoal.msg import PosePcl2
 from geometry_msgs.msg import PoseStamped, PointStamped, Vector3Stamped
@@ -62,6 +62,10 @@ def wrap_angle(x: float) -> float:
     """Wrap angle to [-pi, pi]."""
     return (x + np.pi) % (2 * np.pi) - np.pi
 
+
+def angle_diff(a: float, b: float) -> float:
+    """Minimal absolute angular difference."""
+    return abs(wrap_angle(a - b))
 
 #### configurations
 warnings.filterwarnings("ignore")
@@ -250,6 +254,26 @@ class VSGPNavGlb:
         # 初始化检测历史记录：用于 interest subgoal 过滤
         self.detected_interest_points = []
         self.match_threshold = 0.5  # 例如，0.5米
+        # --- Access-Topo 参数与数据 ---
+        self.anchor_step_dist = rospy.get_param('~anchor_step_dist', 1.0)
+        self.backtrack_arrive_dist = rospy.get_param('~backtrack_arrive_dist', 1.0)
+        self.force_window_deg = rospy.get_param('~force_window_deg', 25.0)
+        self.commit_dist = rospy.get_param('~commit_dist', 2.0)
+        self.cluster_eps_deg = rospy.get_param('~cluster_eps_deg', 15.0)
+        self.cluster_stable_duration = rospy.get_param('~cluster_stable_duration', 3.0)
+        self.cluster_lost_timeout = rospy.get_param('~cluster_lost_timeout', 1.0)
+        self.anchor_nodes = []  # [{'id', 'x','y','stamp','prev','branches':[]}]
+        self.anchor_last_xy = None
+        self.anchor_last_id = None
+        self.backtrack_stack = []  # list of (node_id, branch_id, weight)
+        self.current_backtrack = None  # (node_id, branch_id)
+        self.access_mode = 0  # 0 forward, 1 backtrack
+        self.forced_heading_world = None
+        self.forced_start_xy = None
+        self.forced_branch = None
+        self.cluster_track = []  # tracking clusters for stability
+        self.force_window_rad = np.deg2rad(self.force_window_deg)
+        self.cluster_eps_rad = np.deg2rad(self.cluster_eps_deg)
 
         #zcy
         self.zcyrbt_pose_sub = rospy.Subscriber("rbt_pose",
@@ -271,6 +295,9 @@ class VSGPNavGlb:
         #标志位
         self.change_flag_pub = rospy.Publisher("change_flag", Bool, queue_size=1)
         self.change_flag_sub = rospy.Subscriber("change_flag", Bool, self.flag_cb, queue_size=1)
+        # Access-Topo 回退接口
+        self.backtrack_goal_pub = rospy.Publisher("/lste/access_topo/backtrack_goal", PoseStamped, queue_size=1)
+        self.access_mode_pub = rospy.Publisher("/lste/access_topo/mode", UInt8, queue_size=1)
         # 动态 final goal：上层发布 PoseStamped 到 /lste/final_goal
         self.final_goal_sub = rospy.Subscriber("/lste/final_goal",
                                                PoseStamped,
@@ -420,6 +447,259 @@ class VSGPNavGlb:
         except Exception:
             pass
 
+    # -------- Access-Topo: anchors / branches / backtrack --------
+    def set_access_mode(self, mode: int):
+        self.access_mode = mode
+        self.access_mode_pub.publish(UInt8(mode))
+
+    def ensure_anchor(self, force: bool = False) -> int:
+        """在当前位置落一个路钉节点（必要时）。返回当前 anchor_id。"""
+        if self.pose is None:
+            return self.anchor_last_id
+        cur_xy = (self.pose.x, self.pose.y)
+        if self.anchor_last_xy is None:
+            force = True
+        else:
+            dx = cur_xy[0] - self.anchor_last_xy[0]
+            dy = cur_xy[1] - self.anchor_last_xy[1]
+            if np.hypot(dx, dy) > self.anchor_step_dist:
+                force = True
+        if force:
+            node_id = len(self.anchor_nodes)
+            node = {
+                "id": node_id,
+                "x": cur_xy[0],
+                "y": cur_xy[1],
+                "stamp": rospy.Time.now().to_sec(),
+                "prev": self.anchor_last_id,
+                "branches": [],
+            }
+            self.anchor_nodes.append(node)
+            self.anchor_last_xy = cur_xy
+            self.anchor_last_id = node_id
+        return self.anchor_last_id
+
+    def _get_node(self, node_id: int):
+        if node_id is None:
+            return None
+        if 0 <= node_id < len(self.anchor_nodes):
+            return self.anchor_nodes[node_id]
+        return None
+
+    def _add_branch_if_new(self, node_id: int, heading_world: float, weight: float):
+        node = self._get_node(node_id)
+        if node is None:
+            return None
+        # 如果该节点已有相近的 branch，则不重复添加
+        for br in node["branches"]:
+            if angle_diff(br.get("heading_world", 0.0), heading_world) <= self.cluster_eps_rad:
+                return br["id"]
+        branch_id = len(node["branches"])
+        node["branches"].append({
+            "id": branch_id,
+            "heading_world": heading_world,
+            "weight": weight,
+            "status": "PENDING",
+            "created": rospy.Time.now().to_sec(),
+        })
+        # 以权重升序排序栈，保证 pop() 取到最大的权重
+        self.backtrack_stack.append((node_id, branch_id, weight))
+        self.backtrack_stack.sort(key=lambda x: x[2])
+        return branch_id
+
+    def _publish_backtrack_goal(self, node_id: int):
+        node = self._get_node(node_id)
+        if node is None:
+            return
+        msg = PoseStamped()
+        msg.header.frame_id = "odom"
+        msg.header.stamp = rospy.Time.now()
+        msg.pose.position.x = node["x"]
+        msg.pose.position.y = node["y"]
+        msg.pose.orientation.w = 1.0
+        self.backtrack_goal_pub.publish(msg)
+
+    def enter_backtrack(self):
+        """候选为空时触发：切到 BACKTRACK，并将最近兴趣分支作为回退目标。"""
+        if self.access_mode == 1 and self.current_backtrack is not None:
+            return
+        if len(self.backtrack_stack) == 0:
+            # 没有兴趣点，仍然发布回退模式以阻止 GP 重复进入
+            self.set_access_mode(1)
+            self.change_flag = False
+            self.change_flag_pub.publish(self.change_flag)
+            return
+        node_id, branch_id, weight = self.backtrack_stack.pop()
+        node = self._get_node(node_id)
+        if node is None:
+            return
+        brs = node["branches"]
+        if 0 <= branch_id < len(brs):
+            brs[branch_id]["status"] = "TARGET"
+        self.current_backtrack = (node_id, branch_id)
+        self.set_access_mode(1)
+        self.change_flag = False
+        self.change_flag_pub.publish(self.change_flag)
+        self._publish_backtrack_goal(node_id)
+
+    def _start_forced_heading(self, node_id: int, branch_id: int):
+        node = self._get_node(node_id)
+        if node is None:
+            return
+        brs = node["branches"]
+        if not (0 <= branch_id < len(brs)):
+            return
+        heading_world = brs[branch_id].get("heading_world")
+        brs[branch_id]["status"] = "ACTIVE"
+        self.forced_heading_world = heading_world
+        self.forced_start_xy = (self.pose.x, self.pose.y)
+        self.forced_branch = (node_id, branch_id)
+        self.current_backtrack = None
+        self.set_access_mode(0)
+        self.change_flag = True
+        self.change_flag_pub.publish(self.change_flag)
+
+    def check_backtrack_progress(self):
+        """BACKTRACK 模式下，判断是否已到达回退点并切回 FORWARD。"""
+        if self.access_mode != 1 or self.current_backtrack is None or self.pose is None:
+            return
+        node_id, branch_id = self.current_backtrack
+        node = self._get_node(node_id)
+        if node is None:
+            return
+        dist = np.hypot(self.pose.x - node["x"], self.pose.y - node["y"])
+        if dist <= self.backtrack_arrive_dist:
+            # 到达回退点：强制只走该分支方向
+            self._start_forced_heading(node_id, branch_id)
+
+    def update_forced_heading_progress(self):
+        """当强制沿兴趣分支前进到足够距离后，解除强制窗口并标记 DONE。"""
+        if self.forced_heading_world is None or self.forced_start_xy is None or self.pose is None:
+            return
+        dx = self.pose.x - self.forced_start_xy[0]
+        dy = self.pose.y - self.forced_start_xy[1]
+        progress = dx * np.cos(self.forced_heading_world) + dy * np.sin(self.forced_heading_world)
+        if progress >= self.commit_dist:
+            # 标记当前分支 DONE
+            if self.forced_branch is not None:
+                node = self._get_node(self.forced_branch[0])
+                if node:
+                    idx = self.forced_branch[1]
+                    if 0 <= idx < len(node.get("branches", [])):
+                        node["branches"][idx]["status"] = "DONE"
+            self.forced_heading_world = None
+            self.forced_start_xy = None
+            self.forced_branch = None
+
+    def _angle_mean(self, angles, weights):
+        c = np.sum(np.cos(angles) * weights)
+        s = np.sum(np.sin(angles) * weights)
+        return wrap_angle(np.arctan2(s, c))
+
+    def cluster_frontiers(self):
+        """将 frontier 方向聚类为角度簇。返回 [{'center','weight'}]."""
+        if self.gp_nav_frntr_cntrs is None:
+            return []
+        try:
+            thetas = np.array(self.gp_nav_frntr_cntrs).reshape(-1, 2)[:, 0]
+        except Exception:
+            return []
+        if thetas.size == 0:
+            return []
+        weights = np.array(getattr(self, "gp_nav_frntr_areas", None) or np.ones_like(thetas)).reshape(-1)
+        # 按角度排序
+        idx = np.argsort(thetas)
+        thetas = thetas[idx]
+        weights = weights[idx]
+        clusters = []
+        current_angles = [thetas[0]]
+        current_weights = [weights[0]]
+        for ang, w in zip(thetas[1:], weights[1:]):
+            center_now = self._angle_mean(np.array(current_angles), np.array(current_weights))
+            if angle_diff(ang, center_now) <= self.cluster_eps_rad:
+                current_angles.append(ang)
+                current_weights.append(w)
+            else:
+                clusters.append({"angles": current_angles, "weights": current_weights})
+                current_angles = [ang]
+                current_weights = [w]
+        clusters.append({"angles": current_angles, "weights": current_weights})
+        # wrap 合并首尾
+        if len(clusters) > 1:
+            first_c = self._angle_mean(np.array(clusters[0]["angles"]), np.array(clusters[0]["weights"]))
+            last_c = self._angle_mean(np.array(clusters[-1]["angles"]), np.array(clusters[-1]["weights"]))
+            if angle_diff(first_c, last_c) <= self.cluster_eps_rad:
+                merged_angles = clusters[0]["angles"] + clusters[-1]["angles"]
+                merged_weights = clusters[0]["weights"] + clusters[-1]["weights"]
+                clusters = [{"angles": merged_angles, "weights": merged_weights}] + clusters[1:-1]
+        result = []
+        for cl in clusters:
+            angs = np.array(cl["angles"])
+            wts = np.array(cl["weights"])
+            result.append({"center": self._angle_mean(angs, wts), "weight": float(wts.sum())})
+        return result
+
+    def update_cluster_track(self, clusters):
+        """维护 cluster 跟踪，返回当前稳定的 cluster 列表。"""
+        now = rospy.Time.now().to_sec()
+        # 匹配已有 track
+        for tr in self.cluster_track:
+            tr["matched"] = False
+        for cl in clusters:
+            best = None
+            best_diff = None
+            for tr in self.cluster_track:
+                diff = angle_diff(cl["center"], tr["center"])
+                if diff <= self.cluster_eps_rad and (best_diff is None or diff < best_diff):
+                    best = tr
+                    best_diff = diff
+            if best is not None:
+                best["center"] = cl["center"]
+                best["last_seen"] = now
+                best["weight"] = cl["weight"]
+                best["matched"] = True
+            else:
+                self.cluster_track.append({
+                    "center": cl["center"],
+                    "first_seen": now,
+                    "last_seen": now,
+                    "weight": cl["weight"],
+                    "matched": True,
+                })
+        # 清理长时间未出现的
+        self.cluster_track = [
+            tr for tr in self.cluster_track
+            if (now - tr.get("last_seen", now)) <= self.cluster_lost_timeout
+        ]
+        stable = []
+        for tr in self.cluster_track:
+            if (now - tr.get("first_seen", now)) >= self.cluster_stable_duration:
+                stable.append({"center": tr["center"], "weight": tr.get("weight", 1.0)})
+        return stable
+
+    def create_interest_from_frontiers(self, chosen_theta_rel: float):
+        """在分叉时为未选择的稳定分支创建兴趣点/分支并入栈。"""
+        clusters = self.cluster_frontiers()
+        stable = self.update_cluster_track(clusters)
+        if len(stable) < 2:
+            return
+        node_id = self.ensure_anchor(force=False)
+        if node_id is None:
+            return
+        chosen_heading_world = wrap_angle(self.pose.theta + chosen_theta_rel)
+        # 匹配哪个 cluster 被选中
+        chosen_idx = None
+        for i, cl in enumerate(stable):
+            if angle_diff(wrap_angle(self.pose.theta + cl["center"]), chosen_heading_world) <= self.cluster_eps_rad:
+                chosen_idx = i
+                break
+        for i, cl in enumerate(stable):
+            if i == chosen_idx:
+                continue
+            heading_world = wrap_angle(self.pose.theta + cl["center"])
+            bid = self._add_branch_if_new(node_id, heading_world, cl["weight"])
+            # PENDING 分支已入栈，由 backtrack 时选择
+
     #zcy
     # 切换模式，true为高斯开启发布，flase为topo，高斯subgoal停止发布
     def flag_cb(self, bool_msg):
@@ -449,6 +729,7 @@ class VSGPNavGlb:
             self.int_visited_positions.append(int_position)
             self.visited_positions.append(real_position)
             print(real_position)
+        self.ensure_anchor()
 
     def is_visited(self, point, threshold):
         for traj_pt in self.visited_positions:
@@ -743,19 +1024,27 @@ class VSGPNavGlb:
 
         for idx, subgoal in enumerate(self.gp_nav_actul_xy_gls):
             x, y, _ = subgoal
-            if not self.is_visited([x, y], 3):
-                new_gp_nav_actul_xy_gls.append(subgoal)
-                new_gp_nav_frntr_cntrs.append(self.gp_nav_frntr_cntrs[idx])
-                # 保留对应的 frontier 面积，后续用于“最空旷方向”判断
-                if idx < len(self.gp_nav_frntr_areas):
-                    new_gp_nav_frntr_areas.append(self.gp_nav_frntr_areas[idx])
-            else:
-                # closed.append(subgoal)
-                # print(f"close_list =  {closed} ")
-
+            theta_rel = None
+            try:
+                theta_rel = float(self.gp_nav_frntr_cntrs[idx][0])
+            except Exception:
+                pass
+            in_forced_window = False
+            if self.forced_heading_world is not None and theta_rel is not None:
+                heading_world = wrap_angle(self.pose.theta + theta_rel)
+                if angle_diff(heading_world, self.forced_heading_world) <= self.force_window_rad:
+                    in_forced_window = True
+                else:
+                    continue  # 强制窗口下，非兴趣方向直接丢弃
+            if (not in_forced_window) and self.is_visited([x, y], 3):
                 closed_position = [int(x), int(y)]
                 if closed_position not in self.closed:
                     closed.append(closed_position)
+                continue
+            new_gp_nav_actul_xy_gls.append(subgoal)
+            new_gp_nav_frntr_cntrs.append(self.gp_nav_frntr_cntrs[idx])
+            if idx < len(self.gp_nav_frntr_areas):
+                new_gp_nav_frntr_areas.append(self.gp_nav_frntr_areas[idx])
 
         #对齐形状
         self.gp_nav_actul_xy_gls = np.array(new_gp_nav_actul_xy_gls)
@@ -768,10 +1057,7 @@ class VSGPNavGlb:
         print(f"gp_nav_actul_xy_gls={self.gp_nav_actul_xy_gls}")
 
         if len(self.gp_nav_actul_xy_gls) == 0:
-            if not self.change_flag:
-                return
-            self.change_flag = False
-            self.change_flag_pub.publish(self.change_flag)
+            self.enter_backtrack()
             return
 
         gap_to_gl_dst = np.sqrt((self.gl_y -
@@ -788,7 +1074,12 @@ class VSGPNavGlb:
         self.chsn_gl_idx = self.gap_utlty_fun.argmin(axis=0)
         self.gp_nav_pt = self.gp_nav_pts[self.chsn_gl_idx]
         print("recommended subgoal id and direction: ", self.chsn_gl_idx, self.gp_nav_pt[0])
-
+        try:
+            chosen_theta_rel = float(self.gp_nav_pt[0])
+        except Exception:
+            chosen_theta_rel = None
+        if chosen_theta_rel is not None:
+            self.create_interest_from_frontiers(chosen_theta_rel)
         self.closed.extend(closed)
 
     def publish_frontiers(self):
@@ -1233,6 +1524,9 @@ class VSGPNavGlb:
 
     def step(self):
         while not rospy.is_shutdown():
+            # Access-Topo：检查回退/强制方向进度
+            self.check_backtrack_progress()
+            self.update_forced_heading_progress()
             ## transformation matrices between robot and world
             self.tf_rbt_2_odom()
             self.tf_odom_2_rbt()

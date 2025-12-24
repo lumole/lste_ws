@@ -15,6 +15,7 @@ import rospy
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Pose2D, PoseStamped, PointStamped, Vector3Stamped, TransformStamped, Twist
 from sensor_msgs.msg import Image, CameraInfo, LaserScan
+from std_msgs.msg import UInt8
 from image_geometry import PinholeCameraModel
 import tf2_ros
 from tf.transformations import quaternion_matrix, quaternion_from_euler
@@ -83,6 +84,9 @@ class GoalManager:
         self.latest_cmd_vel: Optional[Twist] = None
         self.headings: Optional[List[float]] = None
         self.last_dir_idx: Optional[int] = None
+        # Access-Topo 覆盖
+        self.access_mode = 0
+        self.access_backtrack_goal: Optional[PoseStamped] = None
 
         # 深度/相机
         self.bridge = CvBridge()
@@ -111,6 +115,8 @@ class GoalManager:
         self.sub_frontiers = rospy.Subscriber(self.frontiers_topic, LsteFrontiers, self.on_frontiers, queue_size=1)
         self.sub_scan = rospy.Subscriber(self.scan_topic, LaserScan, self.on_scan, queue_size=1)
         self.sub_cmd_vel = rospy.Subscriber("/cmd_vel", Twist, self.on_cmd_vel, queue_size=1)
+        self.sub_access_mode = rospy.Subscriber("/lste/access_topo/mode", UInt8, self.on_access_mode, queue_size=1)
+        self.sub_access_goal = rospy.Subscriber("/lste/access_topo/backtrack_goal", PoseStamped, self.on_access_goal, queue_size=1)
 
         self.timer = rospy.Timer(rospy.Duration(0.2), self.on_timer)  # 5Hz
         rospy.loginfo("Goal Manager started: publishes /lste/final_goal")
@@ -164,6 +170,15 @@ class GoalManager:
 
     def on_cmd_vel(self, msg: Twist):
         self.latest_cmd_vel = msg
+
+    def on_access_mode(self, msg: UInt8):
+        try:
+            self.access_mode = int(msg.data)
+        except Exception:
+            self.access_mode = 0
+
+    def on_access_goal(self, msg: PoseStamped):
+        self.access_backtrack_goal = msg
 
     # -------------------- Timer --------------------
     def on_timer(self, _event):
@@ -222,6 +237,9 @@ class GoalManager:
         return self.pass_period
 
     def compute_goal(self) -> Optional[PoseStamped]:
+        # Access-Topo 回退模式优先
+        if self.access_mode == 1 and self.access_backtrack_goal is not None:
+            return self.access_backtrack_goal
         if self.current_state == STATE_LOCKED:
             return self.goal_from_target()
         if self.current_state == STATE_SUSPICIOUS:

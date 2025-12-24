@@ -7,7 +7,7 @@ set -euo pipefail
 
 WS=${WS:-/home/zrz/lste_ws}
 SESSION=${SESSION:-lste}
-WORLD=${WORLD:-$WS/src/lste_core/worlds/test.world}
+WORLD=${WORLD:-$WS/src/lste_core/worlds/guai_road.world}
 TASK_JSON=${TASK_JSON:-$WS/model/Data_exchange/vlm_prompt/lab/yellow_cup.json}
 TASK_ID=${TASK_ID:-yellow_cup}
 VLLM_URL=${VLLM_URL:-http://localhost:8000/v1}
