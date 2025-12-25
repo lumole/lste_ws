@@ -5,6 +5,8 @@
   <arg name="z" default="0.1"/>
   <arg name="yaw" default="0.0"/>
   <arg name="robot_description_path" default="$(find pja)/urdf/pro3.xacro"/>
+  <!-- 控制是否真的向 Gazebo spawn 模型，false 时仍然加载 robot_description + rsp -->
+  <arg name="spawn_model" default="true"/>
 
   <group ns="$(arg robot_name)">
     <param name="robot_description"
@@ -20,6 +22,7 @@
     <node pkg="gazebo_ros"
           type="spawn_model"
           name="spawn_pro3"
-          args="-urdf -param robot_description -model $(arg robot_name) -x $(arg x) -y $(arg y) -z $(arg z) -Y $(arg yaw)" />
+          args="-urdf -param robot_description -model $(arg robot_name) -x $(arg x) -y $(arg y) -z $(arg z) -Y $(arg yaw)"
+          if="$(arg spawn_model)"/>
   </group>
 </launch>

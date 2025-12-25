@@ -4,6 +4,8 @@
   <arg name="gui" default="true"/>
   <arg name="use_sim_time" default="true"/>
   <arg name="robot_name" default="pro3"/>
+  <!-- 当 world 已自带机器人时，设置 spawn_pro3:=false 跳过重复 spawn -->
+  <arg name="spawn_pro3" default="true"/>
 
   <!-- 默认 world，允许从命令行覆盖为任意 .world 路径 -->
   <arg name="world_name" default="$(find lste_core)/worlds/lab_building.world"/>
@@ -25,5 +27,6 @@
     <arg name="y" value="$(arg y)"/>
     <arg name="z" value="$(arg z)"/>
     <arg name="yaw" value="$(arg yaw)"/>
+    <arg name="spawn_model" value="$(arg spawn_pro3)"/>
   </include>
 </launch>

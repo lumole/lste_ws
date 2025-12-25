@@ -3,8 +3,11 @@
 
 #from typing import Tuple, Optional
 #import tempfile
+import faulthandler; faulthandler.enable()
 #import pathlib
 import warnings
+import json
+import yaml
 
 #import io
 import os
@@ -66,6 +69,16 @@ def wrap_angle(x: float) -> float:
 def angle_diff(a: float, b: float) -> float:
     """Minimal absolute angular difference."""
     return abs(wrap_angle(a - b))
+
+
+def safe_load_yaml(path):
+    """Load YAML file, return dict or {} on failure."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 #### configurations
 warnings.filterwarnings("ignore")
@@ -255,25 +268,27 @@ class VSGPNavGlb:
         self.detected_interest_points = []
         self.match_threshold = 0.5  # 例如，0.5米
         # --- Access-Topo 参数与数据 ---
-        self.anchor_step_dist = rospy.get_param('~anchor_step_dist', 1.0)
-        self.backtrack_arrive_dist = rospy.get_param('~backtrack_arrive_dist', 1.0)
-        self.force_window_deg = rospy.get_param('~force_window_deg', 25.0)
-        self.commit_dist = rospy.get_param('~commit_dist', 2.0)
-        self.cluster_eps_deg = rospy.get_param('~cluster_eps_deg', 15.0)
-        self.cluster_stable_duration = rospy.get_param('~cluster_stable_duration', 3.0)
-        self.cluster_lost_timeout = rospy.get_param('~cluster_lost_timeout', 1.0)
+        self.load_access_topo_config()
         self.anchor_nodes = []  # [{'id', 'x','y','stamp','prev','branches':[]}]
         self.anchor_last_xy = None
         self.anchor_last_id = None
         self.backtrack_stack = []  # list of (node_id, branch_id, weight)
         self.current_backtrack = None  # (node_id, branch_id)
+        self.backtrack_start_pose = None  # {"x","y"}
+        self.backtrack_start_anchor = None
+        self.backtrack_path = []  # anchor id list from start to target
         self.access_mode = 0  # 0 forward, 1 backtrack
         self.forced_heading_world = None
         self.forced_start_xy = None
         self.forced_branch = None
         self.cluster_track = []  # tracking clusters for stability
+        self.pending_junctions = []  # [{"node_id":int,"candidates":[{"heading":float,"weight":float,"last_seen":float}]}]
         self.force_window_rad = np.deg2rad(self.force_window_deg)
         self.cluster_eps_rad = np.deg2rad(self.cluster_eps_deg)
+        # 保存 topo tree
+        self.topo_save_file = os.path.join(
+            self.topo_save_dir, f"access_topo_{int(time())}.json")
+        self.last_topo_save_time = 0.0
 
         #zcy
         self.zcyrbt_pose_sub = rospy.Subscriber("rbt_pose",
@@ -447,6 +462,33 @@ class VSGPNavGlb:
         except Exception:
             pass
 
+    def load_access_topo_config(self):
+        """加载 Access-Topo 配置（优先 YAML，其次 ROS param，最后默认值）。"""
+        cfg_path = rospy.get_param('~access_topo_config',
+                                   '/home/zrz/lste_ws/src/lste_topo_access/topo_tree/cfgs/access_topo.yaml')
+        cfg_file = safe_load_yaml(cfg_path)
+        # 基础路径与测试名
+        self.test_name = cfg_file.get('test_name', rospy.get_param('~test_name', 'default'))
+        self.topo_tree_root = cfg_file.get('topo_tree_root',
+                                           rospy.get_param('~topo_tree_root',
+                                                           '/home/zrz/lste_ws/src/lste_topo_access/topo_tree/tree'))
+        # 参数读取（YAML 优先，ROS param 次之）
+        self.anchor_step_dist = cfg_file.get('anchor_step_dist', rospy.get_param('~anchor_step_dist', 1.0))
+        self.backtrack_arrive_dist = cfg_file.get('backtrack_arrive_dist',
+                                                 rospy.get_param('~backtrack_arrive_dist', 1.0))
+        self.visited_thresh = cfg_file.get('visited_thresh', rospy.get_param('~visited_thresh', 3.0))
+        self.force_window_deg = cfg_file.get('force_window_deg', rospy.get_param('~force_window_deg', 25.0))
+        self.commit_dist = cfg_file.get('commit_dist', rospy.get_param('~commit_dist', 2.0))
+        self.cluster_eps_deg = cfg_file.get('cluster_eps_deg', rospy.get_param('~cluster_eps_deg', 15.0))
+        self.cluster_stable_duration = cfg_file.get('cluster_stable_duration',
+                                                    rospy.get_param('~cluster_stable_duration', 3.0))
+        self.cluster_lost_timeout = cfg_file.get('cluster_lost_timeout',
+                                                 rospy.get_param('~cluster_lost_timeout', 1.0))
+        # topo tree 保存目录（默认 root/test_name）
+        default_save_dir = os.path.join(self.topo_tree_root, self.test_name)
+        self.topo_save_dir = cfg_file.get('topo_save_dir', rospy.get_param('~topo_save_dir', default_save_dir))
+        self.topo_save_period = cfg_file.get('topo_save_period', rospy.get_param('~topo_save_period', 2.0))
+
     # -------- Access-Topo: anchors / branches / backtrack --------
     def set_access_mode(self, mode: int):
         self.access_mode = mode
@@ -533,9 +575,25 @@ class VSGPNavGlb:
         node = self._get_node(node_id)
         if node is None:
             return
+        # 记录回退起点与路径
+        if self.pose is not None:
+            self.backtrack_start_pose = {"x": self.pose.x, "y": self.pose.y}
+        start_anchor = self.ensure_anchor(force=False)
+        self.backtrack_start_anchor = start_anchor
+        self.backtrack_path = []
+        if start_anchor is not None:
+            cur = start_anchor
+            visited = set()
+            while cur is not None and cur not in visited:
+                visited.add(cur)
+                self.backtrack_path.append(cur)
+                if cur == node_id:
+                    break
+                cur_node = self._get_node(cur)
+                cur = cur_node.get("prev") if cur_node else None
         brs = node["branches"]
         if 0 <= branch_id < len(brs):
-            brs[branch_id]["status"] = "TARGET"
+            brs[branch_id]["status"] = "TRACKBACK"
         self.current_backtrack = (node_id, branch_id)
         self.set_access_mode(1)
         self.change_flag = False
@@ -550,7 +608,7 @@ class VSGPNavGlb:
         if not (0 <= branch_id < len(brs)):
             return
         heading_world = brs[branch_id].get("heading_world")
-        brs[branch_id]["status"] = "ACTIVE"
+        brs[branch_id]["status"] = "TRACKBACK"
         self.forced_heading_world = heading_world
         self.forced_start_xy = (self.pose.x, self.pose.y)
         self.forced_branch = (node_id, branch_id)
@@ -606,7 +664,19 @@ class VSGPNavGlb:
             return []
         if thetas.size == 0:
             return []
-        weights = np.array(getattr(self, "gp_nav_frntr_areas", None) or np.ones_like(thetas)).reshape(-1)
+        areas = getattr(self, "gp_nav_frntr_areas", None)
+        if areas is None:
+            weights = np.ones_like(thetas)
+        else:
+            try:
+                weights = np.array(areas).reshape(-1)
+            except Exception:
+                weights = np.ones_like(thetas)
+            if weights.size == 0:
+                weights = np.ones_like(thetas)
+            elif weights.size != thetas.size:
+                # fallback to uniform if dimension mismatch
+                weights = np.ones_like(thetas)
         # 按角度排序
         idx = np.argsort(thetas)
         thetas = thetas[idx]
@@ -678,27 +748,99 @@ class VSGPNavGlb:
         return stable
 
     def create_interest_from_frontiers(self, chosen_theta_rel: float):
-        """在分叉时为未选择的稳定分支创建兴趣点/分支并入栈。"""
+        """用聚类跟踪：只在未选分支“消失”后才生成兴趣点，确保丁字口只留一个未选分支。"""
+        now = rospy.Time.now().to_sec()
         clusters = self.cluster_frontiers()
         stable = self.update_cluster_track(clusters)
-        if len(stable) < 2:
+
+        # 记录新的“待确认路口”：当前稳定多峰且有明确选择方向
+        chosen_heading_world = None
+        if chosen_theta_rel is not None:
+            chosen_heading_world = wrap_angle(self.pose.theta + chosen_theta_rel)
+        if len(stable) >= 2 and chosen_heading_world is not None:
+            node_id = self.ensure_anchor(force=False)
+            if node_id is not None:
+                existing_heads = []
+                for pj in self.pending_junctions:
+                    if pj.get("node_id") != node_id:
+                        continue
+                    for cand in pj.get("candidates", []):
+                        existing_heads.append(cand.get("heading"))
+                # 为每个未选方向建立候选，但不立刻入栈，等待其消失
+                cands = []
+                for cl in stable:
+                    heading_world = wrap_angle(self.pose.theta + cl["center"])
+                    if angle_diff(heading_world, chosen_heading_world) <= self.cluster_eps_rad:
+                        continue  # 被选方向永不记为兴趣点
+                    if any(angle_diff(heading_world, eh) <= self.cluster_eps_rad for eh in existing_heads if eh is not None):
+                        continue  # 已经在待确认列表里
+                    cands.append({
+                        "heading": heading_world,
+                        "weight": cl["weight"],
+                        "last_seen": now,
+                    })
+                if cands:
+                    self.pending_junctions.append({
+                        "node_id": node_id,
+                        "candidates": cands,
+                    })
+
+        # 处理“待确认路口”：未选方向消失一段时间后才真正生成兴趣点
+        stable_world = [
+            {"heading": wrap_angle(self.pose.theta + cl["center"]), "weight": cl["weight"]}
+            for cl in stable
+        ]
+        new_pending = []
+        for pj in self.pending_junctions:
+            node_id = pj.get("node_id")
+            cands = []
+            for cand in pj.get("candidates", []):
+                # 如果当前仍能看到这个方向的 cluster，则更新 last_seen
+                matched = False
+                for sw in stable_world:
+                    if angle_diff(sw["heading"], cand["heading"]) <= self.cluster_eps_rad:
+                        cand["last_seen"] = now
+                        cand["weight"] = sw["weight"]
+                        matched = True
+                        break
+                # 若方向已经消失超过 cluster_lost_timeout，则落一个兴趣点
+                if not matched and (now - cand.get("last_seen", now)) >= self.cluster_lost_timeout:
+                    self._add_branch_if_new(node_id, cand["heading"], cand.get("weight", 1.0))
+                else:
+                    cands.append(cand)
+            if cands:
+                new_pending.append({"node_id": node_id, "candidates": cands})
+        self.pending_junctions = new_pending
+
+    def dump_access_topo(self, force: bool = False):
+        """周期性保存 topo tree 为 JSON，便于离线可视化。"""
+        if not self.topo_save_dir:
             return
-        node_id = self.ensure_anchor(force=False)
-        if node_id is None:
+        now = rospy.Time.now().to_sec()
+        if (not force) and (now - self.last_topo_save_time < self.topo_save_period):
             return
-        chosen_heading_world = wrap_angle(self.pose.theta + chosen_theta_rel)
-        # 匹配哪个 cluster 被选中
-        chosen_idx = None
-        for i, cl in enumerate(stable):
-            if angle_diff(wrap_angle(self.pose.theta + cl["center"]), chosen_heading_world) <= self.cluster_eps_rad:
-                chosen_idx = i
-                break
-        for i, cl in enumerate(stable):
-            if i == chosen_idx:
-                continue
-            heading_world = wrap_angle(self.pose.theta + cl["center"])
-            bid = self._add_branch_if_new(node_id, heading_world, cl["weight"])
-            # PENDING 分支已入栈，由 backtrack 时选择
+        self.last_topo_save_time = now
+        try:
+            os.makedirs(self.topo_save_dir, exist_ok=True)
+            data = {
+                "stamp": now,
+                "test_name": self.test_name,
+                "topo_tree_root": self.topo_tree_root,
+                "pose": {"x": getattr(self.pose, "x", None), "y": getattr(self.pose, "y", None)},
+                "access_mode": self.access_mode,
+                "forced_heading_world": self.forced_heading_world,
+                "forced_branch": self.forced_branch,
+                "current_backtrack": self.current_backtrack,
+                "backtrack_start_pose": self.backtrack_start_pose,
+                "backtrack_path": self.backtrack_path,
+                "nodes": self.anchor_nodes,
+                "pending_junctions": self.pending_junctions,
+                "backtrack_stack": self.backtrack_stack,
+            }
+            with open(self.topo_save_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "dump_access_topo failed: %s", exc)
 
     #zcy
     # 切换模式，true为高斯开启发布，flase为topo，高斯subgoal停止发布
@@ -1036,7 +1178,7 @@ class VSGPNavGlb:
                     in_forced_window = True
                 else:
                     continue  # 强制窗口下，非兴趣方向直接丢弃
-            if (not in_forced_window) and self.is_visited([x, y], 3):
+            if (not in_forced_window) and self.is_visited([x, y], self.visited_thresh):
                 closed_position = [int(x), int(y)]
                 if closed_position not in self.closed:
                     closed.append(closed_position)
@@ -1553,6 +1695,7 @@ class VSGPNavGlb:
             self.gp_nav_pkup_nav_pt()
             self.publish_frontiers()
             self.update_global_goal_periodic()  # 每隔 gl_update_period 秒基于当前 frontier 更新全局目标
+            self.dump_access_topo()
             ####calculate navigation point in world frame zcy topo模式下不发布subgoal及可视化
             # self.gp_nav_xypts_actul_pcl()
             # self.gp_nav_pts_pcl()

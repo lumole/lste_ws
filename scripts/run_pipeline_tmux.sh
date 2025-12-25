@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 # 简易一键启动脚本：用 tmux 分窗启动仿真 + VLLM + prompt + DINO 检测 + score/state + 可视化。
 # 可通过环境变量覆盖默认值，例如：
@@ -7,12 +8,14 @@ set -euo pipefail
 
 WS=${WS:-/home/zrz/lste_ws}
 SESSION=${SESSION:-lste}
-WORLD=${WORLD:-$WS/src/lste_core/worlds/guai_road.world}
+WORLD=${WORLD:-$WS/src/lste_core/worlds/topo_test2.world}
 TASK_JSON=${TASK_JSON:-$WS/model/Data_exchange/vlm_prompt/lab/yellow_cup.json}
 TASK_ID=${TASK_ID:-yellow_cup}
 VLLM_URL=${VLLM_URL:-http://localhost:8000/v1}
 VLLM_MODEL=${VLLM_MODEL:-$WS/model/MiniCPM/OpenBMB/MiniCPM4-0___5B}
 VLLM_PROBE=${VLLM_PROBE:-${VLLM_URL%/}}
+ACCESS_TOPO_CONFIG=${ACCESS_TOPO_CONFIG:-$WS/src/lste_topo_access/topo_tree/cfgs/access_topo.yaml}
+ACCESS_TOPO_TEST_NAME=${ACCESS_TOPO_TEST_NAME:-default_test}
 if [[ "$VLLM_PROBE" == */v1 ]]; then
   VLLM_PROBE="$VLLM_PROBE/models"
 fi
@@ -20,6 +23,12 @@ fi
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux 未安装，请先安装 tmux。" >&2
   exit 1
+fi
+
+# 自动判断 world 是否已经包含 pro3 模型，包含则跳过二次 spawn
+SPAWN_PRO3=true
+if [[ -f "$WORLD" ]] && grep -q "<model name='pro3'>" "$WORLD"; then
+  SPAWN_PRO3=false
 fi
 
 tmux_new_window() {
@@ -47,7 +56,7 @@ WAIT_ROSCORE='until rostopic list >/dev/null 2>&1; do echo \"waiting for roscore
 
 # 1: 仿真 + 机器人（等待 master 就绪）
 tmux_new_window 1 "$WS" "world" \
-  "$WAIT_ROSCORE; roslaunch lste_core lab_with_pro3.launch world_name:=$WORLD"
+  "$WAIT_ROSCORE; roslaunch lste_core lab_with_pro3.launch world_name:=$WORLD spawn_pro3:=$SPAWN_PRO3"
 
 # 2: 发布任务（latched，可随时替换 json/task_id）
 tmux_new_window 2 "$WS" "task" \
@@ -100,6 +109,7 @@ tmux_new_window 10 "$WS" "oc_srfc" \
 
 # 11: topo frontier（需 vsgp 环境）
 tmux_new_window 11 "$WS" "gp_frontier" \
-  "$WAIT_ROSCORE; conda activate vsgp; roslaunch lste_topo_access gp_frontier.launch"
+  "$WAIT_ROSCORE; conda activate vsgp; roslaunch lste_topo_access gp_frontier.launch \
+    access_topo_config:=$ACCESS_TOPO_CONFIG access_topo_test_name:=$ACCESS_TOPO_TEST_NAME"
 
 tmux attach -t "$SESSION"

@@ -4,15 +4,12 @@
 
 ## 🚀 Quick Start
 
-使用 Tmux 快速启动整个 Pipeline。
 
 ```bash
 
 # 清理旧的 session (如果存在)
 tmux kill-session -t lste 2>/dev/null || true
-# 进入工作空间
 cd /home/zrz/lste_ws
-# 设置环境变量并运行脚本
 WS=/home/zrz/lste_ws \
 TASK_JSON=/home/zrz/lste_ws/model/Data_exchange/vlm_prompt/lab/yellow_cup.json \
 TASK_ID=yellow_cup \
@@ -31,19 +28,18 @@ TASK_ID=yellow_cup \
 # 操控车来移动（键盘操控）
 rosrun teleop_twist_keyboard teleop_twist_keyboard.py cmd_vel:=/cmd_vel
 
-#强制给直行
+# 强制给直行
 rostopic pub -r 10 /cmd_vel geometry_msgs/Twist \
 '{linear: {x: 0.2, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}'
 
+# rviz看frontier可视化
+rviz -d /home/zrz/lste_ws/src/lste_topo_access/launch/gp_frontier.rviz
 
 # 能看到发布的 task
 rostopic echo /lste/task
 
 # 能看到发布的 prompts
 rostopic echo /lste/prompts
-
-#rviz看frontier可视化
-rviz -d /home/zrz/lste_ws/src/lste_topo_access/launch/gp_frontier.rviz
 
 ```
 
@@ -68,7 +64,9 @@ rosrun vanish_point_detection vanish_point_detection.py
 ```bash
 # 启动基础环境
 roslaunch lste_core lab_with_pro3.launch \
-  world_name:=/home/zrz/lste_ws/src/lste_core/worlds/room.world
+  world_name:=/home/zrz/lste_ws/src/lste_core/worlds/topo_test2.world \
+  spawn_pro3:=false
+
   
 # 启动任务节点
 rosrun lste_core lste_task_node.py _json_path:=/home/zrz/lste_ws/model/Data_exchange/vlm_prompt/lab/yellow_cup.json _task_id:=yellow_cup
