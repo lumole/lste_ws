@@ -25,6 +25,17 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
+# 避免 TF 本地库缓存问题：跑 pipeline 前清理 vsgp 环境下的 TF pyc，并做一次导入自检
+export PYTHONDONTWRITEBYTECODE=1
+if command -v conda >/dev/null 2>&1; then
+  echo "[preflight] 清理 vsgp 环境下的 TensorFlow 缓存并做自检..."
+  conda run -n vsgp bash -lc "find /home/zrz/anaconda3/envs/vsgp/lib/python3.7/site-packages/tensorflow -name '*.pyc' -delete; find /home/zrz/anaconda3/envs/vsgp/lib/python3.7/site-packages/tensorflow -name '__pycache__' -type d -exec rm -rf {} +" || true
+  conda run -n vsgp python - <<'PY' || true
+import sys, tensorflow as tf
+print("TF sanity:", sys.executable, tf.__version__)
+PY
+fi
+
 # 自动判断 world 是否已经包含 pro3 模型，包含则跳过二次 spawn
 SPAWN_PRO3=true
 if [[ -f "$WORLD" ]] && grep -q "<model name='pro3'>" "$WORLD"; then

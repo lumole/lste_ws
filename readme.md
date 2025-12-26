@@ -41,6 +41,8 @@ rostopic echo /lste/task
 # 能看到发布的 prompts
 rostopic echo /lste/prompts
 
+# 可视化拓扑
+
 ```
 
 ### 消失点检测

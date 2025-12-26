@@ -276,13 +276,19 @@ class VSGPNavGlb:
         self.current_backtrack = None  # (node_id, branch_id)
         self.backtrack_start_pose = None  # {"x","y"}
         self.backtrack_start_anchor = None
-        self.backtrack_path = []  # anchor id list from start to target
+        self.backtrack_path = []  # anchor id list for the current backtrack (newly generated path)
+        self.no_frontier_since = None
+        self.no_frontier_start_pose = None
+        self.no_frontier_start_anchor = None
+        self.backtrack_recording = False  # whether we are recording new anchors during backtrack
         self.access_mode = 0  # 0 forward, 1 backtrack
         self.forced_heading_world = None
         self.forced_start_xy = None
         self.forced_branch = None
         self.cluster_track = []  # tracking clusters for stability
         self.pending_junctions = []  # [{"node_id":int,"candidates":[{"heading":float,"weight":float,"last_seen":float}]}]
+        # 连续无 frontier 的计时，用于延迟回溯触发
+        self.no_frontier_since = None
         self.force_window_rad = np.deg2rad(self.force_window_deg)
         self.cluster_eps_rad = np.deg2rad(self.cluster_eps_deg)
         # 保存 topo tree
@@ -484,6 +490,9 @@ class VSGPNavGlb:
                                                     rospy.get_param('~cluster_stable_duration', 3.0))
         self.cluster_lost_timeout = cfg_file.get('cluster_lost_timeout',
                                                  rospy.get_param('~cluster_lost_timeout', 1.0))
+        # 连续无可用 frontier 的触发时间（秒）；同时要求 access_mode==1 才真正回溯
+        self.no_frontier_trigger_sec = cfg_file.get(
+            'no_frontier_trigger_sec', rospy.get_param('~no_frontier_trigger_sec', 3.0))
         # topo tree 保存目录（默认 root/test_name）
         default_save_dir = os.path.join(self.topo_tree_root, self.test_name)
         self.topo_save_dir = cfg_file.get('topo_save_dir', rospy.get_param('~topo_save_dir', default_save_dir))
@@ -506,6 +515,7 @@ class VSGPNavGlb:
             dy = cur_xy[1] - self.anchor_last_xy[1]
             if np.hypot(dx, dy) > self.anchor_step_dist:
                 force = True
+        created = False
         if force:
             node_id = len(self.anchor_nodes)
             node = {
@@ -519,6 +529,11 @@ class VSGPNavGlb:
             self.anchor_nodes.append(node)
             self.anchor_last_xy = cur_xy
             self.anchor_last_id = node_id
+            created = True
+            # 在回溯记录阶段，将新生成的 anchor 追加到 backtrack_path
+            if self.backtrack_recording:
+                if not self.backtrack_path or self.backtrack_path[-1] != node_id:
+                    self.backtrack_path.append(node_id)
         return self.anchor_last_id
 
     def _get_node(self, node_id: int):
@@ -575,22 +590,14 @@ class VSGPNavGlb:
         node = self._get_node(node_id)
         if node is None:
             return
-        # 记录回退起点与路径
-        if self.pose is not None:
-            self.backtrack_start_pose = {"x": self.pose.x, "y": self.pose.y}
-        start_anchor = self.ensure_anchor(force=False)
-        self.backtrack_start_anchor = start_anchor
-        self.backtrack_path = []
-        if start_anchor is not None:
-            cur = start_anchor
-            visited = set()
-            while cur is not None and cur not in visited:
-                visited.add(cur)
-                self.backtrack_path.append(cur)
-                if cur == node_id:
-                    break
-                cur_node = self._get_node(cur)
-                cur = cur_node.get("prev") if cur_node else None
+        # 如果尚未有起点 anchor，使用当前 anchor 作为起点
+        if self.backtrack_start_anchor is None:
+            start_anchor = self.ensure_anchor(force=False)
+            self.backtrack_start_anchor = start_anchor
+            if self.backtrack_recording:
+                self.backtrack_path = []
+                if start_anchor is not None:
+                    self.backtrack_path.append(start_anchor)
         brs = node["branches"]
         if 0 <= branch_id < len(brs):
             brs[branch_id]["status"] = "TRACKBACK"
@@ -627,6 +634,9 @@ class VSGPNavGlb:
             return
         dist = np.hypot(self.pose.x - node["x"], self.pose.y - node["y"])
         if dist <= self.backtrack_arrive_dist:
+            # 回溯段结束，停止记录新路径
+            if self.backtrack_recording:
+                self.backtrack_recording = False
             # 到达回退点：强制只走该分支方向
             self._start_forced_heading(node_id, branch_id)
 
@@ -1199,8 +1209,35 @@ class VSGPNavGlb:
         print(f"gp_nav_actul_xy_gls={self.gp_nav_actul_xy_gls}")
 
         if len(self.gp_nav_actul_xy_gls) == 0:
-            self.enter_backtrack()
+            now = rospy.Time.now().to_sec()
+            if self.no_frontier_since is None:
+                self.no_frontier_since = now
+                if self.pose is not None:
+                    self.no_frontier_start_pose = {"x": self.pose.x, "y": self.pose.y}
+                self.no_frontier_start_anchor = self.ensure_anchor(force=False)
+            # 无 frontier 连续 >=T 触发回退
+            if self.no_frontier_since is not None:
+                if (now - self.no_frontier_since) >= self.no_frontier_trigger_sec:
+                    if self.no_frontier_start_pose is not None and self.backtrack_start_pose is None:
+                        self.backtrack_start_pose = dict(self.no_frontier_start_pose)
+                    if self.backtrack_start_anchor is None:
+                        self.backtrack_start_anchor = self.no_frontier_start_anchor
+                    if not self.backtrack_recording:
+                        self.backtrack_path = []
+                        if self.backtrack_start_anchor is not None:
+                            self.backtrack_path.append(self.backtrack_start_anchor)
+                        self.backtrack_recording = True
+                    self.enter_backtrack()
             return
+        # 恢复有 frontier，清除计时
+        self.no_frontier_since = None
+        self.no_frontier_start_pose = None
+        self.no_frontier_start_anchor = None
+        if not self.backtrack_recording:
+            # 事件未触发回溯，清空起点信息
+            self.backtrack_start_pose = None
+            self.backtrack_start_anchor = None
+            self.backtrack_path = []
 
         gap_to_gl_dst = np.sqrt((self.gl_y -
                                  self.gp_nav_actul_xy_gls.T[1]) ** 2 +
@@ -1393,6 +1430,15 @@ class VSGPNavGlb:
     """ @brief:  publish recommended goal to DRL"""
 
     def gp_nav_glbl_gl_pbl(self):
+        if self.gp_nav_actul_xy_gls is None or np.size(self.gp_nav_actul_xy_gls) == 0:
+            return
+        n = int(np.shape(self.gp_nav_actul_xy_gls)[0])
+        if n <= 0:
+            return
+        if getattr(self, "chsn_gl_idx", None) is None:
+            return
+        if int(self.chsn_gl_idx) < 0 or int(self.chsn_gl_idx) >= n:
+            return
         nav_xy_gl = self.gp_nav_actul_xy_gls[self.chsn_gl_idx].reshape(3, -1)
         yaw = np.arctan2(nav_xy_gl[1], nav_xy_gl[0])
         qtrn = quaternion_from_euler(0, 0, yaw)
@@ -1556,6 +1602,8 @@ class VSGPNavGlb:
     def gp_nav_pts_pcl(self):
         rds = self.gp_nav_goal_dst * np.ones(self.gp_nav_gls_sz,
                                              dtype='float32').reshape(-1, 1)
+        if self.gp_nav_pts is None or self.gp_nav_pts.size == 0:
+            return
         x, y, z = self.convert_spherical_2_cartesian(
             self.gp_nav_pts.T[0].reshape(-1, 1),
             self.gp_nav_pts.T[1].reshape(-1, 1), rds)
@@ -1570,10 +1618,12 @@ class VSGPNavGlb:
 
     def gp_nav_xypts_actul_pcl(self):
         # print(">> gp_nav_xypts_actul_pcl:: ")
+        if self.gp_nav_actul_xy_gls is None or len(self.gp_nav_actul_xy_gls) == 0:
+            return
         intensity = np.array(self.gap_utlty_fun,
                              dtype='float32').reshape(-1, 1)
-        # print("intensity: ", intensity)
-        # print("self.gp_nav_actul_xy_gls: ", self.gp_nav_actul_xy_gls)
+        if intensity.shape[0] != self.gp_nav_actul_xy_gls.shape[0]:
+            intensity = np.zeros((self.gp_nav_actul_xy_gls.shape[0], 1), dtype='float32')
         nav_pts_pcl = np.column_stack((self.gp_nav_actul_xy_gls, intensity))
         self.header.frame_id = "odom"
         pc2 = point_cloud2.create_cloud(self.header, self.fields, nav_pts_pcl)
