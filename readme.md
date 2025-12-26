@@ -42,7 +42,7 @@ rostopic echo /lste/task
 rostopic echo /lste/prompts
 
 # 可视化拓扑
-
+TEST_NAME=topo_test bash /home/zrz/lste_ws/src/lste_topo_access/topo_tree/tools/visualize_access_topo.sh
 ```
 
 ### 消失点检测

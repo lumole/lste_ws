@@ -277,10 +277,14 @@ class VSGPNavGlb:
         self.backtrack_start_pose = None  # {"x","y"}
         self.backtrack_start_anchor = None
         self.backtrack_path = []  # anchor id list for the current backtrack (newly generated path)
+        # 历史回溯段：[{start_pose,start_anchor,path,end_anchor,status,finished,target}]
+        self.backtrack_history = []
         self.no_frontier_since = None
         self.no_frontier_start_pose = None
         self.no_frontier_start_anchor = None
         self.backtrack_recording = False  # whether we are recording new anchors during backtrack
+        # 无兴趣点时的“回到起点”目标（anchor id），None 表示未触发
+        self.return_home_target = None
         self.access_mode = 0  # 0 forward, 1 backtrack
         self.forced_heading_world = None
         self.forced_start_xy = None
@@ -490,6 +494,9 @@ class VSGPNavGlb:
                                                     rospy.get_param('~cluster_stable_duration', 3.0))
         self.cluster_lost_timeout = cfg_file.get('cluster_lost_timeout',
                                                  rospy.get_param('~cluster_lost_timeout', 1.0))
+        # 相邻 anchor 的兴趣方向合并距离（米），用于全局去重
+        self.branch_merge_dist = cfg_file.get('branch_merge_dist',
+                                             rospy.get_param('~branch_merge_dist', 1.0))
         # 连续无可用 frontier 的触发时间（秒）；同时要求 access_mode==1 才真正回溯
         self.no_frontier_trigger_sec = cfg_file.get(
             'no_frontier_trigger_sec', rospy.get_param('~no_frontier_trigger_sec', 3.0))
@@ -532,7 +539,8 @@ class VSGPNavGlb:
             created = True
             # 在回溯记录阶段，将新生成的 anchor 追加到 backtrack_path
             if self.backtrack_recording:
-                if not self.backtrack_path or self.backtrack_path[-1] != node_id:
+                # 只接受连续递增的 anchor id，防止跳号
+                if (not self.backtrack_path) or node_id == self.backtrack_path[-1] + 1:
                     self.backtrack_path.append(node_id)
         return self.anchor_last_id
 
@@ -547,10 +555,28 @@ class VSGPNavGlb:
         node = self._get_node(node_id)
         if node is None:
             return None
-        # 如果该节点已有相近的 branch，则不重复添加
+        heading_world = wrap_angle(heading_world)
+        # 本节点内部去重/合并
         for br in node["branches"]:
             if angle_diff(br.get("heading_world", 0.0), heading_world) <= self.cluster_eps_rad:
+                br["weight"] = max(br.get("weight", 0.0), weight)
                 return br["id"]
+        # 相邻节点全局去重（位置 + 方向）
+        merge_dist = getattr(self, "branch_merge_dist", None)
+        if merge_dist is not None and node.get("x") is not None and node.get("y") is not None:
+            for other in self.anchor_nodes:
+                if other is None or other.get("x") is None or other.get("y") is None:
+                    continue
+                if other.get("id") == node_id:
+                    continue
+                dx = node["x"] - other["x"]
+                dy = node["y"] - other["y"]
+                if np.hypot(dx, dy) <= merge_dist:
+                    for br in other.get("branches", []):
+                        if angle_diff(br.get("heading_world", 0.0), heading_world) <= self.cluster_eps_rad:
+                            br["weight"] = max(br.get("weight", 0.0), weight)
+                            return None  # 已有相近兴趣点，直接跳过新增
+        # 新增 branch
         branch_id = len(node["branches"])
         node["branches"].append({
             "id": branch_id,
@@ -576,16 +602,63 @@ class VSGPNavGlb:
         msg.pose.orientation.w = 1.0
         self.backtrack_goal_pub.publish(msg)
 
+    def _nearest_anchor_dist(self, x: float, y: float) -> float:
+        """返回与已有 anchor 的最小距离；无 anchor 则返回 None。"""
+        if not self.anchor_nodes:
+            return None
+        d_min = None
+        for nd in self.anchor_nodes:
+            dx = x - nd.get("x", 0.0)
+            dy = y - nd.get("y", 0.0)
+            d = np.hypot(dx, dy)
+            if d_min is None or d < d_min:
+                d_min = d
+        return d_min
+
+    def _finalize_backtrack_session(self, end_anchor: int = None, status: str = "done"):
+        """固化当前回溯段到历史，并清空当前记录状态。"""
+        # 确保结束 anchor 也被加入路径（保持连续）
+        if end_anchor is not None and self.backtrack_recording:
+            if (not self.backtrack_path) or end_anchor == self.backtrack_path[-1] + 1:
+                self.backtrack_path.append(end_anchor)
+        if self.backtrack_path or self.backtrack_start_pose or self.backtrack_start_anchor is not None:
+            session = {
+                "start_pose": dict(self.backtrack_start_pose) if self.backtrack_start_pose else None,
+                "start_anchor": self.backtrack_start_anchor,
+                "path": list(self.backtrack_path),
+                "end_anchor": end_anchor,
+                "status": status,
+                "finished": rospy.Time.now().to_sec(),
+            }
+            if self.current_backtrack is not None:
+                session["target"] = {
+                    "node": self.current_backtrack[0],
+                    "branch": self.current_backtrack[1]
+                }
+            self.backtrack_history.append(session)
+        # 清空当前段状态，准备下一次回溯
+        self.backtrack_recording = False
+        self.backtrack_path = []
+        self.backtrack_start_pose = None
+        self.backtrack_start_anchor = None
+        self.no_frontier_start_pose = None
+        self.no_frontier_start_anchor = None
+
     def enter_backtrack(self):
         """候选为空时触发：切到 BACKTRACK，并将最近兴趣分支作为回退目标。"""
         if self.access_mode == 1 and self.current_backtrack is not None:
             return
         if len(self.backtrack_stack) == 0:
-            # 没有兴趣点，仍然发布回退模式以阻止 GP 重复进入
+            # 没有兴趣点：回到起点 (id=0) 作为安全落点
+            self.return_home_target = 0
+            if self.anchor_nodes:
+                self._publish_backtrack_goal(self.return_home_target)
             self.set_access_mode(1)
             self.change_flag = False
             self.change_flag_pub.publish(self.change_flag)
             return
+        # 有兴趣点，正常回溯
+        self.return_home_target = None
         node_id, branch_id, weight = self.backtrack_stack.pop()
         node = self._get_node(node_id)
         if node is None:
@@ -626,17 +699,35 @@ class VSGPNavGlb:
 
     def check_backtrack_progress(self):
         """BACKTRACK 模式下，判断是否已到达回退点并切回 FORWARD。"""
-        if self.access_mode != 1 or self.current_backtrack is None or self.pose is None:
+        if self.access_mode != 1 or self.pose is None:
             return
+        # 没有兴趣点时，回到起点 (anchor 0)
+        if self.return_home_target is not None:
+            target = self._get_node(self.return_home_target)
+            if target is not None:
+                dist_home = np.hypot(self.pose.x - target["x"], self.pose.y - target["y"])
+                if dist_home <= self.backtrack_arrive_dist:
+                    end_anchor = self.ensure_anchor(force=True)
+                    self._finalize_backtrack_session(end_anchor=end_anchor, status="reach_home")
+                    self.return_home_target = None
+                    self.current_backtrack = None
+                    self.set_access_mode(0)
+                    self.change_flag = True
+                    self.change_flag_pub.publish(self.change_flag)
+                    return
+            # 仍在回到起点的路上，无需处理兴趣点回溯
+            if self.current_backtrack is None:
+                return
         node_id, branch_id = self.current_backtrack
         node = self._get_node(node_id)
         if node is None:
             return
         dist = np.hypot(self.pose.x - node["x"], self.pose.y - node["y"])
         if dist <= self.backtrack_arrive_dist:
-            # 回溯段结束，停止记录新路径
+            # 回溯段结束，停止记录新路径并固化本段历史
             if self.backtrack_recording:
-                self.backtrack_recording = False
+                end_anchor = self.ensure_anchor(force=True)
+                self._finalize_backtrack_session(end_anchor=end_anchor, status="reach_interest")
             # 到达回退点：强制只走该分支方向
             self._start_forced_heading(node_id, branch_id)
 
@@ -843,6 +934,8 @@ class VSGPNavGlb:
                 "current_backtrack": self.current_backtrack,
                 "backtrack_start_pose": self.backtrack_start_pose,
                 "backtrack_path": self.backtrack_path,
+                "backtrack_history": self.backtrack_history,
+                "return_home_target": self.return_home_target,
                 "nodes": self.anchor_nodes,
                 "pending_junctions": self.pending_junctions,
                 "backtrack_stack": self.backtrack_stack,
@@ -1207,6 +1300,44 @@ class VSGPNavGlb:
 
         # 全部的候选目标点
         print(f"gp_nav_actul_xy_gls={self.gp_nav_actul_xy_gls}")
+
+        # 回到起点途中：只在发现“新方向”时才打断回退
+        if self.return_home_target is not None and self.gp_nav_gls_sz > 0:
+            new_indices = []
+            for idx, subgoal in enumerate(self.gp_nav_actul_xy_gls):
+                dist_anchor = self._nearest_anchor_dist(subgoal[0], subgoal[1])
+                if dist_anchor is None or dist_anchor > self.anchor_step_dist:
+                    new_indices.append(idx)
+            if len(new_indices) == 0:
+                # 全是旧方向，忽略这些 frontier，保持回到起点
+                self.gp_nav_actul_xy_gls = np.array([])
+                self.gp_nav_frntr_cntrs = np.array([])
+                self.gp_nav_frntr_areas = np.array([])
+                self.gp_nav_pts = self.gp_nav_frntr_cntrs
+                self.gp_nav_gls_sz = 0
+                return
+            # 发现新方向：结束当前回退，切回探索
+            current_anchor = self.ensure_anchor(force=True)
+            self._finalize_backtrack_session(end_anchor=current_anchor, status="abort_home_for_new_frontier")
+            self.return_home_target = None
+            self.current_backtrack = None
+            self.set_access_mode(0)
+            self.change_flag = True
+            self.change_flag_pub.publish(self.change_flag)
+            # 只保留全新方向的 frontier
+            self.gp_nav_actul_xy_gls = self.gp_nav_actul_xy_gls[new_indices]
+            self.gp_nav_frntr_cntrs = self.gp_nav_frntr_cntrs[new_indices]
+            try:
+                if len(self.gp_nav_frntr_areas) >= len(self.gp_nav_frntr_cntrs):
+                    self.gp_nav_frntr_areas = self.gp_nav_frntr_areas[new_indices]
+            except Exception:
+                self.gp_nav_frntr_areas = np.array([])
+            self.gp_nav_pts = self.gp_nav_frntr_cntrs
+            self.gp_nav_gls_sz = len(new_indices)
+            # 清空无 frontier 计时，避免影响下一轮触发
+            self.no_frontier_since = None
+            self.no_frontier_start_pose = None
+            self.no_frontier_start_anchor = None
 
         if len(self.gp_nav_actul_xy_gls) == 0:
             now = rospy.Time.now().to_sec()
