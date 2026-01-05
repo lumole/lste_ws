@@ -238,7 +238,7 @@ class GoalManager:
 
     def compute_goal(self) -> Optional[PoseStamped]:
         # Access-Topo 回退模式优先
-        if self.access_mode == 1 and self.access_backtrack_goal is not None:
+        if self.access_mode in (1, 2) and self.access_backtrack_goal is not None:
             return self.access_backtrack_goal
         if self.current_state == STATE_LOCKED:
             return self.goal_from_target()

@@ -269,6 +269,10 @@ class VSGPNavGlb:
         self.match_threshold = 0.5  # 例如，0.5米
         # --- Access-Topo 参数与数据 ---
         self.load_access_topo_config()
+        # 分支上限/路口冷却
+        self.max_pending_per_node = getattr(self, "max_pending_per_node", 2)
+        self.junction_cooldown_anchors = getattr(self, "junction_cooldown_anchors", 4)
+        self.last_junction_anchor = None  # 最近一次生成“路口候选”的 anchor id
         self.anchor_nodes = []  # [{'id', 'x','y','stamp','prev','branches':[]}]
         self.anchor_last_xy = None
         self.anchor_last_id = None
@@ -277,6 +281,7 @@ class VSGPNavGlb:
         self.backtrack_start_pose = None  # {"x","y"}
         self.backtrack_start_anchor = None
         self.backtrack_path = []  # anchor id list for the current backtrack (newly generated path)
+        self.commit_goal = None  # {"x","y"} commit阶段的目标点
         # 历史回溯段：[{start_pose,start_anchor,path,end_anchor,status,finished,target}]
         self.backtrack_history = []
         self.no_frontier_since = None
@@ -500,6 +505,11 @@ class VSGPNavGlb:
         # 连续无可用 frontier 的触发时间（秒）；同时要求 access_mode==1 才真正回溯
         self.no_frontier_trigger_sec = cfg_file.get(
             'no_frontier_trigger_sec', rospy.get_param('~no_frontier_trigger_sec', 3.0))
+        # 路口/分支限制
+        self.max_pending_per_node = cfg_file.get('max_pending_per_node',
+                                                 rospy.get_param('~max_pending_per_node', 2))
+        self.junction_cooldown_anchors = cfg_file.get('junction_cooldown_anchors',
+                                                      rospy.get_param('~junction_cooldown_anchors', 4))
         # topo tree 保存目录（默认 root/test_name）
         default_save_dir = os.path.join(self.topo_tree_root, self.test_name)
         self.topo_save_dir = cfg_file.get('topo_save_dir', rospy.get_param('~topo_save_dir', default_save_dir))
@@ -556,6 +566,7 @@ class VSGPNavGlb:
         if node is None:
             return None
         heading_world = wrap_angle(heading_world)
+        now_ts = rospy.Time.now().to_sec()
         # 本节点内部去重/合并
         for br in node["branches"]:
             if angle_diff(br.get("heading_world", 0.0), heading_world) <= self.cluster_eps_rad:
@@ -576,6 +587,28 @@ class VSGPNavGlb:
                         if angle_diff(br.get("heading_world", 0.0), heading_world) <= self.cluster_eps_rad:
                             br["weight"] = max(br.get("weight", 0.0), weight)
                             return None  # 已有相近兴趣点，直接跳过新增
+        # 限制同一节点的 PENDING 数量，权重低的会被更高权重的替换
+        pending_branches = [
+            (idx, br) for idx, br in enumerate(node["branches"])
+            if br.get("status") == "PENDING"
+        ]
+        if len(pending_branches) >= self.max_pending_per_node:
+            min_idx, min_br = min(pending_branches, key=lambda t: t[1].get("weight", 0.0))
+            if weight <= min_br.get("weight", 0.0):
+                return None  # 新分支不如现有最低权重，忽略
+            # 用更高权重的 pending 替换最低权重的
+            node["branches"][min_idx] = {
+                "id": min_idx,
+                "heading_world": heading_world,
+                "weight": weight,
+                "status": "PENDING",
+                "created": now_ts,
+            }
+            # 更新栈：移除旧的，添加新的
+            self._remove_from_backtrack_stack(node_id, min_idx)
+            self.backtrack_stack.append((node_id, min_idx, weight))
+            self.backtrack_stack.sort(key=lambda x: x[2])
+            return min_idx
         # 新增 branch
         branch_id = len(node["branches"])
         node["branches"].append({
@@ -583,7 +616,7 @@ class VSGPNavGlb:
             "heading_world": heading_world,
             "weight": weight,
             "status": "PENDING",
-            "created": rospy.Time.now().to_sec(),
+            "created": now_ts,
         })
         # 以权重升序排序栈，保证 pop() 取到最大的权重
         self.backtrack_stack.append((node_id, branch_id, weight))
@@ -599,6 +632,22 @@ class VSGPNavGlb:
         msg.header.stamp = rospy.Time.now()
         msg.pose.position.x = node["x"]
         msg.pose.position.y = node["y"]
+        msg.pose.orientation.w = 1.0
+        self.backtrack_goal_pub.publish(msg)
+
+    def _publish_commit_goal(self, heading_world: float):
+        """沿指定方向发布 commit_dist 的目标点，复用 backtrack_goal 频道覆盖 final_goal。"""
+        if self.pose is None:
+            return
+        dist = self.commit_dist
+        x = self.pose.x + dist * np.cos(heading_world)
+        y = self.pose.y + dist * np.sin(heading_world)
+        self.commit_goal = {"x": x, "y": y}
+        msg = PoseStamped()
+        msg.header.frame_id = "odom"
+        msg.header.stamp = rospy.Time.now()
+        msg.pose.position.x = x
+        msg.pose.position.y = y
         msg.pose.orientation.w = 1.0
         self.backtrack_goal_pub.publish(msg)
 
@@ -680,6 +729,32 @@ class VSGPNavGlb:
         self.change_flag_pub.publish(self.change_flag)
         self._publish_backtrack_goal(node_id)
 
+    def _remove_from_backtrack_stack(self, node_id: int, branch_id: int):
+        """Drop a (node, branch) from回退候选栈，避免重复消费."""
+        self.backtrack_stack = [
+            t for t in self.backtrack_stack
+            if not (len(t) >= 2 and t[0] == node_id and t[1] == branch_id)
+        ]
+
+    def _pick_forced_branch(self, node: dict, fallback_branch_id: int = None) -> int:
+        """
+        选择强制方向：
+        - 优先用同一节点上 status==PENDING 的分支（权重最高的一个）
+        - 否则退回当前回退的分支 fallback_branch_id
+        """
+        if not node:
+            return fallback_branch_id
+        best = None
+        for idx, br in enumerate(node.get("branches", [])):
+            if br.get("status") != "PENDING":
+                continue
+            wt = br.get("weight", 0.0)
+            if best is None or wt > best[0]:
+                best = (wt, idx)
+        if best is not None:
+            return best[1]
+        return fallback_branch_id
+
     def _start_forced_heading(self, node_id: int, branch_id: int):
         node = self._get_node(node_id)
         if node is None:
@@ -688,14 +763,18 @@ class VSGPNavGlb:
         if not (0 <= branch_id < len(brs)):
             return
         heading_world = brs[branch_id].get("heading_world")
-        brs[branch_id]["status"] = "TRACKBACK"
+        # 不再把 PENDING 改成 TRACKBACK，避免同一节点出现多个 TRACKBACK；
+        # 如果原本就是 TRACKBACK（回退目标），保持原状态即可。
         self.forced_heading_world = heading_world
         self.forced_start_xy = (self.pose.x, self.pose.y)
         self.forced_branch = (node_id, branch_id)
         self.current_backtrack = None
-        self.set_access_mode(0)
+        # commit 阶段：保持 Access 覆盖，使用 commit 目标
+        self.set_access_mode(2)
         self.change_flag = True
         self.change_flag_pub.publish(self.change_flag)
+        if heading_world is not None:
+            self._publish_commit_goal(heading_world)
 
     def check_backtrack_progress(self):
         """BACKTRACK 模式下，判断是否已到达回退点并切回 FORWARD。"""
@@ -729,7 +808,10 @@ class VSGPNavGlb:
                 end_anchor = self.ensure_anchor(force=True)
                 self._finalize_backtrack_session(end_anchor=end_anchor, status="reach_interest")
             # 到达回退点：强制只走该分支方向
-            self._start_forced_heading(node_id, branch_id)
+            forced_branch_id = self._pick_forced_branch(node, fallback_branch_id=branch_id)
+            if forced_branch_id is not None:
+                self._remove_from_backtrack_stack(node_id, forced_branch_id)
+                self._start_forced_heading(node_id, forced_branch_id)
 
     def update_forced_heading_progress(self):
         """当强制沿兴趣分支前进到足够距离后，解除强制窗口并标记 DONE。"""
@@ -749,6 +831,11 @@ class VSGPNavGlb:
             self.forced_heading_world = None
             self.forced_start_xy = None
             self.forced_branch = None
+            self.commit_goal = None
+            # 解除 Access 覆盖，恢复正常模式
+            self.set_access_mode(0)
+            self.change_flag = True
+            self.change_flag_pub.publish(self.change_flag)
 
     def _angle_mean(self, angles, weights):
         c = np.sum(np.cos(angles) * weights)
@@ -861,6 +948,10 @@ class VSGPNavGlb:
         if len(stable) >= 2 and chosen_heading_world is not None:
             node_id = self.ensure_anchor(force=False)
             if node_id is not None:
+                # 路口冷却：最近 N 个 anchor 内只生成一次待确认路口
+                if self.last_junction_anchor is not None:
+                    if (node_id - self.last_junction_anchor) < self.junction_cooldown_anchors:
+                        stable = []
                 existing_heads = []
                 for pj in self.pending_junctions:
                     if pj.get("node_id") != node_id:
@@ -885,6 +976,7 @@ class VSGPNavGlb:
                         "node_id": node_id,
                         "candidates": cands,
                     })
+                    self.last_junction_anchor = node_id
 
         # 处理“待确认路口”：未选方向消失一段时间后才真正生成兴趣点
         stable_world = [
