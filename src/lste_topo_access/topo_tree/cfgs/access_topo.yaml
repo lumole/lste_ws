@@ -8,7 +8,7 @@ test_name: topo_1.0
 anchor_step_dist: 1.5           # 米，路钉之间的最小间距
 
 # 回退判定
-backtrack_arrive_dist: 1.8      # 米，回退点到达判定半径
+backtrack_arrive_dist: 2.0      # 米，回退点到达判定半径
 
 # visited 过滤
 visited_thresh: 2.0             # 米，判定“已访问”的距离阈值
@@ -23,7 +23,9 @@ branch_merge_dist: 2.0
 
 # 强制分支窗口（到达兴趣点后只放行兴趣方向）
 force_window_deg: 30.0          # 度，仅保留该窗口内的候选
-commit_dist: 3.0                # 米，沿兴趣方向走多远后解除强制
+commit_dist: 2.0                # 米，沿兴趣方向走多远后解除强制
+commit_goal_dist: 5.0           # 米，mode2 固定目标（分叉点沿强制方向前推）
+commit_carrot_lookahead: 5.0    # 兼容旧字段，未使用动态 carrot 时可与 commit_goal_dist 一致
 # 分支上限与路口冷却
 max_pending_per_node: 2         # 每个 anchor 上最多保留的 PENDING 分支数
 junction_cooldown_anchors: 4     # 最近 N 个 anchor 内只生成一次“路口候选”

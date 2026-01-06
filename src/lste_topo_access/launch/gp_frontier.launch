@@ -54,9 +54,9 @@
         type="lste_goal_manager.py"
         name="lste_goal_manager"
         output="screen">
-    <param name="pass_period" value="5.0" />
-    <param name="sus_c_period" value="3.0" />
-    <param name="locked_period" value="2.0" />
+    <param name="pass_period" value="1.0" />
+    <param name="sus_c_period" value="1.0" />
+    <param name="locked_period" value="1.0" />
     <param name="sus_a_period" value="2.0" />
     <param name="sus_b_period" value="2.0" />
     <param name="forward_dist" value="10.0" />

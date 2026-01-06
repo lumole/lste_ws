@@ -506,6 +506,10 @@ class VSGPNavGlb:
         # 连续无可用 frontier 的触发时间（秒）；同时要求 access_mode==1 才真正回溯
         self.no_frontier_trigger_sec = cfg_file.get(
             'no_frontier_trigger_sec', rospy.get_param('~no_frontier_trigger_sec', 3.0))
+        # commit 固定目标距离（沿强制方向一次性前推，不再动态 carrot）
+        self.commit_goal_dist = cfg_file.get('commit_goal_dist',
+                                             cfg_file.get('commit_carrot_lookahead',
+                                                          rospy.get_param('~commit_carrot_lookahead', 5.0)))
         # 路口/分支限制
         self.max_pending_per_node = cfg_file.get('max_pending_per_node',
                                                  rospy.get_param('~max_pending_per_node', 2))
@@ -636,13 +640,25 @@ class VSGPNavGlb:
         msg.pose.orientation.w = 1.0
         self.backtrack_goal_pub.publish(msg)
 
-    def _publish_commit_goal(self, heading_world: float):
-        """沿指定方向发布 commit_dist 的目标点，复用 backtrack_goal 频道覆盖 final_goal。"""
-        if self.pose is None:
+    def _publish_commit_carrot(self):
+        """
+        固定 commit 目标：进入 mode2 后，一次性在分叉点沿强制方向前推 commit_goal_dist。
+        期间不再动态更新，保持该目标覆盖 final_goal。
+        """
+        if self.forced_heading_world is None or self.forced_start_xy is None:
             return
-        dist = self.commit_dist
-        x = self.pose.x + dist * np.cos(heading_world)
-        y = self.pose.y + dist * np.sin(heading_world)
+        dist = getattr(self, "commit_goal_dist", 5.0)
+        # 将 pending 方向投影到最接近的骨架方向
+        heading_target = self.forced_heading_world
+        try:
+            if self.headings:
+                diffs = [abs(wrap_angle(self.forced_heading_world - h)) for h in self.headings]
+                k_near = int(np.argmin(diffs))
+                heading_target = self.headings[k_near]
+        except Exception:
+            pass
+        x = self.forced_start_xy[0] + dist * np.cos(heading_target)
+        y = self.forced_start_xy[1] + dist * np.sin(heading_target)
         self.commit_goal = {"x": x, "y": y}
         msg = PoseStamped()
         msg.header.frame_id = "odom"
@@ -767,7 +783,8 @@ class VSGPNavGlb:
         # 不再把 PENDING 改成 TRACKBACK，避免同一节点出现多个 TRACKBACK；
         # 如果原本就是 TRACKBACK（回退目标），保持原状态即可。
         self.forced_heading_world = heading_world
-        self.forced_start_xy = (self.pose.x, self.pose.y)
+        # 分叉点作为强制段的起点参考
+        self.forced_start_xy = (node.get("x", self.pose.x), node.get("y", self.pose.y))
         self.forced_branch = (node_id, branch_id)
         self.mode2_start_time = rospy.Time.now().to_sec()
         self.current_backtrack = None
@@ -775,8 +792,8 @@ class VSGPNavGlb:
         self.set_access_mode(2)
         self.change_flag = True
         self.change_flag_pub.publish(self.change_flag)
-        if heading_world is not None:
-            self._publish_commit_goal(heading_world)
+        # 初始发布一个固定 commit 目标
+        self._publish_commit_carrot()
 
     def check_backtrack_progress(self):
         """BACKTRACK 模式下，判断是否已到达回退点并切回 FORWARD。"""
@@ -822,6 +839,8 @@ class VSGPNavGlb:
         dx = self.pose.x - self.forced_start_xy[0]
         dy = self.pose.y - self.forced_start_xy[1]
         progress = dx * np.cos(self.forced_heading_world) + dy * np.sin(self.forced_heading_world)
+        # 固定 commit 目标可按需重复发布（目标不随进度变化）
+        self._publish_commit_carrot()
         if progress >= self.commit_dist:
             # 标记当前分支 DONE
             if self.forced_branch is not None:
