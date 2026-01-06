@@ -294,6 +294,7 @@ class VSGPNavGlb:
         self.forced_heading_world = None
         self.forced_start_xy = None
         self.forced_branch = None
+        self.mode2_start_time = None  # commit阶段开始时间，用于免回退窗口
         self.cluster_track = []  # tracking clusters for stability
         self.pending_junctions = []  # [{"node_id":int,"candidates":[{"heading":float,"weight":float,"last_seen":float}]}]
         # 连续无 frontier 的计时，用于延迟回溯触发
@@ -768,6 +769,7 @@ class VSGPNavGlb:
         self.forced_heading_world = heading_world
         self.forced_start_xy = (self.pose.x, self.pose.y)
         self.forced_branch = (node_id, branch_id)
+        self.mode2_start_time = rospy.Time.now().to_sec()
         self.current_backtrack = None
         # commit 阶段：保持 Access 覆盖，使用 commit 目标
         self.set_access_mode(2)
@@ -831,6 +833,7 @@ class VSGPNavGlb:
             self.forced_heading_world = None
             self.forced_start_xy = None
             self.forced_branch = None
+            self.mode2_start_time = None
             self.commit_goal = None
             # 解除 Access 覆盖，恢复正常模式
             self.set_access_mode(0)
@@ -1433,6 +1436,10 @@ class VSGPNavGlb:
 
         if len(self.gp_nav_actul_xy_gls) == 0:
             now = rospy.Time.now().to_sec()
+            # mode2 免回退窗口：给强制阶段至少 5 秒探索 frontier
+            if self.access_mode == 2 and self.forced_heading_world is not None:
+                if self.mode2_start_time is not None and (now - self.mode2_start_time) < 5.0:
+                    return
             if self.no_frontier_since is None:
                 self.no_frontier_since = now
                 if self.pose is not None:
@@ -1461,6 +1468,43 @@ class VSGPNavGlb:
             self.backtrack_start_pose = None
             self.backtrack_start_anchor = None
             self.backtrack_path = []
+
+        # Access commit 阶段：只保留“每个 PENDING 分支方向最近的一个 frontier”
+        if self.access_mode == 2 and self.pose is not None:
+            pend_headings = []
+            if self.forced_branch is not None:
+                node = self._get_node(self.forced_branch[0])
+                if node:
+                    for br in node.get("branches", []):
+                        if br.get("status") == "PENDING" and br.get("heading_world") is not None:
+                            pend_headings.append(float(br["heading_world"]))
+            if pend_headings and self.gp_nav_frntr_cntrs is not None and self.gp_nav_frntr_cntrs.size > 0:
+                try:
+                    thetas_rel = np.array(self.gp_nav_frntr_cntrs).reshape(-1, 2)[:, 0]
+                except Exception:
+                    thetas_rel = np.array([])
+                if thetas_rel.size > 0:
+                    headings_world = [wrap_angle(float(self.pose.theta) + float(th)) for th in thetas_rel]
+                    keep_idx = set()
+                    for ph in pend_headings:
+                        best = None
+                        for idx, hw in enumerate(headings_world):
+                            diff = angle_diff(hw, ph)
+                            if best is None or diff < best[0]:
+                                best = (diff, idx)
+                        if best is not None:
+                            keep_idx.add(best[1])
+                    if keep_idx:
+                        keep_idx = sorted(list(keep_idx))
+                        self.gp_nav_actul_xy_gls = self.gp_nav_actul_xy_gls[keep_idx]
+                        self.gp_nav_frntr_cntrs = self.gp_nav_frntr_cntrs[keep_idx]
+                        try:
+                            if len(self.gp_nav_frntr_areas) >= len(self.gp_nav_frntr_cntrs):
+                                self.gp_nav_frntr_areas = self.gp_nav_frntr_areas[keep_idx]
+                        except Exception:
+                            self.gp_nav_frntr_areas = np.array([])
+                        self.gp_nav_pts = self.gp_nav_frntr_cntrs
+                        self.gp_nav_gls_sz = len(keep_idx)
 
         gap_to_gl_dst = np.sqrt((self.gl_y -
                                  self.gp_nav_actul_xy_gls.T[1]) ** 2 +

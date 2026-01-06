@@ -22,7 +22,7 @@ cluster_lost_timeout: 2.0       # 秒，丢失多久后移除 cluster
 branch_merge_dist: 2.0
 
 # 强制分支窗口（到达兴趣点后只放行兴趣方向）
-force_window_deg: 18.0          # 度，仅保留该窗口内的候选
+force_window_deg: 30.0          # 度，仅保留该窗口内的候选
 commit_dist: 3.0                # 米，沿兴趣方向走多远后解除强制
 # 分支上限与路口冷却
 max_pending_per_node: 2         # 每个 anchor 上最多保留的 PENDING 分支数
