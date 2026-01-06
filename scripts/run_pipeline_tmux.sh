@@ -8,16 +8,44 @@ export PYTHONDONTWRITEBYTECODE=1
 
 WS=${WS:-/home/zrz/lste_ws}
 SESSION=${SESSION:-lste}
-WORLD=${WORLD:-$WS/src/lste_core/worlds/topo_test2.world}
-TASK_JSON=${TASK_JSON:-$WS/model/Data_exchange/vlm_prompt/lab/yellow_cup.json}
-TASK_ID=${TASK_ID:-yellow_cup}
-VLLM_URL=${VLLM_URL:-http://localhost:8000/v1}
-VLLM_MODEL=${VLLM_MODEL:-$WS/model/MiniCPM/OpenBMB/MiniCPM4-0___5B}
+# 可选 YAML 配置：通过 PIPELINE_CONFIG 指定；存在时为未显式设置的变量提供默认值
+PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/pipeline_defaults.yaml}
+if [[ -f "$PIPELINE_CONFIG" ]]; then
+  eval "$(
+    python - "$PIPELINE_CONFIG" <<'PY' || true
+import sys, json
+path = sys.argv[1]
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)
+with open(path, 'r', encoding='utf-8') as f:
+    data = yaml.safe_load(f) or {}
+for k, v in data.items():
+    if isinstance(v, (str, int, float)):
+        # 简单输出 KEY=VALUE 供 bash eval，只支持标量
+        print(f'CFG_{k}={v}')
+PY
+  )"
+fi
+WS=${WS:-${CFG_WS:-/home/zrz/lste_ws}}
+SESSION=${SESSION:-${CFG_SESSION:-lste}}
+WORLD=${WORLD:-${CFG_WORLD:-$WS/src/lste_core/worlds/place1.world}}
+TASK_JSON=${TASK_JSON:-${CFG_TASK_JSON:-$WS/model/Data_exchange/vlm_prompt/lab/yellow_cup.json}}
+TASK_ID=${TASK_ID:-${CFG_TASK_ID:-yellow_cup}}
+VLLM_URL=${VLLM_URL:-${CFG_VLLM_URL:-http://localhost:8000/v1}}
+VLLM_MODEL=${VLLM_MODEL:-${CFG_VLLM_MODEL:-$WS/model/MiniCPM/OpenBMB/MiniCPM4-0___5B}}
 VLLM_PROBE=${VLLM_PROBE:-${VLLM_URL%/}}
-ACCESS_TOPO_CONFIG=${ACCESS_TOPO_CONFIG:-$WS/src/lste_topo_access/topo_tree/cfgs/access_topo.yaml}
-ACCESS_TOPO_TEST_NAME=${ACCESS_TOPO_TEST_NAME:-default_test}
+ACCESS_TOPO_CONFIG=${ACCESS_TOPO_CONFIG:-${CFG_ACCESS_TOPO_CONFIG:-$WS/src/lste_topo_access/topo_tree/cfgs/access_topo.yaml}}
+ACCESS_TOPO_TEST_NAME=${ACCESS_TOPO_TEST_NAME:-${CFG_ACCESS_TOPO_TEST_NAME:-default_test}}
+GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-${CFG_GP_FRONTIER_RVIZ:-$WS/src/lste_topo_access/launch/gp_frontier.rviz}}
 if [[ "$VLLM_PROBE" == */v1 ]]; then
   VLLM_PROBE="$VLLM_PROBE/models"
+fi
+
+if [[ ! -f "$WORLD" ]]; then
+  echo "[error] WORLD file not found: $WORLD" >&2
+  exit 1
 fi
 
 if ! command -v tmux >/dev/null 2>&1; then
@@ -53,13 +81,21 @@ tmux_new_window() {
 
 # 如果 session 已存在则复用，避免重复启动
 if tmux has-session -t "$SESSION" 2>/dev/null; then
-  echo "tmux session '$SESSION' 已存在，直接附着。" >&2
-  exec tmux attach -t "$SESSION"
+  # 如果已有 session 的 WORLD 与当前需求不同，则先杀掉重新建，避免复用旧 world
+  EXISTING_WORLD="$(tmux show-environment -t "$SESSION" 2>/dev/null | awk -F= '/^LSTE_WORLD=/{print substr($0,length("LSTE_WORLD=")+1)}')"
+  if [[ -n "$EXISTING_WORLD" && "$EXISTING_WORLD" != "$WORLD" ]]; then
+    echo "[info] tmux session '$SESSION' exists with WORLD=$EXISTING_WORLD, restart with WORLD=$WORLD."
+    tmux kill-session -t "$SESSION"
+  else
+    echo "tmux session '$SESSION' 已存在，直接附着。" >&2
+    exec tmux attach -t "$SESSION"
+  fi
 fi
 
 # 新建 session：tmux 默认会创建 window 0，所以直接把 window 0 用作 roscore
 tmux new-session -d -s "$SESSION" -c "$WS" -n "roscore" \
   "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/pipeline_env.sh\"; roscore'; echo; echo '[EXIT] roscore'; exec bash"
+tmux set-environment -t "$SESSION" LSTE_WORLD "$WORLD"
 tmux set-option -t "$SESSION" remain-on-exit on
 
 # helper: wait for roscore
@@ -122,5 +158,13 @@ tmux_new_window 10 "$WS" "oc_srfc" \
 tmux_new_window 11 "$WS" "gp_frontier" \
   "$WAIT_ROSCORE; conda activate vsgp; roslaunch lste_topo_access gp_frontier.launch \
     access_topo_config:=$ACCESS_TOPO_CONFIG access_topo_test_name:=$ACCESS_TOPO_TEST_NAME"
+
+# 12: frontier RViz
+tmux_new_window 12 "$WS" "rviz_frontier" \
+  "$WAIT_ROSCORE; rviz -d $GP_FRONTIER_RVIZ"
+
+# 13: teleop keyboard
+tmux_new_window 13 "$WS" "teleop" \
+  "$WAIT_ROSCORE; rosrun teleop_twist_keyboard teleop_twist_keyboard.py cmd_vel:=/cmd_vel"
 
 tmux attach -t "$SESSION"

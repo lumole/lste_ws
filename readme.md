@@ -10,10 +10,11 @@
 # 清理旧的 session (如果存在)
 tmux kill-session -t lste 2>/dev/null || true
 cd /home/zrz/lste_ws
-WS=/home/zrz/lste_ws \
-TASK_JSON=/home/zrz/lste_ws/model/Data_exchange/vlm_prompt/lab/yellow_cup.json \
-TASK_ID=yellow_cup \
 ./scripts/run_pipeline_tmux.sh
+
+# 默认参数在 scripts/pipeline_defaults.yaml，可直接改里面的 WS / WORLD / TASK_JSON / TASK_ID 等
+# 如需临时覆盖，环境变量优先级最高，例如：
+#   WORLD=/home/zrz/lste_ws/src/lste_core/worlds/room.world TASK_ID=foo ./scripts/run_pipeline_tmux.sh
 
 ```
 
@@ -42,7 +43,7 @@ rostopic echo /lste/task
 rostopic echo /lste/prompts
 
 # 可视化拓扑
-TEST_NAME=topo_test bash /home/zrz/lste_ws/src/lste_topo_access/topo_tree/tools/visualize_access_topo.sh
+TEST_NAME=topo_2.0 bash /home/zrz/lste_ws/src/lste_topo_access/topo_tree/tools/visualize_access_topo.sh
 ```
 
 ### 消失点检测

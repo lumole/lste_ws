@@ -2,7 +2,7 @@
 # 节点：gp_subgoals_sim_topo.py 会在启动时加载本文件（通过 ~access_topo_config）。
 
 # 实验/测试名称，用于归档 topo tree json 到子目录
-test_name: topo_1.0
+test_name: topo_2.0
 
 # 路钉采样
 anchor_step_dist: 1.5           # 米，路钉之间的最小间距
