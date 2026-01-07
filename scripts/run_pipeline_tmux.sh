@@ -2,9 +2,6 @@
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 
-# 简易一键启动脚本：用 tmux 分窗启动仿真 + VLLM + prompt + DINO 检测 + score/state + 可视化。
-# 可通过环境变量覆盖默认值，例如：
-#   WS=/home/zrz/lste_ws TASK_JSON=... TASK_ID=... VLLM_URL=http://localhost:8000/v1 ./scripts/run_pipeline_tmux.sh
 
 WS=${WS:-/home/zrz/lste_ws}
 SESSION=${SESSION:-lste}

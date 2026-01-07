@@ -1415,43 +1415,15 @@ class VSGPNavGlb:
         # 全部的候选目标点
         print(f"gp_nav_actul_xy_gls={self.gp_nav_actul_xy_gls}")
 
-        # 回到起点途中：只在发现“新方向”时才打断回退
+        # 回到起点途中：方案 A——不再因新 frontier 打断，全部忽略
         if self.return_home_target is not None and self.gp_nav_gls_sz > 0:
-            new_indices = []
-            for idx, subgoal in enumerate(self.gp_nav_actul_xy_gls):
-                dist_anchor = self._nearest_anchor_dist(subgoal[0], subgoal[1])
-                if dist_anchor is None or dist_anchor > self.anchor_step_dist:
-                    new_indices.append(idx)
-            if len(new_indices) == 0:
-                # 全是旧方向，忽略这些 frontier，保持回到起点
-                self.gp_nav_actul_xy_gls = np.array([])
-                self.gp_nav_frntr_cntrs = np.array([])
-                self.gp_nav_frntr_areas = np.array([])
-                self.gp_nav_pts = self.gp_nav_frntr_cntrs
-                self.gp_nav_gls_sz = 0
-                return
-            # 发现新方向：结束当前回退，切回探索
-            current_anchor = self.ensure_anchor(force=True)
-            self._finalize_backtrack_session(end_anchor=current_anchor, status="abort_home_for_new_frontier")
-            self.return_home_target = None
-            self.current_backtrack = None
-            self.set_access_mode(0)
-            self.change_flag = True
-            self.change_flag_pub.publish(self.change_flag)
-            # 只保留全新方向的 frontier
-            self.gp_nav_actul_xy_gls = self.gp_nav_actul_xy_gls[new_indices]
-            self.gp_nav_frntr_cntrs = self.gp_nav_frntr_cntrs[new_indices]
-            try:
-                if len(self.gp_nav_frntr_areas) >= len(self.gp_nav_frntr_cntrs):
-                    self.gp_nav_frntr_areas = self.gp_nav_frntr_areas[new_indices]
-            except Exception:
-                self.gp_nav_frntr_areas = np.array([])
+            # 直接丢弃 frontier，继续回家
+            self.gp_nav_actul_xy_gls = np.array([])
+            self.gp_nav_frntr_cntrs = np.array([])
+            self.gp_nav_frntr_areas = np.array([])
             self.gp_nav_pts = self.gp_nav_frntr_cntrs
-            self.gp_nav_gls_sz = len(new_indices)
-            # 清空无 frontier 计时，避免影响下一轮触发
-            self.no_frontier_since = None
-            self.no_frontier_start_pose = None
-            self.no_frontier_start_anchor = None
+            self.gp_nav_gls_sz = 0
+            return
 
         if len(self.gp_nav_actul_xy_gls) == 0:
             now = rospy.Time.now().to_sec()
