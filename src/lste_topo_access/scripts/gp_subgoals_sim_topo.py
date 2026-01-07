@@ -13,6 +13,7 @@ import yaml
 import os
 #import math
 import numpy as np
+import math
 from time import time
 from scipy import stats
 from scipy.spatial import distance
@@ -301,6 +302,13 @@ class VSGPNavGlb:
         self.no_frontier_since = None
         self.force_window_rad = np.deg2rad(self.force_window_deg)
         self.cluster_eps_rad = np.deg2rad(self.cluster_eps_deg)
+        # 路口决策：走出一定距离后用实际运动方向确定“被选分支”
+        self.junction_decision_dist = getattr(self, "junction_decision_dist", self.anchor_step_dist)
+        self.junction_same_dir_gate_rad = np.deg2rad(getattr(self, "junction_same_dir_gate_deg", 30.0))
+        self.junction_finalize_dist = getattr(self, "junction_finalize_dist", self.junction_decision_dist * 1.5)
+        self.junction_finalize_timeout = getattr(self, "junction_finalize_timeout", 6.0)
+        # 路口分支约束：chosen 仅 1 个，pending 最多 2 个
+        self.junction_max_pending = 2
         # 保存 topo tree
         self.topo_save_file = os.path.join(
             self.topo_save_dir, f"access_topo_{int(time())}.json")
@@ -500,6 +508,16 @@ class VSGPNavGlb:
                                                     rospy.get_param('~cluster_stable_duration', 3.0))
         self.cluster_lost_timeout = cfg_file.get('cluster_lost_timeout',
                                                  rospy.get_param('~cluster_lost_timeout', 1.0))
+        # 路口决策：走出一定距离后用实际运动方向确定“被选分支”
+        self.junction_decision_dist = cfg_file.get(
+            'junction_decision_dist', rospy.get_param('~junction_decision_dist', self.anchor_step_dist))
+        self.junction_same_dir_gate_deg = cfg_file.get(
+            'junction_same_dir_gate_deg', rospy.get_param('~junction_same_dir_gate_deg', 30.0))
+        # 路口窗口：离开路口多远/等待多久后固化分支（距离优先）
+        self.junction_finalize_dist = cfg_file.get(
+            'junction_finalize_dist', rospy.get_param('~junction_finalize_dist', self.anchor_step_dist * 1.5))
+        self.junction_finalize_timeout = cfg_file.get(
+            'junction_finalize_timeout', rospy.get_param('~junction_finalize_timeout', 6.0))
         # 相邻 anchor 的兴趣方向合并距离（米），用于全局去重
         self.branch_merge_dist = cfg_file.get('branch_merge_dist',
                                              rospy.get_param('~branch_merge_dist', 1.0))
@@ -612,7 +630,8 @@ class VSGPNavGlb:
             # 更新栈：移除旧的，添加新的
             self._remove_from_backtrack_stack(node_id, min_idx)
             self.backtrack_stack.append((node_id, min_idx, weight))
-            self.backtrack_stack.sort(key=lambda x: x[2])
+            # 按 (node_id, weight) 升序，pop() 会取到“最近的路口、权重更高”的 pending
+            self.backtrack_stack.sort(key=lambda x: (x[0], x[2]))
             return min_idx
         # 新增 branch
         branch_id = len(node["branches"])
@@ -623,9 +642,9 @@ class VSGPNavGlb:
             "status": "PENDING",
             "created": now_ts,
         })
-        # 以权重升序排序栈，保证 pop() 取到最大的权重
+        # 以 (node_id, weight) 升序排序，pop() 取到“最近的 pending，若同节点则权重大”
         self.backtrack_stack.append((node_id, branch_id, weight))
-        self.backtrack_stack.sort(key=lambda x: x[2])
+        self.backtrack_stack.sort(key=lambda x: (x[0], x[2]))
         return branch_id
 
     def _publish_backtrack_goal(self, node_id: int):
@@ -725,6 +744,7 @@ class VSGPNavGlb:
             return
         # 有兴趣点，正常回溯
         self.return_home_target = None
+        # 优先使用“最近的” pending（node_id 最大）；同节点内取权重更高的
         node_id, branch_id, weight = self.backtrack_stack.pop()
         node = self._get_node(node_id)
         if node is None:
@@ -739,7 +759,8 @@ class VSGPNavGlb:
                     self.backtrack_path.append(start_anchor)
         brs = node["branches"]
         if 0 <= branch_id < len(brs):
-            brs[branch_id]["status"] = "TRACKBACK"
+            # 不再修改 PENDING -> TRACKBACK，只做标记，避免把唯一 pending 变“丢失”
+            brs[branch_id]["trackback_target"] = True
         self.current_backtrack = (node_id, branch_id)
         self.set_access_mode(1)
         self.change_flag = False
@@ -849,6 +870,7 @@ class VSGPNavGlb:
                     idx = self.forced_branch[1]
                     if 0 <= idx < len(node.get("branches", [])):
                         node["branches"][idx]["status"] = "DONE"
+                        node["branches"][idx].pop("trackback_target", None)
             self.forced_heading_world = None
             self.forced_start_xy = None
             self.forced_branch = None
@@ -963,68 +985,155 @@ class VSGPNavGlb:
         clusters = self.cluster_frontiers()
         stable = self.update_cluster_track(clusters)
 
-        # 记录新的“待确认路口”：当前稳定多峰且有明确选择方向
-        chosen_heading_world = None
-        if chosen_theta_rel is not None:
-            chosen_heading_world = wrap_angle(self.pose.theta + chosen_theta_rel)
-        if len(stable) >= 2 and chosen_heading_world is not None:
+        # 记录/更新“路口会话”：多峰时缓存候选方向，快速确定 chosen，并在离开路口后固化 pending
+        if len(stable) >= 2:
             node_id = self.ensure_anchor(force=False)
             if node_id is not None:
                 # 路口冷却：最近 N 个 anchor 内只生成一次待确认路口
-                if self.last_junction_anchor is not None:
-                    if (node_id - self.last_junction_anchor) < self.junction_cooldown_anchors:
-                        stable = []
-                existing_heads = []
-                for pj in self.pending_junctions:
-                    if pj.get("node_id") != node_id:
-                        continue
-                    for cand in pj.get("candidates", []):
-                        existing_heads.append(cand.get("heading"))
-                # 为每个未选方向建立候选，但不立刻入栈，等待其消失
-                cands = []
+                if self.last_junction_anchor is not None and (node_id - self.last_junction_anchor) < self.junction_cooldown_anchors:
+                    stable = []
+                # 找或建一个路口会话
+                pj = None
+                for item in self.pending_junctions:
+                    if item.get("node_id") == node_id:
+                        pj = item
+                        break
+                if pj is None:
+                    anchor = self._get_node(node_id)
+                    pj = {
+                        "node_id": node_id,
+                        "anchor_xy": (anchor["x"], anchor["y"]) if anchor else (getattr(self.pose, "x", 0.0), getattr(self.pose, "y", 0.0)),
+                        "created": now,
+                        "candidates": {},  # cand_id -> cand dict
+                        "next_cand_id": 0,
+                        "chosen_id": None,
+                        "chosen_locked": False,
+                        "last_multi_time": now,
+                    }
+                    self.pending_junctions.append(pj)
+                    self.last_junction_anchor = node_id
+                pj["last_multi_time"] = now
+                # 更新/合并候选方向（角度用权重加权均值 + best_heading 记录）
                 for cl in stable:
                     heading_world = wrap_angle(self.pose.theta + cl["center"])
-                    if angle_diff(heading_world, chosen_heading_world) <= self.cluster_eps_rad:
-                        continue  # 被选方向永不记为兴趣点
-                    if any(angle_diff(heading_world, eh) <= self.cluster_eps_rad for eh in existing_heads if eh is not None):
-                        continue  # 已经在待确认列表里
-                    cands.append({
-                        "heading": heading_world,
-                        "weight": cl["weight"],
-                        "last_seen": now,
-                    })
-                if cands:
-                    self.pending_junctions.append({
-                        "node_id": node_id,
-                        "candidates": cands,
-                    })
-                    self.last_junction_anchor = node_id
+                    weight = cl["weight"]
+                    matched_id = None
+                    for cid, cand in pj["candidates"].items():
+                        if angle_diff(cand.get("heading_mean", heading_world), heading_world) <= self.cluster_eps_rad:
+                            matched_id = cid
+                            break
+                    if matched_id is None:
+                        cid = pj["next_cand_id"]
+                        pj["next_cand_id"] = cid + 1
+                        pj["candidates"][cid] = {
+                            "id": cid,
+                            "heading_mean": heading_world,
+                            "best_heading": heading_world,
+                            "best_weight": weight,
+                            "weight": weight,
+                            "last_seen": now,
+                            "seen_count": 1,
+                        }
+                    else:
+                        cand = pj["candidates"][matched_id]
+                        cand_heading = self._angle_mean(
+                            np.array([cand.get("heading_mean", heading_world), heading_world]),
+                            np.array([cand.get("weight", 1.0), weight])
+                        )
+                        cand["heading_mean"] = cand_heading
+                        cand["weight"] = max(cand.get("weight", 1.0), weight)
+                        if weight > cand.get("best_weight", 0.0):
+                            cand["best_weight"] = weight
+                            cand["best_heading"] = heading_world
+                        cand["last_seen"] = now
+                        cand["seen_count"] = cand.get("seen_count", 0) + 1
 
-        # 处理“待确认路口”：未选方向消失一段时间后才真正生成兴趣点
-        stable_world = [
-            {"heading": wrap_angle(self.pose.theta + cl["center"]), "weight": cl["weight"]}
-            for cl in stable
-        ]
+                # 快速确定 chosen：用当前推荐方向（若可用）
+                if pj["chosen_id"] is None and chosen_theta_rel is not None and pj["candidates"]:
+                    chosen_heading_fast = wrap_angle(self.pose.theta + chosen_theta_rel)
+                    diffs = [(cid, angle_diff(c["heading_mean"], chosen_heading_fast)) for cid, c in pj["candidates"].items()]
+                    cid_best = min(diffs, key=lambda t: t[1])[0]
+                    pj["chosen_id"] = cid_best
+
+        # 处理路口会话：校正 chosen（一次），并在离开路口后固化 pending
         new_pending = []
         for pj in self.pending_junctions:
             node_id = pj.get("node_id")
-            cands = []
-            for cand in pj.get("candidates", []):
-                # 如果当前仍能看到这个方向的 cluster，则更新 last_seen
+            anchor_xy = pj.get("anchor_xy", (0.0, 0.0))
+            dist_from_anchor = None
+            if self.pose is not None:
+                dx = self.pose.x - anchor_xy[0]
+                dy = self.pose.y - anchor_xy[1]
+                dist_from_anchor = np.hypot(dx, dy)
+            # 校正 chosen：走出一定距离后，用实际行进方向纠正一次
+            if (not pj.get("chosen_locked", False)) and pj.get("chosen_id") is not None and dist_from_anchor is not None:
+                if dist_from_anchor >= self.junction_decision_dist and pj.get("candidates"):
+                    heading_actual = math.atan2(dy, dx)
+                    diffs = [(cid, angle_diff(c.get("heading_mean", heading_actual), heading_actual)) for cid, c in pj["candidates"].items()]
+                    cid_best = min(diffs, key=lambda t: t[1])[0]
+                    if cid_best != pj["chosen_id"]:
+                        pj["chosen_id"] = cid_best
+                    pj["chosen_locked"] = True  # 只纠正一次
+
+            # 选 pending（最多 2，至少 1 个如果有多于 1 个方向）
+            pending_ids = []
+            if pj.get("candidates"):
+                cand_items = list(pj["candidates"].items())
+                # 排除 chosen
+                cand_items = [item for item in cand_items if item[0] != pj.get("chosen_id")]
+                # 按 best_weight 排序
+                cand_items.sort(key=lambda t: t[1].get("best_weight", t[1].get("weight", 0.0)), reverse=True)
+                pending_ids = [cid for cid, _ in cand_items[:self.junction_max_pending]]
+                # 如果有多于 1 个方向，但 pending_ids 为空（只有 chosen 一条），则为空是合理的
+
+            # 距离/时间达到阈值后固化 pending 分支
+            should_finalize = False
+            if pj.get("chosen_id") is not None:
+                if dist_from_anchor is not None and dist_from_anchor >= self.junction_finalize_dist:
+                    should_finalize = True
+                elif (now - pj.get("created", now)) >= self.junction_finalize_timeout:
+                    should_finalize = True
+
+            if should_finalize:
+                for cid in pending_ids:
+                    cand = pj["candidates"].get(cid)
+                    if not cand:
+                        continue
+                    heading_use = cand.get("best_heading", cand.get("heading_mean"))
+                    weight_use = cand.get("best_weight", cand.get("weight", 1.0))
+                    self._add_branch_if_new(node_id, heading_use, weight_use)
+                # 会话结束
+                continue  # 不保留在 new_pending
+
+            # 更新 last_seen：匹配当前 stable（防止过早清除）
+            stable_world = [
+                {"heading": wrap_angle(self.pose.theta + cl["center"]), "weight": cl["weight"]}
+                for cl in stable
+            ]
+            for cid, cand in list(pj["candidates"].items()):
                 matched = False
                 for sw in stable_world:
-                    if angle_diff(sw["heading"], cand["heading"]) <= self.cluster_eps_rad:
+                    if angle_diff(sw["heading"], cand.get("heading_mean", sw["heading"])) <= self.cluster_eps_rad:
+                        cand_heading = self._angle_mean(
+                            np.array([cand.get("heading_mean", sw["heading"]), sw["heading"]]),
+                            np.array([cand.get("weight", 1.0), sw["weight"]])
+                        )
+                        cand["heading_mean"] = cand_heading
+                        cand["weight"] = max(cand.get("weight", 1.0), sw["weight"])
+                        if sw["weight"] > cand.get("best_weight", 0.0):
+                            cand["best_weight"] = sw["weight"]
+                            cand["best_heading"] = sw["heading"]
                         cand["last_seen"] = now
-                        cand["weight"] = sw["weight"]
+                        cand["seen_count"] = cand.get("seen_count", 0) + 1
                         matched = True
                         break
-                # 若方向已经消失超过 cluster_lost_timeout，则落一个兴趣点
-                if not matched and (now - cand.get("last_seen", now)) >= self.cluster_lost_timeout:
-                    self._add_branch_if_new(node_id, cand["heading"], cand.get("weight", 1.0))
-                else:
-                    cands.append(cand)
-            if cands:
-                new_pending.append({"node_id": node_id, "candidates": cands})
+                if not matched and (now - cand.get("last_seen", now)) >= self.cluster_lost_timeout * 3.0:
+                    # 长时间看不到该候选，直接丢弃它，但不结束会话
+                    pj["candidates"].pop(cid, None)
+
+            # 保留未完成的会话
+            new_pending.append(pj)
+
         self.pending_junctions = new_pending
 
     def dump_access_topo(self, force: bool = False):

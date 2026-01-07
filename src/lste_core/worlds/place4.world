@@ -515,10 +515,20 @@
       <pose>0 0 0.1 0 -0 0</pose>
     </model>
     <state world_name='lab_world'>
-      <sim_time>310 424000000</sim_time>
-      <real_time>44 517596848</real_time>
-      <wall_time>1767774280 742335646</wall_time>
-      <iterations>44125</iterations>
+      <sim_time>412 507000000</sim_time>
+      <real_time>102 763271918</real_time>
+      <wall_time>1767774896 125927584</wall_time>
+      <iterations>102083</iterations>
+      <model name='Floor'>
+        <pose>3.575 -3.58526 0 0 -0 0</pose>
+        <scale>1 1 1</scale>
+        <link name='main'>
+          <pose>3.575 -3.58526 0.01 0 -0 0</pose>
+          <velocity>0 0 0 0 -0 0</velocity>
+          <acceleration>0 0 0 0 -0 0</acceleration>
+          <wrench>0 0 0 0 -0 0</wrench>
+        </link>
+      </model>
       <model name='ground_plane'>
         <pose>0 0 0 0 -0 0</pose>
         <scale>1 1 1</scale>
@@ -642,25 +652,25 @@
         </link>
       </model>
       <model name='pro3'>
-        <pose>0.002772 0.04571 0.010002 -9e-06 -0.004877 -0.019326</pose>
+        <pose>0.165372 -0.025543 0.025004 3e-06 -0.004997 -0.002067</pose>
         <scale>1 1 1</scale>
         <link name='base_footprint'>
-          <pose>0.002772 0.04571 0.010002 -9e-06 -0.004877 -0.019326</pose>
-          <velocity>0.000258 0.000164 -0.005023 -0.008722 0.024712 -5.6e-05</velocity>
-          <acceleration>-0.002215 -0.022448 -9.80034 -0.026311 0.004225 0.000657</acceleration>
-          <wrench>-0.000233 -0.002358 -1.02953 0 -0 0</wrench>
+          <pose>0.165372 -0.025543 0.025004 3e-06 -0.004997 -0.002067</pose>
+          <velocity>-1.5e-05 0.000168 -0.003412 0.002977 -0.002741 -0.000163</velocity>
+          <acceleration>-0.002341 -0.033729 -9.80052 -0.039715 0.004896 0.011106</acceleration>
+          <wrench>-0.000246 -0.003543 -1.02954 0 -0 0</wrench>
         </link>
         <link name='wheel_left_link'>
-          <pose>0.004206 0.125698 0.033001 -1.57002 0.039009 -0.019292</pose>
-          <velocity>0.000835 0.000403 -0.005759 -0.005492 0.024649 2e-05</velocity>
-          <acceleration>0.006569 0.041963 -9.80791 -0.930592 -0.262391 0.313918</acceleration>
-          <wrench>0.000187 0.001196 -0.279515 0 -0 0</wrench>
+          <pose>0.165423 0.054457 0.048004 1.56889 1.14561 3.13779</pose>
+          <velocity>-5.9e-05 0.000136 -0.003177 0.005958 -0.002747 -4.4e-05</velocity>
+          <acceleration>0.010247 0.06313 -9.81184 1.72273 -0.296041 0.580484</acceleration>
+          <wrench>0.000292 0.001799 -0.279626 0 -0 0</wrench>
         </link>
         <link name='wheel_right_link'>
-          <pose>0.001114 -0.034272 0.033003 -1.57002 0.011258 -0.019313</pose>
-          <velocity>0.000823 0.000402 -0.00428 -0.005473 0.024649 -3e-05</velocity>
-          <acceleration>0.001596 0.040781 -9.79084 -0.899077 -0.159295 0.120101</acceleration>
-          <wrench>4.5e-05 0.001162 -0.279028 0 -0 0</wrench>
+          <pose>0.165092 -0.105542 0.048003 1.56989 0.524559 3.13907</pose>
+          <velocity>-9e-05 0.000135 -0.003647 0.005976 -0.002747 -0.000141</velocity>
+          <acceleration>-0.001619 0.061201 -9.78625 1.77869 -0.023296 0.044645</acceleration>
+          <wrench>-4.6e-05 0.001744 -0.278897 0 -0 0</wrench>
         </link>
       </model>
       <light name='sun'>
@@ -669,7 +679,7 @@
     </state>
     <gui fullscreen='0'>
       <camera name='user_camera'>
-        <pose>1.26171 -0.007355 27.5311 0 1.4618 0.312196</pose>
+        <pose>-21.1561 -17.7519 40.6975 0 1.0508 0.472</pose>
         <view_controller>orbit</view_controller>
         <projection_type>perspective</projection_type>
       </camera>
@@ -1487,6 +1497,50 @@
         <kinematic>0</kinematic>
       </link>
       <static>1</static>
+    </model>
+    <model name='Floor'>
+      <link name='main'>
+        <pose>0 0 0.01 0 -0 0</pose>
+        <collision name='main_Collision'>
+          <geometry>
+            <box>
+              <size>40 40 0.01</size>
+            </box>
+          </geometry>
+          <max_contacts>10</max_contacts>
+          <surface>
+            <contact>
+              <ode/>
+            </contact>
+            <bounce/>
+            <friction>
+              <torsional>
+                <ode/>
+              </torsional>
+              <ode/>
+            </friction>
+          </surface>
+        </collision>
+        <visual name='main_Visual'>
+          <geometry>
+            <box>
+              <size>40 40 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <script>
+              <uri>model://Floor/materials/scripts</uri>
+              <uri>model://Floor/materials/textures</uri>
+              <name>floor</name>
+            </script>
+          </material>
+        </visual>
+        <self_collide>0</self_collide>
+        <enable_wind>0</enable_wind>
+        <kinematic>0</kinematic>
+      </link>
+      <static>1</static>
+      <pose>3.575 -3.58526 0 0 -0 0</pose>
     </model>
   </world>
 </sdf>
