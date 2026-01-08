@@ -28,6 +28,12 @@ STATE_SUSPICIOUS = 1
 STATE_LOCKED = 2
 # STATE_EXHAUSTED = 3  # 当前忽略
 
+# 统一的 goal 生成模式命名（对应你约定的 explore/catch 两大类）
+EXPLORE_PASS_MODE = "explore_pass_mode"          # 原 PASS coarse
+EXPLORE_SUS_C_MODE = "explore_sus_c_mode"        # 原 Sus-C fine
+CATCH_TARGET_MODE = "catch_target_mode"          # 原 follow target
+CATCH_CTX_MODE = "catch_ctx_mode"                # 原 follow ctx
+
 
 class GoalManager:
     def __init__(self):
@@ -88,6 +94,10 @@ class GoalManager:
         self.access_mode = 0
         self.access_backtrack_goal: Optional[PoseStamped] = None
 
+        # 模式：base_mode 直接由 state/subtype 映射得到；后续可在 effective_mode 上做 override
+        self.base_mode = EXPLORE_PASS_MODE
+        self.effective_mode = self.base_mode
+
         # 深度/相机
         self.bridge = CvBridge()
         self.depth_image: Optional[Image] = None
@@ -128,6 +138,15 @@ class GoalManager:
         self.latest_state_msg = msg
         self.current_state = msg.state
         self.current_subtype = msg.subtype or ""
+
+        # 基于 state/subtype 冻结基础模式；后续 override（犹豫/降级）统一在 effective_mode 上做
+        new_base = self.mode_from_state(self.current_state, self.current_subtype)
+        if new_base != self.base_mode:
+            rospy.loginfo("GoalManager: base_mode %s -> %s (state=%s subtype=%s)",
+                          self.base_mode, new_base, str(self.current_state), self.current_subtype)
+        self.base_mode = new_base
+        self.effective_mode = new_base
+
         if self.last_state is None or prev_state != msg.state or prev_subtype != self.current_subtype:
             # 立即打断更新
             self.next_update_time = 0.0
@@ -240,19 +259,33 @@ class GoalManager:
         # Access-Topo 回退模式优先
         if self.access_mode in (1, 2) and self.access_backtrack_goal is not None:
             return self.access_backtrack_goal
-        if self.current_state == STATE_LOCKED:
+
+        # 基于 effective_mode 分发（后续犹豫/降级都在 effective_mode 上动手）
+        if self.effective_mode == EXPLORE_PASS_MODE:
+            return self.goal_from_frontiers_prior()
+        if self.effective_mode == EXPLORE_SUS_C_MODE:
+            return self.goal_from_frontiers_prior()
+        if self.effective_mode == CATCH_TARGET_MODE:
             return self.goal_from_target()
-        if self.current_state == STATE_SUSPICIOUS:
-            if self.current_subtype == "Sus-A":
-                return self.goal_from_target()
-            if self.current_subtype == "Sus-B":
-                return self.goal_from_ctx_mid()
-            if self.current_subtype == "Sus-C":
-                return self.goal_from_frontiers_prior()
-            # 未知 subtype：保持现状
-            return None
-        # PASS 默认
-        return self.goal_from_frontiers_prior()
+        if self.effective_mode == CATCH_CTX_MODE:
+            return self.goal_from_ctx_mid()
+        # 未知模式：保持现状
+        rospy.logwarn_throttle(5.0, "GoalManager: unknown mode=%s", str(self.effective_mode))
+        return None
+
+    def mode_from_state(self, state: int, subtype: str) -> str:
+        """冻结映射表：state/subtype -> 基础 goal 模式。"""
+        if state == STATE_LOCKED:
+            return CATCH_TARGET_MODE
+        if state == STATE_SUSPICIOUS:
+            if subtype == "Sus-A":
+                return CATCH_TARGET_MODE
+            if subtype == "Sus-B":
+                return CATCH_CTX_MODE
+            if subtype == "Sus-C":
+                return EXPLORE_SUS_C_MODE
+        # 默认 PASS
+        return EXPLORE_PASS_MODE
 
     def goal_from_target(self) -> Optional[PoseStamped]:
         det = self.pick_best_target()

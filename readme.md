@@ -4,15 +4,13 @@
 
 ## 🚀 Quick Start
 
+> 仿真 world 文件已迁移到工作区根目录的 `worlds/` 目录，命令里统一用相对路径（如 `worlds/place1.world`）。
 
 ```bash
-
 # 清理旧的 session (如果存在)
 tmux kill-session -t lste 2>/dev/null || true
 cd /home/zrz/lste_ws
 ./scripts/run_pipeline_tmux.sh
-
-
 ```
 
 ---
@@ -40,7 +38,7 @@ rostopic echo /lste/task
 rostopic echo /lste/prompts
 
 # 可视化拓扑
-TEST_NAME=topo_2.0 bash /home/zrz/lste_ws/src/lste_topo_access/topo_tree/tools/visualize_access_topo.sh
+TEST_NAME=topo_3.0_catch_mode bash /home/zrz/lste_ws/src/lste_topo_access/topo_tree/tools/visualize_access_topo.sh
 ```
 
 ### 消失点检测
@@ -64,7 +62,7 @@ rosrun vanish_point_detection vanish_point_detection.py
 ```bash
 # 启动基础环境
 roslaunch lste_core lab_with_pro3.launch \
-  world_name:=/home/zrz/lste_ws/src/lste_core/worlds/place3.world \
+  world_name:=/home/zrz/lste_ws/worlds/topo3.0_catch_mode/place1.world \
   spawn_pro3:=false
 
   
@@ -136,7 +134,7 @@ roslaunch lste_core lste_det_vis.launch
 ```bash
 # 1. 启动仿真环境
 roslaunch lste_core lab_with_pro3.launch \
-  world_name:=/home/zrz/lste_ws/src/lste_core/worlds/room.world
+  world_name:=worlds/room.world
 
 # 2. 启动 GP Frontier (注意环境: vsgp)
 conda activate vsgp

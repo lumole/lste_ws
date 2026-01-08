@@ -6,7 +6,7 @@ WS: /home/zrz/lste_ws
 SESSION: lste
 
 # World and task
-WORLD: /home/zrz/lste_ws/src/lste_core/worlds/place3.world
+WORLD: worlds/topo3.0_catch_mode/env01.world
 TASK_JSON: /home/zrz/lste_ws/model/Data_exchange/vlm_prompt/lab/yellow_cup.json
 TASK_ID: yellow_cup
 
@@ -14,5 +14,8 @@ TASK_ID: yellow_cup
 VLLM_URL: http://localhost:8000/v1
 VLLM_MODEL: /home/zrz/lste_ws/model/MiniCPM/OpenBMB/MiniCPM4-0___5B
 ACCESS_TOPO_CONFIG: /home/zrz/lste_ws/src/lste_topo_access/topo_tree/cfgs/access_topo.yaml
+ACCESS_TOPO_CONFIG_PASS: /home/zrz/lste_ws/src/lste_topo_access/topo_tree/cfgs/access_topo_pass.yaml
+ACCESS_TOPO_CONFIG_SUS_C: /home/zrz/lste_ws/src/lste_topo_access/topo_tree/cfgs/access_topo_sus_c.yaml
 ACCESS_TOPO_TEST_NAME: 2601
+ACCESS_TOPO_RUN_NAME: topo_3.0_catch_mode
 GP_FRONTIER_RVIZ: /home/zrz/lste_ws/src/lste_topo_access/launch/gp_frontier.rviz

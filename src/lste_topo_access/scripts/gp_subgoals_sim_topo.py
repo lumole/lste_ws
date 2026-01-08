@@ -28,14 +28,14 @@ from tf.transformations import quaternion_from_euler, euler_from_quaternion
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs.msg import PointField
 from sensor_msgs import point_cloud2
-from std_msgs.msg import Header, Bool, UInt8
+from std_msgs.msg import Header, Bool, UInt8, String
 # defined msg
 #from gp_subgoal.msg import PosePcl2
 from geometry_msgs.msg import PoseStamped, PointStamped, Vector3Stamped
 from geometry_msgs.msg import Pose2D, Point, Pose
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker
-from lste_msgs.msg import LsteFrontiers
+from lste_msgs.msg import LsteFrontiers, LsteState
 
 ### import opencv
 import cv2
@@ -192,6 +192,14 @@ class VSGPNavGlb:
         print("              Initialize gp_subgoal           ")
         print("##############################################")
 
+        # 先定义关键属性，避免回调抢跑时属性不存在
+        self.pose = None
+        self.pcl_arr = None
+        self.header = Header()
+        self.header.seq = 0
+        self.header.stamp = None
+        self.header.frame_id = "odom"
+
         ### subscriber to pose and occupancy surface
         #        self.pose_pcl_sub = rospy.Subscriber("pose_pcl",
         #                                             PosePcl2,
@@ -252,6 +260,18 @@ class VSGPNavGlb:
         self.closed = []
         self.change_flag = True
         self.final_goal_received = False
+        # LSTE state 缓存（仅观察/日志，不影响现有逻辑）
+        self.lste_state = 0  # 0:PASS 1:SUSPICIOUS 2:LOCKED 3:EXHAUSTED(未用)
+        self.lste_subtype = ""
+        # 运行级元信息：确保一次运行只写一个 JSON
+        self.run_id = int(time())
+        self.run_start = rospy.Time.now().to_sec()
+        self.run_end = None
+        self.state_events = []
+        self.profile_events = []
+        self.goal_events = []
+        self.visited_events = []
+        self.active_mode = "unknown"
         self.vanish_distance = None  # 由消失点估计的前向距离（当前停用）
         # PASS 全局目标 4-方向锚定骨架
         self.origin_set = False
@@ -312,9 +332,9 @@ class VSGPNavGlb:
         self.junction_finalize_timeout = getattr(self, "junction_finalize_timeout", 6.0)
         # 路口分支约束：chosen 仅 1 个，pending 最多 2 个
         self.junction_max_pending = 2
-        # 保存 topo tree
-        self.topo_save_file = os.path.join(
-            self.topo_save_dir, f"access_topo_{int(time())}.json")
+        # 保存 topo tree（文件名已在 load_access_topo_config 冻结）
+        if not getattr(self, "topo_save_file", None):
+            self.topo_save_file = os.path.join(self.topo_save_dir, f"access_topo_{self.run_id}.json")
         self.last_topo_save_time = 0.0
 
         #zcy
@@ -344,7 +364,17 @@ class VSGPNavGlb:
         self.final_goal_sub = rospy.Subscriber("/lste/final_goal",
                                                PoseStamped,
                                                self.final_goal_cb,
+                                                queue_size=1)
+        # LSTE 状态（仅缓存/日志，后续策略切换再使用）
+        self.lste_state_sub = rospy.Subscriber("/lste/state",
+                                               LsteState,
+                                               self.lste_state_cb,
                                                queue_size=1)
+        # goal_manager 可选发布的 active_mode（explore_pass / explore_sus_c / catch_target / catch_ctx）
+        self.active_mode_sub = rospy.Subscriber("/lste/access_topo/active_mode",
+                                                String,
+                                                self.active_mode_cb,
+                                                queue_size=1)
         # 对外发布 frontier 最大方向（给 Goal Manager 使用），vector.x=theta_rel(rad)，vector.y=area
         self.frontier_dir_pub = rospy.Publisher("/lste/gp_frontier_dir",
                                                 Vector3Stamped,
@@ -385,9 +415,6 @@ class VSGPNavGlb:
         self.gp_nav_frntr_cntrs = None
         self.gp_nav_frntr_areas = None
 
-        ##variables to deal with odom msg and oc srfr msg
-        self.pcl_arr = None
-
         ## GP param
         self.gp_nav_indpts_sz = rospy.get_param('~gp_nav_indpts_sz', 400)
         self.gp_nav_var_thrshld = rospy.get_param('~gp_nav_var_thrshld', 0.03)
@@ -424,10 +451,6 @@ class VSGPNavGlb:
         self.map_2d_w = 500
 
         ## for generated pointcloud 
-        self.header = Header()
-        self.header.seq = 0
-        self.header.stamp = None
-        self.header.frame_id = "odom"
         self.fields = [
             PointField('x', 0, PointField.FLOAT32, 1),
             PointField('y', 4, PointField.FLOAT32, 1),
@@ -449,26 +472,40 @@ class VSGPNavGlb:
         # 定义匹配的距离阈值（根据实际情况调整）
         self.match_threshold = 0.5  # 例如，0.5米
 
-        ## waite for robot pose and oc_srfc
-        while self.pose is None or self.pcl_arr is None:
-            pass
+        # 是否已用起始位姿设置过默认全局 goal（避免重复）
+        self._start_goal_seeded = False
 
-        # 如果还没有收到 /lste/final_goal，则把“默认全局目标”
-        # 设置为【起步位置正前方 10 m】（odom 坐标系）
-        if not self.final_goal_received and self.pose is not None:
-            try:
-                # Pose2D: x, y, theta（theta 为朝向）
-                forward_dist = 10.0
-                self.gl_x = self.pose.x + forward_dist * np.cos(self.pose.theta)
-                self.gl_y = self.pose.y + forward_dist * np.sin(self.pose.theta)
-                self.gl_yaw = self.pose.theta
-                self.gl_wrt_odom = np.array([self.gl_x, self.gl_y, 1], dtype="float32")
-            except Exception as e:
-                rospy.logwarn("Failed to set default final goal from start pose: %s", e)
+    def lste_state_cb(self, state_msg: LsteState):
+        """缓存 /lste/state，当前仅用于日志观察。"""
+        try:
+            new_state = int(state_msg.state)
+        except Exception:
+            return
+        new_sub = state_msg.subtype or ""
+        if new_state != self.lste_state or new_sub != self.lste_subtype:
+            rospy.loginfo("gp_subgoal: /lste/state changed state=%s subtype=%s",
+                          str(new_state), new_sub)
+            self.state_events.append({
+                "t": rospy.Time.now().to_sec(),
+                "state": new_state,
+                "subtype": new_sub,
+                "pose": {"x": getattr(self.pose, "x", None), "y": getattr(self.pose, "y", None)},
+                "anchor_id": self.anchor_last_id,
+                "profile": self.current_profile,
+                "active_mode": self.active_mode,
+            })
+        self.lste_state = new_state
+        self.lste_subtype = new_sub
+        # 根据 state/subtype 切换 explore 配置：Sus-C 用 fine，其余用 coarse
+        desired_profile = "sus_c" if (new_state == 1 and new_sub == "Sus-C") else "pass"
+        if desired_profile != getattr(self, "current_profile", None):
+            self.apply_access_topo_profile(desired_profile, reason="/lste/state")
 
-        ## print all params
-        self.print_ros_param()
-        #rospy.spin()
+    def active_mode_cb(self, msg: String):
+        mode = msg.data or "unknown"
+        if mode != self.active_mode:
+            rospy.loginfo("gp_subgoal: active_mode changed to %s", mode)
+        self.active_mode = mode
 
     def final_goal_cb(self, msg: PoseStamped):
         """Update final goal from /lste/final_goal (odom frame PoseStamped)."""
@@ -479,6 +516,16 @@ class VSGPNavGlb:
         self.gl_yaw = yaw
         self.gl_wrt_odom = np.array([self.gl_x, self.gl_y, 1], dtype="float32")
         self.final_goal_received = True
+        self.goal_events.append({
+            "t": rospy.Time.now().to_sec(),
+            "goal": {"x": self.gl_x, "y": self.gl_y, "yaw": self.gl_yaw},
+            "mode": self.active_mode,
+            "profile": self.current_profile,
+            "state": self.lste_state,
+            "subtype": self.lste_subtype,
+            "anchor_id": self.anchor_last_id,
+            "pose": {"x": getattr(self.pose, "x", None), "y": getattr(self.pose, "y", None)},
+        })
 
     def vanish_cb(self, msg: Pose):
         """消失点推断的前方距离，单位 m。"""
@@ -490,10 +537,43 @@ class VSGPNavGlb:
             pass
 
     def load_access_topo_config(self):
-        """加载 Access-Topo 配置（优先 YAML，其次 ROS param，最后默认值）。"""
-        cfg_path = rospy.get_param('~access_topo_config',
-                                   '/home/zrz/lste_ws/src/lste_topo_access/topo_tree/cfgs/access_topo.yaml')
-        cfg_file = safe_load_yaml(cfg_path)
+        """加载 Access-Topo 配置（支持 coarse/fine 双 profile，YAML 优先）。"""
+        # 两套配置路径：未提供 fine 时回落到 coarse
+        default_cfg = '/home/zrz/lste_ws/src/lste_topo_access/topo_tree/cfgs/access_topo.yaml'
+        cfg_path_pass = rospy.get_param('~access_topo_config_pass',
+                                        rospy.get_param('~access_topo_config', default_cfg))
+        cfg_path_sus_c = rospy.get_param('~access_topo_config_sus_c', cfg_path_pass)
+        self.cfg_pass = safe_load_yaml(cfg_path_pass) or {}
+        self.cfg_sus_c = safe_load_yaml(cfg_path_sus_c) or {}
+        # 冻结本次运行的保存路径/文件（不随 profile/state 变化）
+        base_root = self.cfg_pass.get('topo_tree_root',
+                                      rospy.get_param('~topo_tree_root',
+                                                      '/home/zrz/lste_ws/src/lste_topo_access/topo_tree/tree'))
+        default_save_dir = os.path.join(base_root, rospy.get_param('~run_name', "run"))
+        self.topo_save_dir = rospy.get_param('~topo_save_dir',
+                                             self.cfg_pass.get('topo_save_dir', default_save_dir))
+        self.topo_save_file = os.path.join(self.topo_save_dir, f"access_topo_{self.run_id}.json")
+        self.current_profile = "pass"
+        self.apply_access_topo_profile(self.current_profile, reason="init")
+
+    def apply_access_topo_profile(self, profile: str, reason: str = ""):
+        """按 profile 应用配置并更新派生参数。profile: 'pass' or 'sus_c'."""
+        cfg_file = self.cfg_pass if profile != "sus_c" else self.cfg_sus_c
+        if not isinstance(cfg_file, dict):
+            cfg_file = {}
+        prev = getattr(self, "current_profile", None)
+        self.current_profile = profile
+        if prev is not None and prev != profile:
+            rospy.loginfo("Access-Topo profile switch: %s -> %s (reason=%s)", prev, profile, reason or "")
+            self.profile_events.append({
+                "t": rospy.Time.now().to_sec(),
+                "from": prev,
+                "to": profile,
+                "reason": reason,
+                "pose": {"x": getattr(self.pose, "x", None), "y": getattr(self.pose, "y", None)},
+                "anchor_id": self.anchor_last_id,
+            })
+
         # 基础路径与测试名
         self.test_name = cfg_file.get('test_name', rospy.get_param('~test_name', 'default'))
         self.topo_tree_root = cfg_file.get('topo_tree_root',
@@ -557,10 +637,17 @@ class VSGPNavGlb:
         self.junction_angle_dir = cfg_file.get('junction_angle_dir',
                                                os.path.join(self.topo_tree_root, "angle"))
         self.junction_angle_counter = 0
-        # topo tree 保存目录（默认 root/test_name）
-        default_save_dir = os.path.join(self.topo_tree_root, self.test_name)
-        self.topo_save_dir = cfg_file.get('topo_save_dir', rospy.get_param('~topo_save_dir', default_save_dir))
+        # topo tree 保存周期（文件名/目录已在 load_access_topo_config 冻结）
         self.topo_save_period = cfg_file.get('topo_save_period', rospy.get_param('~topo_save_period', 2.0))
+
+        # 衍生参数（角度转弧度等）
+        self.force_window_rad = np.deg2rad(self.force_window_deg)
+        self.cluster_eps_rad = np.deg2rad(self.cluster_eps_deg)
+        self.junction_peak_min_sep_rad = np.deg2rad(getattr(self, "junction_peak_min_sep_deg", 30.0))
+        self.junction_decision_dist = getattr(self, "junction_decision_dist", self.anchor_step_dist)
+        self.junction_same_dir_gate_rad = np.deg2rad(getattr(self, "junction_same_dir_gate_deg", 30.0))
+        self.junction_finalize_dist = getattr(self, "junction_finalize_dist", self.junction_decision_dist * 1.5)
+        self.junction_finalize_timeout = getattr(self, "junction_finalize_timeout", 6.0)
 
     # -------- Access-Topo: anchors / branches / backtrack --------
     def set_access_mode(self, mode: int):
@@ -589,6 +676,10 @@ class VSGPNavGlb:
                 "stamp": rospy.Time.now().to_sec(),
                 "prev": self.anchor_last_id,
                 "branches": [],
+                "lste_state": self.lste_state,
+                "lste_subtype": self.lste_subtype,
+                "profile": self.current_profile,
+                "active_mode": self.active_mode,
             }
             self.anchor_nodes.append(node)
             self.anchor_last_xy = cur_xy
@@ -1302,6 +1393,9 @@ class VSGPNavGlb:
             os.makedirs(self.topo_save_dir, exist_ok=True)
             data = {
                 "stamp": now,
+                "run_id": self.run_id,
+                "run_start": self.run_start,
+                "run_end": self.run_end,
                 "test_name": self.test_name,
                 "topo_tree_root": self.topo_tree_root,
                 "pose": {"x": getattr(self.pose, "x", None), "y": getattr(self.pose, "y", None)},
@@ -1313,14 +1407,24 @@ class VSGPNavGlb:
                 "backtrack_path": self.backtrack_path,
                 "backtrack_history": self.backtrack_history,
                 "return_home_target": self.return_home_target,
+                "current_profile": self.current_profile,
                 "nodes": self.anchor_nodes,
                 "pending_junctions": self.pending_junctions,
                 "backtrack_stack": self.backtrack_stack,
+                "state_events": self.state_events,
+                "profile_events": self.profile_events,
+                "goal_events": self.goal_events,
+                "visited_events": self.visited_events,
             }
             with open(self.topo_save_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as exc:
             rospy.logwarn_throttle(5.0, "dump_access_topo failed: %s", exc)
+
+    def on_shutdown(self):
+        """节点退出时强制落盘，确保单个 JSON 包含最终状态。"""
+        self.run_end = rospy.Time.now().to_sec()
+        self.dump_access_topo(force=True)
 
     #zcy
     # 切换模式，true为高斯开启发布，flase为topo，高斯subgoal停止发布
@@ -1591,6 +1695,9 @@ class VSGPNavGlb:
     """ @brief: robot to wolrd 2D TF matrix"""
 
     def tf_rbt_2_odom(self):
+        if self.pose is None:
+            self.tf_2d = None
+            return
         self.tf_2d = np.array(
             [[np.cos(self.pose.theta), -np.sin(self.pose.theta), self.pose.x],
              [np.sin(self.pose.theta),
@@ -1599,6 +1706,9 @@ class VSGPNavGlb:
     """ @brief:  odom to robot 2D TF matrix"""
 
     def tf_odom_2_rbt(self):
+        if self.pose is None:
+            self.tf_2d_inv = None
+            return
         cos_th = np.cos(self.pose.theta)
         sin_th = np.sin(self.pose.theta)
         self.tf_2d_inv = np.array(
@@ -2223,6 +2333,10 @@ class VSGPNavGlb:
     """ @brief:  callback of sph pointcloud """
 
     def sph_pcl_cb(self, sph_pcl_msg):
+        # 防御：若 header 尚未初始化（极早期回调），先建一个
+        if not hasattr(self, "header") or self.header is None:
+            self.header = Header()
+            self.header.frame_id = "odom"
         self.header.stamp = sph_pcl_msg.header.stamp
         pcl_arr = ros_numpy.point_cloud2.pointcloud2_to_array(
             sph_pcl_msg, squeeze=True)
@@ -2237,6 +2351,21 @@ class VSGPNavGlb:
 
     def step(self):
         while not rospy.is_shutdown():
+            if self.pose is None or self.pcl_arr is None:
+                rospy.logwarn_throttle(5.0, "gp_subgoal: waiting for rbt_pose and sph_pcl ...")
+                rospy.sleep(0.05)
+                continue
+            if (not self._start_goal_seeded) and (not self.final_goal_received) and self.pose is not None:
+                try:
+                    # Pose2D: x, y, theta（theta 为朝向）
+                    forward_dist = 10.0
+                    self.gl_x = self.pose.x + forward_dist * np.cos(self.pose.theta)
+                    self.gl_y = self.pose.y + forward_dist * np.sin(self.pose.theta)
+                    self.gl_yaw = self.pose.theta
+                    self.gl_wrt_odom = np.array([self.gl_x, self.gl_y, 1], dtype="float32")
+                    self._start_goal_seeded = True
+                except Exception:
+                    pass
             # Access-Topo：检查回退/强制方向进度
             self.check_backtrack_progress()
             self.update_forced_heading_progress()

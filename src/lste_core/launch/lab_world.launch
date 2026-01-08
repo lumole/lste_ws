@@ -1,8 +1,8 @@
 <launch>
   <arg name="use_sim_time" default="true"/>
   <arg name="gui" default="true"/>
-  <!-- 默认 world 仍然是原来的 lab_building.world，可以通过上层传 world_name 覆盖 -->
-  <arg name="world_name" default="$(find lste_core)/worlds/lab_building.world"/>
+  <!-- 默认 world 路径相对工作区，可通过上层传 world_name 覆盖 -->
+  <arg name="world_name" default="$(find lste_core)/../../worlds/lab_building.world"/>
 
   <env name="GAZEBO_MODEL_PATH"
        value="$(find lste_core)/worlds:$(optenv GAZEBO_MODEL_PATH)"/>

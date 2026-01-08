@@ -1,6 +1,6 @@
 -###################### -pipeline- ################################-
 roslaunch lste_core lab_with_pro3.launch \
-  world_name:=/home/zrz/lste_ws/src/lste_core/worlds/room.world
+  world_name:=worlds/room.world
   
 rosrun lste_core lste_task_node.py _json_path:=/home/zrz/lste_ws/model/Data_exchange/vlm_prompt/lab/yellow_cup.json _task_id:=yellow_cup
 
@@ -50,7 +50,7 @@ rosrun vanish_point_detection vanish_point_detection.py
 
 -####################- access_topo -############################-
 roslaunch lste_core lab_with_pro3.launch \
-  world_name:=/home/zrz/lste_ws/src/lste_core/worlds/room.world
+  world_name:=worlds/room.world
 
 
 conda activate vsgp
@@ -59,6 +59,3 @@ roslaunch lste_topo_access gp_frontier.launch
 roslaunch lste_oc_srfc oc_srfc_proj.launch
 
 rviz -d /home/zrz/lste_ws/src/lste_topo_access/launch/gp_frontier.rviz
-
-
-

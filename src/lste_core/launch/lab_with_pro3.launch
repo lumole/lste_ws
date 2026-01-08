@@ -8,7 +8,7 @@
   <arg name="spawn_pro3" default="true"/>
 
   <!-- 默认 world，允许从命令行覆盖为任意 .world 路径 -->
-  <arg name="world_name" default="$(find lste_core)/worlds/lab_building.world"/>
+  <arg name="world_name" default="$(find lste_core)/../../worlds/lab_building.world"/>
 
   <arg name="x" default="0.0"/>
   <arg name="y" default="0.0"/>

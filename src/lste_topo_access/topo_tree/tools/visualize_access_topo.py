@@ -38,6 +38,14 @@ COLOR_ROBOT = "#FFEB3B"          # Bright Yellow
 # 辅助颜色 (Anchor路径连线，保持柔和以免干扰)
 COLOR_ANCHOR_PATH = "#B0BEC5"    # Blue Grey
 
+# Anchor 路径按 LSTE 状态着色
+# 0:PASS (浅灰), 1:SUSPICIOUS (深灰), 2:LOCKED (红), 其余 fallback 浅灰
+COLOR_PATH_PASS = "#9EA7B3"
+COLOR_PATH_SUS = "#455A64"
+COLOR_PATH_LOCKED = "#D32F2F"
+# 状态切换标记（♻ 符号）
+COLOR_STATE_SWITCH = "#00BCD4"
+
 
 def load_json(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -133,8 +141,21 @@ def anchor_ids_to_xy(anchors: Dict[int, dict], ids: List[int]) -> List[Tuple[flo
 # Plotting functions
 # ---------------------------
 
+def _state_to_path_color(state_val) -> str:
+    try:
+        s = int(state_val)
+    except Exception:
+        s = 0
+    if s == 2:
+        return COLOR_PATH_LOCKED
+    if s == 1:
+        return COLOR_PATH_SUS
+    return COLOR_PATH_PASS
+
+
 def plot_path(ax, anchors: Dict[int, dict]):
     segments = []
+    colors = []
     for node in anchors.values():
         prev = node.get("prev")
         if prev is None:
@@ -143,8 +164,9 @@ def plot_path(ax, anchors: Dict[int, dict]):
         if pnode is None:
             continue
         segments.append([(pnode["x"], pnode["y"]), (node["x"], node["y"])])
+        colors.append(_state_to_path_color(node.get("lste_state")))
     if segments:
-        lc = LineCollection(segments, colors=COLOR_ANCHOR_PATH, linewidths=2.0, alpha=0.6, zorder=1)
+        lc = LineCollection(segments, colors=colors, linewidths=2.6, alpha=0.85, zorder=1)
         ax.add_collection(lc)
 
     xs = [n["x"] for n in anchors.values()]
@@ -189,6 +211,66 @@ def plot_pose(ax, pose: dict):
         return
     ax.scatter([x], [y], s=120, marker="*", color=COLOR_ROBOT,
                edgecolors="black", linewidths=0.8, zorder=10)
+
+
+def plot_state_switches(ax, data: dict, anchors: Dict[int, dict]):
+    """
+    在状态变化处标记 ♻，位置取 state_events 的 anchor_id；如缺失则用事件 pose 最近的 anchor。
+    """
+    events = data.get("state_events") or []
+    if not isinstance(events, list):
+        return
+
+    def nearest_anchor_id(x: float, y: float) -> Optional[int]:
+        best = None
+        best_d2 = None
+        for aid, n in anchors.items():
+            dx = float(n["x"]) - x
+            dy = float(n["y"]) - y
+            d2 = dx * dx + dy * dy
+            if best_d2 is None or d2 < best_d2:
+                best = aid
+                best_d2 = d2
+        return best
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+
+        xy = None
+        aid = ev.get("anchor_id")
+        try:
+            if aid is not None and int(aid) in anchors:
+                n = anchors[int(aid)]
+                xy = (float(n["x"]), float(n["y"]))
+        except Exception:
+            xy = None
+
+        if xy is None:
+            pose = ev.get("pose") or {}
+            try:
+                px = float(pose.get("x"))
+                py = float(pose.get("y"))
+                na = nearest_anchor_id(px, py)
+                if na is not None and na in anchors:
+                    n = anchors[na]
+                    xy = (float(n["x"]), float(n["y"]))
+            except Exception:
+                xy = None
+
+        if xy is None:
+            continue
+
+        ax.text(
+            xy[0],
+            xy[1],
+            "\u267B",  # ♻
+            color=COLOR_STATE_SWITCH,
+            fontsize=14,
+            ha="center",
+            va="center",
+            zorder=9,
+        )
 
 
 def plot_backtrack(ax, data: dict, anchors: Dict[int, dict]):
@@ -258,6 +340,10 @@ def create_custom_legend(ax):
         mlines.Line2D([], [], color='white', marker='o', markerfacecolor=COLOR_ANCHOR_POINTS,
                       markersize=8, label='anchor'),
 
+        mlines.Line2D([], [], color=COLOR_PATH_PASS, linewidth=3, label='path (PASS)'),
+        mlines.Line2D([], [], color=COLOR_PATH_SUS, linewidth=3, label='path (SUS)'),
+        mlines.Line2D([], [], color=COLOR_PATH_LOCKED, linewidth=3, label='path (LOCKED)'),
+
         mlines.Line2D([], [], color=COLOR_BRANCH_SEARCH, linewidth=2, label='branch search'),
 
         mlines.Line2D([], [], color=COLOR_BRANCH_TRACKBACK, linewidth=2, label='branch trackback'),
@@ -270,6 +356,9 @@ def create_custom_legend(ax):
 
         mlines.Line2D([], [], color='white', marker='*', markerfacecolor=COLOR_ROBOT, markeredgecolor='black',
                       markersize=10, label='robot pose'),
+
+        mlines.Line2D([], [], color='white', marker='$\u267B$', markerfacecolor=COLOR_STATE_SWITCH,
+                      markeredgecolor=COLOR_STATE_SWITCH, markersize=12, label='state switch'),
     ]
 
     ax.legend(handles=legend_elements, loc="lower left", frameon=True, framealpha=0.9, fontsize=10)
@@ -303,6 +392,7 @@ def main():
     plot_branches(ax, anchors)
     plot_backtrack(ax, data, anchors)  # <-- only completed sessions
     plot_pose(ax, data.get("pose", {}))
+    plot_state_switches(ax, data, anchors)
 
     create_custom_legend(ax)
 

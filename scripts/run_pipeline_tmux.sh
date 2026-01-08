@@ -27,14 +27,21 @@ PY
 fi
 WS=${WS:-${CFG_WS:-/home/zrz/lste_ws}}
 SESSION=${SESSION:-${CFG_SESSION:-lste}}
-WORLD=${WORLD:-${CFG_WORLD:-$WS/src/lste_core/worlds/place1.world}}
+WORLD=${WORLD:-${CFG_WORLD:-$WS/worlds/place1.world}}
+# 如果 world 路径是相对的，补全到工作区绝对路径，避免 gazebo 找不到文件
+if [[ "$WORLD" != /* ]]; then
+  WORLD="$WS/$WORLD"
+fi
 TASK_JSON=${TASK_JSON:-${CFG_TASK_JSON:-$WS/model/Data_exchange/vlm_prompt/lab/yellow_cup.json}}
 TASK_ID=${TASK_ID:-${CFG_TASK_ID:-yellow_cup}}
 VLLM_URL=${VLLM_URL:-${CFG_VLLM_URL:-http://localhost:8000/v1}}
 VLLM_MODEL=${VLLM_MODEL:-${CFG_VLLM_MODEL:-$WS/model/MiniCPM/OpenBMB/MiniCPM4-0___5B}}
 VLLM_PROBE=${VLLM_PROBE:-${VLLM_URL%/}}
 ACCESS_TOPO_CONFIG=${ACCESS_TOPO_CONFIG:-${CFG_ACCESS_TOPO_CONFIG:-$WS/src/lste_topo_access/topo_tree/cfgs/access_topo.yaml}}
+ACCESS_TOPO_CONFIG_PASS=${ACCESS_TOPO_CONFIG_PASS:-${CFG_ACCESS_TOPO_CONFIG_PASS:-$WS/src/lste_topo_access/topo_tree/cfgs/access_topo_pass.yaml}}
+ACCESS_TOPO_CONFIG_SUS_C=${ACCESS_TOPO_CONFIG_SUS_C:-${CFG_ACCESS_TOPO_CONFIG_SUS_C:-$WS/src/lste_topo_access/topo_tree/cfgs/access_topo_sus_c.yaml}}
 ACCESS_TOPO_TEST_NAME=${ACCESS_TOPO_TEST_NAME:-${CFG_ACCESS_TOPO_TEST_NAME:-default_test}}
+ACCESS_TOPO_RUN_NAME=${ACCESS_TOPO_RUN_NAME:-${CFG_ACCESS_TOPO_RUN_NAME:-$ACCESS_TOPO_TEST_NAME}}
 GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-${CFG_GP_FRONTIER_RVIZ:-$WS/src/lste_topo_access/launch/gp_frontier.rviz}}
 if [[ "$VLLM_PROBE" == */v1 ]]; then
   VLLM_PROBE="$VLLM_PROBE/models"
@@ -154,7 +161,11 @@ tmux_new_window 10 "$WS" "oc_srfc" \
 # 11: topo frontier（需 vsgp 环境）
 tmux_new_window 11 "$WS" "gp_frontier" \
   "$WAIT_ROSCORE; conda activate vsgp; roslaunch lste_topo_access gp_frontier.launch \
-    access_topo_config:=$ACCESS_TOPO_CONFIG access_topo_test_name:=$ACCESS_TOPO_TEST_NAME"
+    access_topo_config:=$ACCESS_TOPO_CONFIG \
+    access_topo_config_pass:=$ACCESS_TOPO_CONFIG_PASS \
+    access_topo_config_sus_c:=$ACCESS_TOPO_CONFIG_SUS_C \
+    access_topo_test_name:=$ACCESS_TOPO_TEST_NAME \
+    access_topo_run_name:=$ACCESS_TOPO_RUN_NAME"
 
 # 12: frontier RViz
 tmux_new_window 12 "$WS" "rviz_frontier" \
