@@ -12,9 +12,6 @@ tmux kill-session -t lste 2>/dev/null || true
 cd /home/zrz/lste_ws
 ./scripts/run_pipeline_tmux.sh
 
-# 默认参数在 scripts/pipeline_defaults.yaml，可直接改里面的 WS / WORLD / TASK_JSON / TASK_ID 等
-# 如需临时覆盖，环境变量优先级最高，例如：
-#   WORLD=/home/zrz/lste_ws/src/lste_core/worlds/room.world TASK_ID=foo ./scripts/run_pipeline_tmux.sh
 
 ```
 
