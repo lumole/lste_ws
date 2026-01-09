@@ -8,6 +8,7 @@ import faulthandler; faulthandler.enable()
 import warnings
 import json
 import yaml
+import sys
 
 #import io
 import os
@@ -389,6 +390,7 @@ class VSGPNavGlb:
         self.oc_srfc_rds = rospy.get_param('~oc_srfc_rds', 5.0)
         self.pcl_skp = rospy.get_param('~pcl_skp', 3)
         self.pose = None
+        self.pcl_arr = None
         self.org_unq_thetas = None
         self.pcl_unq_thetas = None
         self.pcl_thetas = None
@@ -427,6 +429,90 @@ class VSGPNavGlb:
         ## visualization param
         self.gp_nav_var_img_viz = rospy.get_param('~gp_nav_var_img_viz', False)
         self.gp_nav_var_viz = rospy.get_param('~gp_nav_var_viz', 5.0)
+        # frontier 日志（可选）
+        self.frontier_log_enabled = rospy.get_param('~frontier_log', False)
+        self.frontier_log_dir = rospy.get_param(
+            '~frontier_log_dir',
+            '/home/zrz/lste_ws/src/lste_topo_access/topo_tree/frontier_log'
+        )
+        self.frontier_log_file = None
+        self.frontier_log_fh = None
+        self._stdout_orig = None
+        self._stderr_orig = None
+        if self.frontier_log_enabled:
+            try:
+                self.frontier_log_dir = os.path.expanduser(self.frontier_log_dir)
+                os.makedirs(self.frontier_log_dir, exist_ok=True)
+                self.frontier_log_file = os.path.join(
+                    self.frontier_log_dir,
+                    f"frontier_{self.run_id}.log"
+                )
+                rospy.loginfo("gp_subgoal: frontier_log enabled, writing to %s", self.frontier_log_file)
+                self.frontier_log_fh = open(self.frontier_log_file, "a", encoding="utf-8", buffering=1)
+                self.frontier_log_fh.write(f"# frontier_log run_id={self.run_id}\n")
+
+                class _TeeStream:
+                    """Mirror stdout/stderr to log with timestamp, keep console output."""
+
+                    def __init__(self, main_stream, log_stream):
+                        self._main = main_stream
+                        self._log = log_stream
+
+                    def write(self, data):
+                        try:
+                            self._main.write(data)
+                        except Exception:
+                            pass
+                        if not self._log:
+                            return
+                        try:
+                            for chunk in data.splitlines(True):
+                                ts = 0.0
+                                try:
+                                    ts = rospy.Time.now().to_sec()
+                                except Exception:
+                                    pass
+                                if ts <= 0.0:
+                                    ts = time()
+                                if chunk.endswith("\n"):
+                                    content = chunk[:-1]
+                                    newline = "\n"
+                                else:
+                                    content = chunk
+                                    newline = ""
+                                if content.strip():
+                                    self._log.write(f"[{ts:.3f}] {content}{newline}")
+                                elif newline:
+                                    self._log.write(f"[{ts:.3f}]{newline}")
+                            self._log.flush()
+                        except Exception:
+                            pass
+
+                    def flush(self):
+                        try:
+                            self._main.flush()
+                        except Exception:
+                            pass
+                        try:
+                            if self._log:
+                                self._log.flush()
+                        except Exception:
+                            pass
+
+                self._stdout_orig = sys.stdout
+                self._stderr_orig = sys.stderr
+                sys.stdout = _TeeStream(sys.stdout, self.frontier_log_fh)
+                sys.stderr = _TeeStream(sys.stderr, self.frontier_log_fh)
+            except Exception as exc:
+                rospy.logwarn("gp_subgoal: frontier_log disabled (init failed: %s)", exc)
+                self.frontier_log_enabled = False
+                try:
+                    if self.frontier_log_fh:
+                        self.frontier_log_fh.close()
+                except Exception:
+                    pass
+                self.frontier_log_fh = None
+                self.frontier_log_file = None
 
         ## 全局目标动态更新参数（PASS 默认）：每隔 gl_update_period 秒，沿最“空旷”frontier 方向外推 gl_update_forward_dist 米
         # 默认 5s 更新一次（可通过 ~gl_update_period 覆盖）
@@ -585,6 +671,14 @@ class VSGPNavGlb:
                                                  rospy.get_param('~backtrack_arrive_dist', 1.0))
         self.visited_thresh = cfg_file.get('visited_thresh', rospy.get_param('~visited_thresh', 3.0))
         self.force_window_deg = cfg_file.get('force_window_deg', rospy.get_param('~force_window_deg', 25.0))
+        # 前方可行距离过滤开关（默认关闭；避免在走廊/路口远处因短暂预测误差把 frontier 过滤掉）
+        self.enable_min_frontier_clearance = bool(
+            cfg_file.get('enable_min_frontier_clearance',
+                         rospy.get_param('~enable_min_frontier_clearance', False))
+        )
+        # 前方可行距离过滤阈值（小于该距离的 frontier 视为不可走）
+        self.min_frontier_clearance = cfg_file.get('min_frontier_clearance',
+                                                   rospy.get_param('~min_frontier_clearance', 0.0))
         self.commit_dist = cfg_file.get('commit_dist', rospy.get_param('~commit_dist', 2.0))
         self.cluster_eps_deg = cfg_file.get('cluster_eps_deg', rospy.get_param('~cluster_eps_deg', 15.0))
         self.cluster_stable_duration = cfg_file.get('cluster_stable_duration',
@@ -1421,10 +1515,41 @@ class VSGPNavGlb:
         except Exception as exc:
             rospy.logwarn_throttle(5.0, "dump_access_topo failed: %s", exc)
 
+    def frontier_log(self, msg: str):
+        """Append frontier-related log to file when enabled."""
+        if not getattr(self, "frontier_log_enabled", False):
+            return
+        if not getattr(self, "frontier_log_file", None):
+            return
+        try:
+            t = rospy.Time.now().to_sec() if rospy.rostime.is_initialized() else 0.0
+            if getattr(self, "frontier_log_fh", None) is not None:
+                self.frontier_log_fh.write(f"[{t:.3f}] {msg}\n")
+            else:
+                with open(self.frontier_log_file, "a", encoding="utf-8") as f:
+                    f.write(f"[{t:.3f}] {msg}\n")
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "gp_subgoal: frontier_log write failed: %s", exc)
+            self.frontier_log_enabled = False
+
     def on_shutdown(self):
         """节点退出时强制落盘，确保单个 JSON 包含最终状态。"""
         self.run_end = rospy.Time.now().to_sec()
         self.dump_access_topo(force=True)
+        # 关闭 frontier log，并恢复 stdout/stderr
+        try:
+            if self._stdout_orig is not None:
+                sys.stdout = self._stdout_orig
+            if self._stderr_orig is not None:
+                sys.stderr = self._stderr_orig
+        except Exception:
+            pass
+        try:
+            if self.frontier_log_fh:
+                self.frontier_log_fh.flush()
+                self.frontier_log_fh.close()
+        except Exception:
+            pass
 
     #zcy
     # 切换模式，true为高斯开启发布，flase为topo，高斯subgoal停止发布
@@ -1679,9 +1804,9 @@ class VSGPNavGlb:
         if (len(l_frntr_ars) == 1
             and l_frntr_ars[0] > 800000000) or len(l_frntr_ars) == 0:
             print("could not find frontier above threshold")
-            l_frntr_cntrs = [[0, np.pi / 2], [np.pi / 2, np.pi / 2],
-                             [np.pi, np.pi / 2], [-np.pi / 2, np.pi / 2]]
-            l_frntr_ars = [12500, 12500, 12500, 12500]
+            # 不再兜底四个方向，直接认为无 frontier（交给上层 no_frontier 逻辑处理）
+            l_frntr_cntrs = []
+            l_frntr_ars = []
         self.gp_nav_frntr_cntrs = np.array(l_frntr_cntrs).reshape(-1, 2)
         self.gp_nav_frntr_areas = np.array(l_frntr_ars)  #.reshape(-1)
 
@@ -1768,6 +1893,20 @@ class VSGPNavGlb:
                     in_forced_window = True
                 else:
                     continue  # 强制窗口下，非兴趣方向直接丢弃
+            # 可行距离过滤：用 GP 预测该方向的可行半径（oc_srfc_rds - oc），过近则视为不可走
+            clearance_ok = True
+            try:
+                if getattr(self, "enable_min_frontier_clearance", False) and self.min_frontier_clearance > 0.0 and self.gp_nav is not None:
+                    oc_pred, _ = self.gp_nav.model.predict_f(
+                        np.array([theta_rel, np.pi / 2], dtype="float32").reshape(1, 2)
+                    )
+                    rds = float(self.oc_srfc_rds - oc_pred.numpy())
+                    if rds < float(self.min_frontier_clearance):
+                        clearance_ok = False
+            except Exception:
+                clearance_ok = True
+            if not clearance_ok:
+                continue
             if (not in_forced_window) and self.is_visited([x, y], self.visited_thresh):
                 closed_position = [int(x), int(y)]
                 if closed_position not in self.closed:
@@ -1787,6 +1926,7 @@ class VSGPNavGlb:
 
         # 全部的候选目标点
         print(f"gp_nav_actul_xy_gls={self.gp_nav_actul_xy_gls}")
+        self.frontier_log(f"candidates={self.gp_nav_actul_xy_gls.tolist()} areas={self.gp_nav_frntr_areas.tolist() if hasattr(self, 'gp_nav_frntr_areas') else []}")
 
         # 回到起点途中：方案 A——不再因新 frontier 打断，全部忽略
         if self.return_home_target is not None and self.gp_nav_gls_sz > 0:

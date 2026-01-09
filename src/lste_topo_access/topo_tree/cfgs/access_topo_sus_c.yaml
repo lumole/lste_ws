@@ -41,6 +41,10 @@ commit_dist: 2.0
 commit_goal_dist: 5.0
 commit_carrot_lookahead: 5.0
 
+# 前方可行距离过滤（开启 + 阈值）
+enable_min_frontier_clearance: false
+min_frontier_clearance: 0.5
+
 # 分支上限与路口冷却（更激进）
 max_pending_per_node: 3
 junction_cooldown_anchors: 2
