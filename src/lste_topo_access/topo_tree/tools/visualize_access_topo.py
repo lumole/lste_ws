@@ -22,28 +22,19 @@ import matplotlib.lines as mlines
 from matplotlib.collections import LineCollection
 
 # --- Color Palette Configuration ---
-# 1. Anchor: 黑点
 COLOR_ANCHOR_POINTS = "#000000"
-# 2. Branch Search: 水鸭色线 (Teal)
-COLOR_BRANCH_SEARCH = "#00897B"  # Deep Teal
-# 3. Branch Trackback: 琥珀色线 (Amber)
-COLOR_BRANCH_TRACKBACK = "#FFB300" # Vivid Amber
-# 4. Interest: 红色星
-COLOR_INTEREST = "#D32F2F"       # Red
-# 5. Backtrack Start: 紫色星
-COLOR_BACKTRACK_START = "#7B1FA2" # Purple
-# 6. Robot Pose: 黄色星
-COLOR_ROBOT = "#FFEB3B"          # Bright Yellow
+COLOR_BRANCH_SEARCH = "#00897B"
+COLOR_BRANCH_TRACKBACK = "#FFB300"
+COLOR_INTEREST = "#D32F2F"
+COLOR_BACKTRACK_START = "#7B1FA2"
+COLOR_ROBOT = "#FFEB3B"
 
-# 辅助颜色 (Anchor路径连线，保持柔和以免干扰)
-COLOR_ANCHOR_PATH = "#B0BEC5"    # Blue Grey
+COLOR_ANCHOR_PATH = "#B0BEC5"
 
-# Anchor 路径按 LSTE 状态着色
-# 0:PASS (浅灰), 1:SUSPICIOUS (深灰), 2:LOCKED (红), 其余 fallback 浅灰
 COLOR_PATH_PASS = "#9EA7B3"
 COLOR_PATH_SUS = "#455A64"
 COLOR_PATH_LOCKED = "#D32F2F"
-# 状态切换标记（♻ 符号）
+
 COLOR_STATE_SWITCH = "#00BCD4"
 
 
@@ -73,77 +64,57 @@ def _get_prev_id(anchors: Dict[int, dict], aid: int) -> Optional[int]:
     if not node:
         return None
     prev = node.get("prev")
-    if prev is None:
-        return None
     try:
-        return int(prev)
+        return int(prev) if prev is not None else None
     except Exception:
         return None
 
 
 def _trace_to_root(anchors: Dict[int, dict], start_id: int, max_hops: int = 200000) -> List[int]:
-    """Return chain [start, parent, parent, ...] up to root (inclusive)."""
     chain = []
     cur = start_id
-    hops = 0
-    while cur is not None and cur in anchors and hops < max_hops:
+    while cur is not None and cur in anchors and len(chain) < max_hops:
         chain.append(cur)
         cur = _get_prev_id(anchors, cur)
-        hops += 1
     return chain
 
 
 def path_between_anchors_tree(anchors: Dict[int, dict], a: int, b: int) -> List[int]:
-    """
-    Get path from anchor a to anchor b in a rooted tree defined by "prev" pointers.
-    Returns list of anchor ids in order [a ... b]. Empty if cannot build.
-    """
     if a not in anchors or b not in anchors:
         return []
 
     chain_a = _trace_to_root(anchors, a)
-    if not chain_a:
-        return []
-    ancestors_a = {nid: idx for idx, nid in enumerate(chain_a)}
-
     chain_b = _trace_to_root(anchors, b)
-    if not chain_b:
-        return []
 
+    ancestors_a = {nid: i for i, nid in enumerate(chain_a)}
     lca = None
-    lca_idx_b = None
+    idx_b = None
     for j, nid in enumerate(chain_b):
         if nid in ancestors_a:
             lca = nid
-            lca_idx_b = j
+            idx_b = j
             break
     if lca is None:
         return []
 
-    idx_lca_in_a = ancestors_a[lca]
-    part_a = chain_a[: idx_lca_in_a + 1]          # [a ... lca]
-    part_b = list(reversed(chain_b[: lca_idx_b + 1]))  # [lca ... b]
-    if part_b and part_a and part_b[0] == part_a[-1]:
-        part_b = part_b[1:]  # remove duplicated lca
+    part_a = chain_a[: ancestors_a[lca] + 1]
+    part_b = list(reversed(chain_b[: idx_b + 1]))
+    if part_b and part_a[-1] == part_b[0]:
+        part_b = part_b[1:]
     return part_a + part_b
 
 
 def anchor_ids_to_xy(anchors: Dict[int, dict], ids: List[int]) -> List[Tuple[float, float]]:
-    pts: List[Tuple[float, float]] = []
-    for aid in ids:
-        node = anchors.get(int(aid))
-        if node:
-            pts.append((float(node["x"]), float(node["y"])))
-    return pts
+    return [(anchors[i]["x"], anchors[i]["y"]) for i in ids if i in anchors]
 
 
 # ---------------------------
 # Plotting functions
 # ---------------------------
 
-def _state_to_path_color(state_val) -> str:
+def _state_to_path_color(state):
     try:
-        s = int(state_val)
+        s = int(state)
     except Exception:
         s = 0
     if s == 2:
@@ -153,256 +124,163 @@ def _state_to_path_color(state_val) -> str:
     return COLOR_PATH_PASS
 
 
-def plot_path(ax, anchors: Dict[int, dict]):
-    segments = []
-    colors = []
-    for node in anchors.values():
-        prev = node.get("prev")
-        if prev is None:
+def plot_path(ax, anchors):
+    segs, cols = [], []
+    for n in anchors.values():
+        if n.get("prev") is None:
             continue
-        pnode = anchors.get(int(prev))
-        if pnode is None:
+        p = anchors.get(int(n["prev"]))
+        if p is None:
             continue
-        segments.append([(pnode["x"], pnode["y"]), (node["x"], node["y"])])
-        colors.append(_state_to_path_color(node.get("lste_state")))
-    if segments:
-        lc = LineCollection(segments, colors=colors, linewidths=2.6, alpha=0.85, zorder=1)
-        ax.add_collection(lc)
+        segs.append([(p["x"], p["y"]), (n["x"], n["y"])])
+        cols.append(_state_to_path_color(n.get("lste_state")))
 
-    xs = [n["x"] for n in anchors.values()]
-    ys = [n["y"] for n in anchors.values()]
-    ax.scatter(xs, ys, s=20, c=COLOR_ANCHOR_POINTS, alpha=1.0, zorder=2)
+    if segs:
+        ax.add_collection(LineCollection(segs, colors=cols, linewidths=2.6, alpha=0.85))
+
+    ax.scatter(
+        [n["x"] for n in anchors.values()],
+        [n["y"] for n in anchors.values()],
+        s=20,
+        c=COLOR_ANCHOR_POINTS,
+        zorder=3,
+    )
 
 
-def plot_branches(ax, anchors: Dict[int, dict]):
+def plot_branches(ax, anchors):
     ray_len = 1.2
-    search_segments = []
-    trackback_segments = []
+    s_segs, t_segs = [], []
 
-    for node in anchors.values():
-        x0, y0 = node["x"], node["y"]
-        for br in node.get("branches", []):
-            status = br.get("status", "PENDING")
-            heading = float(br.get("heading_world", 0.0))
-            x1 = x0 + ray_len * math.cos(heading)
-            y1 = y0 + ray_len * math.sin(heading)
-
-            if status == "TRACKBACK":
-                trackback_segments.append([(x0, y0), (x1, y1)])
+    for n in anchors.values():
+        x0, y0 = n["x"], n["y"]
+        for br in n.get("branches", []):
+            h = float(br.get("heading_world", 0.0))
+            x1, y1 = x0 + ray_len * math.cos(h), y0 + ray_len * math.sin(h)
+            if br.get("status") == "TRACKBACK":
+                t_segs.append([(x0, y0), (x1, y1)])
             else:
-                search_segments.append([(x0, y0), (x1, y1)])
+                s_segs.append([(x0, y0), (x1, y1)])
 
-            ax.scatter([x1], [y1], s=80, marker="*", color=COLOR_INTEREST,
-                       edgecolors="white", linewidths=0.5, zorder=4)
+            ax.scatter([x1], [y1], s=80, marker="*", color=COLOR_INTEREST, zorder=4)
 
-    if search_segments:
-        lc_search = LineCollection(search_segments, colors=COLOR_BRANCH_SEARCH,
-                                   linewidths=2.0, alpha=0.9, zorder=3)
-        ax.add_collection(lc_search)
-    if trackback_segments:
-        lc_tb = LineCollection(trackback_segments, colors=COLOR_BRANCH_TRACKBACK,
-                               linewidths=2.0, alpha=0.9, zorder=3)
-        ax.add_collection(lc_tb)
+    if s_segs:
+        ax.add_collection(LineCollection(s_segs, colors=COLOR_BRANCH_SEARCH, linewidths=2))
+    if t_segs:
+        ax.add_collection(LineCollection(t_segs, colors=COLOR_BRANCH_TRACKBACK, linewidths=2))
 
 
-def plot_pose(ax, pose: dict):
-    x, y = pose.get("x"), pose.get("y")
-    if x is None or y is None:
-        return
-    ax.scatter([x], [y], s=120, marker="*", color=COLOR_ROBOT,
-               edgecolors="black", linewidths=0.8, zorder=10)
+def plot_pose(ax, pose):
+    if "x" in pose and "y" in pose:
+        ax.scatter([pose["x"]], [pose["y"]], s=120, marker="*", color=COLOR_ROBOT, zorder=6)
 
 
-def plot_state_switches(ax, data: dict, anchors: Dict[int, dict]):
-    """
-    在状态变化处标记 ♻，位置取 state_events 的 anchor_id；如缺失则用事件 pose 最近的 anchor。
-    """
-    events = data.get("state_events") or []
-    if not isinstance(events, list):
-        return
-
-    def nearest_anchor_id(x: float, y: float) -> Optional[int]:
-        best = None
-        best_d2 = None
-        for aid, n in anchors.items():
-            dx = float(n["x"]) - x
-            dy = float(n["y"]) - y
-            d2 = dx * dx + dy * dy
-            if best_d2 is None or d2 < best_d2:
-                best = aid
-                best_d2 = d2
-        return best
-
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-
-        xy = None
-        aid = ev.get("anchor_id")
-        try:
-            if aid is not None and int(aid) in anchors:
-                n = anchors[int(aid)]
-                xy = (float(n["x"]), float(n["y"]))
-        except Exception:
-            xy = None
-
-        if xy is None:
-            pose = ev.get("pose") or {}
-            try:
-                px = float(pose.get("x"))
-                py = float(pose.get("y"))
-                na = nearest_anchor_id(px, py)
-                if na is not None and na in anchors:
-                    n = anchors[na]
-                    xy = (float(n["x"]), float(n["y"]))
-            except Exception:
-                xy = None
-
-        if xy is None:
-            continue
-
-        ax.text(
-            xy[0],
-            xy[1],
-            "\u267B",  # ♻
-            color=COLOR_STATE_SWITCH,
-            fontsize=14,
-            ha="center",
-            va="center",
-            zorder=9,
-        )
-
-
-def plot_backtrack(ax, data: dict, anchors: Dict[int, dict]):
-    """
-    ONLY draw completed backtrack sessions:
-    - Source: backtrack_history (dict sessions)
-    - Condition: sess has "finished" (not None)
-    - Draw:
-      * Backtrack start pose (purple star)
-      * Full backtrack path in amber (reconstructed by start_anchor -> end_anchor)
-    """
-    history = data.get("backtrack_history") or []
-    if not (history and isinstance(history, list) and isinstance(history[0], dict)):
-        return
-
-    amber_line_segments = []
-
-    for sess in history:
-        # Only completed sessions
+def plot_backtrack(ax, data, anchors):
+    segs = []
+    for sess in data.get("backtrack_history", []):
         if sess.get("finished") is None:
             continue
 
-        # Purple star: session start_pose (if available)
-        sp = sess.get("start_pose") or {}
-        if sp.get("x") is not None and sp.get("y") is not None:
-            ax.scatter([float(sp["x"])], [float(sp["y"])], s=120, marker="*",
-                       color=COLOR_BACKTRACK_START, edgecolors="white", linewidths=0.5, zorder=6)
+        sp = sess.get("start_pose", {})
+        if "x" in sp and "y" in sp:
+            ax.scatter([sp["x"]], [sp["y"]], s=120, marker="*", color=COLOR_BACKTRACK_START)
 
-        # Prefer reconstruct full path from start_anchor -> end_anchor
-        sa = sess.get("start_anchor")
-        ea = sess.get("end_anchor")
-        sa_i, ea_i = None, None
+        pts = []
         try:
-            sa_i = int(sa) if sa is not None else None
-            ea_i = int(ea) if ea is not None else None
+            pts = anchor_ids_to_xy(
+                anchors,
+                path_between_anchors_tree(
+                    anchors, int(sess["start_anchor"]), int(sess["end_anchor"])
+                ),
+            )
         except Exception:
-            sa_i, ea_i = None, None
+            pass
 
-        pts: List[Tuple[float, float]] = []
-        if sa_i is not None and ea_i is not None:
-            full_ids = path_between_anchors_tree(anchors, sa_i, ea_i)
-            pts = anchor_ids_to_xy(anchors, full_ids)
-
-        # Fallback: use sess["path"] if reconstruction failed
         if len(pts) < 2:
-            path_ids = sess.get("path") or []
-            pts = anchor_ids_to_xy(anchors, path_ids)
+            pts = anchor_ids_to_xy(anchors, sess.get("path", []))
 
-        # Add segments for LineCollection
-        if len(pts) >= 2:
-            for i in range(len(pts) - 1):
-                amber_line_segments.append([pts[i], pts[i + 1]])
+        for i in range(len(pts) - 1):
+            segs.append([pts[i], pts[i + 1]])
 
-    if amber_line_segments:
-        lc = LineCollection(
-            amber_line_segments,
-            colors=COLOR_BRANCH_TRACKBACK,
-            linewidths=3.0,
-            alpha=0.55,
-            zorder=1.6
+    if segs:
+        ax.add_collection(
+            LineCollection(segs, colors=COLOR_BRANCH_TRACKBACK, linewidths=3.0, alpha=0.55)
         )
-        ax.add_collection(lc)
+
+
+def plot_state_switches(ax, data, anchors):
+    for ev in data.get("state_events", []):
+        aid = ev.get("anchor_id")
+        if aid is not None and int(aid) in anchors:
+            n = anchors[int(aid)]
+            ax.text(
+                n["x"], n["y"], "♻",
+                color=COLOR_STATE_SWITCH,
+                fontsize=14,
+                ha="center",
+                va="center",
+                zorder=7,
+            )
 
 
 def create_custom_legend(ax):
-    legend_elements = [
-        mlines.Line2D([], [], color='white', marker='o', markerfacecolor=COLOR_ANCHOR_POINTS,
-                      markersize=8, label='anchor'),
-
-        mlines.Line2D([], [], color=COLOR_PATH_PASS, linewidth=3, label='path (PASS)'),
-        mlines.Line2D([], [], color=COLOR_PATH_SUS, linewidth=3, label='path (SUS)'),
-        mlines.Line2D([], [], color=COLOR_PATH_LOCKED, linewidth=3, label='path (LOCKED)'),
-
-        mlines.Line2D([], [], color=COLOR_BRANCH_SEARCH, linewidth=2, label='branch search'),
-
-        mlines.Line2D([], [], color=COLOR_BRANCH_TRACKBACK, linewidth=2, label='branch trackback'),
-
-        mlines.Line2D([], [], color='white', marker='*', markerfacecolor=COLOR_INTEREST,
-                      markersize=10, label='interest'),
-
-        mlines.Line2D([], [], color='white', marker='*', markerfacecolor=COLOR_BACKTRACK_START,
-                      markersize=10, label='backtrack start'),
-
-        mlines.Line2D([], [], color='white', marker='*', markerfacecolor=COLOR_ROBOT, markeredgecolor='black',
-                      markersize=10, label='robot pose'),
-
-        mlines.Line2D([], [], color='white', marker='$\u267B$', markerfacecolor=COLOR_STATE_SWITCH,
-                      markeredgecolor=COLOR_STATE_SWITCH, markersize=12, label='state switch'),
+    items = [
+        mlines.Line2D([], [], marker="o", color="white", markerfacecolor=COLOR_ANCHOR_POINTS, label="anchor"),
+        mlines.Line2D([], [], color=COLOR_PATH_PASS, lw=3, label="path (PASS)"),
+        mlines.Line2D([], [], color=COLOR_PATH_SUS, lw=3, label="path (SUS)"),
+        mlines.Line2D([], [], color=COLOR_PATH_LOCKED, lw=3, label="path (LOCKED)"),
+        mlines.Line2D([], [], color=COLOR_BRANCH_SEARCH, lw=2, label="branch search"),
+        mlines.Line2D([], [], color=COLOR_BRANCH_TRACKBACK, lw=2, label="branch trackback"),
+        mlines.Line2D([], [], marker="*", color="white", markerfacecolor=COLOR_INTEREST, label="interest"),
+        mlines.Line2D([], [], marker="*", color="white", markerfacecolor=COLOR_BACKTRACK_START, label="backtrack start"),
+        mlines.Line2D([], [], marker="*", color="white", markerfacecolor=COLOR_ROBOT, label="robot pose"),
+        mlines.Line2D([], [], marker="$♻$", color=COLOR_STATE_SWITCH, label="state switch"),
     ]
 
-    ax.legend(handles=legend_elements, loc="lower left", frameon=True, framealpha=0.9, fontsize=10)
+    ax.legend(
+        handles=items,
+        loc="lower left",
+        bbox_to_anchor=(1.0, 0.0),   # ⭐ 右下角（轴外）
+        bbox_transform=ax.transAxes,
+        frameon=True,
+        framealpha=0.95,
+        fontsize=10,
+    )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize Access-Topo JSON (Custom Colors).")
-    parser.add_argument("--json", help="Path to access_topo_*.json")
-    parser.add_argument("--tree-dir", default="/home/zrz/lste_ws/src/lste_topo_access/topo_tree/tree",
-                        help="Root directory to search for latest json")
-    parser.add_argument("--save", help="Save figure to file.")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json")
+    parser.add_argument("--tree-dir", default="/home/zrz/lste_ws/src/lste_topo_access/topo_tree/tree")
+    parser.add_argument("--save")
     args = parser.parse_args()
 
-    if args.json:
-        json_path = args.json
-    else:
-        json_path = find_latest_json(args.tree_dir)
-        if json_path is None:
-            print(f"No access_topo_*.json found under {args.tree_dir}")
-            return
+    json_path = args.json or find_latest_json(args.tree_dir)
+    if not json_path:
+        print("No json found.")
+        return
 
     data = load_json(json_path)
     anchors = build_anchor_map(data.get("nodes", []))
 
     plt.figure(figsize=(10, 10))
+    plt.subplots_adjust(right=0.78)  # ⭐ 给右侧 legend 腾空间
     ax = plt.gca()
-    ax.set_aspect("equal", adjustable="box")
+    ax.set_aspect("equal")
     ax.set_facecolor("#f5f7fa")
 
     plot_path(ax, anchors)
     plot_branches(ax, anchors)
-    plot_backtrack(ax, data, anchors)  # <-- only completed sessions
+    plot_backtrack(ax, data, anchors)
     plot_pose(ax, data.get("pose", {}))
     plot_state_switches(ax, data, anchors)
 
     create_custom_legend(ax)
 
-    ax.set_title(f"Access-Topo: {os.path.basename(json_path)}", fontsize=12)
-    ax.grid(True, linestyle="--", color="#d0d7de", alpha=0.7)
-    plt.tight_layout()
+    ax.set_title(f"Access-Topo: {os.path.basename(json_path)}")
+    ax.grid(True, linestyle="--", alpha=0.6)
 
     if args.save:
         plt.savefig(args.save, dpi=200)
-        print(f"Saved to {args.save}")
     else:
         plt.show()
 
