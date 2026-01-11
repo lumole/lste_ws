@@ -22,9 +22,9 @@
         output="screen">
 
     <!-- 占据球面配置：oc_srfc_rds 为占据面半径（激光最大考虑距离，单位 m） -->
-    <param name="oc_srfc_rds" value="5.0" />
+    <param name="oc_srfc_rds" value="4.0" />
     <!-- 点云下采样步长：每隔 pcl_skp 个角度方向保留一个，用于减小 GP 训练点数量 -->
-    <param name="pcl_skp" value="4" />
+    <param name="pcl_skp" value="2" />
 
     <!-- GP 相关参数：gp_nav_indpts_sz 为稀疏 GP 的诱导点数量，值越大越准但越慢 -->
     <param name="gp_nav_indpts_sz"   value="400" />
@@ -36,10 +36,10 @@
     <!-- gap_k_dst 控制与全局目标距离项权重（越大越偏向靠近全局目标的 frontier） -->
     <param name="gap_k_dst"       value="5.0" />
     <!-- gp_nav_goal_dst 为子目标距离机器人中心的标称半径（导航点所在球面的半径，单位 m） -->
-    <param name="gp_nav_goal_dst" value="5.0" />
+    <param name="gp_nav_goal_dst" value="4.0" />
 
     <!-- 可视化参数：gp_nav_var_viz 为在 RViz 中绘制方差/占据球壳的半径（单位 m） -->
-    <param name="gp_nav_var_viz"     value="5.0" />
+    <param name="gp_nav_var_viz"     value="4.0" />
     <!-- gp_nav_var_img_viz 控制是否弹出方差二值图窗口用于调试阈值（true 打开，false 关闭） -->
     <param name="gp_nav_var_img_viz" value="false" />
     <!-- frontier 日志 -->

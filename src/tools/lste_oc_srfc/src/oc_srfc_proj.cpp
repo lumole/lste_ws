@@ -111,9 +111,10 @@ int main(int argc, char** argv)
   ros::NodeHandle pnh("~");
 
   pnh.param<std::string>("lidar_frame", lidar_frame, "os_sensor");
-  nh.param<float>("oc_srfc_rds", oc_srfc_rds, 5.0f);
-  nh.param<float>("org_oc_srfc_rds_viz", org_oc_srfc_rds_viz, 5.0f);
-  nh.param<float>("proj_lfrq", proj_lfrq, 10.0f);
+  // Use private parameters so launch-file settings (~oc_srfc_rds, etc.) take effect.
+  pnh.param<float>("oc_srfc_rds", oc_srfc_rds, 5.0f);
+  pnh.param<float>("org_oc_srfc_rds_viz", org_oc_srfc_rds_viz, 5.0f);
+  pnh.param<float>("proj_lfrq", proj_lfrq, 10.0f);
 
   print_param();
 
