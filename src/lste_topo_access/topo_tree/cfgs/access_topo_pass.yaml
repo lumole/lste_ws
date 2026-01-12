@@ -18,8 +18,8 @@ cluster_stable_duration: 3.0
 cluster_lost_timeout: 2.0
 
 # 路口窗口结束条件
-junction_finalize_dist: 5.0
-junction_finalize_timeout: 10.0
+junction_finalize_dist: 5.5
+junction_finalize_timeout: 15.0
 
 # 路口会话触发
 junction_enter_confirm_sec: 1.0

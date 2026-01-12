@@ -19,7 +19,7 @@ cluster_lost_timeout: 1.0
 
 # 路口窗口结束条件（更快固化）
 junction_finalize_dist: 4.0
-junction_finalize_timeout: 8.0
+junction_finalize_timeout: 10.0
 
 # 路口会话触发（更敏感）
 junction_enter_confirm_sec: 0.8
