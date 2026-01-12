@@ -6,7 +6,7 @@ WS: /home/zrz/lste_ws
 SESSION: lste
 
 # World and task
-WORLD: worlds/topo3.0_catch_mode/env04.world
+WORLD: worlds/topo3.0_catch_mode/test3_0.world
 TASK_JSON: /home/zrz/lste_ws/model/Data_exchange/vlm_prompt/lab/yellow_cup.json
 TASK_ID: yellow_cup
 
