@@ -32,6 +32,7 @@ class DetectionVisualizer:
         self.latest_scores = None  # type: LsteScores
         self.latest_task = None  # type: LsteTask
         self.latest_state = None  # type: LsteState
+        self.task_done = False
 
         self.image_topic = rospy.get_param("~image_topic", "/kinect/hd/image_color_rect")
         self.detections_topic = rospy.get_param("~detections_topic", "/lste/detections")
@@ -81,6 +82,7 @@ class DetectionVisualizer:
         self.sub_scores = rospy.Subscriber(self.scores_topic, LsteScores, self.on_scores, queue_size=1)
         self.sub_task = rospy.Subscriber("/lste/task", LsteTask, self.on_task, queue_size=1)
         self.sub_state = rospy.Subscriber(self.state_topic, LsteState, self.on_state, queue_size=1)
+        self.sub_task_done = rospy.Subscriber("/lste/task_done", Bool, self.on_task_done, queue_size=1)
         self.sub_robot_pose = rospy.Subscriber("/rbt_pose", Pose2D, self.on_robot_pose, queue_size=1)
         self.sub_camera_info = rospy.Subscriber(self.camera_info_topic, CameraInfo, self.on_camera_info, queue_size=1)
         # 只订阅 /lste/final_goal 作为全局目标
@@ -108,9 +110,17 @@ class DetectionVisualizer:
 
     def on_task(self, msg: LsteTask):
         self.latest_task = msg
+        # 新任务默认清除 task_done 标志
+        self.task_done = False
 
     def on_state(self, msg: LsteState):
         self.latest_state = msg
+
+    def on_task_done(self, msg: Bool):
+        try:
+            self.task_done = bool(msg.data)
+        except Exception:
+            self.task_done = False
 
     def on_camera_info(self, msg: CameraInfo):
         try:
@@ -314,10 +324,15 @@ class DetectionVisualizer:
         status = "SEARCHING"
         status_color = (50, 70, 220)  # blue
         subtype_text = ""
-        if state is not None:
+        if self.task_done:
+            status = "DONE"
+            status_color = (0, 200, 0)
+        elif state is not None:
             if state.state == 1:
                 status = "SUSPICIOUS"
                 status_color = (0, 165, 255)  # orange
+                if state.subtype:
+                    subtype_text = f"SUSPICIOUS-{state.subtype}"
             elif state.state == 2:
                 status = "LOCKED"
                 status_color = (72, 210, 170)  # green
@@ -327,11 +342,12 @@ class DetectionVisualizer:
             else:
                 status = "PASS"
                 status_color = (50, 70, 220)
-            subtype_text = state.subtype or ""
         else:
             if scores.detected:
                 status = "LOCKED"
                 status_color = (72, 210, 170)
+        if not subtype_text and state is not None and state.subtype:
+            subtype_text = state.subtype
         title = f"S_total {scores.s_total:.2f}"
         cv2.putText(
             image,

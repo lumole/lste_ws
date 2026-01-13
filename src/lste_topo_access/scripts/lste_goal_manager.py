@@ -15,7 +15,7 @@ import rospy
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Pose2D, PoseStamped, PointStamped, Vector3Stamped, TransformStamped, Twist
 from sensor_msgs.msg import Image, CameraInfo, LaserScan
-from std_msgs.msg import UInt8
+from std_msgs.msg import UInt8, Bool
 from image_geometry import PinholeCameraModel
 import tf2_ros
 from tf.transformations import quaternion_matrix, quaternion_from_euler
@@ -53,6 +53,12 @@ class GoalManager:
         self.depth_topic = gp("~depth_topic", "/kinect/hd/image_depth_rect")
         self.image_topic = gp("~image_topic", "/kinect/hd/image_color_rect")
         self.use_depth = bool(gp("~use_depth", False))  # 默认关闭深度，当前环境无 depth
+        # follow 模式鲁棒性参数
+        self.follow_target_lost_timeout = float(gp("~follow_target_lost_timeout", 10.0))
+        self.follow_ctx_lost_timeout = float(gp("~follow_ctx_lost_timeout", 5.0))
+        self.follow_min_update_period = float(gp("~follow_min_update_period", 0.3))
+        self.follow_heading_alpha = float(gp("~follow_heading_alpha", 0.5))
+        self.follow_locked_done_time = float(gp("~follow_locked_done_time", 10.0))
         # 激光裁剪相关
         self.scan_topic = gp("~scan_topic", "/pro3/rl_scan")
         self.scan_frame = gp("~scan_frame", "")  # 留空则使用 scan.header.frame_id
@@ -93,6 +99,15 @@ class GoalManager:
         # Access-Topo 覆盖
         self.access_mode = 0
         self.access_backtrack_goal: Optional[PoseStamped] = None
+        # follow 模式内部计时与缓存
+        self.target_last_seen: Optional[float] = None
+        self.target_last_goal: Optional[PoseStamped] = None
+        self.target_last_update: float = 0.0
+        self.locked_enter_time: Optional[float] = None
+        self.task_done_published = False
+        self.ctx_start_time: Optional[float] = None
+        self.ctx_last_goal: Optional[PoseStamped] = None
+        self.ctx_last_update: float = 0.0
 
         # 模式：base_mode 直接由 state/subtype 映射得到；后续可在 effective_mode 上做 override
         self.base_mode = EXPLORE_PASS_MODE
@@ -112,6 +127,8 @@ class GoalManager:
 
         # 发布
         self.pub_goal = rospy.Publisher("/lste/final_goal", PoseStamped, queue_size=1)
+        self.pub_access_mode = rospy.Publisher("/lste/access_topo/active_mode", String, queue_size=1, latch=True)
+        self.pub_task_done = rospy.Publisher("/lste/task_done", Bool, queue_size=1, latch=True)
 
         # 订阅
         self.sub_state = rospy.Subscriber("/lste/state", LsteState, self.on_state, queue_size=1)
@@ -138,6 +155,13 @@ class GoalManager:
         self.latest_state_msg = msg
         self.current_state = msg.state
         self.current_subtype = msg.subtype or ""
+        now = rospy.Time.now().to_sec()
+        # 记录 LOCKED 持续时间
+        if self.current_state == STATE_LOCKED:
+            if self.locked_enter_time is None:
+                self.locked_enter_time = now
+        else:
+            self.locked_enter_time = None
 
         # 基于 state/subtype 冻结基础模式；后续 override（犹豫/降级）统一在 effective_mode 上做
         new_base = self.mode_from_state(self.current_state, self.current_subtype)
@@ -260,15 +284,17 @@ class GoalManager:
         if self.access_mode in (1, 2) and self.access_backtrack_goal is not None:
             return self.access_backtrack_goal
 
+        now = rospy.Time.now().to_sec()
+
         # 基于 effective_mode 分发（后续犹豫/降级都在 effective_mode 上动手）
         if self.effective_mode == EXPLORE_PASS_MODE:
             return self.goal_from_frontiers_prior()
         if self.effective_mode == EXPLORE_SUS_C_MODE:
             return self.goal_from_frontiers_prior()
         if self.effective_mode == CATCH_TARGET_MODE:
-            return self.goal_from_target()
+            return self.goal_from_target_follow(now)
         if self.effective_mode == CATCH_CTX_MODE:
-            return self.goal_from_ctx_mid()
+            return self.goal_from_ctx_follow(now)
         # 未知模式：保持现状
         rospy.logwarn_throttle(5.0, "GoalManager: unknown mode=%s", str(self.effective_mode))
         return None
@@ -287,44 +313,101 @@ class GoalManager:
         # 默认 PASS
         return EXPLORE_PASS_MODE
 
-    def goal_from_target(self) -> Optional[PoseStamped]:
+    # -------------------- Follow helpers --------------------
+    def goal_from_target_follow(self, now: float) -> Optional[PoseStamped]:
+        goal = None
         det = self.pick_best_target()
-        if det is None:
-            rospy.logwarn_throttle(5.0, "GoalManager: no target det available for target-based goal")
-            return None
-        heading_world = self.det_heading_world(det)
-        if heading_world is None:
-            return None
-        dist = self.clip_distance(heading_world, self.goal_dist_det)
-        if dist is None:
-            return None
-        x = self.latest_pose.x + dist * math.cos(heading_world)
-        y = self.latest_pose.y + dist * math.sin(heading_world)
-        return self.make_goal_pose((x, y, 0.0), heading_world)
+        if det is not None:
+            heading_world = self.det_heading_world(det)
+            if heading_world is not None:
+                dist = self.clip_distance(heading_world, self.goal_dist_det)
+                if dist is not None:
+                    x = self.latest_pose.x + dist * math.cos(heading_world)
+                    y = self.latest_pose.y + dist * math.sin(heading_world)
+                    if self.follow_heading_alpha and self.target_last_goal is not None:
+                        prev_yaw = self.yaw_from_pose(self.target_last_goal)
+                        if prev_yaw is not None:
+                            heading_world = self._slerp_yaw(prev_yaw, heading_world, self.follow_heading_alpha)
+                    goal = self.make_goal_pose((x, y, 0.0), heading_world)
+                    self.target_last_seen = now
+                    if (now - self.target_last_update) >= self.follow_min_update_period:
+                        self.target_last_goal = goal
+                        self.target_last_update = now
+        if goal is None:
+            if self.target_last_seen is not None and (now - self.target_last_seen) < self.follow_target_lost_timeout:
+                return self.target_last_goal
+            if self.effective_mode == CATCH_TARGET_MODE:
+                rospy.loginfo_throttle(2.0, "GoalManager: target lost >= %.1fs, fallback to explore_sus_c_mode",
+                                       self.follow_target_lost_timeout)
+                self.effective_mode = EXPLORE_SUS_C_MODE
+                self.pub_access_mode.publish(String(data=self.effective_mode))
+                self.target_last_goal = None
+            return self.goal_from_frontiers_prior()
 
-    def goal_from_ctx_mid(self) -> Optional[PoseStamped]:
+        # LOCKED 完成判定
+        if self.current_state == STATE_LOCKED and self.locked_enter_time is not None:
+            if (now - self.locked_enter_time) >= self.follow_locked_done_time and not self.task_done_published:
+                rospy.loginfo("GoalManager: LOCKED for %.1fs, publish task_done", self.follow_locked_done_time)
+                self.pub_task_done.publish(Bool(data=True))
+                self.task_done_published = True
+        return goal
+
+    def goal_from_ctx_follow(self, now: float) -> Optional[PoseStamped]:
+        if self.ctx_start_time is None:
+            self.ctx_start_time = now
+
+        # ctx 期间检测到 target：直接切到 target 模式
+        if self.pick_best_target() is not None:
+            self.effective_mode = CATCH_TARGET_MODE
+            self.pub_access_mode.publish(String(data=self.effective_mode))
+            self.ctx_start_time = None
+            return self.goal_from_target_follow(now)
+
+        goal = None
         ctx_dets = self.pick_ctx_dets()
-        if len(ctx_dets) == 0:
-            rospy.logwarn_throttle(5.0, "GoalManager: no ctx detections for Sus-B")
-            return None
-        dirs = []
-        for d in ctx_dets[:2]:
-            h = self.det_heading_world(d)
-            if h is not None:
-                dirs.append(h)
-        if len(dirs) == 0:
-            return None
-        if len(dirs) == 1:
-            heading_world = dirs[0]
-        else:
-            v = np.array([math.cos(dirs[0]) + math.cos(dirs[1]), math.sin(dirs[0]) + math.sin(dirs[1])])
-            heading_world = math.atan2(v[1], v[0])
-        dist = self.clip_distance(heading_world, self.goal_dist_det)
-        if dist is None:
-            return None
-        x = self.latest_pose.x + dist * math.cos(heading_world)
-        y = self.latest_pose.y + dist * math.sin(heading_world)
-        return self.make_goal_pose((x, y, 0.0), heading_world)
+        if len(ctx_dets) >= 1:
+            dirs = []
+            for d in ctx_dets[:2]:
+                h = self.det_heading_world(d)
+                if h is not None:
+                    dirs.append(h)
+            if len(dirs) == 1:
+                heading_world = dirs[0]
+            elif len(dirs) >= 2:
+                v = np.array([math.cos(dirs[0]) + math.cos(dirs[1]), math.sin(dirs[0]) + math.sin(dirs[1])])
+                heading_world = math.atan2(v[1], v[0])
+            else:
+                heading_world = None
+            if heading_world is not None:
+                dist = self.clip_distance(heading_world, self.goal_dist_det)
+                if dist is not None:
+                    x = self.latest_pose.x + dist * math.cos(heading_world)
+                    y = self.latest_pose.y + dist * math.sin(heading_world)
+                    if self.follow_heading_alpha and self.ctx_last_goal is not None:
+                        prev_yaw = self.yaw_from_pose(self.ctx_last_goal)
+                        if prev_yaw is not None:
+                            heading_world = self._slerp_yaw(prev_yaw, heading_world, self.follow_heading_alpha)
+                    if (now - self.ctx_last_update) >= self.follow_min_update_period:
+                        goal = self.make_goal_pose((x, y, 0.0), heading_world)
+                        self.ctx_last_goal = goal
+                        self.ctx_last_update = now
+
+        # ctx 窗口过期：回到探索
+        if (now - self.ctx_start_time) >= self.follow_ctx_lost_timeout:
+            if goal is None:
+                goal = self.ctx_last_goal
+            rospy.loginfo_throttle(2.0, "GoalManager: ctx window %.1fs expired, switch to explore_sus_c_mode",
+                                   self.follow_ctx_lost_timeout)
+            self.effective_mode = EXPLORE_SUS_C_MODE
+            self.pub_access_mode.publish(String(data=self.effective_mode))
+            self.ctx_start_time = None
+            return goal if goal is not None else self.goal_from_frontiers_prior()
+
+        if goal is None and self.ctx_last_goal is not None:
+            return self.ctx_last_goal
+        if goal is None:
+            return self.goal_from_frontiers_prior()
+        return goal
 
     def goal_from_frontier(self, period_mode: str) -> Optional[PoseStamped]:
         if self.latest_frontier is None:
@@ -503,6 +586,20 @@ class GoalManager:
                 hits.append(d)
         hits.sort(key=lambda d: float(d.score), reverse=True)
         return hits
+
+    def yaw_from_pose(self, pose: PoseStamped) -> Optional[float]:
+        try:
+            q = pose.pose.orientation
+            mat = quaternion_matrix([q.x, q.y, q.z, q.w])
+            return math.atan2(mat[1, 0], mat[0, 0])
+        except Exception:
+            return None
+
+    def _slerp_yaw(self, prev: float, new: float, alpha: float) -> float:
+        """简单对 yaw 做插值，避免大跳变。"""
+        delta = wrap_angle(new - prev)
+        blended = prev + alpha * delta
+        return wrap_angle(blended)
 
     # -------------------- Projection --------------------
     def det_heading_world(self, det: LsteDetection) -> Optional[float]:
