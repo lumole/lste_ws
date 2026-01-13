@@ -62,7 +62,7 @@ rosrun vanish_point_detection vanish_point_detection.py
 ```bash
 # 启动基础环境
 roslaunch lste_core lab_with_pro3.launch \
-  world_name:=/home/zrz/lste_ws/worlds/topo3.0_catch_mode/test3_0.world \
+  world_name:=/home/zrz/lste_ws/worlds/topo3.0_catch_mode/session_test/test3_0.world \
   spawn_pro3:=false
 
   

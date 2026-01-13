@@ -19,6 +19,7 @@ import tf2_ros
 import tf2_geometry_msgs  # noqa: F401  # 注册 Point/PointStamped 的 TF 转换
 from image_geometry import PinholeCameraModel
 
+from std_msgs.msg import Bool
 from lste_msgs.msg import LsteDetections, LsteDetection, LsteScores, LsteTask, LsteState
 
 
@@ -329,10 +330,18 @@ class DetectionVisualizer:
             status_color = (0, 200, 0)
         elif state is not None:
             if state.state == 1:
-                status = "SUSPICIOUS"
                 status_color = (0, 165, 255)  # orange
-                if state.subtype:
-                    subtype_text = f"SUSPICIOUS-{state.subtype}"
+                raw_subtype = (state.subtype or "").strip()
+                suffix = ""
+                if raw_subtype:
+                    low = raw_subtype.lower()
+                    if low.startswith("sus-"):
+                        suffix = low.split("-", 1)[1].strip().upper()
+                    else:
+                        suffix = raw_subtype.strip().upper()
+                if suffix not in ("A", "B", "C"):
+                    suffix = "C"  # 兜底显示 SUSPICIOUS-C
+                status = f"SUSPICIOUS-{suffix}"
             elif state.state == 2:
                 status = "LOCKED"
                 status_color = (72, 210, 170)  # green
@@ -346,7 +355,7 @@ class DetectionVisualizer:
             if scores.detected:
                 status = "LOCKED"
                 status_color = (72, 210, 170)
-        if not subtype_text and state is not None and state.subtype:
+        if not subtype_text and state is not None and state.state != 1 and state.subtype:
             subtype_text = state.subtype
         title = f"S_total {scores.s_total:.2f}"
         cv2.putText(
@@ -359,10 +368,12 @@ class DetectionVisualizer:
             2,
             cv2.LINE_AA,
         )
+        status_size, _ = cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        status_x = max(x0 + 12, x1 - 12 - status_size[0])
         cv2.putText(
             image,
             status,
-            (x1 - 120, y0 + 24),
+            (status_x, y0 + 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             status_color,
@@ -370,10 +381,12 @@ class DetectionVisualizer:
             cv2.LINE_AA,
         )
         if subtype_text:
+            subtype_size, _ = cv2.getTextSize(subtype_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            subtype_x = max(x0 + 12, x1 - 12 - subtype_size[0])
             cv2.putText(
                 image,
                 subtype_text,
-                (x1 - 120, y0 + 46),
+                (subtype_x, y0 + 46),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 (230, 230, 230),

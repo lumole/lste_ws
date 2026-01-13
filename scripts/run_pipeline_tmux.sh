@@ -43,6 +43,7 @@ ACCESS_TOPO_CONFIG_SUS_C=${ACCESS_TOPO_CONFIG_SUS_C:-${CFG_ACCESS_TOPO_CONFIG_SU
 ACCESS_TOPO_TEST_NAME=${ACCESS_TOPO_TEST_NAME:-${CFG_ACCESS_TOPO_TEST_NAME:-default_test}}
 ACCESS_TOPO_RUN_NAME=${ACCESS_TOPO_RUN_NAME:-${CFG_ACCESS_TOPO_RUN_NAME:-$ACCESS_TOPO_TEST_NAME}}
 GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-${CFG_GP_FRONTIER_RVIZ:-$WS/src/lste_topo_access/launch/gp_frontier.rviz}}
+GUI=${GUI:-${CFG_GUI:-true}}
 if [[ "$VLLM_PROBE" == */v1 ]]; then
   VLLM_PROBE="$VLLM_PROBE/models"
 fi
@@ -107,7 +108,7 @@ WAIT_ROSCORE='until rostopic list >/dev/null 2>&1; do echo \"waiting for roscore
 
 # 1: 仿真 + 机器人（等待 master 就绪）
 tmux_new_window 1 "$WS" "world" \
-  "$WAIT_ROSCORE; roslaunch lste_core lab_with_pro3.launch world_name:=$WORLD spawn_pro3:=$SPAWN_PRO3"
+  "$WAIT_ROSCORE; roslaunch lste_core lab_with_pro3.launch world_name:=$WORLD spawn_pro3:=$SPAWN_PRO3 gui:=$GUI"
 
 # 2: 发布任务（latched，可随时替换 json/task_id）
 tmux_new_window 2 "$WS" "task" \

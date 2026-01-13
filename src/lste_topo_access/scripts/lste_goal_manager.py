@@ -15,7 +15,7 @@ import rospy
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Pose2D, PoseStamped, PointStamped, Vector3Stamped, TransformStamped, Twist
 from sensor_msgs.msg import Image, CameraInfo, LaserScan
-from std_msgs.msg import UInt8, Bool
+from std_msgs.msg import UInt8, Bool, String
 from image_geometry import PinholeCameraModel
 import tf2_ros
 from tf.transformations import quaternion_matrix, quaternion_from_euler
