@@ -364,20 +364,14 @@ class GoalManager:
             return self.goal_from_target_follow(now)
 
         goal = None
-        ctx_dets = self.pick_ctx_dets()
-        if len(ctx_dets) >= 1:
-            dirs = []
-            for d in ctx_dets[:2]:
-                h = self.det_heading_world(d)
-                if h is not None:
-                    dirs.append(h)
-            if len(dirs) == 1:
-                heading_world = dirs[0]
-            elif len(dirs) >= 2:
-                v = np.array([math.cos(dirs[0]) + math.cos(dirs[1]), math.sin(dirs[0]) + math.sin(dirs[1])])
-                heading_world = math.atan2(v[1], v[0])
-            else:
-                heading_world = None
+        left_det, right_det = self.pick_ctx_pair()
+        if left_det is not None and right_det is not None:
+            # 用两框中心的中点方向
+            mid_det = LsteDetection()
+            mid_det.cx = 0.5 * (float(left_det.cx) + float(right_det.cx))
+            mid_det.cy = 0.5 * (float(left_det.cy) + float(right_det.cy))
+            mid_det.w = mid_det.h = 0.0
+            heading_world = self.det_heading_world(mid_det)
             if heading_world is not None:
                 dist = self.clip_distance(heading_world, self.goal_dist_det)
                 if dist is not None:
@@ -564,28 +558,40 @@ class GoalManager:
         dets = sorted(self.latest_dets.target_dets, key=lambda d: float(d.score), reverse=True)
         return dets[0]
 
-    def pick_ctx_dets(self) -> List[LsteDetection]:
-        if self.latest_dets is None:
-            return []
-        terms = []
-        if self.latest_task:
-            for key in ("ctx_left", "ctx_right"):
-                val = getattr(self.latest_task, key, "")
-                if val:
-                    s = str(val).strip().lower()
-                    if s and s != "none":
-                        terms.append(s)
-        if not terms:
-            return []
-        hits: List[LsteDetection] = []
-        # env_dets + target_dets 都查一遍
-        all_dets = list(self.latest_dets.env_dets) + list(self.latest_dets.target_dets)
-        for d in all_dets:
-            label = (d.label or "").lower()
-            if any(t in label for t in terms):
-                hits.append(d)
-        hits.sort(key=lambda d: float(d.score), reverse=True)
-        return hits
+    def pick_ctx_pair(self) -> Tuple[Optional[LsteDetection], Optional[LsteDetection]]:
+        """
+        返回左右各一个 ctx 检测（label 分别包含 ctx_left / ctx_right），选 2D 中心距离最近的一对。
+        若左右缺任意一侧则返回 (None, None)。
+        """
+        if self.latest_dets is None or self.latest_task is None:
+            return None, None
+        left_term = (self.latest_task.ctx_left or "").strip().lower()
+        right_term = (self.latest_task.ctx_right or "").strip().lower()
+        if not left_term or left_term == "none" or not right_term or right_term == "none":
+            return None, None
+        all_dets: List[LsteDetection] = list(self.latest_dets.env_dets) + list(self.latest_dets.target_dets)
+        left_hits = [d for d in all_dets if left_term in (d.label or "").lower()]
+        right_hits = [d for d in all_dets if right_term in (d.label or "").lower()]
+        if not left_hits or not right_hits:
+            return None, None
+        best_pair: Tuple[Optional[LsteDetection], Optional[LsteDetection]] = (None, None)
+        best_dist = float("inf")
+        for l in left_hits:
+            for r in right_hits:
+                if l is r:
+                    continue  # 左右不能是同一个框
+                try:
+                    dx = float(l.cx) - float(r.cx)
+                    dy = float(l.cy) - float(r.cy)
+                except Exception:
+                    continue
+                d = math.hypot(dx, dy)
+                if d < best_dist:
+                    best_dist = d
+                    best_pair = (l, r)
+        if best_pair[0] is None or best_pair[1] is None:
+            return None, None
+        return best_pair
 
     def yaw_from_pose(self, pose: PoseStamped) -> Optional[float]:
         try:

@@ -139,6 +139,9 @@ def _compute_s_env(
     negative_terms: Iterable[str],
     params: EnvScoreParams,
 ) -> Tuple[float, float, float]:
+    # 如果有效环境检测少于2个，直接不给 env 得分
+    if len(env_pairs) < 2:
+        return 0.0, 0.0, 0.0
     pos_map = env_mod.normalize_terms(positive_terms)
     neg_map = env_mod.normalize_terms(negative_terms)
 

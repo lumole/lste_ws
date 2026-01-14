@@ -13,6 +13,8 @@
   <!-- frontier 日志开关与目录 -->
   <arg name="frontier_log" default="true"/>
   <arg name="frontier_log_dir" default="/home/zrz/lste_ws/src/lste_topo_access/topo_tree/frontier_log"/>
+  <!-- GoalManager: LOCKED 持续多久视为任务完成 -->
+  <arg name="follow_locked_done_time" default="10.0"/>
 
   <!-- 启动的节点属于 lste_topo_access 功能包 -->
   <!-- pkg：包名；type：Python 脚本名；name：节点名；output="screen"：日志打印到终端 -->
@@ -81,5 +83,6 @@
     <param name="depth_topic" value="/kinect/hd/image_depth_rect" />
     <param name="image_topic" value="/kinect/hd/image_color_rect" />
     <param name="use_depth" value="true" />
+    <param name="follow_locked_done_time" value="$(arg follow_locked_done_time)" />
   </node>
 </launch>

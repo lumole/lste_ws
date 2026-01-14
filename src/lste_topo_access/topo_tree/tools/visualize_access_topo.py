@@ -180,8 +180,8 @@ def plot_backtrack(ax, data, anchors):
         if sess.get("finished") is None:
             continue
 
-        sp = sess.get("start_pose", {})
-        if "x" in sp and "y" in sp:
+        sp = sess.get("start_pose", {}) or {}
+        if isinstance(sp, dict) and "x" in sp and "y" in sp:
             ax.scatter([sp["x"]], [sp["y"]], s=120, marker="*", color=COLOR_BACKTRACK_START)
 
         pts = []

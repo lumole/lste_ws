@@ -16,7 +16,7 @@ from typing import Deque, Optional
 import rospy
 from std_msgs.msg import Header
 
-from lste_msgs.msg import LsteScores, LsteState, LsteTask
+from lste_msgs.msg import LsteScores, LsteState, LsteTask, LsteDetections
 
 
 STATE_PASS = 0
@@ -45,6 +45,8 @@ class StateNode:
         self.promising_target = float(gp("~promising_target_thresh", 0.60))
         self.promising_env = float(gp("~promising_env_thresh", 0.35))
         self.promising_ctx = float(gp("~promising_ctx_thresh", 0.35))
+        # 细分 subtype 的检测阈值
+        self.sus_a_score_thresh = float(gp("~sus_a_score_thresh", 0.4))
 
         # 放宽 LOCKED 进入条件（总分/目标分阈值下降，连续帧数减少）
         self.lock_enter_total = float(gp("~lock_total_enter", 0.6))
@@ -80,6 +82,8 @@ class StateNode:
         self.last_promising_time: Optional[float] = None
         self.total_scores_count = 0
         self.locked_unstable_count = 0
+        self.latest_dets: Optional[LsteDetections] = None
+        self.latest_task_msg: Optional[LsteTask] = None
         self.scores_short: Deque[ScoreSample] = collections.deque(maxlen=self.susp_window)
         self.scores_long: Deque[ScoreSample] = collections.deque(maxlen=self.exh_window)
         self.last_published_time = 0.0
@@ -88,6 +92,7 @@ class StateNode:
         self.pub = rospy.Publisher("/lste/state", LsteState, queue_size=10, latch=True)
         self.sub_task = rospy.Subscriber("/lste/task", LsteTask, self.on_task, queue_size=1)
         self.sub_scores = rospy.Subscriber("/lste/scores", LsteScores, self.on_scores, queue_size=20)
+        self.sub_dets = rospy.Subscriber("/lste/detections", LsteDetections, self.on_detections, queue_size=5)
 
         rospy.loginfo("lste_state_node started.")
 
@@ -96,6 +101,10 @@ class StateNode:
         if not self.current_task_id or msg.task_id != self.current_task_id:
             self.reset_task(msg.task_id)
             rospy.loginfo("State reset for new task_id=%s", msg.task_id)
+        self.latest_task_msg = msg
+
+    def on_detections(self, msg: LsteDetections):
+        self.latest_dets = msg
 
     def on_scores(self, msg: LsteScores):
         if not self.allow_task_mismatch and self.current_task_id:
@@ -131,6 +140,8 @@ class StateNode:
         self.scores_short.clear()
         self.scores_long.clear()
         self.last_published_time = 0.0
+        self.latest_dets = None
+        self.latest_task_msg = None
         self.publish_state(rospy.Time.now().to_sec())
 
     def ingest_sample(self, sample: ScoreSample):
@@ -241,13 +252,35 @@ class StateNode:
         return not low_all and self.current_state == STATE_SUSPICIOUS
 
     def pick_suspicious_subtype(self, sample: ScoreSample) -> str:
-        if sample.s_target >= 0.60 and sample.s_env < 0.30 and sample.s_ctx < 0.30:
+        # 按检测结果细分：target>阈值 -> Sus-A；同时命中左右 ctx -> Sus-B；其余默认为 Sus-C
+        if self.has_target_detection():
             return "Sus-A"
-        if sample.s_ctx >= 0.35 and sample.s_ctx >= sample.s_env and sample.s_ctx >= (sample.s_target - 0.10):
+        if self.has_ctx_pair():
             return "Sus-B"
-        if sample.s_env >= 0.35 and sample.s_env > sample.s_ctx and sample.s_env >= (sample.s_target - 0.10):
-            return "Sus-C"
-        return ""
+        return "Sus-C"
+
+    def has_target_detection(self) -> bool:
+        if self.latest_dets is None:
+            return False
+        for det in self.latest_dets.target_dets:
+            try:
+                if float(det.score) >= self.sus_a_score_thresh:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def has_ctx_pair(self) -> bool:
+        if self.latest_dets is None or self.latest_task_msg is None:
+            return False
+        left_term = (self.latest_task_msg.ctx_left or "").strip().lower()
+        right_term = (self.latest_task_msg.ctx_right or "").strip().lower()
+        if not left_term or left_term == "none" or not right_term or right_term == "none":
+            return False
+        all_dets = list(self.latest_dets.env_dets) + list(self.latest_dets.target_dets)
+        has_left = any(left_term in (d.label or "").lower() for d in all_dets)
+        has_right = any(right_term in (d.label or "").lower() for d in all_dets)
+        return has_left and has_right
 
     def should_exhaust(self, now: float) -> bool:
         if self.total_scores_count < self.exh_min_scores:

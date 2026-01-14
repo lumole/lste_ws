@@ -43,6 +43,9 @@ ACCESS_TOPO_CONFIG_SUS_C=${ACCESS_TOPO_CONFIG_SUS_C:-${CFG_ACCESS_TOPO_CONFIG_SU
 ACCESS_TOPO_TEST_NAME=${ACCESS_TOPO_TEST_NAME:-${CFG_ACCESS_TOPO_TEST_NAME:-default_test}}
 ACCESS_TOPO_RUN_NAME=${ACCESS_TOPO_RUN_NAME:-${CFG_ACCESS_TOPO_RUN_NAME:-$ACCESS_TOPO_TEST_NAME}}
 GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-${CFG_GP_FRONTIER_RVIZ:-$WS/src/lste_topo_access/launch/gp_frontier.rviz}}
+SUSPICIOUS_WINDOW=${SUSPICIOUS_WINDOW:-${CFG_SUSPICIOUS_WINDOW:-5}}
+FOLLOW_LOCKED_DONE_TIME=${FOLLOW_LOCKED_DONE_TIME:-${CFG_FOLLOW_LOCKED_DONE_TIME:-4.0}}
+FRONTIER_LOG=${FRONTIER_LOG:-${CFG_FRONTIER_LOG:-true}}
 GUI=${GUI:-${CFG_GUI:-true}}
 if [[ "$VLLM_PROBE" == */v1 ]]; then
   VLLM_PROBE="$VLLM_PROBE/models"
@@ -120,7 +123,7 @@ tmux_new_window 3 "$WS/model/MiniCPM/test" "vllm" \
 
 # 4: 全局目标（/lste/final_goal）
 tmux_new_window 4 "$WS" "goal" \
-  "$WAIT_ROSCORE; rosrun lste_topo_access lste_goal_manager.py"
+  "$WAIT_ROSCORE; rosrun lste_topo_access lste_goal_manager.py _follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME"
 
 # 5: 等待 VLLM 就绪后启动 prompt 节点
 tmux_new_window 5 "$WS" "prompt" \
@@ -149,7 +152,7 @@ tmux_new_window 7 "$WS" "score" \
 
 # 8: state
 tmux_new_window 8 "$WS" "state" \
-  "$WAIT_ROSCORE; rosrun lste_core lste_state_node.py"
+  "$WAIT_ROSCORE; rosrun lste_core lste_state_node.py _suspicious_window:=$SUSPICIOUS_WINDOW"
 
 # 9: 可视化（叠加图 + RViz）
 tmux_new_window 9 "$WS" "vis" \
@@ -166,7 +169,9 @@ tmux_new_window 11 "$WS" "gp_frontier" \
     access_topo_config_pass:=$ACCESS_TOPO_CONFIG_PASS \
     access_topo_config_sus_c:=$ACCESS_TOPO_CONFIG_SUS_C \
     access_topo_test_name:=$ACCESS_TOPO_TEST_NAME \
-    access_topo_run_name:=$ACCESS_TOPO_RUN_NAME"
+    access_topo_run_name:=$ACCESS_TOPO_RUN_NAME \
+    follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME \
+    frontier_log:=$FRONTIER_LOG"
 
 # 12: frontier RViz
 tmux_new_window 12 "$WS" "rviz_frontier" \

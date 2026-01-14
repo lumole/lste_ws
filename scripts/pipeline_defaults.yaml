@@ -20,5 +20,12 @@ ACCESS_TOPO_TEST_NAME: 2601
 ACCESS_TOPO_RUN_NAME: topo_3.0_catch_mode
 GP_FRONTIER_RVIZ: /home/zrz/lste_ws/src/lste_topo_access/launch/gp_frontier.rviz
 
+# State / Goal tuning
+SUSPICIOUS_WINDOW: 5
+FOLLOW_LOCKED_DONE_TIME: 4.0
+
+# Frontier logging toggle (true/false)
+FRONTIER_LOG: false
+
 # Gazebo GUI toggle (true/false)
 GUI: true

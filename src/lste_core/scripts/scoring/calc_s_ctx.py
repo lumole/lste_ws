@@ -237,6 +237,9 @@ def best_ctx_score_for_target(target_entry: DetEntry, others: List[DetEntry], ct
     # 如果完全未命中任何 ctx，给予轻微负分，保持与旧逻辑一致
     if found_count == 0:
         raw = -0.4
+    # 若有两种 ctx 但只命中一种，将理想得分上限收紧至 0.35，避免“半命中”给过高分
+    if ctx_len >= 2 and found_count == 1:
+        raw = min(raw, 0.35)
 
     return {
         "raw_score": raw,
