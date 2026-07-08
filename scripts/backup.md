@@ -1,8 +1,8 @@
 -###################### -pipeline- ################################-
 roslaunch lste_core lab_with_pro3.launch \
-  world_name:=worlds/room.world
+  world_name:=/worlds/topo2.0_explore_mode/place2.world
   
-rosrun lste_core lste_task_node.py _json_path:=/home/zrz/lste_ws/model/Data_exchange/vlm_prompt/lab/yellow_cup.json _task_id:=yellow_cup
+rosrun lste_core lste_task_node.py _json_path:=$LSTE_WS/model/Data_exchange/vlm_prompt/lab/yellow_cup.json _task_id:=yellow_cup
 
 conda activate minicpm
 cd ~/lste_ws/model/MiniCPM/test/
@@ -12,7 +12,7 @@ conda activate minicpm
 rosparam set /lste_prompt_node/vllm_stop_command "pkill -f 'vllm serve'"
 rosrun lste_core lste_prompt_node.py \
   _vllm_base_url:=http://localhost:8000/v1 \
-  _vllm_model_name:=/home/zrz/lste_ws/model/MiniCPM/OpenBMB/MiniCPM4-0___5B
+  _vllm_model_name:=$LSTE_WS/model/MiniCPM/OpenBMB/MiniCPM4-0___5B
 
 conda activate dino
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7
@@ -58,4 +58,4 @@ roslaunch lste_topo_access gp_frontier.launch
 
 roslaunch lste_oc_srfc oc_srfc_proj.launch
 
-rviz -d /home/zrz/lste_ws/src/lste_topo_access/launch/gp_frontier.rviz
+rviz -d $LSTE_WS/src/lste_topo_access/launch/gp_frontier.rviz

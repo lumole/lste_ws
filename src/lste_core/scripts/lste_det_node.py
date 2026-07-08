@@ -3,8 +3,7 @@
 
 """
 lste_det_node
-- 常驻节点：订阅 /lste/task + /lste/prompts + /camera/color/image_raw (+ /lste/state 可选)
-- 复用 /home/zrz/Desktop/LSTE/Data_exchange/8B-05B.py 的 DINO/后处理逻辑
+- 常驻节点：订阅 /lste/task + /lste/prompts + camera image (+ /lste/state 可选)
 - 每次触发检测：prompt_A 走目标检测，prompt_B_list 走环境/上下文检测
 - 输出 /lste/detections（LsteDetections）
 """

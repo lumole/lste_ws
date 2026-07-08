@@ -10,7 +10,9 @@ conda activate dino
 export CUDA_HOME=/usr
 
 # 设置 LD_LIBRARY_PATH（关键！防止 libc10.so 找不到）
-export LD_LIBRARY_PATH=/home/zrz/anaconda3/envs/dino/lib/python3.9/site-packages/torch/lib:$LD_LIBRARY_PATH
+# Auto-detect conda prefix
+_CONDA_PREFIX="${CONDA_PREFIX:-$(conda info --base 2>/dev/null || echo "$HOME/anaconda3")}"
+export LD_LIBRARY_PATH="$_CONDA_PREFIX/envs/dino/lib/python3.9/site-packages/torch/lib:$LD_LIBRARY_PATH"
 
 echo "✅ 环境已配置"
 echo "   - Conda 环境: dino"

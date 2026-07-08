@@ -2482,7 +2482,7 @@
           <geometry>
             <mesh>
               <scale>0.001 0.001 0.001</scale>
-              <uri>/home/zrz/lste_ws/src/tools/autolabor_description/meshes/autolabor_pro1.stl</uri>
+              <uri>model://tools/autolabor_description/meshes/autolabor_pro1.stl</uri>
             </mesh>
           </geometry>
           <material>
@@ -2506,7 +2506,7 @@
           <geometry>
             <mesh>
               <scale>1 1 1</scale>
-              <uri>/home/zrz/lste_ws/src/tools/ouster_description/meshes/os1_64.dae</uri>
+              <uri>model://tools/ouster_description/meshes/os1_64.dae</uri>
             </mesh>
           </geometry>
         </visual>
@@ -2515,7 +2515,7 @@
           <geometry>
             <mesh>
               <scale>1 1 1</scale>
-              <uri>/home/zrz/lste_ws/src/tools/kinect_description/meshes/sensors/kinect.dae</uri>
+              <uri>model://tools/kinect_description/meshes/sensors/kinect.dae</uri>
             </mesh>
           </geometry>
         </visual>
@@ -3127,7 +3127,7 @@
           <pose>0 0 0 0 -0 0</pose>
           <geometry>
             <mesh>
-              <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/base.dae</uri>
+              <uri>model://table_conference_2/meshes/base.dae</uri>
               <scale>1 1 1</scale>
             </mesh>
           </geometry>
@@ -3208,7 +3208,7 @@
           <pose>0 0 0 0 -0 0</pose>
           <geometry>
             <mesh>
-              <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/top.dae</uri>
+              <uri>model://table_conference_2/meshes/top.dae</uri>
               <scale>1 1 1</scale>
             </mesh>
           </geometry>
@@ -3295,7 +3295,7 @@
           <pose>0 0 0 0 -0 0</pose>
           <geometry>
             <mesh>
-              <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/glasses.dae</uri>
+              <uri>model://table_conference_2/meshes/glasses.dae</uri>
               <scale>1 1 1</scale>
             </mesh>
           </geometry>
@@ -3377,7 +3377,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/base.dae</uri>
+                <uri>model://table_conference_2/meshes/base.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -3458,7 +3458,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/top.dae</uri>
+                <uri>model://table_conference_2/meshes/top.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -3545,7 +3545,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/glasses.dae</uri>
+                <uri>model://table_conference_2/meshes/glasses.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -6041,7 +6041,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/base.dae</uri>
+                <uri>model://table_conference_2/meshes/base.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -6122,7 +6122,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/top.dae</uri>
+                <uri>model://table_conference_2/meshes/top.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -6209,7 +6209,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/glasses.dae</uri>
+                <uri>model://table_conference_2/meshes/glasses.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>

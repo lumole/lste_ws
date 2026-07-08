@@ -168,7 +168,7 @@
           <geometry>
             <mesh>
               <scale>0.001 0.001 0.001</scale>
-              <uri>/home/zrz/lste_ws/src/tools/autolabor_description/meshes/autolabor_pro1.stl</uri>
+              <uri>../../../../src/tools/autolabor_description/meshes/autolabor_pro1.stl</uri>
             </mesh>
           </geometry>
           <material>
@@ -192,7 +192,7 @@
           <geometry>
             <mesh>
               <scale>1 1 1</scale>
-              <uri>/home/zrz/lste_ws/src/tools/ouster_description/meshes/os1_64.dae</uri>
+              <uri>../../../../src/tools/ouster_description/meshes/os1_64.dae</uri>
             </mesh>
           </geometry>
         </visual>
@@ -201,7 +201,7 @@
           <geometry>
             <mesh>
               <scale>1 1 1</scale>
-              <uri>/home/zrz/lste_ws/src/tools/kinect_description/meshes/sensors/kinect.dae</uri>
+              <uri>../../../../src/tools/kinect_description/meshes/sensors/kinect.dae</uri>
             </mesh>
           </geometry>
         </visual>

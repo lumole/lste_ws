@@ -7,9 +7,11 @@
 > 仿真 world 文件已迁移到工作区根目录的 `worlds/` 目录，命令里统一用相对路径（如 `worlds/place1.world`）。
 
 ```bash
+# 设置工作区路径（或让脚本自动检测）
+export LSTE_WS=$(pwd)   # 在 lste_ws 目录下执行
+
 # 清理旧的 session (如果存在)
 tmux kill-session -t lste 2>/dev/null || true
-cd /home/zrz/lste_ws
 ./scripts/run_pipeline_tmux.sh
 ```
 
@@ -29,7 +31,7 @@ rostopic pub -r 10 /cmd_vel geometry_msgs/Twist \
 '{linear: {x: 0.2, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}'
 
 # rviz看frontier可视化
-rviz -d /home/zrz/lste_ws/src/lste_topo_access/launch/gp_frontier.rviz
+rviz -d src/lste_topo_access/launch/gp_frontier.rviz
 
 # 能看到发布的 task
 rostopic echo /lste/task
@@ -38,7 +40,7 @@ rostopic echo /lste/task
 rostopic echo /lste/prompts
 
 # 可视化拓扑
-TEST_NAME=topo_3.0_catch_mode bash /home/zrz/lste_ws/src/lste_topo_access/topo_tree/tools/visualize_access_topo.sh
+TEST_NAME=topo_3.0_catch_mode bash src/lste_topo_access/topo_tree/tools/visualize_access_topo.sh
 ```
 
 ### 消失点检测
@@ -56,18 +58,19 @@ rosrun vanish_point_detection vanish_point_detection.py
 ## 🧬 Pipeline Steps (Manual Launch)
 
 如果需要分步调试或手动运行，请按照以下顺序在不同的终端窗口中执行。
+以下路径均相对于 `lste_ws` 工作区根目录，或使用 `$LSTE_WS` 环境变量。
 
 ### 1. 启动仿真环境与任务节点
 
 ```bash
 # 启动基础环境
 roslaunch lste_core lab_with_pro3.launch \
-  world_name:=/home/zrz/lste_ws/worlds/topo3.0_catch_mode/session_test/test3_0.world \
+  world_name:=worlds/topo3.0_catch_mode/session_test/test3_0.world \
   spawn_pro3:=false
 
   
 # 启动任务节点
-rosrun lste_core lste_task_node.py _json_path:=/home/zrz/lste_ws/model/Data_exchange/vlm_prompt/lab/yellow_cup.json _task_id:=yellow_cup
+rosrun lste_core lste_task_node.py _json_path:=model/Data_exchange/vlm_prompt/lab/yellow_cup.json _task_id:=yellow_cup
 
 ```
 
@@ -77,7 +80,7 @@ rosrun lste_core lste_task_node.py _json_path:=/home/zrz/lste_ws/model/Data_exch
 
 ```bash
 conda activate minicpm
-cd ~/lste_ws/model/MiniCPM/test/
+cd model/MiniCPM/test/
 bash start.sh 
 
 ```
@@ -92,7 +95,7 @@ rosparam set /lste_prompt_node/vllm_stop_command "pkill -f 'vllm serve'"
 
 rosrun lste_core lste_prompt_node.py \
   _vllm_base_url:=http://localhost:8000/v1 \
-  _vllm_model_name:=/home/zrz/lste_ws/model/MiniCPM/OpenBMB/MiniCPM4-0___5B
+  _vllm_model_name:=model/MiniCPM/OpenBMB/MiniCPM4-0___5B
 
 ```
 
@@ -144,6 +147,6 @@ roslaunch lste_topo_access gp_frontier.launch
 roslaunch lste_oc_srfc oc_srfc_proj.launch
 
 # 4. 启动 Rviz 可视化
-rviz -d /home/zrz/lste_ws/src/lste_topo_access/launch/gp_frontier.rviz
+rviz -d src/lste_topo_access/launch/gp_frontier.rviz
 
 ```

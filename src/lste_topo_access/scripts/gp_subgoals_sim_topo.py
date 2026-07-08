@@ -4,7 +4,8 @@
 #from typing import Tuple, Optional
 #import tempfile
 import faulthandler; faulthandler.enable()
-#import pathlib
+import os
+from pathlib import Path
 import warnings
 import json
 import yaml
@@ -51,6 +52,23 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 #######disabled warning when import tensorflow
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+
+def _resolve_topo_path(rel_path: str) -> str:
+    """Resolve a path relative to lste_topo_access package or LSTE_WS."""
+    if os.path.isabs(rel_path) and rel_path != "":
+        return rel_path
+    ws = os.environ.get("LSTE_WS")
+    if ws:
+        return os.path.join(ws, "src", "lste_topo_access", rel_path) if rel_path else os.path.join(ws, "src", "lste_topo_access", "topo_tree", "tree")
+    try:
+        import rospkg
+        pkg_path = rospkg.RosPack().get_path("lste_topo_access")
+        return os.path.join(pkg_path, rel_path) if rel_path else os.path.join(pkg_path, "topo_tree", "tree")
+    except Exception:
+        # Fallback: resolve relative to this file
+        pkg = Path(__file__).resolve().parents[1]  # lste_topo_access/
+        return str(pkg / rel_path) if rel_path else str(pkg / "topo_tree" / "tree")
 
 ### import tensrflow and gpflow and related lib
 import tensorflow as tf
@@ -437,7 +455,7 @@ class VSGPNavGlb:
         self.frontier_log_enabled = rospy.get_param('~frontier_log', False)
         self.frontier_log_dir = rospy.get_param(
             '~frontier_log_dir',
-            '/home/zrz/lste_ws/src/lste_topo_access/topo_tree/frontier_log'
+            _resolve_topo_path('topo_tree/frontier_log')
         )
         self.frontier_log_file = None
         self.frontier_log_fh = None
@@ -629,16 +647,15 @@ class VSGPNavGlb:
     def load_access_topo_config(self):
         """加载 Access-Topo 配置（支持 coarse/fine 双 profile，YAML 优先）。"""
         # 两套配置路径：未提供 fine 时回落到 coarse
-        default_cfg = '/home/zrz/lste_ws/src/lste_topo_access/topo_tree/cfgs/access_topo.yaml'
+        default_cfg = _resolve_topo_path('topo_tree/cfgs/access_topo.yaml')
         cfg_path_pass = rospy.get_param('~access_topo_config_pass',
                                         rospy.get_param('~access_topo_config', default_cfg))
         cfg_path_sus_c = rospy.get_param('~access_topo_config_sus_c', cfg_path_pass)
         self.cfg_pass = safe_load_yaml(cfg_path_pass) or {}
         self.cfg_sus_c = safe_load_yaml(cfg_path_sus_c) or {}
         # 冻结本次运行的保存路径/文件（不随 profile/state 变化）
-        base_root = self.cfg_pass.get('topo_tree_root',
-                                      rospy.get_param('~topo_tree_root',
-                                                      '/home/zrz/lste_ws/src/lste_topo_access/topo_tree/tree'))
+        base_root = self.cfg_pass.get('topo_tree_root') or \
+                    rospy.get_param('~topo_tree_root', _resolve_topo_path(''))
         default_save_dir = os.path.join(base_root, rospy.get_param('~run_name', "run"))
         self.topo_save_dir = rospy.get_param('~topo_save_dir',
                                              self.cfg_pass.get('topo_save_dir', default_save_dir))
@@ -666,9 +683,8 @@ class VSGPNavGlb:
 
         # 基础路径与测试名
         self.test_name = cfg_file.get('test_name', rospy.get_param('~test_name', 'default'))
-        self.topo_tree_root = cfg_file.get('topo_tree_root',
-                                           rospy.get_param('~topo_tree_root',
-                                                           '/home/zrz/lste_ws/src/lste_topo_access/topo_tree/tree'))
+        self.topo_tree_root = cfg_file.get('topo_tree_root') or \
+                               rospy.get_param('~topo_tree_root', _resolve_topo_path(''))
         # 参数读取（YAML 优先，ROS param 次之）
         self.anchor_step_dist = cfg_file.get('anchor_step_dist', rospy.get_param('~anchor_step_dist', 1.0))
         self.backtrack_arrive_dist = cfg_file.get('backtrack_arrive_dist',
@@ -732,8 +748,7 @@ class VSGPNavGlb:
         # 路口角度调试日志：开启后记录路口会话内每帧 frontier 角度
         self.junction_angle_log = cfg_file.get('junction_angle_log',
                                                rospy.get_param('~junction_angle_log', False))
-        self.junction_angle_dir = cfg_file.get('junction_angle_dir',
-                                               os.path.join(self.topo_tree_root, "angle"))
+        self.junction_angle_dir = cfg_file.get('junction_angle_dir') or os.path.join(self.topo_tree_root, "angle")
         self.junction_angle_counter = 0
         # topo tree 保存周期（文件名/目录已在 load_access_topo_config 冻结）
         self.topo_save_period = cfg_file.get('topo_save_period', rospy.get_param('~topo_save_period', 2.0))

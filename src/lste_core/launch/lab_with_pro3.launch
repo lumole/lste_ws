@@ -1,6 +1,7 @@
 <launch>
-  <!-- ensure Gazebo can load custom Velodyne plugin from pre_ws -->
-  <env name="GAZEBO_PLUGIN_PATH" value="/home/zrz/pre_ws/devel/lib:$(optenv GAZEBO_PLUGIN_PATH '')"/>
+  <!-- ensure Gazebo can load custom Velodyne/Ouster plugins -->
+  <!-- LSTE_PRE_WS is auto-detected by pipeline_env.sh, or set manually -->
+  <env name="GAZEBO_PLUGIN_PATH" value="$(optenv LSTE_PRE_WS)/devel/lib:$(optenv GAZEBO_PLUGIN_PATH '')"/>
   <arg name="gui" default="true"/>
   <arg name="use_sim_time" default="true"/>
   <arg name="robot_name" default="pro3"/>

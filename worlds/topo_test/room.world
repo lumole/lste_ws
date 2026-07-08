@@ -117,7 +117,7 @@
           <pose>0 0 0 0 -0 0</pose>
           <geometry>
             <mesh>
-              <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/base.dae</uri>
+              <uri>model://table_conference_2/meshes/base.dae</uri>
               <scale>1 1 1</scale>
             </mesh>
           </geometry>
@@ -198,7 +198,7 @@
           <pose>0 0 0 0 -0 0</pose>
           <geometry>
             <mesh>
-              <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/top.dae</uri>
+              <uri>model://table_conference_2/meshes/top.dae</uri>
               <scale>1 1 1</scale>
             </mesh>
           </geometry>
@@ -285,7 +285,7 @@
           <pose>0 0 0 0 -0 0</pose>
           <geometry>
             <mesh>
-              <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/glasses.dae</uri>
+              <uri>model://table_conference_2/meshes/glasses.dae</uri>
               <scale>1 1 1</scale>
             </mesh>
           </geometry>
@@ -367,7 +367,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/base.dae</uri>
+                <uri>model://table_conference_2/meshes/base.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -448,7 +448,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/top.dae</uri>
+                <uri>model://table_conference_2/meshes/top.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -535,7 +535,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/glasses.dae</uri>
+                <uri>model://table_conference_2/meshes/glasses.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -3031,7 +3031,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/base.dae</uri>
+                <uri>model://table_conference_2/meshes/base.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -3112,7 +3112,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/top.dae</uri>
+                <uri>model://table_conference_2/meshes/top.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -3199,7 +3199,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/glasses.dae</uri>
+                <uri>model://table_conference_2/meshes/glasses.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -4494,7 +4494,7 @@
           <pose>0 0 0 0 -0 0</pose>
           <geometry>
             <mesh>
-              <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/base.dae</uri>
+              <uri>model://table_conference_2/meshes/base.dae</uri>
               <scale>1 1 1</scale>
             </mesh>
           </geometry>
@@ -4575,7 +4575,7 @@
           <pose>0 0 0 0 -0 0</pose>
           <geometry>
             <mesh>
-              <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/top.dae</uri>
+              <uri>model://table_conference_2/meshes/top.dae</uri>
               <scale>1 1 1</scale>
             </mesh>
           </geometry>
@@ -4662,7 +4662,7 @@
           <pose>0 0 0 0 -0 0</pose>
           <geometry>
             <mesh>
-              <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/glasses.dae</uri>
+              <uri>model://table_conference_2/meshes/glasses.dae</uri>
               <scale>1 1 1</scale>
             </mesh>
           </geometry>
@@ -4744,7 +4744,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/base.dae</uri>
+                <uri>model://table_conference_2/meshes/base.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -4825,7 +4825,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/top.dae</uri>
+                <uri>model://table_conference_2/meshes/top.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -4912,7 +4912,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/glasses.dae</uri>
+                <uri>model://table_conference_2/meshes/glasses.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -7408,7 +7408,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/base.dae</uri>
+                <uri>model://table_conference_2/meshes/base.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -7489,7 +7489,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/top.dae</uri>
+                <uri>model://table_conference_2/meshes/top.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>
@@ -7576,7 +7576,7 @@
             <pose>0 0 0 0 -0 0</pose>
             <geometry>
               <mesh>
-                <uri>/home/zrz/.gazebo/models/table_conference_2/meshes/glasses.dae</uri>
+                <uri>model://table_conference_2/meshes/glasses.dae</uri>
                 <scale>1 1 1</scale>
               </mesh>
             </geometry>

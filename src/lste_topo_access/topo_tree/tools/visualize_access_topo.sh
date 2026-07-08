@@ -5,9 +5,9 @@ set -euo pipefail
 # 可修改下列变量指向想要可视化的 JSON
 TEST_NAME="${TEST_NAME:-default_test}"
 JSON_PATH="${JSON_PATH:-}"
-TREE_ROOT="${TREE_ROOT:-/home/zrz/lste_ws/src/lste_topo_access/topo_tree/tree}"
+TREE_ROOT="${TREE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tree}"
 TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VIS_DIR="/home/zrz/lste_ws/src/lste_topo_access/topo_tree/visualized/${TEST_NAME}"
+VIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/visualized/${TEST_NAME}"
 mkdir -p "$VIS_DIR"
 
 # 如果未指定 JSON_PATH，则自动取指定 test_name 目录下最新的 JSON

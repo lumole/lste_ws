@@ -4,8 +4,8 @@
 """
 lste_prompt_node
 - 订阅 /lste/task
-- 调用 MiniCPM (通过 /home/zrz/Desktop/LSTE/Data_exchange/8B-05B.py) 生成 prompt_A / prompt_B
-- 发布 /lste/prompts (latched)，然后主动退出以释放显存/内存
+- 调用 MiniCPM (通过 vLLM API) 生成 prompt_A / prompt_B
+- 发布 /lste/prompts (latched)
 """
 
 import json

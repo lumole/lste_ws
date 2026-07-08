@@ -5,7 +5,7 @@
   <arg name="world_name" default="$(find lste_core)/../../worlds/lab_building.world"/>
 
   <env name="GAZEBO_MODEL_PATH"
-       value="$(find lste_core)/worlds:$(optenv GAZEBO_MODEL_PATH)"/>
+       value="$(find lste_core)/../../worlds:$(find lste_core)/../tools:$(optenv GAZEBO_MODEL_PATH)"/>
 
   <include file="$(find gazebo_ros)/launch/empty_world.launch">
     <arg name="world_name" value="$(arg world_name)"/>

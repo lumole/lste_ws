@@ -250,7 +250,7 @@ def create_custom_legend(ax):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--json")
-    parser.add_argument("--tree-dir", default="/home/zrz/lste_ws/src/lste_topo_access/topo_tree/tree")
+    parser.add_argument("--tree-dir", default=str(Path(__file__).resolve().parents[1] / "tree"))
     parser.add_argument("--save")
     args = parser.parse_args()
 

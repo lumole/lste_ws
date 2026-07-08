@@ -16,7 +16,10 @@ except ImportError:
     sys.exit(1)
 
 
-DEFAULT_BASE_DIR = Path("/home/zrz/Desktop/LSTE/Initialization")
+# Auto-detect: this file is at lste_ws/src/lste_core/scripts/scoring/, LSTE is at ../../../../LSTE/
+_SCRIPT_DIR = Path(__file__).resolve().parents[0]
+_LSTE_DIR = _SCRIPT_DIR.parents[4] / ".." / "LSTE"
+DEFAULT_BASE_DIR = _LSTE_DIR / "Initialization" if _LSTE_DIR.is_dir() else _SCRIPT_DIR.parents[4] / ".." / ".." / "LSTE" / "Initialization"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -3,7 +3,11 @@ set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 
 
-WS=${WS:-/home/zrz/lste_ws}
+# Auto-detect workspace root (can override with LSTE_WS env var)
+if [ -z "${WS:-}" ]; then
+  WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+fi
+LSTE_WS="$WS"
 SESSION=${SESSION:-lste}
 # 可选 YAML 配置：通过 PIPELINE_CONFIG 指定；存在时为未显式设置的变量提供默认值
 PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/pipeline_defaults.yaml}
@@ -25,24 +29,30 @@ for k, v in data.items():
 PY
   )"
 fi
-WS=${WS:-${CFG_WS:-/home/zrz/lste_ws}}
 SESSION=${SESSION:-${CFG_SESSION:-lste}}
-WORLD=${WORLD:-${CFG_WORLD:-$WS/worlds/place1.world}}
-# 如果 world 路径是相对的，补全到工作区绝对路径，避免 gazebo 找不到文件
-if [[ "$WORLD" != /* ]]; then
-  WORLD="$WS/$WORLD"
-fi
-TASK_JSON=${TASK_JSON:-${CFG_TASK_JSON:-$WS/model/Data_exchange/vlm_prompt/lab/yellow_cup.json}}
+
+# Helper: resolve a path — if relative, prepend $WS/
+_resolve() {
+  local val="$1"
+  if [[ -z "$val" || "$val" == http://* || "$val" == https://* || "$val" == /* ]]; then
+    echo "$val"
+  else
+    echo "$WS/$val"
+  fi
+}
+
+WORLD=${WORLD:-$(_resolve "${CFG_WORLD:-worlds/place1.world}")}
+TASK_JSON=${TASK_JSON:-$(_resolve "${CFG_TASK_JSON:-model/Data_exchange/vlm_prompt/lab/yellow_cup.json}")}
 TASK_ID=${TASK_ID:-${CFG_TASK_ID:-yellow_cup}}
 VLLM_URL=${VLLM_URL:-${CFG_VLLM_URL:-http://localhost:8000/v1}}
-VLLM_MODEL=${VLLM_MODEL:-${CFG_VLLM_MODEL:-$WS/model/MiniCPM/OpenBMB/MiniCPM4-0___5B}}
+VLLM_MODEL=${VLLM_MODEL:-$(_resolve "${CFG_VLLM_MODEL:-model/MiniCPM/OpenBMB/MiniCPM4-0___5B}")}
 VLLM_PROBE=${VLLM_PROBE:-${VLLM_URL%/}}
-ACCESS_TOPO_CONFIG=${ACCESS_TOPO_CONFIG:-${CFG_ACCESS_TOPO_CONFIG:-$WS/src/lste_topo_access/topo_tree/cfgs/access_topo.yaml}}
-ACCESS_TOPO_CONFIG_PASS=${ACCESS_TOPO_CONFIG_PASS:-${CFG_ACCESS_TOPO_CONFIG_PASS:-$WS/src/lste_topo_access/topo_tree/cfgs/access_topo_pass.yaml}}
-ACCESS_TOPO_CONFIG_SUS_C=${ACCESS_TOPO_CONFIG_SUS_C:-${CFG_ACCESS_TOPO_CONFIG_SUS_C:-$WS/src/lste_topo_access/topo_tree/cfgs/access_topo_sus_c.yaml}}
+ACCESS_TOPO_CONFIG=${ACCESS_TOPO_CONFIG:-$(_resolve "${CFG_ACCESS_TOPO_CONFIG:-src/lste_topo_access/topo_tree/cfgs/access_topo.yaml}")}
+ACCESS_TOPO_CONFIG_PASS=${ACCESS_TOPO_CONFIG_PASS:-$(_resolve "${CFG_ACCESS_TOPO_CONFIG_PASS:-src/lste_topo_access/topo_tree/cfgs/access_topo_pass.yaml}")}
+ACCESS_TOPO_CONFIG_SUS_C=${ACCESS_TOPO_CONFIG_SUS_C:-$(_resolve "${CFG_ACCESS_TOPO_CONFIG_SUS_C:-src/lste_topo_access/topo_tree/cfgs/access_topo_sus_c.yaml}")}
 ACCESS_TOPO_TEST_NAME=${ACCESS_TOPO_TEST_NAME:-${CFG_ACCESS_TOPO_TEST_NAME:-default_test}}
 ACCESS_TOPO_RUN_NAME=${ACCESS_TOPO_RUN_NAME:-${CFG_ACCESS_TOPO_RUN_NAME:-$ACCESS_TOPO_TEST_NAME}}
-GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-${CFG_GP_FRONTIER_RVIZ:-$WS/src/lste_topo_access/launch/gp_frontier.rviz}}
+GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-$(_resolve "${CFG_GP_FRONTIER_RVIZ:-src/lste_topo_access/launch/gp_frontier.rviz}")}
 SUSPICIOUS_WINDOW=${SUSPICIOUS_WINDOW:-${CFG_SUSPICIOUS_WINDOW:-5}}
 FOLLOW_LOCKED_DONE_TIME=${FOLLOW_LOCKED_DONE_TIME:-${CFG_FOLLOW_LOCKED_DONE_TIME:-4.0}}
 FRONTIER_LOG=${FRONTIER_LOG:-${CFG_FRONTIER_LOG:-true}}
@@ -65,7 +75,8 @@ fi
 export PYTHONDONTWRITEBYTECODE=1
 if command -v conda >/dev/null 2>&1; then
   echo "[preflight] 清理 vsgp 环境下的 TensorFlow 缓存并做自检..."
-  conda run -n vsgp bash -lc "find /home/zrz/anaconda3/envs/vsgp/lib/python3.7/site-packages/tensorflow -name '*.pyc' -delete; find /home/zrz/anaconda3/envs/vsgp/lib/python3.7/site-packages/tensorflow -name '__pycache__' -type d -exec rm -rf {} +" || true
+  CONDA_PREFIX="$(conda info --base 2>/dev/null || echo "$HOME/anaconda3")"
+  conda run -n vsgp bash -lc "find \"$CONDA_PREFIX/envs/vsgp/lib/python3.7/site-packages/tensorflow\" -name '*.pyc' -delete 2>/dev/null; find \"$CONDA_PREFIX/envs/vsgp/lib/python3.7/site-packages/tensorflow\" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null" || true
   conda run -n vsgp python - <<'PY' || true
 import sys, tensorflow as tf
 print("TF sanity:", sys.executable, tf.__version__)

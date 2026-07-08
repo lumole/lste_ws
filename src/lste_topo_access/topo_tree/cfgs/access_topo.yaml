@@ -34,7 +34,7 @@ branch_merge_dist: 2.0
 
 # 路口角度调试日志：开启后记录路口会话内每帧 frontier 角度，写到 topo_tree_root/angle
 junction_angle_log: false
-junction_angle_dir: /home/zrz/lste_ws/src/lste_topo_access/topo_tree/angle
+junction_angle_dir: ""   # auto-resolved relative to topo_tree_root at runtime
 
 # 强制分支窗口（到达兴趣点后只放行兴趣方向）
 force_window_deg: 30.0          # 度，仅保留该窗口内的候选
@@ -49,6 +49,6 @@ junction_cooldown_anchors: 3     # 最近 N 个 anchor 内只生成一次“路�
 no_frontier_trigger_sec: 3.0
 
 # topo tree 保存
-topo_tree_root: /home/zrz/lste_ws/src/lste_topo_access/topo_tree/tree
+topo_tree_root: ""        # auto-resolved at runtime from package path or LSTE_WS
 topo_save_period: 2.0           # 秒，保存频率
 # topo_save_dir 可选覆盖；默认使用 topo_tree_root/test_name

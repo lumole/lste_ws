@@ -6,7 +6,20 @@ set -euo pipefail
 # - Loads this workspace overlay (devel)
 # - Initializes conda (without requiring `conda init`)
 
-WS=${WS:-/home/zrz/lste_ws}
+# Auto-detect workspace root (can override with LSTE_WS env var)
+if [ -z "${WS:-}" ]; then
+  WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+fi
+
+# Auto-detect pre_work workspace (for Gazebo plugins). Can override with LSTE_PRE_WS.
+if [ -z "${LSTE_PRE_WS:-}" ]; then
+  LSTE_PRE_WS="$(dirname "$WS")/pre_work"
+  if [ ! -d "$LSTE_PRE_WS/devel/lib" ]; then
+    LSTE_PRE_WS=""  # not found, leave empty
+  fi
+fi
+export LSTE_PRE_WS
+export LSTE_WS="$WS"
 
 if [ -f /opt/ros/noetic/setup.bash ]; then
   # shellcheck disable=SC1091

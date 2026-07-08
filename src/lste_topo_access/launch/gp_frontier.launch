@@ -12,7 +12,7 @@
   <arg name="access_topo_save_dir" default="$(find lste_topo_access)/topo_tree/tree/$(arg access_topo_run_name)"/>
   <!-- frontier 日志开关与目录 -->
   <arg name="frontier_log" default="true"/>
-  <arg name="frontier_log_dir" default="/home/zrz/lste_ws/src/lste_topo_access/topo_tree/frontier_log"/>
+  <arg name="frontier_log_dir" default="$(find lste_topo_access)/topo_tree/frontier_log"/>
   <!-- GoalManager: LOCKED 持续多久视为任务完成 -->
   <arg name="follow_locked_done_time" default="10.0"/>
 

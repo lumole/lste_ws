@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Prompt helper utilities extracted from /home/zrz/Desktop/LSTE/Data_exchange/8B-05B.py
+Prompt helper utilities extracted from LSTE/Data_exchange/8B-05B.py
 Lightweight: 不依赖 GroundingDINO / cv2，专供 lste_prompt_node 使用。
 """
 
 import json
+import os
 from pathlib import Path
 
 import httpx
 import openai
 
 
-PROJECT_ROOT = Path("/home/zrz/lste_ws/model")
+def _get_workspace_root() -> Path:
+    """Auto-detect workspace root from LSTE_WS env var or this file's location."""
+    env = os.environ.get("LSTE_WS")
+    if env:
+        return Path(env)
+    # This file is at WS/src/lste_core/scripts/utils/prompts.py
+    return Path(__file__).resolve().parents[4]
+
+
+PROJECT_ROOT = _get_workspace_root() / "model"
 DEFAULT_VLLM_MODEL_PATH = PROJECT_ROOT / "MiniCPM" / "OpenBMB" / "MiniCPM4-0___5B"
 DEFAULT_VLLM_BASE_URL = "http://localhost:8000/v1"
 

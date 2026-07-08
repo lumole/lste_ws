@@ -33,7 +33,7 @@ branch_merge_dist: 1.5
 
 # 路口角度调试日志
 junction_angle_log: false
-junction_angle_dir: /home/zrz/lste_ws/src/lste_topo_access/topo_tree/angle
+junction_angle_dir: ""   # auto-resolved relative to topo_tree_root at runtime
 
 # 强制分支窗口
 force_window_deg: 30.0
@@ -53,5 +53,5 @@ junction_cooldown_anchors: 2
 no_frontier_trigger_sec: 2.0
 
 # topo tree 保存
-topo_tree_root: /home/zrz/lste_ws/src/lste_topo_access/topo_tree/tree
+topo_tree_root: ""        # auto-resolved at runtime from package path or LSTE_WS
 topo_save_period: 2.0

@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GroundingDINO helper utilities extracted from /home/zrz/Desktop/LSTE/Data_exchange/8B-05B.py
+GroundingDINO helper utilities extracted from LSTE/Data_exchange/8B-05B.py
 专供 lste_det_node 使用。
 """
 
 import cv2
 import numpy as np
+import os
 import torch
 from pathlib import Path
 from torchvision.ops import box_convert
 from groundingdino.util.inference import load_model, load_image, predict, annotate
 
 
-PROJECT_ROOT = Path("/home/zrz/lste_ws/model")
+def _get_workspace_root() -> Path:
+    """Auto-detect workspace root from LSTE_WS env var or this file's location."""
+    env = os.environ.get("LSTE_WS")
+    if env:
+        return Path(env)
+    # This file is at WS/src/lste_core/scripts/utils/detector.py
+    return Path(__file__).resolve().parents[4]
+
+
+PROJECT_ROOT = _get_workspace_root() / "model"
 DEFAULT_DINO_CONFIG_PATH = PROJECT_ROOT / "GroundingDINO" / "groundingdino" / "config" / "GroundingDINO_SwinB_cfg.py"
 DEFAULT_DINO_WEIGHTS_PATH = PROJECT_ROOT / "GroundingDINO" / "weights" / "groundingdino_swinb_cogcoor.pth"
 
