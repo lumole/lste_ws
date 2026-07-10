@@ -1,5 +1,3 @@
----
-
 # 🤖 LSTE Workspace README
 
 ## 🚀 Quick Start
