@@ -11,6 +11,9 @@ __pycache__/
 ros_logs/
 log/
 
+# Runtime topology snapshots
+src/lste_topo_access/topo_tree/tree/**/access_topo_*.json
+
 # Local editor / IDE files
 .DS_Store
 .vscode/
