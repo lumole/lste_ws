@@ -40,5 +40,10 @@ if command -v conda >/dev/null 2>&1; then
     # fallback: try the shell hook
     eval "$(conda shell.bash hook 2>/dev/null || true)"
   fi
+  # fix conda libffi.so.8 shadowing system libffi.so.7 (needed by apt opencv/PyKDL)
+  export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7${LD_PRELOAD:+:$LD_PRELOAD}
 fi
+
+# 统一 ROS master URI，避免 lste-env 和 lste session 各连不同的 roscore
+export ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311/}
 

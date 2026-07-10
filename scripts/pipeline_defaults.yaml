@@ -7,7 +7,7 @@
 # SESSION: lste
 
 # World and task (paths relative to $WS)
-WORLD: worlds/topo3.0_catch_mode/session_test/env04.world
+WORLD: worlds/topo3.0_catch_mode/session_test/env04_no_pro3.world
 TASK_JSON: model/Data_exchange/vlm_prompt/lab/yellow_cup.json
 TASK_ID: yellow_cup
 

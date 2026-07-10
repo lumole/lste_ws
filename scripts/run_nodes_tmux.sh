@@ -2,19 +2,24 @@
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 
+# ============================================
+# 业务节点脚本：独立 session "lste"，依赖 lste-env 的 roscore + Gazebo
+# 可反复重启调试，不影响环境 session
+# 前置条件：先运行 ./scripts/run_env_tmux.sh
+# ============================================
 
-# Auto-detect workspace root (can override with LSTE_WS env var)
+# ---- 路径解析（与 run_env_tmux.sh 完全一致） ----
 if [ -z "${WS:-}" ]; then
   WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 fi
 LSTE_WS="$WS"
-SESSION=${SESSION:-lste}
-# 可选 YAML 配置：通过 PIPELINE_CONFIG 指定；存在时为未显式设置的变量提供默认值
+ENV_SESSION=lste-env
+SESSION=lste
 PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/pipeline_defaults.yaml}
 if [[ -f "$PIPELINE_CONFIG" ]]; then
   eval "$(
     python - "$PIPELINE_CONFIG" <<'PY' || true
-import sys, json
+import sys
 path = sys.argv[1]
 try:
     import yaml
@@ -24,14 +29,11 @@ with open(path, 'r', encoding='utf-8') as f:
     data = yaml.safe_load(f) or {}
 for k, v in data.items():
     if isinstance(v, (str, int, float)):
-        # 简单输出 KEY=VALUE 供 bash eval，只支持标量
         print(f'CFG_{k}={v}')
 PY
   )"
 fi
-SESSION=${SESSION:-${CFG_SESSION:-lste}}
 
-# Helper: resolve a path — if relative, prepend $WS/
 _resolve() {
   local val="$1"
   if [[ -z "$val" || "$val" == http://* || "$val" == https://* || "$val" == /* ]]; then
@@ -41,7 +43,7 @@ _resolve() {
   fi
 }
 
-WORLD=${WORLD:-$(_resolve "${CFG_WORLD:-worlds/place1.world}")}
+# ---- 所有变量解析 ----
 TASK_JSON=${TASK_JSON:-$(_resolve "${CFG_TASK_JSON:-model/Data_exchange/vlm_prompt/lab/yellow_cup.json}")}
 TASK_ID=${TASK_ID:-${CFG_TASK_ID:-yellow_cup}}
 VLLM_URL=${VLLM_URL:-${CFG_VLLM_URL:-http://localhost:8000/v1}}
@@ -56,39 +58,41 @@ GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-$(_resolve "${CFG_GP_FRONTIER_RVIZ:-src/lst
 SUSPICIOUS_WINDOW=${SUSPICIOUS_WINDOW:-${CFG_SUSPICIOUS_WINDOW:-5}}
 FOLLOW_LOCKED_DONE_TIME=${FOLLOW_LOCKED_DONE_TIME:-${CFG_FOLLOW_LOCKED_DONE_TIME:-4.0}}
 FRONTIER_LOG=${FRONTIER_LOG:-${CFG_FRONTIER_LOG:-true}}
-GUI=${GUI:-${CFG_GUI:-true}}
 if [[ "$VLLM_PROBE" == */v1 ]]; then
   VLLM_PROBE="$VLLM_PROBE/models"
 fi
 
-if [[ ! -f "$WORLD" ]]; then
-  echo "[error] WORLD file not found: $WORLD" >&2
-  exit 1
-fi
-
+# ---- 前置检查 ----
 if ! command -v tmux >/dev/null 2>&1; then
-  echo "tmux 未安装，请先安装 tmux。" >&2
+  echo "[error] tmux 未安装" >&2
   exit 1
 fi
 
-# 避免 TF 本地库缓存问题：跑 pipeline 前清理 vsgp 环境下的 TF pyc，并做一次导入自检
-export PYTHONDONTWRITEBYTECODE=1
-if command -v conda >/dev/null 2>&1; then
-  echo "[preflight] 清理 vsgp 环境下的 TensorFlow 缓存并做自检..."
-  CONDA_PREFIX="$(conda info --base 2>/dev/null || echo "$HOME/anaconda3")"
-  conda run -n vsgp bash -lc "find \"$CONDA_PREFIX/envs/vsgp/lib/python3.7/site-packages/tensorflow\" -name '*.pyc' -delete 2>/dev/null; find \"$CONDA_PREFIX/envs/vsgp/lib/python3.7/site-packages/tensorflow\" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null" || true
-  conda run -n vsgp python - <<'PY' || true
-import sys, tensorflow as tf
-print("TF sanity:", sys.executable, tf.__version__)
-PY
+if ! tmux has-session -t "=$ENV_SESSION" 2>/dev/null; then
+  echo "[error] 环境 session '$ENV_SESSION' 不存在，请先运行 ./scripts/run_env_tmux.sh" >&2
+  exit 1
 fi
+echo "[nodes] 检测到 $ENV_SESSION 存活"
 
-# 自动判断 world 是否已经包含 pro3 模型，包含则跳过二次 spawn
-SPAWN_PRO3=true
-if [[ -f "$WORLD" ]] && grep -q "<model name='pro3'>" "$WORLD"; then
-  SPAWN_PRO3=false
+# ---- 如果节点 session 已存在，先杀 ----
+if tmux has-session -t "=$SESSION" 2>/dev/null; then
+  echo "[nodes] 发现旧 session '$SESSION'，杀掉重建..."
+  tmux kill-session -t "=$SESSION"
 fi
+echo "[nodes] 清理旧 session 完毕"
 
+# ---- 新建节点 session ----
+echo "[nodes] 创建 session '$SESSION'..."
+tmux new-session -d -s "$SESSION" -c "$WS" -n "pro3" \
+  "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/pipeline_env.sh\"; set -e; \
+until rostopic list >/dev/null 2>&1; do echo \"waiting for rocore...\"; sleep 1; done; \
+roslaunch lste_core spawn_pro3.launch spawn_model:=true; \
+echo; echo \"[EXIT] pro3 spawn\"; exec bash'"
+echo "[nodes] 创建后检查 sessions: $(tmux list-sessions 2>&1)"
+tmux set-option -t "=$SESSION:" remain-on-exit on
+echo "[nodes] pro3 spawned (window 0)"
+
+# ---- 辅助函数 ----
 tmux_new_window() {
   local index="$1"
   local dir="$2"
@@ -96,48 +100,26 @@ tmux_new_window() {
   local cmd="$4"
   tmux new-window -t "=$SESSION:$index" -n "$title" -c "$dir" \
     "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/pipeline_env.sh\"; set -e; $cmd'; echo; echo '[EXIT] $title'; exec bash"
+  echo "[nodes] 创建窗口 $index($title) 后检查: $(tmux list-sessions 2>&1)"
 }
 
-# 如果 session 已存在则复用，避免重复启动
-if tmux has-session -t "=$SESSION" 2>/dev/null; then
-  # 如果已有 session 的 WORLD 与当前需求不同，则先杀掉重新建，避免复用旧 world
-  EXISTING_WORLD="$(tmux show-environment -t "=$SESSION" 2>/dev/null | awk -F= '/^LSTE_WORLD=/{print substr($0,length("LSTE_WORLD=")+1)}')"
-  if [[ -n "$EXISTING_WORLD" && "$EXISTING_WORLD" != "$WORLD" ]]; then
-    echo "[info] tmux session '$SESSION' exists with WORLD=$EXISTING_WORLD, restart with WORLD=$WORLD."
-    tmux kill-session -t "=$SESSION"
-  else
-    echo "tmux session '$SESSION' 已存在，直接附着。" >&2
-    exec tmux attach -t "=$SESSION"
-  fi
-fi
-
-# 新建 session：tmux 默认会创建 window 0，所以直接把 window 0 用作 roscore
-tmux new-session -d -s "$SESSION" -c "$WS" -n "roscore" \
-  "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/pipeline_env.sh\"; roscore'; echo; echo '[EXIT] roscore'; exec bash"
-tmux set-environment -t "=$SESSION" LSTE_WORLD "$WORLD"
-tmux set-option -t "=$SESSION:" remain-on-exit on
-
-# helper: wait for roscore
 WAIT_ROSCORE='until rostopic list >/dev/null 2>&1; do echo \"waiting for roscore...\"; sleep 1; done'
 
-# 1: 仿真 + 机器人（等待 master 就绪）
-tmux_new_window 1 "$WS" "world" \
-  "$WAIT_ROSCORE; roslaunch lste_core lab_with_pro3.launch world_name:=$WORLD spawn_pro3:=$SPAWN_PRO3 gui:=$GUI"
-
-# 2: 发布任务（latched，可随时替换 json/task_id）
-tmux_new_window 2 "$WS" "task" \
+# ---- 逐窗口启动（index 从 1 开始，0 已被 pro3 占用） ----
+# 1: 发布任务
+tmux_new_window 1 "$WS" "task" \
   "$WAIT_ROSCORE; rosrun lste_core lste_task_node.py _json_path:=$TASK_JSON _task_id:=$TASK_ID"
 
-# 3: 启动 VLLM 服务（MiniCPM）
-tmux_new_window 3 "$WS/model/MiniCPM/test" "vllm" \
+# 2: VLLM 服务
+tmux_new_window 2 "$WS/model/MiniCPM/test" "vllm" \
   "conda activate minicpm; bash start.sh"
 
-# 4: 全局目标（/lste/final_goal）
-tmux_new_window 4 "$WS" "goal" \
+# 3: 全局目标
+tmux_new_window 3 "$WS" "goal" \
   "$WAIT_ROSCORE; rosrun lste_topo_access lste_goal_manager.py _follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME"
 
-# 5: 等待 VLLM 就绪后启动 prompt 节点
-tmux_new_window 5 "$WS" "prompt" \
+# 4: VLM Prompt 节点
+tmux_new_window 4 "$WS" "prompt" \
   "$WAIT_ROSCORE; conda activate minicpm; \
    echo \"等待 VLLM 就绪...\"; \
    for i in \$(seq 1 120); do \
@@ -150,31 +132,31 @@ tmux_new_window 5 "$WS" "prompt" \
    rosparam set /lste_prompt_node/vllm_stop_command \"pkill -f vllm.*serve\"; \
    rosrun lste_core lste_prompt_node.py _vllm_base_url:=$VLLM_URL _vllm_model_name:=$VLLM_MODEL"
 
-# 6: DINO 检测
-tmux_new_window 6 "$WS" "dino" \
+# 5: DINO 检测
+tmux_new_window 5 "$WS" "dino" \
   "$WAIT_ROSCORE; conda activate dino; export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7; rosrun lste_core lste_det_node.py"
 
-# 7: score
-tmux_new_window 7 "$WS" "score" \
+# 6: Score
+tmux_new_window 6 "$WS" "score" \
   "$WAIT_ROSCORE; rosrun lste_core lste_score_node.py \
     _w_target:=0.2 _w_env:=0.3 _w_ctx:=0.5 \
     _lambda_neg:=0.7 _pos_midpoint:=0.25 _pos_steepness:=6 \
     _neg_midpoint:=0.15 _neg_steepness:=12"
 
-# 8: state
-tmux_new_window 8 "$WS" "state" \
+# 7: State
+tmux_new_window 7 "$WS" "state" \
   "$WAIT_ROSCORE; rosrun lste_core lste_state_node.py _suspicious_window:=$SUSPICIOUS_WINDOW"
 
-# 9: 可视化（叠加图 + RViz）
-tmux_new_window 9 "$WS" "vis" \
+# 8: 可视化（叠加图 + RViz）
+tmux_new_window 8 "$WS" "vis" \
   "$WAIT_ROSCORE; roslaunch lste_core lste_det_vis.launch"
 
-# 10: oc_srfc（提供 /rbt_pose 等；goal_manager 依赖 /rbt_pose 才会发布 /lste/final_goal）
-tmux_new_window 10 "$WS" "oc_srfc" \
+# 9: 球面投影
+tmux_new_window 9 "$WS" "oc_srfc" \
   "$WAIT_ROSCORE; roslaunch lste_oc_srfc oc_srfc_proj.launch"
 
-# 11: topo frontier（需 vsgp 环境）
-tmux_new_window 11 "$WS" "gp_frontier" \
+# 10: GP Frontier
+tmux_new_window 10 "$WS" "gp_frontier" \
   "$WAIT_ROSCORE; conda activate vsgp; roslaunch lste_topo_access gp_frontier.launch \
     access_topo_config:=$ACCESS_TOPO_CONFIG \
     access_topo_config_pass:=$ACCESS_TOPO_CONFIG_PASS \
@@ -184,14 +166,21 @@ tmux_new_window 11 "$WS" "gp_frontier" \
     follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME \
     frontier_log:=$FRONTIER_LOG"
 
-# 12: frontier RViz
-tmux_new_window 12 "$WS" "rviz_frontier" \
+# 11: Frontier RViz
+tmux_new_window 11 "$WS" "rviz_frontier" \
   "$WAIT_ROSCORE; rviz -d $GP_FRONTIER_RVIZ"
 
-# 13: teleop keyboard
-tmux_new_window 13 "$WS" "teleop" \
-  "$WAIT_ROSCORE; rosrun teleop_twist_keyboard teleop_twist_keyboard.py cmd_vel:=/cmd_vel"
+# 12: 键盘遥控
+tmux_new_window 12 "$WS" "teleop" \
+  "$WAIT_ROSCORE; python \"$WS/scripts/teleop_with_reset.py\" cmd_vel:=/cmd_vel"
+
+echo ""
+echo "============================================"
+echo "  节点全部启动完毕 (13 个窗口：pro3 + 12 节点)"
+echo "  环境 session:  tmux attach -t lste-env"
+echo "  节点 session:  tmux attach -t lste"
+echo "============================================"
 
 if [[ -t 0 ]]; then
-  tmux attach -t "=$SESSION"
+  tmux attach -t "$SESSION"
 fi
