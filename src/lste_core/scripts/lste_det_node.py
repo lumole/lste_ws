@@ -86,6 +86,9 @@ class DetNode:
         self.interval_suspicious = float(rospy.get_param("~interval_suspicious", 0.5))
         self.interval_locked = float(rospy.get_param("~interval_locked", 0.3))
         self.interval_exhausted = float(rospy.get_param("~interval_exhausted", 3.0))
+        # GroundingDINO shares the simulation GPU with Gazebo and RViz. Keep a
+        # guaranteed rendering window even when the state requests rapid checks.
+        self.min_inference_interval = float(rospy.get_param("~min_inference_interval", 3.0))
 
         # 模型加载
         rospy.loginfo("Loading GroundingDINO model...")
@@ -162,14 +165,16 @@ class DetNode:
 
     def current_interval(self) -> float:
         if self.current_state == STATE_PASS:
-            return self.interval_pass
-        if self.current_state == STATE_SUSPICIOUS:
-            return self.interval_suspicious
-        if self.current_state == STATE_LOCKED:
-            return self.interval_locked
-        if self.current_state == STATE_EXHAUSTED:
-            return self.interval_exhausted
-        return self.interval_pass
+            interval = self.interval_pass
+        elif self.current_state == STATE_SUSPICIOUS:
+            interval = self.interval_suspicious
+        elif self.current_state == STATE_LOCKED:
+            interval = self.interval_locked
+        elif self.current_state == STATE_EXHAUSTED:
+            interval = self.interval_exhausted
+        else:
+            interval = self.interval_pass
+        return max(self.min_inference_interval, interval)
 
     def ready(self) -> bool:
         if self.current_task is None or self.task_parsed is None:

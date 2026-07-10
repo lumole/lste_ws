@@ -57,6 +57,7 @@ ACCESS_TOPO_RUN_NAME=${ACCESS_TOPO_RUN_NAME:-${CFG_ACCESS_TOPO_RUN_NAME:-$ACCESS
 GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-$(_resolve "${CFG_GP_FRONTIER_RVIZ:-src/lste_topo_access/launch/gp_frontier.rviz}")}
 SUSPICIOUS_WINDOW=${SUSPICIOUS_WINDOW:-${CFG_SUSPICIOUS_WINDOW:-5}}
 FOLLOW_LOCKED_DONE_TIME=${FOLLOW_LOCKED_DONE_TIME:-${CFG_FOLLOW_LOCKED_DONE_TIME:-4.0}}
+DINO_MIN_INTERVAL=${DINO_MIN_INTERVAL:-${CFG_DINO_MIN_INTERVAL:-6.0}}
 FRONTIER_LOG=${FRONTIER_LOG:-${CFG_FRONTIER_LOG:-true}}
 if [[ "$VLLM_PROBE" == */v1 ]]; then
   VLLM_PROBE="$VLLM_PROBE/models"
@@ -134,7 +135,7 @@ tmux_new_window 4 "$WS" "prompt" \
 
 # 5: DINO 检测
 tmux_new_window 5 "$WS" "dino" \
-  "$WAIT_ROSCORE; conda activate dino; export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7; rosrun lste_core lste_det_node.py"
+  "$WAIT_ROSCORE; conda activate dino; export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7; rosrun lste_core lste_det_node.py _min_inference_interval:=$DINO_MIN_INTERVAL"
 
 # 6: Score
 tmux_new_window 6 "$WS" "score" \

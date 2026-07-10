@@ -24,6 +24,7 @@ GP_FRONTIER_RVIZ: src/lste_topo_access/launch/gp_frontier.rviz
 # State / Goal tuning
 SUSPICIOUS_WINDOW: 5
 FOLLOW_LOCKED_DONE_TIME: 4.0
+DINO_MIN_INTERVAL: 3.0
 
 # Frontier logging toggle (true/false)
 FRONTIER_LOG: false

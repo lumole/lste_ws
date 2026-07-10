@@ -8,9 +8,14 @@
 """
 
 import math
+import copy
+import threading
+import time
+from collections import deque
 from typing import Iterable, Tuple, Optional, List
 
 import cv2
+import numpy as np
 import rospy
 from cv_bridge import CvBridge, CvBridgeError
 from sensor_msgs.msg import Image, CameraInfo
@@ -30,6 +35,7 @@ class DetectionVisualizer:
         self.bridge = CvBridge()
         self.latest_image = None  # type: Image
         self.latest_detections = None  # type: LsteDetections
+        self.display_detections = None  # type: LsteDetections
         self.latest_scores = None  # type: LsteScores
         self.latest_task = None  # type: LsteTask
         self.latest_state = None  # type: LsteState
@@ -46,6 +52,37 @@ class DetectionVisualizer:
         self.font_scale = float(rospy.get_param("~font_scale", 0.5))
         self.line_thickness = int(rospy.get_param("~line_thickness", 2))
         self.camera_fov_deg = float(rospy.get_param("~camera_fov_deg", 60.0))
+        self.tracking_enabled = bool(rospy.get_param("~tracking_enabled", True))
+        self.tracking_scale = float(rospy.get_param("~tracking_scale", 0.25))
+        self.tracking_history_size = int(rospy.get_param("~tracking_history_size", 90))
+        self.max_tracking_lag = float(rospy.get_param("~max_tracking_lag", 3.0))
+        # Leave a small grace window beyond the DINO refresh cadence so a
+        # scheduler delay does not create a visible one-frame flicker.
+        self.max_tracking_age = float(rospy.get_param("~max_tracking_age", 4.0))
+        self.tracking_update_stride = max(1, int(rospy.get_param("~tracking_update_stride", 3)))
+        # CSRT may clamp a lost target to the last image edge.  Continue its
+        # last outward motion briefly so the box leaves the frame naturally.
+        self.tracking_edge_touch_pixels = float(rospy.get_param("~tracking_edge_touch_pixels", 2.0))
+        self.tracking_edge_exit_frames = max(1, int(rospy.get_param("~tracking_edge_exit_frames", 12)))
+        self.tracking_edge_exit_speed_scale = float(
+            rospy.get_param("~tracking_edge_exit_speed_scale", 0.65)
+        )
+        self.tracking_edge_min_visible_fraction = float(
+            rospy.get_param("~tracking_edge_min_visible_fraction", 0.05)
+        )
+        # Pure image-motion fallback for small/distant objects.  It does not
+        # use robot pose or any TF information.
+        self.tracking_flow_enabled = bool(rospy.get_param("~tracking_flow_enabled", True))
+        self.tracking_flow_min_points = max(4, int(rospy.get_param("~tracking_flow_min_points", 12)))
+        self.tracking_flow_max_lost_frames = max(
+            1, int(rospy.get_param("~tracking_flow_max_lost_frames", 30))
+        )
+        self._frame_history = deque(maxlen=max(1, self.tracking_history_size))
+        self._trackers = []
+        self._tracking_started_at = None
+        self._tracking_frame_count = 0
+        self._previous_tracking_image = None
+        self._tracking_lock = threading.Lock()
 
         if not self.camera_info_topic:
             # 简单猜测 camera_info 话题：把最后一级替换成 camera_info
@@ -100,11 +137,27 @@ class DetectionVisualizer:
     # ----------------- Callbacks -----------------
     def on_image(self, msg: Image):
         self.latest_image = msg
-        self.try_publish()
+        try:
+            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except CvBridgeError as exc:
+            rospy.logwarn("cv_bridge failed to convert Image: %s", exc)
+            return
+
+        if cv_img is None or cv_img.size == 0:
+            return
+
+        with self._tracking_lock:
+            tracking_image = self._tracking_image(cv_img)
+            self._frame_history.append((self._stamp_ns(msg.header), tracking_image))
+            self._tracking_frame_count += 1
+            if self._tracking_frame_count % self.tracking_update_stride == 0:
+                self._update_trackers(tracking_image, cv_img.shape[1], cv_img.shape[0])
+        self.try_publish(cv_img)
 
     def on_detections(self, msg: LsteDetections):
         self.latest_detections = msg
-        self.try_publish()
+        with self._tracking_lock:
+            self._start_trackers(msg)
 
     def on_scores(self, msg: LsteScores):
         self.latest_scores = msg
@@ -144,18 +197,21 @@ class DetectionVisualizer:
         self.global_goal_frame = msg.header.frame_id or "odom"
 
     # ----------------- Helpers -----------------
-    def try_publish(self):
+    def try_publish(self, cv_img=None):
         # 只要有图像，就先转发图像；如果有检测/score，就叠加可视化
         if self.latest_image is None:
             return
 
-        try:
-            cv_img = self.bridge.imgmsg_to_cv2(self.latest_image, desired_encoding="bgr8")
-        except CvBridgeError as exc:
-            rospy.logwarn("cv_bridge failed to convert Image: %s", exc)
-            return
+        if cv_img is None:
+            try:
+                cv_img = self.bridge.imgmsg_to_cv2(self.latest_image, desired_encoding="bgr8")
+            except CvBridgeError as exc:
+                rospy.logwarn("cv_bridge failed to convert Image: %s", exc)
+                return
 
-        annotated = self.draw_detections(cv_img.copy(), self.latest_detections, self.latest_scores, self.latest_state)
+        with self._tracking_lock:
+            detections = copy.deepcopy(self.display_detections or self.latest_detections)
+        annotated = self.draw_detections(cv_img.copy(), detections, self.latest_scores, self.latest_state)
         try:
             out_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
         except CvBridgeError as exc:
@@ -167,6 +223,304 @@ class DetectionVisualizer:
         if not hasattr(self, "pub"):
             self.pub = rospy.Publisher(self.output_topic, Image, queue_size=1)
         self.pub.publish(out_msg)
+
+    # ----------------- Lightweight box tracking -----------------
+    @staticmethod
+    def _stamp_ns(header) -> int:
+        try:
+            return int(header.stamp.to_nsec())
+        except Exception:
+            return 0
+
+    def _tracking_image(self, image):
+        if self.tracking_scale >= 0.999:
+            return image
+        return cv2.resize(image, None, fx=self.tracking_scale, fy=self.tracking_scale,
+                          interpolation=cv2.INTER_LINEAR)
+
+    @staticmethod
+    def _make_tracker():
+        return cv2.TrackerCSRT_create()
+
+    def _start_trackers(self, detections: LsteDetections):
+        """Initialize CSRT on the source frame and replay buffered frames to now."""
+        self.display_detections = copy.deepcopy(detections)
+        self._trackers = []
+        self._tracking_started_at = time.monotonic()
+        if not self.tracking_enabled or not self._frame_history:
+            return
+
+        stamp_ns = self._stamp_ns(detections.header)
+        if not stamp_ns:
+            return
+        history = list(self._frame_history)
+        frame_index = min(range(len(history)), key=lambda i: abs(history[i][0] - stamp_ns))
+        matched_stamp, source_frame = history[frame_index]
+        if abs(matched_stamp - stamp_ns) > int(self.max_tracking_lag * 1e9):
+            rospy.logwarn_throttle(2.0, "Detection image is no longer in the tracker history")
+            return
+
+        self._previous_tracking_image = source_frame.copy()
+
+        height, width = source_frame.shape[:2]
+        for kind in ("target_dets", "env_dets"):
+            for det in getattr(self.display_detections, kind):
+                x = max(0.0, (float(det.cx) - 0.5 * float(det.w)) * width)
+                y = max(0.0, (float(det.cy) - 0.5 * float(det.h)) * height)
+                w = max(2.0, float(det.w) * width)
+                h = max(2.0, float(det.h) * height)
+                w = min(w, width - x)
+                h = min(h, height - y)
+                if w <= 1.0 or h <= 1.0:
+                    continue
+                try:
+                    tracker = self._make_tracker()
+                    if tracker.init(source_frame, (x, y, w, h)):
+                        self._trackers.append({
+                            "tracker": tracker,
+                            "det": det,
+                            "edge_exit_count": 0,
+                            "edge_exit_direction": None,
+                            "edge_exit_offset": (0.0, 0.0),
+                            "edge_exit_speed": 0.0,
+                            "last_center": (x + 0.5 * w, y + 0.5 * h),
+                            "last_bbox": (x, y, w, h),
+                            "flow_lost_count": 0,
+                        })
+                except cv2.error as exc:
+                    rospy.logwarn_throttle(2.0, "Failed to initialize CSRT tracker: %s", exc)
+
+        rospy.loginfo("Initialized %d CSRT trackers for the latest detection", len(self._trackers))
+
+        # GroundingDINO returns after processing its source frame. Replay the
+        # buffered intermediate frames before drawing on the next live frame.
+        replay_frames = history[frame_index + 1::self.tracking_update_stride]
+        if history[-1:] and (not replay_frames or replay_frames[-1][0] != history[-1][0]):
+            replay_frames.append(history[-1])
+        for _, frame in replay_frames:
+            self._update_trackers(frame, width, height)
+
+    def _update_trackers(self, tracking_image, full_width: int, full_height: int):
+        if (
+            self._tracking_started_at is not None
+            and time.monotonic() - self._tracking_started_at > self.max_tracking_age
+        ):
+            self._clear_display_tracks()
+            self._trackers = []
+            return
+        if not self._trackers:
+            self._previous_tracking_image = tracking_image.copy()
+            return
+        height, width = tracking_image.shape[:2]
+        image_flow = self._global_image_flow(self._previous_tracking_image, tracking_image)
+        self._previous_tracking_image = tracking_image.copy()
+        alive = []
+        expired = set()
+        for track in self._trackers:
+            tracker = track["tracker"]
+            det = track["det"]
+            try:
+                ok, bbox = tracker.update(tracking_image)
+            except cv2.error:
+                ok = False
+            last_bbox = track["last_bbox"]
+            x, y, w, h = last_bbox
+            if ok:
+                candidate = tuple(float(v) for v in bbox)
+                tracker_motion = (
+                    candidate[0] + 0.5 * candidate[2] - track["last_center"][0],
+                    candidate[1] + 0.5 * candidate[3] - track["last_center"][1],
+                )
+                # CSRT can report success while frozen on the old patch during
+                # a fast pan. Prefer image motion only in that stalled case.
+                if self._flow_explains_stalled_tracker(image_flow, tracker_motion):
+                    x, y, w, h = self._apply_image_flow(last_bbox, image_flow)
+                else:
+                    x, y, w, h = candidate
+                    track["flow_lost_count"] = 0
+            elif image_flow is not None and track["flow_lost_count"] < self.tracking_flow_max_lost_frames:
+                x, y, w, h = self._apply_image_flow(last_bbox, image_flow)
+                track["flow_lost_count"] += 1
+                rospy.logdebug_throttle(1.0, "CSRT lost; using image-flow box fallback")
+            else:
+                expired.add(id(det))
+                continue
+
+            center = (x + 0.5 * w, y + 0.5 * h)
+            last_x, last_y = track["last_center"]
+            motion = (center[0] - last_x, center[1] - last_y)
+            direction = self._outward_edge_direction(x, y, w, h, width, height, motion)
+            active_direction = track["edge_exit_direction"]
+
+            # Start only after the tracker reaches the real image edge while
+            # moving outward.  This deliberately does not use a percentage
+            # margin: a box may be partly outside the image before it exits.
+            if direction is not None:
+                if active_direction != direction:
+                    track["edge_exit_direction"] = direction
+                    track["edge_exit_count"] = 0
+                    track["edge_exit_offset"] = (0.0, 0.0)
+                    track["edge_exit_speed"] = self._outward_speed(direction, motion)
+                active_direction = direction
+            elif active_direction is not None and self._moves_back_into_frame(active_direction, motion):
+                # A reversal means the target has re-entered the image; use
+                # the live CSRT result again instead of continuing an exit.
+                track["edge_exit_direction"] = None
+                track["edge_exit_count"] = 0
+                track["edge_exit_offset"] = (0.0, 0.0)
+                track["edge_exit_speed"] = 0.0
+                active_direction = None
+
+            draw_x, draw_y = x, y
+            if active_direction is not None:
+                speed = max(
+                    1.0,
+                    track["edge_exit_speed"] * 0.8,
+                    self._outward_speed(active_direction, motion),
+                )
+                track["edge_exit_speed"] = speed
+                offset_x, offset_y = track["edge_exit_offset"]
+                step_x, step_y = self._edge_step(active_direction, speed)
+                offset_x += step_x
+                offset_y += step_y
+                track["edge_exit_offset"] = (offset_x, offset_y)
+                track["edge_exit_count"] += 1
+                draw_x = x + offset_x
+                draw_y = y + offset_y
+            track["last_center"] = center
+            track["last_bbox"] = (x, y, w, h)
+
+            if (
+                active_direction is not None
+                and (
+                    self._visible_fraction(draw_x, draw_y, w, h, width, height)
+                    <= self.tracking_edge_min_visible_fraction
+                    or track["edge_exit_count"] >= self.tracking_edge_exit_frames
+                )
+            ):
+                expired.add(id(det))
+                continue
+            det.cx = float((draw_x + 0.5 * w) / width)
+            det.cy = float((draw_y + 0.5 * h) / height)
+            det.w = float(w / width)
+            det.h = float(h / height)
+            alive.append(track)
+        self._trackers = alive
+        if expired:
+            self._remove_display_tracks(expired)
+
+    def _global_image_flow(self, previous, current):
+        """Estimate global 2D image motion from sparse optical flow."""
+        if not self.tracking_flow_enabled or previous is None or current is None:
+            return None
+        if previous.shape[:2] != current.shape[:2]:
+            return None
+        previous_gray = cv2.cvtColor(previous, cv2.COLOR_BGR2GRAY)
+        current_gray = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY)
+        points = cv2.goodFeaturesToTrack(
+            previous_gray, maxCorners=120, qualityLevel=0.01, minDistance=6, blockSize=7
+        )
+        if points is None or len(points) < self.tracking_flow_min_points:
+            return None
+        next_points, status, error = cv2.calcOpticalFlowPyrLK(
+            previous_gray, current_gray, points, None, winSize=(21, 21), maxLevel=3
+        )
+        if next_points is None or status is None:
+            return None
+        valid = status.reshape(-1).astype(bool)
+        if error is not None:
+            valid &= error.reshape(-1) < 25.0
+        vectors = (next_points.reshape(-1, 2) - points.reshape(-1, 2))[valid]
+        if len(vectors) < self.tracking_flow_min_points:
+            return None
+        median = np.median(vectors, axis=0)
+        deviations = np.linalg.norm(vectors - median, axis=1)
+        inliers = vectors[deviations <= max(0.5, 2.5 * np.median(deviations))]
+        if len(inliers) < self.tracking_flow_min_points:
+            return None
+        return tuple(float(value) for value in np.median(inliers, axis=0))
+
+    @staticmethod
+    def _apply_image_flow(bbox, image_flow):
+        x, y, w, h = bbox
+        dx, dy = image_flow
+        return x + dx, y + dy, w, h
+
+    @staticmethod
+    def _flow_explains_stalled_tracker(image_flow, tracker_motion):
+        if image_flow is None:
+            return False
+        flow_size = math.hypot(*image_flow)
+        tracker_size = math.hypot(*tracker_motion)
+        return flow_size >= 0.75 and tracker_size <= 0.25
+
+    def _outward_edge_direction(self, x, y, w, h, width, height, motion):
+        """Return the touched edge only when the tracked centre moves outward."""
+        dx, dy = motion
+        touch = self.tracking_edge_touch_pixels
+        candidates = []
+        if x <= touch and dx < -0.2:
+            candidates.append((abs(dx), "left"))
+        if x + w >= width - touch and dx > 0.2:
+            candidates.append((abs(dx), "right"))
+        if y <= touch and dy < -0.2:
+            candidates.append((abs(dy), "top"))
+        if y + h >= height - touch and dy > 0.2:
+            candidates.append((abs(dy), "bottom"))
+        return max(candidates)[1] if candidates else None
+
+    def _outward_speed(self, direction, motion):
+        dx, dy = motion
+        component = {
+            "left": -dx,
+            "right": dx,
+            "top": -dy,
+            "bottom": dy,
+        }[direction]
+        return max(0.0, component * self.tracking_edge_exit_speed_scale)
+
+    @staticmethod
+    def _edge_step(direction, speed):
+        return {
+            "left": (-speed, 0.0),
+            "right": (speed, 0.0),
+            "top": (0.0, -speed),
+            "bottom": (0.0, speed),
+        }[direction]
+
+    @staticmethod
+    def _moves_back_into_frame(direction, motion):
+        dx, dy = motion
+        return {
+            "left": dx > 0.2,
+            "right": dx < -0.2,
+            "top": dy > 0.2,
+            "bottom": dy < -0.2,
+        }[direction]
+
+    @staticmethod
+    def _visible_fraction(x, y, w, h, width, height):
+        if w <= 0.0 or h <= 0.0:
+            return 0.0
+        visible_w = max(0.0, min(x + w, width) - max(x, 0.0))
+        visible_h = max(0.0, min(y + h, height) - max(y, 0.0))
+        return (visible_w * visible_h) / (w * h)
+
+    def _clear_display_tracks(self):
+        if self.display_detections is None:
+            return
+        del self.display_detections.target_dets[:]
+        del self.display_detections.env_dets[:]
+
+    def _remove_display_tracks(self, expired_ids):
+        if self.display_detections is None:
+            return
+        self.display_detections.target_dets[:] = [
+            det for det in self.display_detections.target_dets if id(det) not in expired_ids
+        ]
+        self.display_detections.env_dets[:] = [
+            det for det in self.display_detections.env_dets if id(det) not in expired_ids
+        ]
 
     def draw_detections(
         self,
