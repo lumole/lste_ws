@@ -1,6 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+局部 GP frontier 与 Access-Topo 探索节点。
+
+不要从上到下逐行阅读本文件。它同时保留了早期“直接发布子目标”的
+接口和当前 LSTE/Goal Manager 接口，正确的阅读入口是 VSGPNavGlb.step()。
+业务流程图见 docs/gp_subgoal_business_flow.md。
+
+运行时数据流：
+
+    /sph_pcl + /rbt_pose
+            |  (雷达球面点云、机器人二维位姿)
+            v
+    step(): 下采样 -> Sparse GP -> 预测占据/方差 -> 提取 frontier
+            |                         |
+            |                         +-> gp_nav_var / gp_nav_oc（RViz 调试）
+            v
+    /lste/gp_frontiers              （全部候选方向和面积）
+    /lste/gp_frontier_dir           （旧的单方向接口）
+            v
+    lste_goal_manager.py            （结合任务状态后发布 /lste/final_goal）
+
+Access-Topo 是与 GP 并行的长期记忆：它把机器人每走一段距离的位置
+记为 anchor；在多个稳定 frontier 同时出现时记录路口分支；没有可走
+frontier 时发出回退目标。运行快照会定期保存为 access_topo_<run_id>.json。
+"""
+
 #from typing import Tuple, Optional
 #import tempfile
 import faulthandler; faulthandler.enable()
@@ -110,6 +136,12 @@ tf.random.set_seed(0)
 
 
 class SGP2D:
+    """Sparse Gaussian Process 的薄封装。
+
+    输入为球面方向 ``(theta, alpha)``，输出为该方向的占据观测值。
+    VSGPNavGlb 每轮都会创建该对象、绑定当前点云训练数据，并在固定的
+    球面网格上调用 ``model.predict_f`` 得到占据均值与预测方差。
+    """
 
     def __init__(self):
         self.model = None
@@ -203,6 +235,18 @@ class SGP2D:
 
 
 class VSGPNavGlb:
+    """GP frontier、局部子目标和拓扑回退的总控制器。
+
+    本类同时维护四类状态：
+
+    * 感知缓存：``pose`` 与 ``pcl_arr``，分别由 ROS 回调更新；
+    * GP 中间结果：训练点、预测网格、frontier 和候选子目标；
+    * Access-Topo 长期状态：anchor、路口分支、回退栈和强制前进方向；
+    * LSTE 协作状态：当前 state、Goal Manager 的 final_goal 和 active_mode。
+
+    所有重计算发生在 ``step``；回调只更新最新消息，避免在回调线程里
+    训练 GP。
+    """
 
     def __init__(self):
         ### Node initialization
@@ -225,7 +269,8 @@ class VSGPNavGlb:
         #                                             self.pose_pcl_cb,
         #                                             queue_size=1)
 
-        ### subscriber to pose and occupancy surface by two topics
+        # 入口感知数据。oc_srfc_proj 将雷达原始点云转换为 /sph_pcl，并从
+        # 里程计提取 /rbt_pose；本节点只缓存两者，实际计算在 step() 中执行。
         self.rbt_pose_sub = rospy.Subscriber("rbt_pose",
                                              Pose2D,
                                              self.pose_cb,
@@ -235,7 +280,8 @@ class VSGPNavGlb:
                                             PointCloud2,
                                             self.sph_pcl_cb,
                                             queue_size=1)
-        ### publishers
+        # 以下大部分是 GP 中间结果和 RViz 调试数据。当前 LSTE 主链最重要
+        # 的对外接口位于后面的 /lste/gp_frontiers 与 /lste/gp_frontier_dir。
         ## variance surface
         self.gp_var_pub = rospy.Publisher("gp_nav_var",
                                           PointCloud2,
@@ -273,7 +319,8 @@ class VSGPNavGlb:
                                                     PoseStamped,
                                                     queue_size=1)
 
-        # ---- zcy 相关状态先初始化，再注册订阅者，避免回调在属性创建前触发 ----
+        # ---- LSTE / Access-Topo 状态 ----
+        # 先创建状态，再注册后续订阅者，避免 ROS 回调早到而访问未初始化属性。
         self.visited_positions = []
         self.int_visited_positions = []
         self.closed = []
@@ -308,6 +355,8 @@ class VSGPNavGlb:
         self.detected_interest_points = []
         self.match_threshold = 0.5  # 例如，0.5米
         # --- Access-Topo 参数与数据 ---
+        # anchor 是沿机器人实际轨迹定期落下的“路钉”；branch 是在 anchor
+        # 附近观察到但尚未选择的方向；backtrack_stack 用于无路可走时回退。
         self.load_access_topo_config()
         # 分支上限/路口冷却
         self.max_pending_per_node = getattr(self, "max_pending_per_node", 2)
@@ -645,7 +694,12 @@ class VSGPNavGlb:
             pass
 
     def load_access_topo_config(self):
-        """加载 Access-Topo 配置（支持 coarse/fine 双 profile，YAML 优先）。"""
+        """加载 Access-Topo 配置并冻结本次运行的快照文件路径。
+
+        ``pass`` 与 ``sus_c`` 可以使用不同的拓扑参数。profile 切换会改变
+        分支判定/回退等阈值，但不会更换本次运行的 JSON 文件，确保一份
+        access_topo_<run_id>.json 记录完整的一次实验。
+        """
         # 两套配置路径：未提供 fine 时回落到 coarse
         default_cfg = _resolve_topo_path('topo_tree/cfgs/access_topo.yaml')
         cfg_path_pass = rospy.get_param('~access_topo_config_pass',
@@ -764,6 +818,7 @@ class VSGPNavGlb:
 
     # -------- Access-Topo: anchors / branches / backtrack --------
     def set_access_mode(self, mode: int):
+        """发布拓扑层的动作优先级：0 前进、1 回退、2 强制分支前进。"""
         self.access_mode = mode
         self.access_mode_pub.publish(UInt8(mode))
 
@@ -813,6 +868,12 @@ class VSGPNavGlb:
         return None
 
     def _add_branch_if_new(self, node_id: int, heading_world: float, weight: float):
+        """向 anchor 登记一个尚未走过的分支，并做局部/相邻节点去重。
+
+        ``heading_world`` 是 odom 世界系方向，不是相对相机或雷达的角度。
+        只有状态为 ``PENDING`` 的分支会进入回退栈，之后可被选为强制前进
+        的方向。
+        """
         node = self._get_node(node_id)
         if node is None:
             return None
@@ -1093,7 +1154,11 @@ class VSGPNavGlb:
         self._publish_commit_carrot()
 
     def check_backtrack_progress(self):
-        """BACKTRACK 模式下，判断是否已到达回退点并切回 FORWARD。"""
+        """BACKTRACK 模式下，判断是否已到达回退点并切回 FORWARD。
+
+        这不是路径规划器：它只从已记录的 anchor/branch 中选一个回退目标，
+        再由 Goal Manager 将该目标作为当前 /lste/final_goal 的高优先级来源。
+        """
         if self.access_mode != 1 or self.pose is None:
             return
         # 没有兴趣点时，回到起点 (anchor 0)
@@ -1163,7 +1228,13 @@ class VSGPNavGlb:
         return wrap_angle(np.arctan2(s, c))
 
     def cluster_frontiers(self):
-        """将 frontier 方向聚类为角度簇。返回 [{'center','weight'}]."""
+        """把本轮 frontier 按相近方向聚成峰，供路口判定使用。
+
+        单个 frontier 可能只是噪声。多个分离的稳定峰持续出现，才可能表示
+        左右岔路等真实分支；最终的时间稳定性判断在
+        ``create_interest_from_frontiers``。返回值为 ``center`` 与 ``weight``
+        组成的角度簇列表。
+        """
         if self.gp_nav_frntr_cntrs is None:
             return []
         try:
@@ -1256,7 +1327,12 @@ class VSGPNavGlb:
         return stable
 
     def create_interest_from_frontiers(self, chosen_theta_rel: float):
-        """基于“多峰→单峰”会话：进入路口时记录所有峰，退出后再确定 chosen/pending。"""
+        """根据“多峰 -> 单峰”过程更新路口分支状态。
+
+        进入路口时先记录所有稳定峰；机器人继续前进一段距离或超时后，再用
+        实际运动方向确认哪一支已走过（CHOSEN），其余方向保留为 PENDING，
+        以后可作为回退后的待探索分支。
+        """
         now = rospy.Time.now().to_sec()
         clusters = self.cluster_frontiers()
         # 维护 cluster 跟踪，用于判定“多峰是否持续存在”
@@ -1514,7 +1590,11 @@ class VSGPNavGlb:
         self.last_finalized_anchor = target_anchor
 
     def dump_access_topo(self, force: bool = False):
-        """周期性保存 topo tree 为 JSON，便于离线可视化。"""
+        """周期性保存 topo tree 为 JSON，便于离线可视化和实验复盘。
+
+        写入同一个 run_id 文件而不是每周期新建文件；下次重新启动节点才会
+        生成新的 run_id 和新文件。该 JSON 是运行产物，不是启动配置。
+        """
         if not self.topo_save_dir:
             return
         now = rospy.Time.now().to_sec()
@@ -1676,6 +1756,12 @@ class VSGPNavGlb:
     """ @brief: to initiate and train 2D SGP using the SGP2D class"""
 
     def gp_nav_fit(self, ls1, ls2, var, alpha, noise, noise_var):
+        """用当前球面观测创建 Sparse GP 模型。
+
+        输入 ``gp_nav_din`` 的每行是 ``[theta, alpha]``，``gp_nav_dout`` 是
+        该方向的占据值。随后 step() 会用此模型预测 ``gp_grd`` 全网格，从
+        方差中找尚未观测充分的 frontier。
+        """
         self.gp_nav = SGP2D()
         self.gp_nav.set_kernel_param(ls1, ls2, var, alpha, noise, noise_var)
         self.gp_nav.set_training_data(self.gp_nav_din, self.gp_nav_dout)
@@ -1784,6 +1870,14 @@ class VSGPNavGlb:
     """ @brief: convert variance to cv image and detect high variance regions usign the variance threshold"""
 
     def gp_grd_var_img(self):
+        """把 GP 方差网格转为二维图像，并用轮廓中心提取 frontier。
+
+        此处的 frontier 不是全局地图的路口名称，而是“当前视野中方差高、
+        可能通向未知区域”的局部球面方向。输出写入：
+
+        * ``gp_nav_frntr_cntrs``: 每个候选的 ``[theta_rel, alpha]``；
+        * ``gp_nav_frntr_areas``: 对应未知区域面积，用作 Goal Manager 权重。
+        """
         img = np.zeros((self.gp_grd_h, 3 * self.gp_grd_w), np.uint8)
         ## normlize variance
         var_xtnd = np.array([]).reshape(-1, 1)
@@ -1904,7 +1998,12 @@ class VSGPNavGlb:
     """ @brief:  calculate the recommended subgoal (navigation point) based on cost function"""
 
     def gp_nav_pkup_nav_pt(self):
-        # print("gp_nav_pkup_nav_pt:: ")
+        """将 frontier 变为机器人周围的候选点，并选出旧接口的推荐点。
+
+        当前 LSTE 主链会把“全部 frontier”交给 Goal Manager 统一选择；本函数
+        仍会根据距内部全局目标的距离、偏离正前方的角度和拓扑强制窗口选出
+        ``chsn_gl_idx``，以兼容旧的 gp_subgoal/gp_subgoal_os 发布接口。
+        """
         self.gp_nav_pts = self.gp_nav_frntr_cntrs
         # print(f"gp_nav_frntr_cntrs={self.gp_nav_frntr_cntrs}")
         self.gp_nav_gls_sz = np.shape(self.gp_nav_pts)[0]
@@ -2071,7 +2170,11 @@ class VSGPNavGlb:
         self.closed.extend(closed)
 
     def publish_frontiers(self):
-        """发布全量 frontier（theta_rel + area）供 GoalManager 聚合使用。"""
+        """发布全量 frontier（theta_rel + area）供 GoalManager 聚合使用。
+
+        不在这里决定车辆最终走哪条路：Goal Manager 会再根据 LSTE 状态、
+        运动先验、激光安全距离和回退覆盖规则选出唯一 final_goal。
+        """
         if self.gp_nav_frntr_cntrs is None:
             return
         try:
@@ -2101,7 +2204,10 @@ class VSGPNavGlb:
 
     def update_global_goal_periodic(self):
         """
-        基于 4-方向锚定 + 分叉 commit 的全局目标更新。
+        基于 4-方向锚定 + 分叉 commit 的内部全局目标更新。
+        这里维护的是 GP 的评分参考目标，不等于 Goal Manager 对外发布的
+        /lste/final_goal。
+
         - commit_active=True: 沿 commit_heading 前推固定距离 D。
         - 否则用 frontier 按四个骨架方向聚合投票，满足门槛后切换。
         """
@@ -2453,6 +2559,12 @@ class VSGPNavGlb:
     """ @brief:  downsample pointcloud"""
 
     def downsample_pcl(self, pcl_arr):
+        """按方位角下采样球面点云，并生成 GP 训练样本。
+
+        输入点格式来自 oc_srfc_proj：x=theta、y=alpha、z=distance、
+        intensity=占据相关量。``pcl_skp`` 越大，训练点越少、计算越快，
+        但方向分辨率越低。
+        """
         pcl_arr = pcl_arr[np.argsort(pcl_arr[:, 0])]  ## sort based on thetas
         thetas = pcl_arr.transpose()[:][0].reshape(-1, 1)
         self.org_unq_thetas = np.array(sorted(set(
@@ -2511,6 +2623,7 @@ class VSGPNavGlb:
     """ @brief:  callback of sph pointcloud """
 
     def sph_pcl_cb(self, sph_pcl_msg):
+        """缓存最新球面点云；不在回调中执行昂贵的 GP 训练。"""
         # 防御：若 header 尚未初始化（极早期回调），先建一个
         if not hasattr(self, "header") or self.header is None:
             self.header = Header()
@@ -2523,16 +2636,35 @@ class VSGPNavGlb:
         """ @brief:  callback of robot pose """
 
     def pose_cb(self, rbt_pose_msg):
+        """缓存最新二维位姿，供下一轮 step() 使用。"""
         self.pose = rbt_pose_msg
 
         """ @brief:  main process function """
 
     def step(self):
+        """节点主循环：从最新传感器缓存计算 frontier、拓扑和调试输出。
+
+        每轮可按以下顺序理解：
+
+        1. 等待 pose 与 sph_pcl；
+        2. 推进旧的回退/强制分支状态；
+        3. 点云下采样并训练 GP；
+        4. 在球面网格预测占据与不确定度；
+        5. 提取并发布全部 frontier；
+        6. 更新拓扑快照和 RViz 点云；
+        7. 保留旧子目标接口的直达/绕障分支。
+
+        回调只覆盖最新输入，因此本循环可能对同一帧运行多次；循环频率由
+        GP 计算耗时决定，而不是由 /sph_pcl 的发布频率直接限定。
+        """
         while not rospy.is_shutdown():
+            # [1] 没有位姿无法把相对方向放进 odom；没有球面点云无法训练 GP。
             if self.pose is None or self.pcl_arr is None:
                 rospy.logwarn_throttle(5.0, "gp_subgoal: waiting for rbt_pose and sph_pcl ...")
                 rospy.sleep(0.05)
                 continue
+            # [2] 启动初期 Goal Manager 尚未发布 final_goal 时，先给 GP 一个
+            # “正前方 10 m”的内部评分参考。它不会直接驱动车辆。
             if (not self._start_goal_seeded) and (not self.final_goal_received) and self.pose is not None:
                 try:
                     # Pose2D: x, y, theta（theta 为朝向）
@@ -2544,19 +2676,21 @@ class VSGPNavGlb:
                     self._start_goal_seeded = True
                 except Exception:
                     pass
-            # Access-Topo：检查回退/强制方向进度
+            # [3] Access-Topo 先兑现上轮决定：检查回退是否到点、强制方向
+            # 是否已走够距离。可能更新 /lste/access_topo/mode 或回退目标。
             self.check_backtrack_progress()
             self.update_forced_heading_progress()
-            ## transformation matrices between robot and world
+            # [4] 构造 robot <-> odom 的二维变换，并计算到内部参考目标的距离。
             self.tf_rbt_2_odom()
             self.tf_odom_2_rbt()
             self.rbt2gl_error()
 
 
-            ## Downsample and assign thetas, alphas, occs, rds variables
+            # [5] 将最新 /sph_pcl 整理为稀疏训练样本：(theta, alpha) -> occupancy。
             self.downsample_pcl(self.pcl_arr)
 
-            ## define input and output data for training
+            # [6] 每轮以当前局部观测创建 GP，并在固定球面网格预测：
+            # gp_grd_oc 为占据均值，gp_grd_var 为模型不确定度。
             self.gp_nav_din = np.column_stack((self.pcl_thetas, self.pcl_alphas))
             self.gp_nav_dout = np.array(self.pcl_oc, dtype='float').reshape(-1, 1)
 
@@ -2567,7 +2701,8 @@ class VSGPNavGlb:
             self.gp_grd_oc = nav_grd_oc.numpy()
             self.gp_grd_rds = self.oc_srfc_rds - self.gp_grd_oc
 
-            ## process the variance surface to define GPFrontiers and assign subgoals
+            # [7] 方差图 -> 多个 frontier；随后发布给 Goal Manager，并同步维护
+            # 路口/分支/回退快照。Goal Manager 而非这里发布最终 final_goal。
             self.gp_nav_mask_thrshld()
             self.gp_grd_var_img()
             self.gp_nav_pkup_nav_pt()
@@ -2578,11 +2713,14 @@ class VSGPNavGlb:
             # self.gp_nav_xypts_actul_pcl()
             # self.gp_nav_pts_pcl()
 
-            #### occupancy and variance surfaces visualization
+            # [8] 将 GP 预测转换回 PointCloud2，仅用于 RViz/调试观察。
             self.gp_grd_oc_pcl()
             self.gp_grd_var_pcl()
 
-            # goal in polar coordinate wrt to velodyne
+            # [9] 以下是保留的旧子目标接口：判断内部参考目标方向的预测可行
+            # 距离，并据此发布 gp_subgoal/gp_subgoal_os 等话题。当前 LSTE 主链
+            # 主要使用第 [7] 步的 /lste/gp_frontiers + Goal Manager。
+            # 将内部目标从 odom 转回机器人坐标，得到它对应的球面方向。
             self.gl_wrt_rbt = self.tf_2d_inv @ self.gl_wrt_odom
 
             # predict occupancy in direction of final goal using GP occupancy model
@@ -2594,7 +2732,7 @@ class VSGPNavGlb:
             # print("gl_var, var_thrshld: ", gl_var.numpy(), self.gp_nav_var_thrshld)
             # print("gl_dst_err, gl_rds: ", self.gl_dst_err, gl_rds)
 
-            ### mode: no obstacle betwen goal and robot, robots go directly to final goal
+            # 若预测的自由距离足以覆盖目标距离，旧接口认为可直接朝目标走。
             if (self.gl_dst_err < gl_rds):
                 if not self.goal_published:
                     self.glbl_gl_pbl()  ## not sure if this correct situation
@@ -2603,7 +2741,8 @@ class VSGPNavGlb:
                 else:
                     quit()
 
-            ### mode: there is obstacle betwen goal and robot, robots follow recommended subgoal
+            # 否则旧接口发布推荐子目标和其余兴趣点；若拓扑标志禁止旧接口，
+            # 则清空其可视化点并进入下一轮。
             else:
                 #zcy
                 self.publish_closed_targets()

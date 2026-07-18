@@ -25,5 +25,13 @@
           name="spawn_pro3"
           args="-urdf -param robot_description -model $(arg robot_name) -x $(arg x) -y $(arg y) -z $(arg z) -Y $(arg yaw)"
           if="$(arg spawn_model)"/>
+
+    <!-- Gazebo prefixes the LiDAR message frame with the robot namespace,
+         while robot_state_publisher exposes the URDF frame as os_lidar. -->
+    <node pkg="tf"
+          type="static_transform_publisher"
+          name="os_lidar_frame_alias"
+          args="0 0 0 0 0 0 os_lidar pro3/os_lidar 100"
+          if="$(arg spawn_model)"/>
   </group>
 </launch>

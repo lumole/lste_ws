@@ -49,7 +49,7 @@ class DetectionVisualizer:
         self.camera_info_topic = rospy.get_param("~camera_info_topic", "")
         self.base_frame_id = rospy.get_param("~base_frame_id", "base_footprint")
         self.draw_labels = bool(rospy.get_param("~draw_labels", True))
-        self.font_scale = float(rospy.get_param("~font_scale", 0.5))
+        self.font_scale = float(rospy.get_param("~font_scale", 0.65))
         self.line_thickness = int(rospy.get_param("~line_thickness", 2))
         self.camera_fov_deg = float(rospy.get_param("~camera_fov_deg", 60.0))
         self.tracking_enabled = bool(rospy.get_param("~tracking_enabled", True))
@@ -642,9 +642,9 @@ class DetectionVisualizer:
     def _draw_label(self, image, text: str, origin: Tuple[int, int], color: Tuple[int, int, int]):
         if not text:
             return
-        font = cv2.FONT_HERSHEY_SIMPLEX
+        font = cv2.FONT_HERSHEY_DUPLEX
         scale = self.font_scale
-        thickness = max(1, self.line_thickness - 1)
+        thickness = max(2, self.line_thickness)
         text_size, baseline = cv2.getTextSize(text, font, scale, thickness)
         x, y = origin
         x = max(0, min(image.shape[1] - text_size[0], x))
@@ -663,8 +663,8 @@ class DetectionVisualizer:
         # 高级风格条状图：上方深色横幅 + 四条渐变色 bar
         h, w = image.shape[:2]
         panel_margin = 10
-        panel_width = int(w * 0.32)
-        panel_height = int(h * 0.18)
+        panel_width = min(w - 2 * panel_margin, max(330, int(w * 0.36)))
+        panel_height = min(h - 2 * panel_margin, max(145, int(h * 0.22)))
         x0 = panel_margin
         y0 = panel_margin
         x1 = x0 + panel_width
@@ -711,49 +711,50 @@ class DetectionVisualizer:
                 status_color = (72, 210, 170)
         if not subtype_text and state is not None and state.state != 1 and state.subtype:
             subtype_text = state.subtype
+        font = cv2.FONT_HERSHEY_DUPLEX
         title = f"S_total {scores.s_total:.2f}"
         cv2.putText(
             image,
             title,
-            (x0 + 12, y0 + 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            (x0 + 12, y0 + 30),
+            font,
+            0.76,
             (230, 230, 230),
             2,
             cv2.LINE_AA,
         )
-        status_size, _ = cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        status_size, _ = cv2.getTextSize(status, font, 0.64, 2)
         status_x = max(x0 + 12, x1 - 12 - status_size[0])
         cv2.putText(
             image,
             status,
-            (status_x, y0 + 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            (status_x, y0 + 30),
+            font,
+            0.64,
             status_color,
             2,
             cv2.LINE_AA,
         )
         if subtype_text:
-            subtype_size, _ = cv2.getTextSize(subtype_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            subtype_size, _ = cv2.getTextSize(subtype_text, font, 0.56, 2)
             subtype_x = max(x0 + 12, x1 - 12 - subtype_size[0])
             cv2.putText(
                 image,
                 subtype_text,
-                (subtype_x, y0 + 46),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                (subtype_x, y0 + 54),
+                font,
+                0.56,
                 (230, 230, 230),
-                1,
+                2,
                 cv2.LINE_AA,
             )
 
         # 条状图参数
         bar_left = x0 + 14
-        bar_top = y0 + 40
+        bar_top = y0 + (72 if subtype_text else 52)
         bar_width = panel_width - 28
-        bar_height = max(6, int(h * 0.012))
-        bar_gap = max(6, int(h * 0.008))
+        bar_height = max(9, int(h * 0.014))
+        bar_gap = max(13, int(h * 0.018))
 
         def norm01(value: float, vmin: float, vmax: float) -> float:
             if value <= vmin:
@@ -800,37 +801,38 @@ class DetectionVisualizer:
             cv2.putText(
                 image,
                 label_text,
-                (bar_left, y_bar_top - 2),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
+                (bar_left, y_bar_top - 3),
+                font,
+                0.58,
                 (210, 210, 210),
-                1,
+                2,
                 cv2.LINE_AA,
             )
+            value_size, _ = cv2.getTextSize(value_text, font, 0.58, 2)
             cv2.putText(
                 image,
                 value_text,
-                (bar_left + bar_width - 70, y_bar_top + bar_height - 2),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
+                (bar_left + bar_width - value_size[0], y_bar_top + bar_height - 2),
+                font,
+                0.58,
                 (240, 240, 240),
-                1,
+                2,
                 cv2.LINE_AA,
             )
 
     def _draw_goal_hint(self, image, text: str):
         h, w = image.shape[:2]
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.5
-        thickness = 1
+        font = cv2.FONT_HERSHEY_DUPLEX
+        scale = 0.68
+        thickness = 2
         text_size, baseline = cv2.getTextSize(text, font, scale, thickness)
         margin = 10
         x = max(margin, w - text_size[0] - margin)
         y = h - margin
         cv2.rectangle(
             image,
-            (x - 4, y - text_size[1] - baseline - 2),
-            (x + text_size[0] + 4, y + baseline + 2),
+            (x - 6, y - text_size[1] - baseline - 4),
+            (x + text_size[0] + 6, y + baseline + 4),
             (0, 0, 0),
             thickness=-1,
         )
@@ -864,10 +866,10 @@ class DetectionVisualizer:
                 image,
                 "GLOBAL",
                 (center[0] - 25, max(12, center[1] - 14)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
+                cv2.FONT_HERSHEY_DUPLEX,
+                0.58,
                 (0, 255, 0),
-                1,
+                2,
                 cv2.LINE_AA,
             )
 
