@@ -79,6 +79,16 @@ pip install torch torchvision
 # Grounding DINO 安装见: https://github.com/IDEA-Research/GroundingDINO
 ```
 
+若启动时出现 `Failed to load custom C++ ops`，不要用系统 CUDA 10.1 的头文件
+编译，也不要替换本项目中经过适配的 GroundingDINO 源码。运行：
+
+```bash
+bash model/GroundingDINO/env_install/fix_cuda_extension.sh
+```
+
+脚本会根据 `torch.version.cuda` 安装匹配的 `nvcc` 和开发头文件，针对当前
+GPU 架构编译 `groundingdino._C`，最后实际执行一次 CUDA kernel 验证。
+
 ### 3.3 minicpm — VLM 推理（MiniCPM）
 
 ```bash
