@@ -263,10 +263,22 @@ rostopic echo -n 1 /lste/scores
 rostopic hz /lste/det_vis_image
 ```
 
-VLLM 只负责生成一次任务 prompt。成功发布 `/lste/prompts` 后，它会按设计停止，
-释放显存给 GroundingDINO 和 SA-PPO。因此，此时端口 `8000` 关闭和 `vllm` 窗口
-显示 `[EXIT]` 是正常行为；判断标准应是 `/lste_prompt_node` 和
+VLLM 只负责首次生成任务 prompt。结果按任务 JSON 内容、prompt 模板和模型标识
+缓存到 `runtime/prompt_cache/`。同一任务再次 `runall` 时，prompt 节点直接发布缓存，
+`vllm` 窗口显示 `Prompt cache hit; MiniCPM was not started.`，不会加载 MiniCPM。
+
+任务内容、prompt 模板或模型标识改变后，缓存键自动变化，MiniCPM 会启动一次并生成
+新缓存。成功发布 `/lste/prompts` 后，VLLM 随即停止并释放显存给 GroundingDINO 和
+SA-PPO。因此端口 `8000` 关闭是正常行为；判断标准应是 `/lste_prompt_node` 和
 `/lste/prompts` 是否存在。
+
+需要对同一任务强制重新生成时，删除本地缓存后重新启动节点：
+
+```bash
+rm -rf runtime/prompt_cache
+stopall
+runall
+```
 
 ### 识别 CUDA 驱动初始化故障
 

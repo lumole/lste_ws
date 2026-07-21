@@ -63,7 +63,7 @@ def extract_color_terms(attributes):
     colors = []
     for attr in attributes or []:
         attr_lower = str(attr).lower()
-        for color in COLOR_KEYWORDS:
+        for color in sorted(COLOR_KEYWORDS):
             if color in attr_lower and color not in colors:
                 colors.append(color)
     return colors
@@ -83,7 +83,9 @@ def build_llm_prompt_from_task(task_parsed: dict) -> str:
     key_objects = obj_related.get("key_objects", [])
     env_type_prior = _extract_env_type_strings(env.get("env_type_prior", []))
 
-    env_objects = list(set(related_structures + key_objects + env_type_prior))
+    # Keep the task JSON order stable. A set makes the LLM prompt (and its
+    # persistent cache key) change across Python processes.
+    env_objects = list(dict.fromkeys(related_structures + key_objects + env_type_prior))
     env_objects = [obj for obj in env_objects if obj.lower() not in target_name.lower()]
     env_objects_str = ", ".join(env_objects[:8]) if env_objects else "desk, chair, monitor, keyboard"
 

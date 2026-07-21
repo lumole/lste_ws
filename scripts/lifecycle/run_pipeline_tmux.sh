@@ -55,7 +55,9 @@ if [[ ! -f "$TASK_JSON" ]]; then
 fi
 VLLM_URL=${VLLM_URL:-${CFG_VLLM_URL:-http://localhost:8000/v1}}
 VLLM_MODEL=${VLLM_MODEL:-$(_resolve "${CFG_VLLM_MODEL:-model/MiniCPM/OpenBMB/MiniCPM4-0___5B}")}
-VLLM_PROBE=${VLLM_PROBE:-${VLLM_URL%/}}
+PROMPT_CACHE_ENABLED=${PROMPT_CACHE_ENABLED:-${CFG_PROMPT_CACHE_ENABLED:-true}}
+PROMPT_CACHE_DIR=${PROMPT_CACHE_DIR:-$(_resolve "${CFG_PROMPT_CACHE_DIR:-runtime/prompt_cache}")}
+VLLM_START_TIMEOUT=${VLLM_START_TIMEOUT:-${CFG_VLLM_START_TIMEOUT:-240}}
 ACCESS_TOPO_CONFIG=${ACCESS_TOPO_CONFIG:-$(_resolve "${CFG_ACCESS_TOPO_CONFIG:-src/lste_topo_access/topo_tree/cfgs/access_topo.yaml}")}
 ACCESS_TOPO_CONFIG_PASS=${ACCESS_TOPO_CONFIG_PASS:-$(_resolve "${CFG_ACCESS_TOPO_CONFIG_PASS:-src/lste_topo_access/topo_tree/cfgs/access_topo_pass.yaml}")}
 ACCESS_TOPO_CONFIG_SUS_C=${ACCESS_TOPO_CONFIG_SUS_C:-$(_resolve "${CFG_ACCESS_TOPO_CONFIG_SUS_C:-src/lste_topo_access/topo_tree/cfgs/access_topo_sus_c.yaml}")}
@@ -67,10 +69,6 @@ FOLLOW_LOCKED_DONE_TIME=${FOLLOW_LOCKED_DONE_TIME:-${CFG_FOLLOW_LOCKED_DONE_TIME
 FRONTIER_LOG=${FRONTIER_LOG:-${CFG_FRONTIER_LOG:-true}}
 # The Gazebo click-coordinate plugin is part of the required operator UI.
 GUI=true
-if [[ "$VLLM_PROBE" == */v1 ]]; then
-  VLLM_PROBE="$VLLM_PROBE/models"
-fi
-
 if [[ ! -f "$WORLD" ]]; then
   echo "[error] WORLD file not found: $WORLD" >&2
   exit 1
@@ -138,27 +136,32 @@ tmux_new_window 1 "$WS" "world" \
 tmux_new_window 2 "$WS" "task" \
   "$WAIT_ROSCORE; rosrun lste_core lste_task_node.py _json_path:=$TASK_JSON _task_id:=$TASK_ID"
 
-# 3: 启动 VLLM 服务（MiniCPM）
+# 3: 按 prompt 缓存决策启动 VLLM（MiniCPM）
 tmux_new_window 3 "$WS/model/MiniCPM/test" "vllm" \
-  "conda activate minicpm; bash start.sh"
+  "$WAIT_ROSCORE; echo \"Waiting for prompt cache decision...\"; \
+   while true; do \
+     decision=\$(rosparam get /lste_prompt_node/needs_vllm 2>/dev/null || true); \
+     case \"\$decision\" in \
+       true) echo \"Prompt cache miss; starting MiniCPM.\"; conda activate minicpm; exec bash start.sh ;; \
+       false) echo \"Prompt cache hit; MiniCPM was not started.\"; exit 0 ;; \
+     esac; \
+     sleep 0.5; \
+   done"
 
 # 4: 全局目标（/lste/final_goal）
 tmux_new_window 4 "$WS" "goal" \
   "$WAIT_ROSCORE; rosrun lste_topo_access lste_goal_manager.py _follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME"
 
-# 5: 等待 VLLM 就绪后启动 prompt 节点
+# 5: prompt 节点先查缓存，仅在 miss 时等待 VLLM
 tmux_new_window 5 "$WS" "prompt" \
   "$WAIT_ROSCORE; conda activate minicpm; \
-   echo \"等待 VLLM 就绪...\"; \
-   for i in \$(seq 1 120); do \
-     if command -v curl >/dev/null 2>&1 && curl -sSf \"$VLLM_PROBE\" >/dev/null 2>&1; then echo \"VLLM ready\"; break; fi; \
-     if ! command -v curl >/dev/null 2>&1; then \
-       python -c \"import urllib.request; urllib.request.urlopen(\\\"$VLLM_PROBE\\\", timeout=1)\" >/dev/null 2>&1 && echo \"VLLM ready\" && break || true; \
-     fi; \
-     sleep 2; \
-   done; \
    rosparam set /lste_prompt_node/vllm_stop_command \"tmux kill-window -t =$SESSION:vllm\"; \
-   rosrun lste_core lste_prompt_node.py _vllm_base_url:=$VLLM_URL _vllm_model_name:=$VLLM_MODEL"
+   rosrun lste_core lste_prompt_node.py \
+     _vllm_base_url:=$VLLM_URL \
+     _vllm_model_name:=$VLLM_MODEL \
+     _cache_enabled:=$PROMPT_CACHE_ENABLED \
+     _cache_dir:=$PROMPT_CACHE_DIR \
+     _vllm_start_timeout:=$VLLM_START_TIMEOUT"
 
 # 6: DINO 检测
 tmux_new_window 6 "$WS" "dino" \

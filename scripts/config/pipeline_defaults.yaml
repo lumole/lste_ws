@@ -14,6 +14,9 @@ TASK_ID: blue_cup
 # Models and configs (paths relative to $WS)
 VLLM_URL: http://localhost:8000/v1
 VLLM_MODEL: model/MiniCPM/OpenBMB/MiniCPM4-0___5B
+PROMPT_CACHE_ENABLED: true
+PROMPT_CACHE_DIR: runtime/prompt_cache
+VLLM_START_TIMEOUT: 240
 ACCESS_TOPO_CONFIG: src/lste_topo_access/topo_tree/cfgs/access_topo.yaml
 ACCESS_TOPO_CONFIG_PASS: src/lste_topo_access/topo_tree/cfgs/access_topo_pass.yaml
 ACCESS_TOPO_CONFIG_SUS_C: src/lste_topo_access/topo_tree/cfgs/access_topo_sus_c.yaml

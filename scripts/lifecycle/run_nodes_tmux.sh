@@ -57,7 +57,9 @@ if [[ ! -f "$TASK_JSON" ]]; then
 fi
 VLLM_URL=${VLLM_URL:-${CFG_VLLM_URL:-http://localhost:8000/v1}}
 VLLM_MODEL=${VLLM_MODEL:-$(_resolve "${CFG_VLLM_MODEL:-model/MiniCPM/OpenBMB/MiniCPM4-0___5B}")}
-VLLM_PROBE=${VLLM_PROBE:-${VLLM_URL%/}}
+PROMPT_CACHE_ENABLED=${PROMPT_CACHE_ENABLED:-${CFG_PROMPT_CACHE_ENABLED:-true}}
+PROMPT_CACHE_DIR=${PROMPT_CACHE_DIR:-$(_resolve "${CFG_PROMPT_CACHE_DIR:-runtime/prompt_cache}")}
+VLLM_START_TIMEOUT=${VLLM_START_TIMEOUT:-${CFG_VLLM_START_TIMEOUT:-240}}
 ACCESS_TOPO_CONFIG=${ACCESS_TOPO_CONFIG:-$(_resolve "${CFG_ACCESS_TOPO_CONFIG:-src/lste_topo_access/topo_tree/cfgs/access_topo.yaml}")}
 ACCESS_TOPO_CONFIG_PASS=${ACCESS_TOPO_CONFIG_PASS:-$(_resolve "${CFG_ACCESS_TOPO_CONFIG_PASS:-src/lste_topo_access/topo_tree/cfgs/access_topo_pass.yaml}")}
 ACCESS_TOPO_CONFIG_SUS_C=${ACCESS_TOPO_CONFIG_SUS_C:-$(_resolve "${CFG_ACCESS_TOPO_CONFIG_SUS_C:-src/lste_topo_access/topo_tree/cfgs/access_topo_sus_c.yaml}")}
@@ -75,10 +77,6 @@ FRONTIER_LOG=${FRONTIER_LOG:-${CFG_FRONTIER_LOG:-true}}
 LSTE_CONTROLLER=${LSTE_CONTROLLER:-sappo}
 SAPPO_SPEED=${SAPPO_SPEED:-0.50}
 SAPPO_PYTHON=${SAPPO_PYTHON:-$HOME/miniconda3/envs/rlenvs/bin/python}
-if [[ "$VLLM_PROBE" == */v1 ]]; then
-  VLLM_PROBE="$VLLM_PROBE/models"
-fi
-
 case "$LSTE_CONTROLLER" in
   teleop|sappo) ;;
   *)
@@ -110,6 +108,10 @@ if tmux has-session -t "=$SESSION" 2>/dev/null; then
 fi
 echo "[nodes] 清理旧 session 完毕"
 
+# lste-env may keep roscore alive across node restarts, so remove the previous
+# prompt decision before the gated vLLM window starts.
+bash -lc "WS=\"$WS\"; source \"$WS/scripts/config/pipeline_env.sh\"; rosparam delete /lste_prompt_node/needs_vllm >/dev/null 2>&1 || true"
+
 # ---- 新建节点 session ----
 echo "[nodes] 创建 session '$SESSION'..."
 tmux new-session -d -s "$SESSION" -c "$WS" -n "pro3" \
@@ -139,27 +141,32 @@ WAIT_ROSCORE='until rostopic list >/dev/null 2>&1; do echo \"waiting for roscore
 tmux_new_window 1 "$WS" "task" \
   "$WAIT_ROSCORE; rosrun lste_core lste_task_node.py _json_path:=$TASK_JSON _task_id:=$TASK_ID"
 
-# 2: VLLM 服务
+# 2: VLLM 服务。缓存命中时不加载 MiniCPM。
 tmux_new_window 2 "$WS/model/MiniCPM/test" "vllm" \
-  "conda activate minicpm; bash start.sh"
+  "$WAIT_ROSCORE; echo \"Waiting for prompt cache decision...\"; \
+   while true; do \
+     decision=\$(rosparam get /lste_prompt_node/needs_vllm 2>/dev/null || true); \
+     case \"\$decision\" in \
+       true) echo \"Prompt cache miss; starting MiniCPM.\"; conda activate minicpm; exec bash start.sh ;; \
+       false) echo \"Prompt cache hit; MiniCPM was not started.\"; exit 0 ;; \
+     esac; \
+     sleep 0.5; \
+   done"
 
 # 3: 全局目标
 tmux_new_window 3 "$WS" "goal" \
   "$WAIT_ROSCORE; rosrun lste_topo_access lste_goal_manager.py _follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME"
 
-# 4: VLM Prompt 节点
+# 4: VLM Prompt 节点。它先检查缓存，再通知窗口 2 是否启动 MiniCPM。
 tmux_new_window 4 "$WS" "prompt" \
   "$WAIT_ROSCORE; conda activate minicpm; \
-   echo \"等待 VLLM 就绪...\"; \
-   for i in \$(seq 1 120); do \
-     if command -v curl >/dev/null 2>&1 && curl -sSf \"$VLLM_PROBE\" >/dev/null 2>&1; then echo \"VLLM ready\"; break; fi; \
-     if ! command -v curl >/dev/null 2>&1; then \
-       python -c \"import urllib.request; urllib.request.urlopen(\\\"$VLLM_PROBE\\\", timeout=1)\" >/dev/null 2>&1 && echo \"VLLM ready\" && break || true; \
-     fi; \
-     sleep 2; \
-   done; \
    rosparam set /lste_prompt_node/vllm_stop_command \"tmux kill-window -t =$SESSION:vllm\"; \
-   rosrun lste_core lste_prompt_node.py _vllm_base_url:=$VLLM_URL _vllm_model_name:=$VLLM_MODEL"
+   rosrun lste_core lste_prompt_node.py \
+     _vllm_base_url:=$VLLM_URL \
+     _vllm_model_name:=$VLLM_MODEL \
+     _cache_enabled:=$PROMPT_CACHE_ENABLED \
+     _cache_dir:=$PROMPT_CACHE_DIR \
+     _vllm_start_timeout:=$VLLM_START_TIMEOUT"
 
 # 5: DINO 检测
 tmux_new_window 5 "$WS" "dino" \
