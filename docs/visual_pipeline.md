@@ -1,6 +1,6 @@
 # 视觉链路性能与框跟随
 
-更新日期：2026-07-10
+更新日期：2026-07-21
 
 提交记录：`perf(vision): smooth detection visualization and Gazebo rendering`
 
@@ -9,8 +9,8 @@
 提高 Gazebo/RViz 画面流畅度，并让检测框在 GroundingDINO 两次推理之间持续跟随图像。保持现有启动方式不变：
 
 ```bash
-./scripts/run_env_tmux.sh
-./scripts/run_nodes_tmux.sh
+./scripts/lifecycle/run_env_tmux.sh
+./scripts/lifecycle/run_nodes_tmux.sh
 ```
 
 ## 性能策略
@@ -18,13 +18,31 @@
 - Kinect Gazebo 相机更新率为 30 Hz。
 - 场景关闭阴影，避免不必要的 Gazebo 渲染负担。
 - `GAZEBO_MODEL_DATABASE_URI` 默认指向工作区的本地空模型数据库，避免 Gazebo Classic 访问已退役的公网模型数据库而阻塞启动。
-- GroundingDINO 最小推理间隔为 3 秒。DINO 与 Gazebo、RViz 共用 GPU；限制推理频率为渲染留下稳定时间，不改变相机的 30 Hz 图像发布。
+- GroundingDINO 的常用推理间隔为 1.5 秒；`EXHAUSTED` 状态为 3 秒。DINO 与 Gazebo、RViz 共用 GPU；限制推理频率为渲染留下稳定时间，不改变相机的 30 Hz 图像发布。
 
-可用环境变量临时覆盖 DINO 间隔：
+这些值集中配置在 `scripts/config/pipeline_defaults.yaml`：
 
-```bash
-DINO_MIN_INTERVAL=2.0 ./scripts/run_nodes_tmux.sh
+```yaml
+DINO_MIN_INTERVAL: 1.5
+DINO_INTERVAL_PASS: 1.5
+DINO_INTERVAL_SUSPICIOUS: 1.5
+DINO_INTERVAL_LOCKED: 1.5
+DINO_INTERVAL_EXHAUSTED: 3.0
 ```
+
+`runall` 启动时会自动读取该配置，不需要在命令行追加参数。
+
+## GroundingDINO 实测帧率
+
+测试环境为 NVIDIA GeForce RTX 3060，当前每帧执行两次 GroundingDINO 推理（目标 prompt 和环境 prompt）。
+
+| 调度方式 | 平均结果间隔 | 平均结果率 | 平均 GPU 利用率 | 峰值 GPU 利用率 |
+| --- | ---: | ---: | ---: | ---: |
+| 原配置，最小间隔 3.0 秒 | 3.074 秒 | 0.325 FPS | - | - |
+| 不限速 | 1.284 秒 | 0.779 FPS | 82.8% | 100% |
+| 推荐配置，最小间隔 1.5 秒 | 1.588 秒 | 0.630 FPS | 68.9% | 99% |
+
+不限速时的 `0.779 FPS` 是当前实现测得的最高持续结果率。推荐使用 1.5 秒调度：相比不限速仅少约 19% 的结果率，但明显降低平均 GPU 占用，为 Gazebo 和 RViz 留出余量。日志中的 `Failed to load custom C++ ops. Running on CPU mode Only!` 表明 GroundingDINO 自定义算子没有成功加载；修复该安装问题后，性能上限可能变化，需要重新测试。
 
 ## 检测框策略
 

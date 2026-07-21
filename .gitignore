@@ -10,6 +10,7 @@ __pycache__/
 # ROS logs
 ros_logs/
 log/
+runtime/
 
 # Runtime topology snapshots
 src/lste_topo_access/topo_tree/tree/**/access_topo_*.json
@@ -31,3 +32,6 @@ model/**/*.bin
 model/**/*.ckpt
 model/**/*.safetensors
 model/**/*.onnx
+
+# SA-PPO policies are runtime artifacts; keep acquisition instructions only.
+rl_navigation/policy/*.pth

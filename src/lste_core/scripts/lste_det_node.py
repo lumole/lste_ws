@@ -82,13 +82,13 @@ class DetNode:
         self.text_threshold = float(rospy.get_param("~text_threshold", 0.25))
 
         # 频率控制：不同 state 对应的最小检测间隔（秒）
-        self.interval_pass = float(rospy.get_param("~interval_pass", 2.0))
-        self.interval_suspicious = float(rospy.get_param("~interval_suspicious", 0.5))
-        self.interval_locked = float(rospy.get_param("~interval_locked", 0.3))
+        self.interval_pass = float(rospy.get_param("~interval_pass", 1.5))
+        self.interval_suspicious = float(rospy.get_param("~interval_suspicious", 1.5))
+        self.interval_locked = float(rospy.get_param("~interval_locked", 1.5))
         self.interval_exhausted = float(rospy.get_param("~interval_exhausted", 3.0))
         # GroundingDINO shares the simulation GPU with Gazebo and RViz. Keep a
         # guaranteed rendering window even when the state requests rapid checks.
-        self.min_inference_interval = float(rospy.get_param("~min_inference_interval", 3.0))
+        self.min_inference_interval = float(rospy.get_param("~min_inference_interval", 1.5))
 
         # 模型加载
         rospy.loginfo("Loading GroundingDINO model...")

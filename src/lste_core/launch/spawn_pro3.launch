@@ -1,7 +1,7 @@
 <launch>
   <arg name="robot_name" default="pro3"/>
-  <arg name="x" default="0.0"/>
-  <arg name="y" default="0.0"/>
+  <arg name="x" default="20.0"/>
+  <arg name="y" default="-6.5"/>
   <arg name="z" default="0.1"/>
   <arg name="yaw" default="0.0"/>
   <arg name="robot_description_path" default="$(find pja)/urdf/pro3.xacro"/>

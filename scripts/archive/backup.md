@@ -1,4 +1,4 @@
--###################### -pipeline- ################################-
+-###################### historical pipeline notes ######################-
 roslaunch lste_core lab_with_pro3.launch \
   world_name:=/worlds/topo2.0_explore_mode/place2.world
   

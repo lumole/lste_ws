@@ -124,7 +124,7 @@ world 文件位置: worlds/topo3.0_catch_mode/session_test/env04.world
 
 ## 6. libffi 兼容
 
-conda 自带 `libffi.so.8` 与系统的 `libffi.so.7` 冲突，已通过 `scripts/pipeline_env.sh` 自动处理。  
+conda 自带 `libffi.so.8` 与系统的 `libffi.so.7` 冲突，已通过 `scripts/config/pipeline_env.sh` 自动处理。
 手动运行节点时如果遇到：
 
 ```
@@ -168,13 +168,16 @@ kill %1
 
 ---
 
-## 8. 启动完整 Pipeline
+## 8. 启动 Pipeline
+
+日常启动 LSTE + SA-PPO 集成模式、键盘调试模式和 SA-PPO 独立验证，请参见
+[`startup_guide.md`](startup_guide.md)。
 
 ```bash
 cd lste_ws
 
 # 方式 1：一键脚本
-./scripts/run_pipeline_tmux.sh
+./scripts/lifecycle/run_pipeline_tmux.sh
 
 # 方式 2：手动分步（见 readme.md § Pipeline Steps）
 ```

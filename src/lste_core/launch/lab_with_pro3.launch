@@ -1,6 +1,6 @@
 <launch>
   <!-- ensure Gazebo can load custom Velodyne/Ouster plugins -->
-  <!-- LSTE_PRE_WS is auto-detected by pipeline_env.sh, or set manually -->
+  <!-- LSTE_PRE_WS is auto-detected by scripts/config/pipeline_env.sh, or set manually -->
   <env name="GAZEBO_PLUGIN_PATH" value="$(optenv LSTE_PRE_WS)/devel/lib:$(optenv GAZEBO_PLUGIN_PATH '')"/>
   <arg name="gui" default="true"/>
   <arg name="use_sim_time" default="true"/>
@@ -11,8 +11,8 @@
   <!-- 默认 world，允许从命令行覆盖为任意 .world 路径 -->
   <arg name="world_name" default="$(find lste_core)/../../worlds/lab_building.world"/>
 
-  <arg name="x" default="0.0"/>
-  <arg name="y" default="0.0"/>
+  <arg name="x" default="20.0"/>
+  <arg name="y" default="-6.5"/>
   <arg name="z" default="0.1"/>
   <arg name="yaw" default="0.0"/>
 

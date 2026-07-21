@@ -8,7 +8,7 @@ set -euo pipefail
 
 # Auto-detect workspace root (can override with LSTE_WS env var)
 if [ -z "${WS:-}" ]; then
-  WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 fi
 
 # Auto-detect pre_work workspace (for Gazebo plugins). Can override with LSTE_PRE_WS.

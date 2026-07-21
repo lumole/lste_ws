@@ -24,8 +24,13 @@ flowchart TD
     final --> gp
     final --> vis[Detection/RViz visualization]
 
-    final -. 仍缺目标跟踪控制器 .-> cmd[/cmd_vel/]
-    teleop[当前：键盘遥控] --> cmd
+    final --> rl[SA-PPO 控制器]
+    lidar --> scan[pointcloud_to_laserscan]
+    scan -->|/pro3/rlscan| rl
+    rl -->|/lste/cmd_vel/sappo| mux[速度 mux]
+    teleop[键盘遥控] -->|/lste/cmd_vel/teleop| mux
+    mode[/lste/controller_mode/] --> mux
+    mux --> cmd[/cmd_vel/]
     cmd --> base[Gazebo 差速底盘]
     base --> odom
 ```
@@ -77,9 +82,9 @@ anchor 是机器人轨迹上的稀疏点，不是 GP 训练点。当前 profile 
 anchor 附近出现多个稳定 frontier 峰时，被视作可能路口。已选择的分支标记
 为已走过，未选择的分支保留为 `PENDING`，以便未来回退后继续探索。
 
-## 当前边界
+## 控制器模式
 
-当前一条龙流程发布 `/lste/final_goal`，但没有启动一个把该目标转换为
-`/cmd_vel` 的控制器。键盘遥控是当前 `/cmd_vel` 的发布者；Gazebo 消费
-`/cmd_vel` 并移动车辆。未来的自主控制器应位于 `final_goal` 和 `cmd_vel`
-之间。
+默认执行 `./scripts/lifecycle/run_nodes_tmux.sh` 时，SA-PPO 直接订阅 `/lste/final_goal`，
+结合 `/pro3/rlscan` 和 `/pro3/wheel_odom` 发布候选速度。SA-PPO 与键盘控制始终
+并存，但发布到不同输入话题；速度 mux 根据 `/lste/controller_mode` 选择一个输入，
+并作为 `/cmd_vel` 的唯一发布者。

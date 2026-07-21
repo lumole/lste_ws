@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""teleop_twist_keyboard with reset functionality.
+"""Teleop keyboard utility with Gazebo reset functionality.
 Press 'r' to reset robot to initial spawn position via Gazebo service.
 """
 from __future__ import print_function
 import threading
-import roslib; roslib.load_manifest('teleop_twist_keyboard')
 import rospy
 from geometry_msgs.msg import Twist
 from std_srvs.srv import Empty

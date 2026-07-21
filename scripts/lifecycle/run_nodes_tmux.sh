@@ -5,17 +5,17 @@ export PYTHONDONTWRITEBYTECODE=1
 # ============================================
 # 业务节点脚本：独立 session "lste"，依赖 lste-env 的 roscore + Gazebo
 # 可反复重启调试，不影响环境 session
-# 前置条件：先运行 ./scripts/run_env_tmux.sh
+# 前置条件：先运行 ./scripts/lifecycle/run_env_tmux.sh
 # ============================================
 
 # ---- 路径解析（与 run_env_tmux.sh 完全一致） ----
 if [ -z "${WS:-}" ]; then
-  WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 fi
 LSTE_WS="$WS"
 ENV_SESSION=lste-env
 SESSION=lste
-PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/pipeline_defaults.yaml}
+PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}
 if [[ -f "$PIPELINE_CONFIG" ]]; then
   eval "$(
     python - "$PIPELINE_CONFIG" <<'PY' || true
@@ -44,8 +44,17 @@ _resolve() {
 }
 
 # ---- 所有变量解析 ----
-TASK_JSON=${TASK_JSON:-$(_resolve "${CFG_TASK_JSON:-model/Data_exchange/vlm_prompt/lab/yellow_cup.json}")}
-TASK_ID=${TASK_ID:-${CFG_TASK_ID:-yellow_cup}}
+TASK_JSON_VALUE=${TASK_JSON:-${CFG_TASK_JSON:-}}
+TASK_ID=${TASK_ID:-${CFG_TASK_ID:-}}
+if [[ -z "$TASK_JSON_VALUE" || -z "$TASK_ID" ]]; then
+  echo "[error] TASK_JSON and TASK_ID must be set in $PIPELINE_CONFIG or the environment" >&2
+  exit 1
+fi
+TASK_JSON=$(_resolve "$TASK_JSON_VALUE")
+if [[ ! -f "$TASK_JSON" ]]; then
+  echo "[error] TASK_JSON file not found: $TASK_JSON" >&2
+  exit 1
+fi
 VLLM_URL=${VLLM_URL:-${CFG_VLLM_URL:-http://localhost:8000/v1}}
 VLLM_MODEL=${VLLM_MODEL:-$(_resolve "${CFG_VLLM_MODEL:-model/MiniCPM/OpenBMB/MiniCPM4-0___5B}")}
 VLLM_PROBE=${VLLM_PROBE:-${VLLM_URL%/}}
@@ -57,11 +66,26 @@ ACCESS_TOPO_RUN_NAME=${ACCESS_TOPO_RUN_NAME:-${CFG_ACCESS_TOPO_RUN_NAME:-$ACCESS
 GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-$(_resolve "${CFG_GP_FRONTIER_RVIZ:-src/lste_topo_access/launch/gp_frontier.rviz}")}
 SUSPICIOUS_WINDOW=${SUSPICIOUS_WINDOW:-${CFG_SUSPICIOUS_WINDOW:-5}}
 FOLLOW_LOCKED_DONE_TIME=${FOLLOW_LOCKED_DONE_TIME:-${CFG_FOLLOW_LOCKED_DONE_TIME:-4.0}}
-DINO_MIN_INTERVAL=${DINO_MIN_INTERVAL:-${CFG_DINO_MIN_INTERVAL:-6.0}}
+DINO_MIN_INTERVAL=${DINO_MIN_INTERVAL:-${CFG_DINO_MIN_INTERVAL:-1.5}}
+DINO_INTERVAL_PASS=${DINO_INTERVAL_PASS:-${CFG_DINO_INTERVAL_PASS:-1.5}}
+DINO_INTERVAL_SUSPICIOUS=${DINO_INTERVAL_SUSPICIOUS:-${CFG_DINO_INTERVAL_SUSPICIOUS:-1.5}}
+DINO_INTERVAL_LOCKED=${DINO_INTERVAL_LOCKED:-${CFG_DINO_INTERVAL_LOCKED:-1.5}}
+DINO_INTERVAL_EXHAUSTED=${DINO_INTERVAL_EXHAUSTED:-${CFG_DINO_INTERVAL_EXHAUSTED:-3.0}}
 FRONTIER_LOG=${FRONTIER_LOG:-${CFG_FRONTIER_LOG:-true}}
+LSTE_CONTROLLER=${LSTE_CONTROLLER:-sappo}
+SAPPO_SPEED=${SAPPO_SPEED:-0.50}
+SAPPO_PYTHON=${SAPPO_PYTHON:-$HOME/miniconda3/envs/rlenvs/bin/python}
 if [[ "$VLLM_PROBE" == */v1 ]]; then
   VLLM_PROBE="$VLLM_PROBE/models"
 fi
+
+case "$LSTE_CONTROLLER" in
+  teleop|sappo) ;;
+  *)
+    echo "[error] LSTE_CONTROLLER must be 'teleop' or 'sappo' (got '$LSTE_CONTROLLER')" >&2
+    exit 1
+    ;;
+esac
 
 # ---- 前置检查 ----
 if ! command -v tmux >/dev/null 2>&1; then
@@ -70,7 +94,11 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 if ! tmux has-session -t "=$ENV_SESSION" 2>/dev/null; then
-  echo "[error] 环境 session '$ENV_SESSION' 不存在，请先运行 ./scripts/run_env_tmux.sh" >&2
+  echo "[error] 环境 session '$ENV_SESSION' 不存在，请先运行 ./scripts/lifecycle/run_env_tmux.sh" >&2
+  exit 1
+fi
+if tmux has-session -t "=sappo-lste" 2>/dev/null; then
+  echo "[error] 独立 SA-PPO session 'sappo-lste' 仍在运行，请先停止它再启动 LSTE 节点" >&2
   exit 1
 fi
 echo "[nodes] 检测到 $ENV_SESSION 存活"
@@ -85,7 +113,7 @@ echo "[nodes] 清理旧 session 完毕"
 # ---- 新建节点 session ----
 echo "[nodes] 创建 session '$SESSION'..."
 tmux new-session -d -s "$SESSION" -c "$WS" -n "pro3" \
-  "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/pipeline_env.sh\"; set -e; \
+  "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/config/pipeline_env.sh\"; set -e; \
 until rostopic list >/dev/null 2>&1; do echo \"waiting for rocore...\"; sleep 1; done; \
 roslaunch lste_core spawn_pro3.launch spawn_model:=true; \
 echo; echo \"[EXIT] pro3 spawn\"; exec bash'"
@@ -100,7 +128,7 @@ tmux_new_window() {
   local title="$3"
   local cmd="$4"
   tmux new-window -t "=$SESSION:$index" -n "$title" -c "$dir" \
-    "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/pipeline_env.sh\"; set -e; $cmd'; echo; echo '[EXIT] $title'; exec bash"
+    "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/config/pipeline_env.sh\"; set -e; $cmd'; echo; echo '[EXIT] $title'; exec bash"
   echo "[nodes] 创建窗口 $index($title) 后检查: $(tmux list-sessions 2>&1)"
 }
 
@@ -130,12 +158,18 @@ tmux_new_window 4 "$WS" "prompt" \
      fi; \
      sleep 2; \
    done; \
-   rosparam set /lste_prompt_node/vllm_stop_command \"pkill -f vllm.*serve\"; \
+   rosparam set /lste_prompt_node/vllm_stop_command \"tmux kill-window -t =$SESSION:vllm\"; \
    rosrun lste_core lste_prompt_node.py _vllm_base_url:=$VLLM_URL _vllm_model_name:=$VLLM_MODEL"
 
 # 5: DINO 检测
 tmux_new_window 5 "$WS" "dino" \
-  "$WAIT_ROSCORE; conda activate dino; export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7; rosrun lste_core lste_det_node.py _min_inference_interval:=$DINO_MIN_INTERVAL"
+  "$WAIT_ROSCORE; conda activate dino; export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7; \
+   rosrun lste_core lste_det_node.py \
+     _min_inference_interval:=$DINO_MIN_INTERVAL \
+     _interval_pass:=$DINO_INTERVAL_PASS \
+     _interval_suspicious:=$DINO_INTERVAL_SUSPICIOUS \
+     _interval_locked:=$DINO_INTERVAL_LOCKED \
+     _interval_exhausted:=$DINO_INTERVAL_EXHAUSTED"
 
 # 6: Score
 tmux_new_window 6 "$WS" "score" \
@@ -171,17 +205,33 @@ tmux_new_window 10 "$WS" "gp_frontier" \
 tmux_new_window 11 "$WS" "rviz_frontier" \
   "$WAIT_ROSCORE; rviz -d $GP_FRONTIER_RVIZ"
 
-# 12: 键盘遥控
-tmux_new_window 12 "$WS" "teleop" \
-  "$WAIT_ROSCORE; python \"$WS/scripts/teleop_with_reset.py\" cmd_vel:=/cmd_vel"
+# 12: GUI 热切换请求处理（只切换 mux，不停止控制器进程）
+tmux_new_window 12 "$WS" "controller_switch" \
+  "$WAIT_ROSCORE; rosrun lste_core lste_controller_switch_node.py \
+    _initial_mode:=$LSTE_CONTROLLER"
+
+# 13: 唯一 /cmd_vel 发布者
+tmux_new_window 13 "$WS" "cmd_vel_mux" \
+  "$WAIT_ROSCORE; rosrun lste_core lste_cmd_vel_mux_node.py"
+
+# 14: 持续健康检查（在控制器前启动，以便捕获 SA-PPO 启动失败）
+tmux_new_window 14 "$WS" "health" \
+  "$WAIT_ROSCORE; python3 $WS/scripts/tools/lste_health_audit.py"
+
+# 15+: SA-PPO 与 teleop 始终运行，切换只改变 mux 输入。
+SAPPO_SPEED="$SAPPO_SPEED" SAPPO_PYTHON="$SAPPO_PYTHON" \
+  "$WS/scripts/lifecycle/switch_controller.sh" "$LSTE_CONTROLLER"
+WINDOW_SUMMARY="17 个 lste 窗口 + 始终运行的 lste-teleop 会话"
 
 echo ""
 echo "============================================"
-echo "  节点全部启动完毕 (13 个窗口：pro3 + 12 节点)"
+echo "  节点全部启动完毕 ($WINDOW_SUMMARY)"
+echo "  控制器: $LSTE_CONTROLLER"
 echo "  环境 session:  tmux attach -t lste-env"
 echo "  节点 session:  tmux attach -t lste"
+echo "  遥控 session:  teleop"
 echo "============================================"
 
-if [[ -t 0 ]]; then
+if [[ -t 0 && "${LSTE_NO_ATTACH:-0}" != "1" ]]; then
   tmux attach -t "$SESSION"
 fi

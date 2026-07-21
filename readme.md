@@ -10,7 +10,7 @@ export LSTE_WS=$(pwd)   # 在 lste_ws 目录下执行
 
 # 清理旧的 session (如果存在)
 tmux kill-session -t lste 2>/dev/null || true
-./scripts/run_pipeline_tmux.sh
+./scripts/lifecycle/run_pipeline_tmux.sh
 ```
 
 ---
@@ -92,7 +92,7 @@ conda 自带的 `libffi.so.8` 与系统 `libffi.so.7` 冲突，会导致 apt 版
 undefined symbol: ffi_type_pointer, version LIBFFI_BASE_7.0
 ```
 
-已在 `scripts/pipeline_env.sh` 中通过 `LD_PRELOAD` 修复；手动运行时如果遇到同样问题：
+已在 `scripts/config/pipeline_env.sh` 中通过 `LD_PRELOAD` 修复；手动运行时如果遇到同样问题：
 
 ```bash
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7

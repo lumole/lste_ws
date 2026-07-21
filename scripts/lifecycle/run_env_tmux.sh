@@ -9,11 +9,11 @@ export PYTHONDONTWRITEBYTECODE=1
 
 # ---- 路径解析（与 run_nodes_tmux.sh 完全一致） ----
 if [ -z "${WS:-}" ]; then
-  WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 fi
 LSTE_WS="$WS"
 SESSION=lste-env
-PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/pipeline_defaults.yaml}
+PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}
 if [[ -f "$PIPELINE_CONFIG" ]]; then
   eval "$(
     python - "$PIPELINE_CONFIG" <<'PY' || true
@@ -41,10 +41,17 @@ _resolve() {
 }
 
 WORLD=${WORLD:-$(_resolve "${CFG_WORLD:-worlds/place1.world}")}
-GUI=${GUI:-${CFG_GUI:-true}}
+GUI=true
+GUI_PLUGIN="$WS/devel/lib/libgazebo_click_point.so"
 
 if [[ ! -f "$WORLD" ]]; then
   echo "[error] WORLD file not found: $WORLD" >&2
+  exit 1
+fi
+
+if [[ ! -f "$GUI_PLUGIN" ]]; then
+  echo "[error] Gazebo click plugin not found: $GUI_PLUGIN" >&2
+  echo "        Run: source /opt/ros/noetic/setup.bash && catkin_make --pkg gazebo_click_point" >&2
   exit 1
 fi
 
@@ -53,6 +60,23 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
+gazebo_gui_ready() {
+  pgrep -f 'gzclient.*--gui-client-plugin .*libgazebo_click_point\.so' >/dev/null
+}
+
+start_gazebo_gui() {
+  local window_name
+  for window_name in gui gazebo_gui; do
+    if tmux list-windows -t "=$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$window_name"; then
+      tmux kill-window -t "=$SESSION:$window_name"
+    fi
+  done
+  tmux new-window -t "=$SESSION:" -n "gazebo_gui" -c "$WS" \
+    "bash -lc 'source \"$WS/scripts/config/pipeline_env.sh\"; \
+until rostopic list >/dev/null 2>&1; do sleep 1; done; \
+exec rosrun gazebo_ros gzclient --gui-client-plugin \"$GUI_PLUGIN\" __name:=gazebo_gui'"
+}
+
 # ---- Session 管理 ----
 if tmux has-session -t "=$SESSION" 2>/dev/null; then
   EXISTING_WORLD="$(tmux show-environment -t "=$SESSION" 2>/dev/null | awk -F= '/^LSTE_WORLD=/{print substr($0,length("LSTE_WORLD=")+1)}')"
@@ -60,15 +84,22 @@ if tmux has-session -t "=$SESSION" 2>/dev/null; then
     echo "[info] WORLD changed ($EXISTING_WORLD → $WORLD), restarting session."
     tmux kill-session -t "=$SESSION"
   else
-    echo "[info] Session '$SESSION' 已存在 (WORLD=$WORLD), 直接附着。" >&2
+    if ! gazebo_gui_ready; then
+      echo "[info] Gazebo GUI/plugin missing; restarting the GUI client."
+      start_gazebo_gui
+    fi
+    echo "[info] Session '$SESSION' 已存在 (WORLD=$WORLD), GUI 插件已就绪。" >&2
     echo "  提示：按 Ctrl+B 再按 D 可分离 tmux，Ctrl+C 退出。"
-    tmux attach -t "=$SESSION"; exit 0
+    if [[ -t 0 && "${LSTE_NO_ATTACH:-0}" != "1" ]]; then
+      tmux attach -t "=$SESSION"
+    fi
+    exit 0
   fi
 fi
 
 # ---- 新建 session ----
 tmux new-session -d -s "$SESSION" -c "$WS" -n "roscore" \
-  "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/pipeline_env.sh\"; roscore'; echo; echo '[EXIT] roscore'; exec bash"
+  "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/config/pipeline_env.sh\"; roscore'; echo; echo '[EXIT] roscore'; exec bash"
 tmux set-environment -t "=$SESSION" LSTE_WORLD "$WORLD"
 tmux set-option -t "=$SESSION:" remain-on-exit on
 echo "[env] roscore started (window 0)"
@@ -77,7 +108,7 @@ WAIT_ROSCORE='until rostopic list >/dev/null 2>&1; do echo \"waiting for roscore
 
 # Window 1: Gazebo 场景（不含 pro3，用 _no_pro3.world）
 tmux new-window -t "=$SESSION:1" -n "world" -c "$WS" \
-  "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/pipeline_env.sh\"; \
+  "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/config/pipeline_env.sh\"; \
 $WAIT_ROSCORE; \
 roslaunch lste_core lab_with_pro3.launch world_name:=$WORLD spawn_pro3:=false gui:=$GUI; \
 echo \"[world] roslaunch exited, sleeping to keep window alive...\"; sleep 86400'; \
@@ -87,9 +118,10 @@ echo "[env] Gazebo world started (window 1)"
 echo ""
 echo "============================================"
 echo "  环境已启动（场景无小车）。运行以下命令："
-echo "  ./scripts/run_nodes_tmux.sh  （启动小车 + 节点）"
+echo "  ./scripts/lifecycle/run_nodes_tmux.sh                         （大脑 + SA-PPO）"
+echo "  LSTE_CONTROLLER=teleop ./scripts/lifecycle/run_nodes_tmux.sh  （大脑 + 键盘遥控）"
 echo "============================================"
 
-if [[ -t 0 ]]; then
+if [[ -t 0 && "${LSTE_NO_ATTACH:-0}" != "1" ]]; then
   tmux attach -t "=$SESSION"
 fi

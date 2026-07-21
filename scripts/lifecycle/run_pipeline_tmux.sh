@@ -5,12 +5,12 @@ export PYTHONDONTWRITEBYTECODE=1
 
 # Auto-detect workspace root (can override with LSTE_WS env var)
 if [ -z "${WS:-}" ]; then
-  WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 fi
 LSTE_WS="$WS"
 SESSION=${SESSION:-lste}
 # 可选 YAML 配置：通过 PIPELINE_CONFIG 指定；存在时为未显式设置的变量提供默认值
-PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/pipeline_defaults.yaml}
+PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}
 if [[ -f "$PIPELINE_CONFIG" ]]; then
   eval "$(
     python - "$PIPELINE_CONFIG" <<'PY' || true
@@ -42,8 +42,17 @@ _resolve() {
 }
 
 WORLD=${WORLD:-$(_resolve "${CFG_WORLD:-worlds/place1.world}")}
-TASK_JSON=${TASK_JSON:-$(_resolve "${CFG_TASK_JSON:-model/Data_exchange/vlm_prompt/lab/yellow_cup.json}")}
-TASK_ID=${TASK_ID:-${CFG_TASK_ID:-yellow_cup}}
+TASK_JSON_VALUE=${TASK_JSON:-${CFG_TASK_JSON:-}}
+TASK_ID=${TASK_ID:-${CFG_TASK_ID:-}}
+if [[ -z "$TASK_JSON_VALUE" || -z "$TASK_ID" ]]; then
+  echo "[error] TASK_JSON and TASK_ID must be set in $PIPELINE_CONFIG or the environment" >&2
+  exit 1
+fi
+TASK_JSON=$(_resolve "$TASK_JSON_VALUE")
+if [[ ! -f "$TASK_JSON" ]]; then
+  echo "[error] TASK_JSON file not found: $TASK_JSON" >&2
+  exit 1
+fi
 VLLM_URL=${VLLM_URL:-${CFG_VLLM_URL:-http://localhost:8000/v1}}
 VLLM_MODEL=${VLLM_MODEL:-$(_resolve "${CFG_VLLM_MODEL:-model/MiniCPM/OpenBMB/MiniCPM4-0___5B}")}
 VLLM_PROBE=${VLLM_PROBE:-${VLLM_URL%/}}
@@ -56,7 +65,8 @@ GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-$(_resolve "${CFG_GP_FRONTIER_RVIZ:-src/lst
 SUSPICIOUS_WINDOW=${SUSPICIOUS_WINDOW:-${CFG_SUSPICIOUS_WINDOW:-5}}
 FOLLOW_LOCKED_DONE_TIME=${FOLLOW_LOCKED_DONE_TIME:-${CFG_FOLLOW_LOCKED_DONE_TIME:-4.0}}
 FRONTIER_LOG=${FRONTIER_LOG:-${CFG_FRONTIER_LOG:-true}}
-GUI=${GUI:-${CFG_GUI:-true}}
+# The Gazebo click-coordinate plugin is part of the required operator UI.
+GUI=true
 if [[ "$VLLM_PROBE" == */v1 ]]; then
   VLLM_PROBE="$VLLM_PROBE/models"
 fi
@@ -95,7 +105,7 @@ tmux_new_window() {
   local title="$3"
   local cmd="$4"
   tmux new-window -t "=$SESSION:$index" -n "$title" -c "$dir" \
-    "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/pipeline_env.sh\"; set -e; $cmd'; echo; echo '[EXIT] $title'; exec bash"
+    "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/config/pipeline_env.sh\"; set -e; $cmd'; echo; echo '[EXIT] $title'; exec bash"
 }
 
 # 如果 session 已存在则复用，避免重复启动
@@ -113,7 +123,7 @@ fi
 
 # 新建 session：tmux 默认会创建 window 0，所以直接把 window 0 用作 roscore
 tmux new-session -d -s "$SESSION" -c "$WS" -n "roscore" \
-  "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/pipeline_env.sh\"; roscore'; echo; echo '[EXIT] roscore'; exec bash"
+  "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/config/pipeline_env.sh\"; roscore'; echo; echo '[EXIT] roscore'; exec bash"
 tmux set-environment -t "=$SESSION" LSTE_WORLD "$WORLD"
 tmux set-option -t "=$SESSION:" remain-on-exit on
 
@@ -147,7 +157,7 @@ tmux_new_window 5 "$WS" "prompt" \
      fi; \
      sleep 2; \
    done; \
-   rosparam set /lste_prompt_node/vllm_stop_command \"pkill -f vllm.*serve\"; \
+   rosparam set /lste_prompt_node/vllm_stop_command \"tmux kill-window -t =$SESSION:vllm\"; \
    rosrun lste_core lste_prompt_node.py _vllm_base_url:=$VLLM_URL _vllm_model_name:=$VLLM_MODEL"
 
 # 6: DINO 检测
