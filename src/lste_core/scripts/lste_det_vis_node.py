@@ -53,6 +53,25 @@ class DetectionVisualizer:
         self.line_thickness = int(rospy.get_param("~line_thickness", 2))
         self.camera_fov_deg = float(rospy.get_param("~camera_fov_deg", 60.0))
         self.tracking_enabled = bool(rospy.get_param("~tracking_enabled", True))
+        self.display_sync_mode = str(rospy.get_param("~display_sync_mode", "latest_frame")).lower()
+        if self.display_sync_mode not in ("latest_frame", "detection_frame"):
+            rospy.logwarn("Unknown display_sync_mode=%s; using latest_frame", self.display_sync_mode)
+            self.display_sync_mode = "latest_frame"
+        self.display_history_size = max(1, int(rospy.get_param("~display_history_size", 90)))
+        self.detector_backend = str(rospy.get_param("~detector_backend", "groundingdino")).lower()
+        requested_tracking_mode = str(rospy.get_param("~tracking_mode", "auto")).lower()
+        if requested_tracking_mode == "auto":
+            self.tracking_mode = "associated" if self.detector_backend == "wedetect" else "legacy"
+        elif requested_tracking_mode in ("legacy", "associated"):
+            self.tracking_mode = requested_tracking_mode
+        else:
+            rospy.logwarn("Unknown tracking_mode=%s; using legacy", requested_tracking_mode)
+            self.tracking_mode = "legacy"
+        self.associated_iou_threshold = float(rospy.get_param("~associated_iou_threshold", 0.25))
+        self.associated_measurement_alpha = float(
+            rospy.get_param("~associated_measurement_alpha", 0.35)
+        )
+        self.associated_track_ttl = float(rospy.get_param("~associated_track_ttl", 0.8))
         self.tracking_scale = float(rospy.get_param("~tracking_scale", 0.25))
         self.tracking_history_size = int(rospy.get_param("~tracking_history_size", 90))
         self.max_tracking_lag = float(rospy.get_param("~max_tracking_lag", 3.0))
@@ -78,10 +97,16 @@ class DetectionVisualizer:
             1, int(rospy.get_param("~tracking_flow_max_lost_frames", 30))
         )
         self._frame_history = deque(maxlen=max(1, self.tracking_history_size))
+        # Full-resolution frames are retained only to draw detections on the
+        # exact image that produced them. They are not used for tracking.
+        self._display_frame_history = deque(maxlen=self.display_history_size)
+        self._display_image = None
+        self._display_image_header = None
         self._trackers = []
         self._tracking_started_at = None
         self._tracking_frame_count = 0
         self._previous_tracking_image = None
+        self._last_associated_detection_stamp = None
         self._tracking_lock = threading.Lock()
 
         if not self.camera_info_topic:
@@ -127,11 +152,14 @@ class DetectionVisualizer:
         self.sub_global_goal_pose = rospy.Subscriber("/lste/final_goal", PoseStamped, self.on_global_goal_pose, queue_size=1)
 
         rospy.loginfo(
-            "lste_det_vis_node started. image_topic=%s detections_topic=%s scores_topic=%s output_topic=%s",
+            "lste_det_vis_node started. image_topic=%s detections_topic=%s scores_topic=%s "
+            "output_topic=%s tracking_mode=%s display_sync_mode=%s",
             self.image_topic,
             self.detections_topic,
             self.scores_topic,
             self.output_topic,
+            self.tracking_mode,
+            self.display_sync_mode,
         )
 
     # ----------------- Callbacks -----------------
@@ -149,6 +177,8 @@ class DetectionVisualizer:
         with self._tracking_lock:
             tracking_image = self._tracking_image(cv_img)
             self._frame_history.append((self._stamp_ns(msg.header), tracking_image))
+            if self.display_sync_mode == "detection_frame":
+                self._display_frame_history.append((self._stamp_ns(msg.header), msg.header, cv_img))
             self._tracking_frame_count += 1
             if self._tracking_frame_count % self.tracking_update_stride == 0:
                 self._update_trackers(tracking_image, cv_img.shape[1], cv_img.shape[0])
@@ -157,7 +187,15 @@ class DetectionVisualizer:
     def on_detections(self, msg: LsteDetections):
         self.latest_detections = msg
         with self._tracking_lock:
-            self._start_trackers(msg)
+            if self.tracking_mode == "associated":
+                self._associate_trackers(msg)
+            else:
+                # Keep the original GroundingDINO visual behavior unchanged.
+                self._start_trackers(msg)
+            if self.display_sync_mode == "detection_frame":
+                self._select_detection_frame(msg)
+        if self.display_sync_mode == "detection_frame":
+            self.try_publish()
 
     def on_scores(self, msg: LsteScores):
         self.latest_scores = msg
@@ -198,6 +236,17 @@ class DetectionVisualizer:
 
     # ----------------- Helpers -----------------
     def try_publish(self, cv_img=None):
+        # Detection-frame mode deliberately publishes only the source frame of
+        # the most recent detector result. This preserves exact box/image
+        # alignment during camera motion without any prediction or smoothing.
+        output_header = None
+        if self.display_sync_mode == "detection_frame":
+            with self._tracking_lock:
+                if self._display_image is None or self._display_image_header is None:
+                    return
+                cv_img = self._display_image.copy()
+                output_header = self._display_image_header
+
         # 只要有图像，就先转发图像；如果有检测/score，就叠加可视化
         if self.latest_image is None:
             return
@@ -209,16 +258,20 @@ class DetectionVisualizer:
                 rospy.logwarn("cv_bridge failed to convert Image: %s", exc)
                 return
 
+        if output_header is None:
+            output_header = self.latest_image.header
         with self._tracking_lock:
             detections = copy.deepcopy(self.display_detections or self.latest_detections)
-        annotated = self.draw_detections(cv_img.copy(), detections, self.latest_scores, self.latest_state)
+        annotated = self.draw_detections(
+            cv_img.copy(), detections, self.latest_scores, self.latest_state, output_header
+        )
         try:
             out_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
         except CvBridgeError as exc:
             rospy.logwarn("cv_bridge failed to convert cv image back to ROS Image: %s", exc)
             return
 
-        out_msg.header = self.latest_image.header
+        out_msg.header = output_header
         # 兜底：如果由于某些原因 pub 还没初始化，懒加载一个
         if not hasattr(self, "pub"):
             self.pub = rospy.Publisher(self.output_topic, Image, queue_size=1)
@@ -241,6 +294,23 @@ class DetectionVisualizer:
     @staticmethod
     def _make_tracker():
         return cv2.TrackerCSRT_create()
+
+    def _select_detection_frame(self, detections: LsteDetections):
+        """Use the original camera frame instead of the latest moving frame."""
+        stamp_ns = self._stamp_ns(detections.header)
+        if not stamp_ns or not self._display_frame_history:
+            rospy.logwarn_throttle(2.0, "No camera frame available for detection visualization")
+            return
+        history = list(self._display_frame_history)
+        frame_stamp, frame_header, frame = min(history, key=lambda item: abs(item[0] - stamp_ns))
+        if frame_stamp != stamp_ns:
+            rospy.logwarn_throttle(
+                2.0,
+                "Exact detector source frame is no longer in visualization history; skipping result",
+            )
+            return
+        self._display_image = frame
+        self._display_image_header = frame_header
 
     def _start_trackers(self, detections: LsteDetections):
         """Initialize CSRT on the source frame and replay buffered frames to now."""
@@ -265,30 +335,7 @@ class DetectionVisualizer:
         height, width = source_frame.shape[:2]
         for kind in ("target_dets", "env_dets"):
             for det in getattr(self.display_detections, kind):
-                x = max(0.0, (float(det.cx) - 0.5 * float(det.w)) * width)
-                y = max(0.0, (float(det.cy) - 0.5 * float(det.h)) * height)
-                w = max(2.0, float(det.w) * width)
-                h = max(2.0, float(det.h) * height)
-                w = min(w, width - x)
-                h = min(h, height - y)
-                if w <= 1.0 or h <= 1.0:
-                    continue
-                try:
-                    tracker = self._make_tracker()
-                    if tracker.init(source_frame, (x, y, w, h)):
-                        self._trackers.append({
-                            "tracker": tracker,
-                            "det": det,
-                            "edge_exit_count": 0,
-                            "edge_exit_direction": None,
-                            "edge_exit_offset": (0.0, 0.0),
-                            "edge_exit_speed": 0.0,
-                            "last_center": (x + 0.5 * w, y + 0.5 * h),
-                            "last_bbox": (x, y, w, h),
-                            "flow_lost_count": 0,
-                        })
-                except cv2.error as exc:
-                    rospy.logwarn_throttle(2.0, "Failed to initialize CSRT tracker: %s", exc)
+                self._append_tracker(source_frame, det, kind)
 
         rospy.loginfo("Initialized %d CSRT trackers for the latest detection", len(self._trackers))
 
@@ -299,6 +346,138 @@ class DetectionVisualizer:
             replay_frames.append(history[-1])
         for _, frame in replay_frames:
             self._update_trackers(frame, width, height)
+
+    def _append_tracker(self, source_frame, det: LsteDetection, kind: str):
+        """Create one CSRT track without disturbing existing tracks."""
+        height, width = source_frame.shape[:2]
+        x = max(0.0, (float(det.cx) - 0.5 * float(det.w)) * width)
+        y = max(0.0, (float(det.cy) - 0.5 * float(det.h)) * height)
+        w = min(max(2.0, float(det.w) * width), width - x)
+        h = min(max(2.0, float(det.h) * height), height - y)
+        if w <= 1.0 or h <= 1.0:
+            return False
+        try:
+            tracker = self._make_tracker()
+            if not tracker.init(source_frame, (x, y, w, h)):
+                return False
+            self._trackers.append({
+                "tracker": tracker,
+                "det": det,
+                "kind": kind,
+                "edge_exit_count": 0,
+                "edge_exit_direction": None,
+                "edge_exit_offset": (0.0, 0.0),
+                "edge_exit_speed": 0.0,
+                "last_center": (x + 0.5 * w, y + 0.5 * h),
+                "last_bbox": (x, y, w, h),
+                "flow_lost_count": 0,
+                "last_measurement_time": time.monotonic(),
+            })
+            return True
+        except cv2.error as exc:
+            rospy.logwarn_throttle(2.0, "Failed to initialize CSRT tracker: %s", exc)
+            return False
+
+    def _associate_trackers(self, detections: LsteDetections):
+        """Merge frequent detector measurements into persistent CSRT tracks.
+
+        GroundingDINO refreshes slowly and intentionally uses _start_trackers.
+        WeDetect refreshes much faster, so recreating every CSRT tracker on each
+        result causes visible jumps. This path keeps matched tracks alive and
+        uses the detector only as a smoothed measurement correction.
+        """
+        stamp_ns = self._stamp_ns(detections.header)
+        if stamp_ns and stamp_ns == self._last_associated_detection_stamp:
+            return
+        if stamp_ns:
+            self._last_associated_detection_stamp = stamp_ns
+
+        if not self.tracking_enabled or not self._frame_history:
+            self.display_detections = copy.deepcopy(detections)
+            return
+        if self.display_detections is None or not self._trackers:
+            self._start_trackers(detections)
+            return
+
+        history = list(self._frame_history)
+        if not stamp_ns:
+            self._start_trackers(detections)
+            return
+        frame_index = min(range(len(history)), key=lambda i: abs(history[i][0] - stamp_ns))
+        matched_stamp, source_frame = history[frame_index]
+        if abs(matched_stamp - stamp_ns) > int(self.max_tracking_lag * 1e9):
+            rospy.logwarn_throttle(2.0, "Detection image is no longer in the tracker history")
+            return
+
+        now = time.monotonic()
+        self._tracking_started_at = now
+        matched_tracks = set()
+        height, width = source_frame.shape[:2]
+        for kind in ("target_dets", "env_dets"):
+            for measurement in getattr(detections, kind):
+                candidate_index = self._best_matching_track(kind, measurement, matched_tracks)
+                if candidate_index is None:
+                    display_det = copy.deepcopy(measurement)
+                    getattr(self.display_detections, kind).append(display_det)
+                    self._append_tracker(source_frame, display_det, kind)
+                    continue
+                track = self._trackers[candidate_index]
+                matched_tracks.add(candidate_index)
+                self._blend_measurement(track, measurement, width, height)
+                track["last_measurement_time"] = now
+
+        # A brief TTL masks one missed WeDetect result, but stale objects do
+        # not remain on screen indefinitely when the detector loses them.
+        expired = {
+            id(track["det"])
+            for track in self._trackers
+            if now - track.get("last_measurement_time", now) > self.associated_track_ttl
+        }
+        if expired:
+            self._trackers = [track for track in self._trackers if id(track["det"]) not in expired]
+            self._remove_display_tracks(expired)
+
+    def _best_matching_track(self, kind: str, measurement: LsteDetection, used_indices):
+        best_index = None
+        best_iou = self.associated_iou_threshold
+        for index, track in enumerate(self._trackers):
+            if index in used_indices or track.get("kind") != kind:
+                continue
+            if (track["det"].label or "").lower() != (measurement.label or "").lower():
+                continue
+            overlap = self._normalized_iou(track["det"], measurement)
+            if overlap > best_iou:
+                best_index = index
+                best_iou = overlap
+        return best_index
+
+    @staticmethod
+    def _normalized_iou(first: LsteDetection, second: LsteDetection):
+        first_x1 = float(first.cx) - 0.5 * float(first.w)
+        first_y1 = float(first.cy) - 0.5 * float(first.h)
+        second_x1 = float(second.cx) - 0.5 * float(second.w)
+        second_y1 = float(second.cy) - 0.5 * float(second.h)
+        inter_x1 = max(first_x1, second_x1)
+        inter_y1 = max(first_y1, second_y1)
+        inter_x2 = min(first_x1 + float(first.w), second_x1 + float(second.w))
+        inter_y2 = min(first_y1 + float(first.h), second_y1 + float(second.h))
+        intersection = max(0.0, inter_x2 - inter_x1) * max(0.0, inter_y2 - inter_y1)
+        union = float(first.w) * float(first.h) + float(second.w) * float(second.h) - intersection
+        return intersection / union if union > 1e-9 else 0.0
+
+    def _blend_measurement(self, track, measurement: LsteDetection, width: int, height: int):
+        det = track["det"]
+        alpha = min(1.0, max(0.0, self.associated_measurement_alpha))
+        for field in ("cx", "cy", "w", "h"):
+            setattr(det, field, float((1.0 - alpha) * getattr(det, field) + alpha * getattr(measurement, field)))
+        det.score = float(measurement.score)
+        x = max(0.0, (float(det.cx) - 0.5 * float(det.w)) * width)
+        y = max(0.0, (float(det.cy) - 0.5 * float(det.h)) * height)
+        w = min(max(2.0, float(det.w) * width), width - x)
+        h = min(max(2.0, float(det.h) * height), height - y)
+        if w > 1.0 and h > 1.0:
+            track["last_bbox"] = (x, y, w, h)
+            track["last_center"] = (x + 0.5 * w, y + 0.5 * h)
 
     def _update_trackers(self, tracking_image, full_width: int, full_height: int):
         if (
@@ -528,6 +707,7 @@ class DetectionVisualizer:
         detections: Optional[LsteDetections],
         scores: Optional[LsteScores] = None,
         state: Optional[LsteState] = None,
+        image_header=None,
     ):
         if image is None:
             return image
@@ -599,7 +779,7 @@ class DetectionVisualizer:
             self._draw_scores(image, scores, state)
 
         try:
-            self._draw_global_goal_indicator(image)
+            self._draw_global_goal_indicator(image, image_header)
         except Exception as exc:
             rospy.logwarn_throttle(5.0, "Draw global goal failed: %s", exc)
 
@@ -838,7 +1018,7 @@ class DetectionVisualizer:
         )
         cv2.putText(image, text, (x, y), font, scale, (0, 255, 0), thickness, cv2.LINE_AA)
 
-    def _draw_global_goal_indicator(self, image):
+    def _draw_global_goal_indicator(self, image, image_header=None):
         """显示 /lste/final_goal 的 (x,y)，并尝试将该点投影到相机图像上绘制固定大小的绿色标记。"""
         if self.global_goal_point is None:
             self._draw_goal_hint(image, "Global goal not received")
@@ -873,16 +1053,20 @@ class DetectionVisualizer:
                 cv2.LINE_AA,
             )
 
-        # 优先用 TF 直接从 global_goal_frame 变到相机光学帧
-        if self.camera_frame_id:
+        # Prefer the displayed image frame; camera_info is a fallback.
+        camera_frame = getattr(image_header, "frame_id", "") or self.camera_frame_id
+        if camera_frame:
             goal_pt = PointStamped()
             goal_pt.header.frame_id = self.global_goal_frame or "odom"
-            goal_pt.header.stamp = rospy.Time(0)
+            # The camera pose must be queried at the displayed image time. In
+            # detection-frame mode, using Time(0) (latest TF) projects a static
+            # goal into a later camera pose and makes it drift during rotation.
+            goal_pt.header.stamp = getattr(image_header, "stamp", rospy.Time(0))
             goal_pt.point.x = gx
             goal_pt.point.y = gy
             goal_pt.point.z = 0.0
             try:
-                goal_cam = self.tf_buffer.transform(goal_pt, self.camera_frame_id, rospy.Duration(0.05))
+                goal_cam = self.tf_buffer.transform(goal_pt, camera_frame, rospy.Duration(0.05))
                 Z = goal_cam.point.z
                 if Z > 1e-3:
                     try:

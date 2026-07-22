@@ -8,6 +8,7 @@ directory-local commands:
 ```bash
 runall
 stopall
+lste-env
 teleop
 health
 ```
@@ -48,5 +49,6 @@ the lifecycle scripts.
 
 ## Bin
 
-`bin/` contains the short command wrappers exposed by `.envrc`. `teleop`
+`bin/` contains the short command wrappers exposed by `.envrc`. `lste-env`
+starts only `lste-env` (roscore + Gazebo + GUI) in the background. `teleop`
 attaches directly to the `lste-teleop` keyboard-control session.

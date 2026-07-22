@@ -73,8 +73,88 @@ DINO_INTERVAL_PASS=${DINO_INTERVAL_PASS:-${CFG_DINO_INTERVAL_PASS:-1.5}}
 DINO_INTERVAL_SUSPICIOUS=${DINO_INTERVAL_SUSPICIOUS:-${CFG_DINO_INTERVAL_SUSPICIOUS:-1.5}}
 DINO_INTERVAL_LOCKED=${DINO_INTERVAL_LOCKED:-${CFG_DINO_INTERVAL_LOCKED:-1.5}}
 DINO_INTERVAL_EXHAUSTED=${DINO_INTERVAL_EXHAUSTED:-${CFG_DINO_INTERVAL_EXHAUSTED:-3.0}}
+DETECTOR=${DETECTOR:-${CFG_DETECTOR:-wedetect-large}}
+DETECTION_TRACKING_MODE=${DETECTION_TRACKING_MODE:-${CFG_DETECTION_TRACKING_MODE:-auto}}
+DETECTION_VISUAL_TRACKING_ENABLED=${DETECTION_VISUAL_TRACKING_ENABLED:-${CFG_DETECTION_VISUAL_TRACKING_ENABLED:-true}}
+DETECTION_DISPLAY_SYNC_MODE=${DETECTION_DISPLAY_SYNC_MODE:-${CFG_DETECTION_DISPLAY_SYNC_MODE:-latest_frame}}
+DETECTION_DISPLAY_HISTORY_SIZE=${DETECTION_DISPLAY_HISTORY_SIZE:-${CFG_DETECTION_DISPLAY_HISTORY_SIZE:-90}}
+WDETECT_SOURCE_DIR=${WDETECT_SOURCE_DIR:-$(_resolve "${CFG_WDETECT_SOURCE_DIR:-model/WeDetect}")}
+WDETECT_VARIANT=${WDETECT_VARIANT:-${CFG_WDETECT_VARIANT:-base}}
+WDETECT_CHECKPOINT=${WDETECT_CHECKPOINT:-$(_resolve "${CFG_WDETECT_CHECKPOINT:-model/WeDetect/checkpoints/wedetect_base.pth}")}
+WDETECT_LANGUAGE_MODEL=${WDETECT_LANGUAGE_MODEL:-$(_resolve "${CFG_WDETECT_LANGUAGE_MODEL:-model/WeDetect/xlm-roberta-base}")}
+WDETECT_SCORE_THRESHOLD=${WDETECT_SCORE_THRESHOLD:-${CFG_WDETECT_SCORE_THRESHOLD:-0.20}}
+WDETECT_NMS_IOU=${WDETECT_NMS_IOU:-${CFG_WDETECT_NMS_IOU:-0.70}}
+WDETECT_PRE_NMS_TOPK=${WDETECT_PRE_NMS_TOPK:-${CFG_WDETECT_PRE_NMS_TOPK:-3000}}
+WDETECT_MAX_DETECTIONS=${WDETECT_MAX_DETECTIONS:-${CFG_WDETECT_MAX_DETECTIONS:-100}}
+WDETECT_USE_FP16=${WDETECT_USE_FP16:-${CFG_WDETECT_USE_FP16:-true}}
+WDETECT_RUNTIME=${WDETECT_RUNTIME:-${CFG_WDETECT_RUNTIME:-tensorrt}}
+WDETECT_VISION_ONNX=${WDETECT_VISION_ONNX:-$(_resolve "${CFG_WDETECT_VISION_ONNX:-model/WeDetect/deploy/onnx_models/wedetect_base_vision.onnx}")}
+WDETECT_TRT_ENGINE_CACHE=${WDETECT_TRT_ENGINE_CACHE:-$(_resolve "${CFG_WDETECT_TRT_ENGINE_CACHE:-model/WeDetect/deploy/trt_cache}")}
+WDETECT_TRT_MAX_CLASSES=${WDETECT_TRT_MAX_CLASSES:-${CFG_WDETECT_TRT_MAX_CLASSES:-16}}
+WDETECT_SPIN_HZ=${WDETECT_SPIN_HZ:-${CFG_WDETECT_SPIN_HZ:-10.0}}
+WDETECT_MIN_INTERVAL=${WDETECT_MIN_INTERVAL:-${CFG_WDETECT_MIN_INTERVAL:-0.10}}
+WDETECT_INTERVAL_PASS=${WDETECT_INTERVAL_PASS:-${CFG_WDETECT_INTERVAL_PASS:-0.10}}
+WDETECT_INTERVAL_SUSPICIOUS=${WDETECT_INTERVAL_SUSPICIOUS:-${CFG_WDETECT_INTERVAL_SUSPICIOUS:-0.10}}
+WDETECT_INTERVAL_LOCKED=${WDETECT_INTERVAL_LOCKED:-${CFG_WDETECT_INTERVAL_LOCKED:-0.10}}
+WDETECT_INTERVAL_EXHAUSTED=${WDETECT_INTERVAL_EXHAUSTED:-${CFG_WDETECT_INTERVAL_EXHAUSTED:-0.30}}
+case "$DETECTOR" in
+  groundingdino)
+    DETECTOR_BACKEND=groundingdino
+    ;;
+  wedetect-base)
+    DETECTOR_BACKEND=wedetect
+    WDETECT_VARIANT=base
+    WDETECT_CHECKPOINT="$WS/model/WeDetect/checkpoints/wedetect_base.pth"
+    WDETECT_LANGUAGE_MODEL="$WS/model/WeDetect/xlm-roberta-base"
+    WDETECT_VISION_ONNX="$WS/model/WeDetect/deploy/onnx_models/wedetect_base_vision.onnx"
+    WDETECT_TRT_ENGINE_CACHE="$WS/model/WeDetect/deploy/trt_cache"
+    WDETECT_RUNTIME=tensorrt
+    ;;
+  wedetect-large)
+    DETECTOR_BACKEND=wedetect
+    WDETECT_VARIANT=large
+    WDETECT_CHECKPOINT="$WS/model/WeDetect/checkpoints/wedetect_large.pth"
+    WDETECT_LANGUAGE_MODEL="$WS/model/WeDetect/xlm-roberta-large"
+    WDETECT_VISION_ONNX="$WS/model/WeDetect/deploy/onnx_models/wedetect_large_vision.onnx"
+    WDETECT_TRT_ENGINE_CACHE="$WS/model/WeDetect/deploy/trt_cache_large"
+    WDETECT_RUNTIME=tensorrt
+    ;;
+  *)
+    echo "[error] DETECTOR must be groundingdino, wedetect-base, or wedetect-large (got '$DETECTOR')" >&2
+    exit 1
+    ;;
+esac
+if [[ "$DETECTOR_BACKEND" == "wedetect" ]]; then
+  DETECTOR_MIN_INTERVAL=$WDETECT_MIN_INTERVAL
+  DETECTOR_INTERVAL_PASS=$WDETECT_INTERVAL_PASS
+  DETECTOR_INTERVAL_SUSPICIOUS=$WDETECT_INTERVAL_SUSPICIOUS
+  DETECTOR_INTERVAL_LOCKED=$WDETECT_INTERVAL_LOCKED
+  DETECTOR_INTERVAL_EXHAUSTED=$WDETECT_INTERVAL_EXHAUSTED
+  DETECTOR_NODE=lste_wedetect_det_node.py
+  DETECTOR_MODEL_ARGS="_wedetect_source_dir:=$WDETECT_SOURCE_DIR \
+_wedetect_variant:=$WDETECT_VARIANT \
+_wedetect_checkpoint:=$WDETECT_CHECKPOINT \
+_wedetect_language_model:=$WDETECT_LANGUAGE_MODEL \
+_wedetect_score_threshold:=$WDETECT_SCORE_THRESHOLD \
+_wedetect_nms_iou:=$WDETECT_NMS_IOU \
+_wedetect_pre_nms_topk:=$WDETECT_PRE_NMS_TOPK \
+_wedetect_max_detections:=$WDETECT_MAX_DETECTIONS \
+_wedetect_use_fp16:=$WDETECT_USE_FP16 \
+_wedetect_runtime:=$WDETECT_RUNTIME \
+_wedetect_vision_onnx:=$WDETECT_VISION_ONNX \
+_wedetect_trt_engine_cache:=$WDETECT_TRT_ENGINE_CACHE \
+_wedetect_trt_max_classes:=$WDETECT_TRT_MAX_CLASSES"
+else
+  DETECTOR_MIN_INTERVAL=$DINO_MIN_INTERVAL
+  DETECTOR_INTERVAL_PASS=$DINO_INTERVAL_PASS
+  DETECTOR_INTERVAL_SUSPICIOUS=$DINO_INTERVAL_SUSPICIOUS
+  DETECTOR_INTERVAL_LOCKED=$DINO_INTERVAL_LOCKED
+  DETECTOR_INTERVAL_EXHAUSTED=$DINO_INTERVAL_EXHAUSTED
+  DETECTOR_NODE=lste_det_node.py
+  DETECTOR_MODEL_ARGS=""
+fi
 FRONTIER_LOG=${FRONTIER_LOG:-${CFG_FRONTIER_LOG:-true}}
-LSTE_CONTROLLER=${LSTE_CONTROLLER:-sappo}
+LSTE_CONTROLLER=${LSTE_CONTROLLER:-${CFG_LSTE_CONTROLLER:-teleop}}
 SAPPO_SPEED=${SAPPO_SPEED:-0.50}
 SAPPO_PYTHON=${SAPPO_PYTHON:-$HOME/miniconda3/envs/rlenvs/bin/python}
 case "$LSTE_CONTROLLER" in
@@ -117,7 +197,13 @@ echo "[nodes] 创建 session '$SESSION'..."
 tmux new-session -d -s "$SESSION" -c "$WS" -n "pro3" \
   "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/config/pipeline_env.sh\"; set -e; \
 until rostopic list >/dev/null 2>&1; do echo \"waiting for rocore...\"; sleep 1; done; \
-roslaunch lste_core spawn_pro3.launch spawn_model:=true; \
+if rosservice call /gazebo/get_world_properties 2>/dev/null | grep -q \"pro3\"; then \
+  echo \"[pro3] Existing Gazebo model found; reuse it without respawning.\"; \
+  SPAWN_MODEL=false; \
+else \
+  SPAWN_MODEL=true; \
+fi; \
+roslaunch lste_core spawn_pro3.launch spawn_model:=\$SPAWN_MODEL; \
 echo; echo \"[EXIT] pro3 spawn\"; exec bash'"
 echo "[nodes] 创建后检查 sessions: $(tmux list-sessions 2>&1)"
 tmux set-option -t "=$SESSION:" remain-on-exit on
@@ -168,15 +254,18 @@ tmux_new_window 4 "$WS" "prompt" \
      _cache_dir:=$PROMPT_CACHE_DIR \
      _vllm_start_timeout:=$VLLM_START_TIMEOUT"
 
-# 5: DINO 检测
-tmux_new_window 5 "$WS" "dino" \
+# 5: 独立检测节点：GroundingDINO 或 WeDetect，绝不在同一进程内混用。
+tmux_new_window 5 "$WS" "detector" \
   "$WAIT_ROSCORE; conda activate dino; export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7; \
-   rosrun lste_core lste_det_node.py \
-     _min_inference_interval:=$DINO_MIN_INTERVAL \
-     _interval_pass:=$DINO_INTERVAL_PASS \
-     _interval_suspicious:=$DINO_INTERVAL_SUSPICIOUS \
-     _interval_locked:=$DINO_INTERVAL_LOCKED \
-     _interval_exhausted:=$DINO_INTERVAL_EXHAUSTED"
+   export LD_LIBRARY_PATH=\"\$CONDA_PREFIX/lib/python3.9/site-packages/tensorrt_libs:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cudnn/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cublas/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cufft/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/curand/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cusolver/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cusparse/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cuda_runtime/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cuda_nvrtc/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/nvjitlink/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/torch/lib:\${LD_LIBRARY_PATH:-}\"; \
+   rosrun lste_core $DETECTOR_NODE \
+     _min_inference_interval:=$DETECTOR_MIN_INTERVAL \
+     _interval_pass:=$DETECTOR_INTERVAL_PASS \
+     _interval_suspicious:=$DETECTOR_INTERVAL_SUSPICIOUS \
+     _interval_locked:=$DETECTOR_INTERVAL_LOCKED \
+     _interval_exhausted:=$DETECTOR_INTERVAL_EXHAUSTED \
+     $DETECTOR_MODEL_ARGS \
+     _spin_hz:=$WDETECT_SPIN_HZ"
 
 # 6: Score
 tmux_new_window 6 "$WS" "score" \
@@ -191,7 +280,11 @@ tmux_new_window 7 "$WS" "state" \
 
 # 8: 可视化（叠加图 + RViz）
 tmux_new_window 8 "$WS" "vis" \
-  "$WAIT_ROSCORE; roslaunch lste_core lste_det_vis.launch"
+  "$WAIT_ROSCORE; roslaunch lste_core lste_det_vis.launch \
+    tracking_enabled:=$DETECTION_VISUAL_TRACKING_ENABLED \
+    display_sync_mode:=$DETECTION_DISPLAY_SYNC_MODE \
+    display_history_size:=$DETECTION_DISPLAY_HISTORY_SIZE \
+    tracking_mode:=$DETECTION_TRACKING_MODE detector_backend:=$DETECTOR_BACKEND"
 
 # 9: 球面投影
 tmux_new_window 9 "$WS" "oc_srfc" \

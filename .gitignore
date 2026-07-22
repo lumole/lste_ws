@@ -21,6 +21,7 @@ src/lste_topo_access/topo_tree/tree/**/access_topo_*.json
 .idea/
 
 # Models: keep code/configs, ignore heavy checkpoints/outputs
+model/WeDetect/
 model/**/weights/
 model/**/checkpoints/
 model/**/result/

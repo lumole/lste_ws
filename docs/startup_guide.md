@@ -37,7 +37,7 @@ SA-PPO 默认使用 `$HOME/miniconda3/envs/rlenvs/bin/python`；若环境位于�
 direnv allow
 ```
 
-之后进入工作区会自动设置 `LSTE_WS` 并提供 `runall`、`stopall`；离开工作区后
+之后进入工作区会自动设置 `LSTE_WS` 并提供 `runall`、`stopall`、`lste-env`；离开工作区后
 这些环境设置会自动撤销。推荐使用一键启动命令：
 
 ```bash
@@ -68,11 +68,15 @@ cd /home/yhq/dh_ws/lste_ws
 
 ### 分步启动
 
-需要分步调试时，先启动 ROS 与 Gazebo 环境：
+需要编辑世界、测试 Gazebo 插件或分步调试时，只启动 ROS 与 Gazebo 环境：
 
 ```bash
-./scripts/lifecycle/run_env_tmux.sh
+lste-env
 ```
+
+`lste-env` 始终在后台返回当前终端，不会进入 tmux，也不会启动 `lste`、`lste-teleop`、
+车辆、检测器、MiniCPM 或 SA-PPO。完整脚本形式
+`./scripts/lifecycle/run_env_tmux.sh` 仍可用于需要直接附着环境会话的调试。
 
 `lste-env` 包含：
 
@@ -94,9 +98,58 @@ cd /home/yhq/dh_ws/lste_ws
 ./scripts/lifecycle/run_nodes_tmux.sh
 ```
 
-无需设置额外参数：控制器默认为 SA-PPO，速度倍率默认为 `0.50`。
+无需设置额外参数：控制器默认使用键盘遥控，速度倍率默认为 `0.50`。SA-PPO 仍会常驻运行，
+可通过 Gazebo 插件或 `Ctrl+Shift+K` 热切换。
 
-脚本创建 tmux 会话 `lste`，只生成一辆 Pro3，并启动任务、VLLM、Goal Manager、VLM Prompt、GroundingDINO、评分、状态、可视化、球面投影、GP frontier、Frontier RViz、点云转激光和 SA-PPO。
+脚本创建 tmux 会话 `lste`，只生成一辆 Pro3，并启动任务、VLLM、Goal Manager、VLM Prompt、开放词汇检测器、评分、状态、可视化、球面投影、GP frontier、Frontier RViz、点云转激光和 SA-PPO。
+
+### 检测器选择
+
+检测器不是同一个文件中的两个后端分支，而是两个独立 ROS 节点；两者只共享
+`/lste/detections` 消息接口，因此评分、Goal Manager、SA-PPO 和 RViz 无需随模型切换而修改：
+
+| 选择 | 独立节点文件 | 当前用途 |
+| --- | --- | --- |
+| `groundingdino` | `src/lste_core/scripts/lste_det_node.py` | 保留的原始 GroundingDINO 路径，独立加载 DINO 模型、执行两次推理。 |
+| `wedetect` | `src/lste_core/scripts/lste_wedetect_det_node.py` | WeDetect 路径，当前配置为 WeDetect-Large TensorRT FP16。 |
+
+启动器根据 `scripts/config/pipeline_defaults.yaml` 的唯一模型选择项 `DETECTOR` 选择其中一个
+可执行文件，两个模型不会在同一个 Python 进程中导入、加载或运行。只需要修改这一行：
+
+```yaml
+DETECTOR: wedetect-large
+```
+
+可选值为 `groundingdino`、`wedetect-base`、`wedetect-large`。选择 WeDetect 后，启动器自动
+匹配该型号的 checkpoint、XLM-RoBERTa、ONNX 与 TensorRT engine cache；不需要同时修改任何
+`WDETECT_*` 路径。改完后重启 LSTE 节点会话即可生效。WeDetect 的 checkpoint、ONNX 与
+TensorRT engine 会保留在 `model/WeDetect/`，DINO 的配置和权重也不会被改写或删除。
+
+WeDetect 一次视觉前向同时处理目标和环境类别，类别文本向量只在任务 prompt 变化时计算一次。
+
+首次使用 WeDetect 时下载官方源码和零样本权重（下载文件不纳入 Git）：
+
+```bash
+bash scripts/models/setup_wedetect.sh
+```
+
+该脚本只在 `dino` 环境补充 `mmengine==0.10.7`，用于读取官方 checkpoint 元数据；
+不安装 MMCV/MMDetection，也不会升级 ROS/OpenCV 使用的 NumPy 1.26.4。
+
+Large 的首次 TensorRT 启动会为 RTX 3060 构建 FP16 engine；后续直接复用
+`model/WeDetect/deploy/trt_cache_large/` 中的缓存。无需改动 Goal Manager、评分、
+可视化或 SA-PPO。
+
+`WDETECT_TRT_MAX_CLASSES` 固定 TensorRT 的提示词容量，默认 16。任务可自由切换
+prompt，只要类别数不超过该值就复用同一份 engine；只有提高该容量、修改视觉 ONNX、
+更换 GPU 或删除缓存时才需要重新编译。
+
+完整的架构、环境版本、缓存策略与实测结果见
+[`wedetect_tensorrt_integration.md`](wedetect_tensorrt_integration.md)。
+
+WeDetect 的中文类别映射、阈值、NMS 和 FP16 设置也位于同一配置文件。当前映射覆盖
+`blue mug`、`yellow mug`、桌椅、显示器、文件夹、门、消防栓和灭火器；新类别可通过
+`~wedetect_label_map` ROS 参数补充英文到中文的映射。
 
 `lste_goal_manager.py` 是 `/lste/final_goal` 的唯一发布者。该消息类型为 `geometry_msgs/PoseStamped`，坐标系为 `odom`。SA-PPO 使用同一 `odom` 坐标系下的 `/pro3/wheel_odom` 计算车体局部目标，并输出 `/cmd_vel`。
 
@@ -235,7 +288,9 @@ health --json
 `cu_init` 和恢复建议。健康检查不仅读取 ROS master 注册信息，还会主动连接
 每个关键节点的 XMLRPC 端点，避免已经退出但仍残留注册信息的节点被误判为健康。
 启动宽限期内状态为 `starting`，全部链路首次就绪后变为 `healthy`；之后任一
-关键项丢失会变为 `unhealthy` 并在 health 窗口记录错误。
+关键项丢失会变为 `unhealthy` 并在 health 窗口记录错误。`cuInit != 0` 或 ROS master
+不可达属于致命故障，不受启动宽限期影响，会立即标记为 `unhealthy`。健康检查只报告并
+保存恢复步骤，不会未经确认停止仿真或执行需要 root 权限的 NVIDIA 驱动模块重载。
 
 也可手动检查 ROS 节点和话题：
 

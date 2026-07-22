@@ -1,12 +1,12 @@
 {
   "task_parsed": {
     "target": {
-      "name": "yellow mug",
+      "name": "yellow cup",
       "attributes": [
         "yellow",
         "ceramic",
         "handle on the side",
-        "medium-sized drinking mug",
+        "medium-sized drinking cup",
         "placed on a wooden office desk"
       ],
       "typical_locations": [
@@ -22,24 +22,24 @@
         "shared working area"
       ],
       "layout_prior": [
-        "long desks arranged in rows",
+        "long office desks arranged in rows",
         "multiple monitors positioned closely",
         "office chairs around the workstations"
       ],
       "related_structures": [
-        "desk",
-        "computer monitor",
+        "office desk",
+        "monitor",
         "chair"
       ]
     },
     "obj_related": {
       "key_objects": [
         "monitor",
-        "other mugs",
+        "other cups",
         "file folder",
         "chair"
       ],
-      "search_strategy": "search along work desks near keyboards and monitors for brightly colored handled mugs",
+      "search_strategy": "search along work desks near keyboards and monitors for brightly colored handled cups",
       "negative_clues": [
         "door",
         "fire hydrant",
@@ -47,8 +47,8 @@
       ]
     },
     "target_ctx": {
-      "left": "blue mug",
-      "right": "computer monitor"
+      "left": "monitor",
+      "right": "monitor"
     }
   }
 }

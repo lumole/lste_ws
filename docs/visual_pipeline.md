@@ -49,13 +49,29 @@ DINO_INTERVAL_EXHAUSTED: 3.0
 
 ## 检测框策略
 
-`lste_det_vis_node.py` 在每次 DINO 结果到达时，在对应历史图像上初始化 OpenCV CSRT 跟踪器，再重放缓冲帧追到当前画面。
+`lste_det_vis_node.py` 的跟踪模式由 `DETECTION_TRACKING_MODE` 控制，默认 `auto`。它根据
+统一的 `DETECTOR` profile 解析后的后端选择策略：
+
+- `groundingdino` 自动使用 `legacy`，即保留原有行为：每次 DINO 结果到达时，在对应历史图像上初始化 OpenCV CSRT 跟踪器，再重放缓冲帧追到当前画面。
+- `wedetect` 自动使用 `associated`：同一图像戳的重复结果会忽略；标签相同且 IoU 足够的检测框会关联到已有 CSRT 跟踪器，并以 EMA 小幅校正，不会每帧清空重建。未匹配的新框才新建跟踪器。
+- 可以显式设为 `legacy` 或 `associated`，例如 `DETECTION_TRACKING_MODE=legacy runall`。该配置只影响 `/lste/det_vis_image`，不会更改 `/lste/detections` 或控制逻辑。
+
+两种模式都使用以下视觉跟踪能力：
 
 - 跟踪计算在 1/4 分辨率、每 3 帧执行一次，显示图像仍按相机回调发布。
 - CSRT 跟随框的位置和尺度。
 - 对远处小物体或水平转动时 CSRT 丢失/卡住的情形，使用相邻图像的稀疏 Lucas-Kanade 光流估计全局二维画面平移，作为短时纯图像兜底。该过程不读取车辆位姿、`/rbt_pose` 或 TF。
 - 框实际触及图像边界并持续向外运动时，会逐步显示为被裁剪的部分框；接近完全出画或持续外移约 1.2 秒后移除。若画面运动反向，退出过程取消。
 - 光流和 CSRT 都不能继续支持时，框会移除；下一次 DINO 结果重新初始化跟踪。
+
+## 原始检测帧显示
+
+当 `DETECTION_VISUAL_TRACKING_ENABLED: false` 且
+`DETECTION_DISPLAY_SYNC_MODE: detection_frame` 时，可视化不使用任何跟踪、插值或
+预测。每个检测结果只绘制在产生该结果的原始相机帧上，因此快速转动时框不会因推理延迟
+画到错误的新画面。代价是 `/lste/det_vis_image` 按检测结果到达时更新，不再保持相机帧率。
+全局目标投影也使用该检测帧的 TF 时间戳，而不是最新机器人姿态，因此不会在转动时相对
+同一张历史图像漂移。
 
 ## 关键参数
 

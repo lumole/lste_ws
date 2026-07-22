@@ -41,7 +41,7 @@ Visualization Manager:
       Median window: 5
       Min Value: 0
       Name: Image
-      Normalize Range: true
+      Normalize Range: false
       Queue Size: 2
       Transport Hint: raw
       Unreliable: false

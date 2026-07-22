@@ -61,20 +61,21 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 gazebo_gui_ready() {
-  pgrep -f 'gzclient.*--gui-client-plugin .*libgazebo_click_point\.so' >/dev/null
+  # The bracket prevents pgrep from matching its own command line.
+  pgrep -f '[g]zclient.*--gui-client-plugin .*libgazebo_click_point\.so' >/dev/null
 }
 
 start_gazebo_gui() {
   local window_name
   for window_name in gui gazebo_gui; do
     if tmux list-windows -t "=$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$window_name"; then
-      tmux kill-window -t "=$SESSION:$window_name"
+      tmux kill-window -t "$SESSION:$window_name"
     fi
   done
-  tmux new-window -t "=$SESSION:" -n "gazebo_gui" -c "$WS" \
+  tmux new-window -d -t "=$SESSION" -n "gazebo_gui" -c "$WS" \
     "bash -lc 'source \"$WS/scripts/config/pipeline_env.sh\"; \
 until rostopic list >/dev/null 2>&1; do sleep 1; done; \
-exec rosrun gazebo_ros gzclient --gui-client-plugin \"$GUI_PLUGIN\" __name:=gazebo_gui'"
+LSTE_WORLD=\"$WORLD\" exec rosrun gazebo_ros gzclient --gui-client-plugin \"$GUI_PLUGIN\" __name:=gazebo_gui'"
 }
 
 # ---- Session 管理 ----

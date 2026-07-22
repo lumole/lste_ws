@@ -293,9 +293,15 @@ class HealthAudit:
             failures.append("stale_topics")
 
         within_grace = now - self.started_at < self.startup_grace
+        # CUDA driver initialization and ROS master reachability cannot become
+        # healthy merely by waiting for normal node startup. Do not hide these
+        # terminal failures behind the ordinary startup grace window.
+        critical_failures = {"cuda", "ros_master"}
         if not failures:
             self.ready_once = True
             status = "healthy"
+        elif critical_failures.intersection(failures):
+            status = "unhealthy"
         elif within_grace and not self.ready_once:
             status = "starting"
         else:
