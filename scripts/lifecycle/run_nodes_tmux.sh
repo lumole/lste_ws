@@ -55,6 +55,10 @@ if [[ ! -f "$TASK_JSON" ]]; then
   echo "[error] TASK_JSON file not found: $TASK_JSON" >&2
   exit 1
 fi
+PRO3_SPAWN_X=${PRO3_SPAWN_X:-${CFG_PRO3_SPAWN_X:-0.0}}
+PRO3_SPAWN_Y=${PRO3_SPAWN_Y:-${CFG_PRO3_SPAWN_Y:-0.0}}
+PRO3_SPAWN_Z=${PRO3_SPAWN_Z:-${CFG_PRO3_SPAWN_Z:-0.0}}
+PRO3_SPAWN_YAW=${PRO3_SPAWN_YAW:-${CFG_PRO3_SPAWN_YAW:-0.0}}
 VLLM_URL=${VLLM_URL:-${CFG_VLLM_URL:-http://localhost:8000/v1}}
 VLLM_MODEL=${VLLM_MODEL:-$(_resolve "${CFG_VLLM_MODEL:-model/MiniCPM/OpenBMB/MiniCPM4-0___5B}")}
 PROMPT_CACHE_ENABLED=${PROMPT_CACHE_ENABLED:-${CFG_PROMPT_CACHE_ENABLED:-true}}
@@ -68,6 +72,7 @@ ACCESS_TOPO_RUN_NAME=${ACCESS_TOPO_RUN_NAME:-${CFG_ACCESS_TOPO_RUN_NAME:-$ACCESS
 GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-$(_resolve "${CFG_GP_FRONTIER_RVIZ:-src/lste_topo_access/launch/gp_frontier.rviz}")}
 SUSPICIOUS_WINDOW=${SUSPICIOUS_WINDOW:-${CFG_SUSPICIOUS_WINDOW:-5}}
 FOLLOW_LOCKED_DONE_TIME=${FOLLOW_LOCKED_DONE_TIME:-${CFG_FOLLOW_LOCKED_DONE_TIME:-4.0}}
+GOAL_DEBUG_LOG=${GOAL_DEBUG_LOG:-${CFG_GOAL_DEBUG_LOG:-false}}
 DINO_MIN_INTERVAL=${DINO_MIN_INTERVAL:-${CFG_DINO_MIN_INTERVAL:-1.5}}
 DINO_INTERVAL_PASS=${DINO_INTERVAL_PASS:-${CFG_DINO_INTERVAL_PASS:-1.5}}
 DINO_INTERVAL_SUSPICIOUS=${DINO_INTERVAL_SUSPICIOUS:-${CFG_DINO_INTERVAL_SUSPICIOUS:-1.5}}
@@ -203,7 +208,8 @@ if rosservice call /gazebo/get_world_properties 2>/dev/null | grep -q \"pro3\"; 
 else \
   SPAWN_MODEL=true; \
 fi; \
-roslaunch lste_core spawn_pro3.launch spawn_model:=\$SPAWN_MODEL; \
+roslaunch lste_core spawn_pro3.launch spawn_model:=\$SPAWN_MODEL \
+  x:=$PRO3_SPAWN_X y:=$PRO3_SPAWN_Y z:=$PRO3_SPAWN_Z yaw:=$PRO3_SPAWN_YAW; \
 echo; echo \"[EXIT] pro3 spawn\"; exec bash'"
 echo "[nodes] 创建后检查 sessions: $(tmux list-sessions 2>&1)"
 tmux set-option -t "=$SESSION:" remain-on-exit on
@@ -241,7 +247,8 @@ tmux_new_window 2 "$WS/model/MiniCPM/test" "vllm" \
 
 # 3: 全局目标
 tmux_new_window 3 "$WS" "goal" \
-  "$WAIT_ROSCORE; rosrun lste_topo_access lste_goal_manager.py _follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME"
+  "$WAIT_ROSCORE; rosrun lste_topo_access lste_goal_manager.py \
+    _follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME _debug_goal_log:=$GOAL_DEBUG_LOG"
 
 # 4: VLM Prompt 节点。它先检查缓存，再通知窗口 2 是否启动 MiniCPM。
 tmux_new_window 4 "$WS" "prompt" \

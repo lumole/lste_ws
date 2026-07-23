@@ -53,6 +53,10 @@ if [[ ! -f "$TASK_JSON" ]]; then
   echo "[error] TASK_JSON file not found: $TASK_JSON" >&2
   exit 1
 fi
+PRO3_SPAWN_X=${PRO3_SPAWN_X:-${CFG_PRO3_SPAWN_X:-0.0}}
+PRO3_SPAWN_Y=${PRO3_SPAWN_Y:-${CFG_PRO3_SPAWN_Y:-0.0}}
+PRO3_SPAWN_Z=${PRO3_SPAWN_Z:-${CFG_PRO3_SPAWN_Z:-0.0}}
+PRO3_SPAWN_YAW=${PRO3_SPAWN_YAW:-${CFG_PRO3_SPAWN_YAW:-0.0}}
 VLLM_URL=${VLLM_URL:-${CFG_VLLM_URL:-http://localhost:8000/v1}}
 VLLM_MODEL=${VLLM_MODEL:-$(_resolve "${CFG_VLLM_MODEL:-model/MiniCPM/OpenBMB/MiniCPM4-0___5B}")}
 PROMPT_CACHE_ENABLED=${PROMPT_CACHE_ENABLED:-${CFG_PROMPT_CACHE_ENABLED:-true}}
@@ -151,6 +155,7 @@ ACCESS_TOPO_RUN_NAME=${ACCESS_TOPO_RUN_NAME:-${CFG_ACCESS_TOPO_RUN_NAME:-$ACCESS
 GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-$(_resolve "${CFG_GP_FRONTIER_RVIZ:-src/lste_topo_access/launch/gp_frontier.rviz}")}
 SUSPICIOUS_WINDOW=${SUSPICIOUS_WINDOW:-${CFG_SUSPICIOUS_WINDOW:-5}}
 FOLLOW_LOCKED_DONE_TIME=${FOLLOW_LOCKED_DONE_TIME:-${CFG_FOLLOW_LOCKED_DONE_TIME:-4.0}}
+GOAL_DEBUG_LOG=${GOAL_DEBUG_LOG:-${CFG_GOAL_DEBUG_LOG:-false}}
 FRONTIER_LOG=${FRONTIER_LOG:-${CFG_FRONTIER_LOG:-true}}
 # The Gazebo click-coordinate plugin is part of the required operator UI.
 GUI=true
@@ -215,7 +220,8 @@ WAIT_ROSCORE='until rostopic list >/dev/null 2>&1; do echo \"waiting for roscore
 
 # 1: 仿真 + 机器人（等待 master 就绪）
 tmux_new_window 1 "$WS" "world" \
-  "$WAIT_ROSCORE; roslaunch lste_core lab_with_pro3.launch world_name:=$WORLD spawn_pro3:=$SPAWN_PRO3 gui:=$GUI"
+  "$WAIT_ROSCORE; roslaunch lste_core lab_with_pro3.launch world_name:=$WORLD spawn_pro3:=$SPAWN_PRO3 gui:=$GUI \
+    x:=$PRO3_SPAWN_X y:=$PRO3_SPAWN_Y z:=$PRO3_SPAWN_Z yaw:=$PRO3_SPAWN_YAW"
 
 # 2: 发布任务（latched，可随时替换 json/task_id）
 tmux_new_window 2 "$WS" "task" \
@@ -235,7 +241,8 @@ tmux_new_window 3 "$WS/model/MiniCPM/test" "vllm" \
 
 # 4: 全局目标（/lste/final_goal）
 tmux_new_window 4 "$WS" "goal" \
-  "$WAIT_ROSCORE; rosrun lste_topo_access lste_goal_manager.py _follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME"
+  "$WAIT_ROSCORE; rosrun lste_topo_access lste_goal_manager.py \
+    _follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME _debug_goal_log:=$GOAL_DEBUG_LOG"
 
 # 5: prompt 节点先查缓存，仅在 miss 时等待 VLLM
 tmux_new_window 5 "$WS" "prompt" \

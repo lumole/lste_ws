@@ -20,7 +20,7 @@ from image_geometry import PinholeCameraModel
 import tf2_ros
 from tf.transformations import quaternion_matrix, quaternion_from_euler
 
-from lste_msgs.msg import LsteState, LsteDetections, LsteDetection, LsteTask, LsteFrontiers
+from lste_msgs.msg import LsteState, LsteDetections, LsteDetection, LsteTask, LsteFrontiers, LsteScores
 
 
 STATE_PASS = 0
@@ -77,6 +77,9 @@ class GoalManager:
         self.v_gate = float(gp("~v_gate", 0.08))
         self.min_allowed_score = float(gp("~min_allowed_score", 0.05))
         self.switch_margin = float(gp("~switch_margin", 0.15))
+        # Diagnostic-only: emits one compact line per final-goal publication.
+        debug_goal_log = gp("~debug_goal_log", False)
+        self.debug_goal_log = str(debug_goal_log).strip().lower() in ("1", "true", "yes", "on")
 
         # --- 状态缓存 ---
         self.current_state = STATE_PASS
@@ -90,12 +93,15 @@ class GoalManager:
         self.latest_state_msg: Optional[LsteState] = None
         self.latest_task: Optional[LsteTask] = None
         self.latest_dets: Optional[LsteDetections] = None
+        self.latest_scores: Optional[LsteScores] = None
         self.latest_frontiers: Optional[LsteFrontiers] = None
         self.latest_frontier: Optional[Vector3Stamped] = None
         self.latest_scan: Optional[LaserScan] = None
         self.latest_cmd_vel: Optional[Twist] = None
         self.headings: Optional[List[float]] = None
         self.last_dir_idx: Optional[int] = None
+        self.goal_source = "uninitialized"
+        self.frontier_debug = "unavailable"
         # Access-Topo 覆盖
         self.access_mode = 0
         self.access_backtrack_goal: Optional[PoseStamped] = None
@@ -133,6 +139,7 @@ class GoalManager:
         # 订阅
         self.sub_state = rospy.Subscriber("/lste/state", LsteState, self.on_state, queue_size=1)
         self.sub_dets = rospy.Subscriber("/lste/detections", LsteDetections, self.on_dets, queue_size=1)
+        self.sub_scores = rospy.Subscriber("/lste/scores", LsteScores, self.on_scores, queue_size=1)
         self.sub_task = rospy.Subscriber("/lste/task", LsteTask, self.on_task, queue_size=1)
         self.sub_pose = rospy.Subscriber("/rbt_pose", Pose2D, self.on_pose, queue_size=1)
         self.sub_cam_info = rospy.Subscriber("/kinect/hd/camera_info", CameraInfo, self.on_cam_info, queue_size=1)
@@ -178,6 +185,9 @@ class GoalManager:
 
     def on_dets(self, msg: LsteDetections):
         self.latest_dets = msg
+
+    def on_scores(self, msg: LsteScores):
+        self.latest_scores = msg
 
     def on_task(self, msg: LsteTask):
         self.latest_task = msg
@@ -233,6 +243,7 @@ class GoalManager:
         if self.last_goal is None and self.start_pose is not None:
             goal = self.build_goal_from_pose(self.start_pose, self.forward_dist)
             if goal:
+                self.goal_source = "startup_forward"
                 self.publish_goal(goal)
                 self.next_update_time = now + self.pass_period
             return
@@ -282,6 +293,7 @@ class GoalManager:
     def compute_goal(self) -> Optional[PoseStamped]:
         # Access-Topo 回退模式优先
         if self.access_mode in (1, 2) and self.access_backtrack_goal is not None:
+            self.goal_source = "access_backtrack"
             return self.access_backtrack_goal
 
         now = rospy.Time.now().to_sec()
@@ -329,12 +341,14 @@ class GoalManager:
                         if prev_yaw is not None:
                             heading_world = self._slerp_yaw(prev_yaw, heading_world, self.follow_heading_alpha)
                     goal = self.make_goal_pose((x, y, 0.0), heading_world)
+                    self.goal_source = "target_follow"
                     self.target_last_seen = now
                     if (now - self.target_last_update) >= self.follow_min_update_period:
                         self.target_last_goal = goal
                         self.target_last_update = now
         if goal is None:
             if self.target_last_seen is not None and (now - self.target_last_seen) < self.follow_target_lost_timeout:
+                self.goal_source = "target_cached"
                 return self.target_last_goal
             if self.effective_mode == CATCH_TARGET_MODE:
                 rospy.loginfo_throttle(2.0, "GoalManager: target lost >= %.1fs, fallback to explore_sus_c_mode",
@@ -383,6 +397,7 @@ class GoalManager:
                             heading_world = self._slerp_yaw(prev_yaw, heading_world, self.follow_heading_alpha)
                     if (now - self.ctx_last_update) >= self.follow_min_update_period:
                         goal = self.make_goal_pose((x, y, 0.0), heading_world)
+                        self.goal_source = "ctx_pair_follow"
                         self.ctx_last_goal = goal
                         self.ctx_last_update = now
 
@@ -398,6 +413,7 @@ class GoalManager:
             return goal if goal is not None else self.goal_from_frontiers_prior()
 
         if goal is None and self.ctx_last_goal is not None:
+            self.goal_source = "ctx_cached"
             return self.ctx_last_goal
         if goal is None:
             return self.goal_from_frontiers_prior()
@@ -507,12 +523,18 @@ class GoalManager:
             return None
 
         # 滞回：优势不够则保持上次方向
+        selected_idx = best_idx
         if self.last_dir_idx is not None and best_idx != self.last_dir_idx:
             margin = second_val * (1.0 + self.switch_margin)
             if best_val < margin:
                 best_idx = self.last_dir_idx
                 best_val = scores[best_idx]
         self.last_dir_idx = best_idx
+        self.goal_source = "frontier_vote"
+        self.frontier_debug = "n=%d selected=%d raw_best=%d scores=[%s]" % (
+            len(thetas_rel), best_idx, selected_idx,
+            ",".join("%.3f" % score for score in scores),
+        )
 
         heading_world = self.headings[best_idx]
         dist = self.clip_distance(heading_world, self.forward_dist)
@@ -542,10 +564,60 @@ class GoalManager:
         return goal
 
     def publish_goal(self, goal: PoseStamped):
+        previous_goal = self.last_goal
         self.last_goal = goal
         self.pub_goal.publish(goal)
         rospy.loginfo_throttle(2.0, "Publish /lste/final_goal: x=%.2f y=%.2f state=%s",
                                goal.pose.position.x, goal.pose.position.y, self.current_state)
+        if self.debug_goal_log:
+            self.log_goal_diagnostic(goal, previous_goal)
+
+    def log_goal_diagnostic(self, goal: PoseStamped, previous_goal: Optional[PoseStamped]):
+        """Record inputs and movement behind one final-goal decision."""
+        pose = self.latest_pose
+        if pose is None:
+            return
+        goal_yaw = self.yaw_from_pose(goal) or 0.0
+        robot_goal_dist = math.hypot(goal.pose.position.x - pose.x, goal.pose.position.y - pose.y)
+        goal_delta = 0.0
+        if previous_goal is not None:
+            goal_delta = math.hypot(
+                goal.pose.position.x - previous_goal.pose.position.x,
+                goal.pose.position.y - previous_goal.pose.position.y,
+            )
+        cmd_v = float(self.latest_cmd_vel.linear.x) if self.latest_cmd_vel is not None else 0.0
+        cmd_w = float(self.latest_cmd_vel.angular.z) if self.latest_cmd_vel is not None else 0.0
+        if self.latest_scores is None:
+            score_info = "unavailable"
+        else:
+            score_info = "total=%.3f,target=%.3f,env=%.3f,ctx=%.3f,detected=%s" % (
+                self.latest_scores.s_total, self.latest_scores.s_target,
+                self.latest_scores.s_env, self.latest_scores.s_ctx,
+                self.latest_scores.detected,
+            )
+        det_info = self.diagnostic_detection_summary()
+        rospy.loginfo(
+            "GOAL_DIAG source=%s state=%d subtype=%s mode=%s access=%d "
+            "robot=(%.2f,%.2f,%.2f) cmd=(%.2f,%.2f) "
+            "goal=(%.2f,%.2f,%.2f) robot_goal_dist=%.2f goal_delta=%.2f "
+            "scores={%s} detections={%s} frontiers={%s}",
+            self.goal_source, self.current_state, self.current_subtype or "-",
+            self.effective_mode, self.access_mode, pose.x, pose.y, pose.theta,
+            cmd_v, cmd_w, goal.pose.position.x, goal.pose.position.y, goal_yaw,
+            robot_goal_dist, goal_delta, score_info, det_info, self.frontier_debug,
+        )
+
+    def diagnostic_detection_summary(self) -> str:
+        if self.latest_dets is None:
+            return "unavailable"
+        target_count = len(self.latest_dets.target_dets)
+        env_count = len(self.latest_dets.env_dets)
+        best = self.pick_best_target()
+        if best is None:
+            return "target=0,env=%d" % env_count
+        return "target=%d,env=%d,best=%s:%.3f@%.3f,%.3f" % (
+            target_count, env_count, best.label, best.score, best.cx, best.cy,
+        )
 
     def build_goal_from_pose(self, pose: Pose2D, dist: float) -> PoseStamped:
         x = pose.x + dist * math.cos(pose.theta)

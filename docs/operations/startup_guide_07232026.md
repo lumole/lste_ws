@@ -145,7 +145,7 @@ prompt，只要类别数不超过该值就复用同一份 engine；只有提高�
 更换 GPU 或删除缓存时才需要重新编译。
 
 完整的架构、环境版本、缓存策略与实测结果见
-[`wedetect_tensorrt_integration.md`](wedetect_tensorrt_integration.md)。
+[`wedetect_tensorrt_integration_07232026.md`](../perception/wedetect_tensorrt_integration_07232026.md)。
 
 WeDetect 的中文类别映射、阈值、NMS 和 FP16 设置也位于同一配置文件。当前映射覆盖
 `blue mug`、`yellow mug`、桌椅、显示器、文件夹、门、消防栓和灭火器；新类别可通过

@@ -8,6 +8,15 @@ WORLD: worlds/topo3.0_catch_mode/session_test/env04_no_pro3.world
 TASK_JSON: model/Data_exchange/vlm_prompt/lab/yellow_cup.json
 TASK_ID: yellow_cup
 
+# Initial Pro3 pose when its model is spawned. X/Y/Z use Gazebo world metres;
+# YAW is radians, counter-clockwise about +Z. The default yaw (+pi/2) makes the
+# Pro3 forward axis face the world +Y direction. Edit these four values before
+# starting the robot; an already-spawned robot keeps its existing pose.
+PRO3_SPAWN_X: 3.4
+PRO3_SPAWN_Y: 0
+PRO3_SPAWN_Z: 0.1
+PRO3_SPAWN_YAW: 0
+
 # MiniCPM is used only to create a prompt cache when that task has no cache.
 # VLLM_URL is normally local; change it only when vLLM is hosted elsewhere.
 VLLM_URL: http://localhost:8000/v1
@@ -34,10 +43,14 @@ SUSPICIOUS_WINDOW: 5
 # Seconds for which a locked target must remain complete before Goal Manager
 # treats the follow action as done. Larger values reduce premature completion.
 FOLLOW_LOCKED_DONE_TIME: 4.0
+# true writes one GOAL_DIAG line for every /lste/final_goal publication. It
+# records the decision source, state, robot pose, scores, detections, frontier
+# vote and goal delta. Set false after diagnosing goal movement/flicker.
+GOAL_DEBUG_LOG: true
 
 # Initial speed-mux selection. Valid values: teleop, sappo. Both processes stay
 # alive; this only selects the initial source. It can be hot-switched later.
-LSTE_CONTROLLER: teleop
+LSTE_CONTROLLER: sappo
 # Select exactly one detector profile. This is the only key needed to change
 # detector model:
 #   groundingdino  - original DINO node; two prompt passes; lower FPS.

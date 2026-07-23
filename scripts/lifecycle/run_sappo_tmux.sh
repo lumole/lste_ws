@@ -5,6 +5,27 @@ WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 RL_DIR="$WS/rl_navigation"
 ENV_SESSION="lste-env"
 SESSION="sappo-lste"
+PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}
+if [[ -f "$PIPELINE_CONFIG" ]]; then
+  eval "$(
+    python - "$PIPELINE_CONFIG" <<'PY' || true
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    data = yaml.safe_load(f) or {}
+for key, value in data.items():
+    if isinstance(value, (str, int, float)):
+        print(f'CFG_{key}={value}')
+PY
+  )"
+fi
+PRO3_SPAWN_X=${PRO3_SPAWN_X:-${CFG_PRO3_SPAWN_X:-0.0}}
+PRO3_SPAWN_Y=${PRO3_SPAWN_Y:-${CFG_PRO3_SPAWN_Y:-0.0}}
+PRO3_SPAWN_Z=${PRO3_SPAWN_Z:-${CFG_PRO3_SPAWN_Z:-0.0}}
+PRO3_SPAWN_YAW=${PRO3_SPAWN_YAW:-${CFG_PRO3_SPAWN_YAW:-0.0}}
 SPEED="${SAPPO_SPEED:-0.35}"
 GOAL_X="${SAPPO_GOAL_X:-10.5}"
 GOAL_Y="${SAPPO_GOAL_Y:-6.0}"
@@ -38,7 +59,7 @@ if [[ -d "$RUNTIME_DIR/policy" && ! -L "$RUNTIME_DIR/policy" ]]; then
 fi
 ln -sfn "$POLICY_DIR" "$RUNTIME_DIR/policy"
 tmux new-session -d -s "$SESSION" -c "$WS" -n "pro3" \
-  "bash -lc 'source \"$WS/scripts/config/pipeline_env.sh\"; until rosservice list | grep -qx /gazebo/spawn_urdf_model; do sleep 1; done; roslaunch lste_core spawn_pro3.launch spawn_model:=true || true; until rostopic list | grep -qx /pro3/wheel_odom; do sleep 1; done; exec bash'"
+  "bash -lc 'source \"$WS/scripts/config/pipeline_env.sh\"; until rosservice list | grep -qx /gazebo/spawn_urdf_model; do sleep 1; done; roslaunch lste_core spawn_pro3.launch spawn_model:=true x:=$PRO3_SPAWN_X y:=$PRO3_SPAWN_Y z:=$PRO3_SPAWN_Z yaw:=$PRO3_SPAWN_YAW || true; until rostopic list | grep -qx /pro3/wheel_odom; do sleep 1; done; exec bash'"
 tmux new-window -t "=$SESSION:1" -n "scan" -c "$WS" \
   "bash -lc 'source \"$WS/scripts/config/pipeline_env.sh\"; until rostopic list >/dev/null 2>&1; do sleep 1; done; roslaunch pointcloud_to_laserscan lste_pro3_to_scan.launch; exec bash'"
 tmux new-window -t "=$SESSION:2" -n "sappo" -c "$RUNTIME_DIR" \
