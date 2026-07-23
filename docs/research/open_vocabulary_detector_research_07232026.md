@@ -6,7 +6,7 @@
 
 本项目需要在 Gazebo/RViz、SA-PPO 和 ROS 节点同时运行时，按自然语言类别检测目标（当前重点为远距离 `blue mug`），并将结果提供给导航链路。任务 JSON 和类别集合相对固定；MiniCPM 已会将类别 prompt 缓存到 `runtime/prompt_cache/`，不应在每帧调用 MiniCPM。
 
-当前 GroundingDINO 对每张图像分别执行目标和环境两次前向推理。RTX 3060（12 GB）全链路实测：启用 CUDA 扩展、不限速时约 **0.570 FPS**；生产调度为 1.5 秒一次。详见 [visual_pipeline.md](visual_pipeline.md)。它保留为效果基线和回退方案，不适合作为实时主检测器。
+当前 GroundingDINO 对每张图像分别执行目标和环境两次前向推理。RTX 3060（12 GB）全链路实测：启用 CUDA 扩展、不限速时约 **0.570 FPS**；生产调度为 1.5 秒一次。详见 [visual_pipeline_07232026.md](../perception/visual_pipeline_07232026.md)。它保留为效果基线和回退方案，不适合作为实时主检测器。
 
 选型约束：代码与可本地运行的权重必须公开；无需从零训练；ROS 支持不是前提；优先保证远距离目标召回，其次才是极高 FPS。系统当前已有约 2.43 GB GPU 占用；替换 GroundingDINO 后可释放其对应显存。
 
@@ -106,7 +106,7 @@ Gazebo 相机帧；切换到 `wedetect` 后应在完整仿真链路中补测端�
 
 ## 来源
 
-- GroundingDINO 本机测试：[visual_pipeline.md](visual_pipeline.md)
+- GroundingDINO 本机测试：[visual_pipeline_07232026.md](../perception/visual_pipeline_07232026.md)
 - YOLOE：<https://github.com/THU-MIG/yoloe>；YOLOE-26 文档：<https://docs.ultralytics.com/models/yoloe/>
 - OV-DEIM：<https://github.com/wleilei/OV-DEIM>
 - WeDetect：<https://github.com/WeChatCV/WeDetect>；权重：<https://huggingface.co/fushh7/WeDetect>
