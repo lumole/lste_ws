@@ -27,7 +27,27 @@ class FrontierGoalManager:
         # updates from replacing that target with a different frontier.
         self.final_goal_dispatched = False
         self.final_goal_completed = False
+        # The fixed-goal publisher republishes its latched value at 1 Hz. Keep
+        # a bounded number of full move_base recovery attempts for transient
+        # SLAM failures, then make an obstacle-embedded target terminal.
+        self.final_goal_unreachable = False
+        self.final_goal_failure_count = 0
+        self.max_final_goal_failures = max(
+            1, int(rospy.get_param("~max_final_goal_failures", 3))
+        )
         self.max_subgoal_seconds = float(rospy.get_param("~max_subgoal_seconds", 45.0))
+        # A frontier cell can be globally free but still be too close to a
+        # newly observed local obstacle for TEB to enter its goal tolerance.
+        # Do not hold that stale waypoint for the full action timeout when
+        # SLAM has already supplied a materially different reachable frontier.
+        self.frontier_stall_seconds = float(rospy.get_param("~frontier_stall_seconds", 6.0))
+        self.frontier_stall_progress = float(rospy.get_param("~frontier_stall_progress", 0.10))
+        self.frontier_stall_proximity = float(rospy.get_param("~frontier_stall_proximity", 1.0))
+        self.frontier_replacement_distance = float(
+            rospy.get_param("~frontier_replacement_distance", 0.60)
+        )
+        self.active_goal_best_distance = None
+        self.active_goal_last_progress_time = None
         # Exploration may use a normal doorway, so this is the vehicle radius
         # (0.30 m) plus a modest mapping margin, rather than the larger local
         # planner comfort zone. TEB still provides the final collision check.
@@ -51,6 +71,12 @@ class FrontierGoalManager:
 
     def on_odom(self, message):
         self.pose = np.array([message.pose.pose.position.x, message.pose.pose.position.y])
+        if self.active_goal is not None and not self.final_goal_dispatched:
+            distance = float(np.linalg.norm(self.pose - self.active_goal))
+            if (self.active_goal_best_distance is None
+                    or distance <= self.active_goal_best_distance - self.frontier_stall_progress):
+                self.active_goal_best_distance = distance
+                self.active_goal_last_progress_time = rospy.Time.now()
         # Topic delivery order is not deterministic. If gmapping supplied a
         # cached map before this first pose, finish the deferred plan now.
         if self.latest_map is not None and not self.map_processed_for_current_goal:
@@ -70,6 +96,8 @@ class FrontierGoalManager:
         """Restart exploration when the test publisher accepts a Shift-click goal."""
         new_goal = np.array([message.pose.position.x, message.pose.position.y], dtype=float)
         if np.linalg.norm(new_goal - self.goal) < 0.05:
+            # publish_goal.py republishes the current target every second.
+            # Do not let that periodic message revive an unreachable target.
             return
         old_goal = self.goal.copy()
         self.goal = new_goal
@@ -78,8 +106,12 @@ class FrontierGoalManager:
         self.last_published_goal = None
         self.active_goal = None
         self.active_goal_time = None
+        self.active_goal_best_distance = None
+        self.active_goal_last_progress_time = None
         self.final_goal_dispatched = False
         self.final_goal_completed = False
+        self.final_goal_unreachable = False
+        self.final_goal_failure_count = 0
         self.map_processed_for_current_goal = False
         # Stop the old frontier/final action immediately. The next map update
         # will publish a route that belongs to the newly clicked final goal.
@@ -109,13 +141,36 @@ class FrontierGoalManager:
                     self.final_goal_completed = True
                     rospy.loginfo("move_base reports the fixed final goal reached")
                 else:
-                    # Keep the fixed target selected after a transient abort;
-                    # do not fall back to unconstrained frontier wandering.
-                    self.last_published_goal = None
-                    rospy.logwarn("Fixed final goal ended with status %s; retrying the same final goal", terminal_statuses)
-            rospy.loginfo("Frontier goal completed or failed; selecting the next reachable frontier")
+                    self.final_goal_failure_count += 1
+                    if self.final_goal_failure_count < self.max_final_goal_failures:
+                        # Keep the fixed target selected for a bounded retry.
+                        # Clearing this marker causes publish_pending() to
+                        # issue one new simple-goal action on its next tick.
+                        self.last_published_goal = None
+                        rospy.logwarn(
+                            "Fixed final goal failed after recovery: target=(%.2f,%.2f) "
+                            "status=%s; retrying (%d/%d)",
+                            self.goal[0], self.goal[1], terminal_statuses,
+                            self.final_goal_failure_count, self.max_final_goal_failures,
+                        )
+                    else:
+                        self.final_goal_unreachable = True
+                        self.final_goal_dispatched = False
+                        self.pending_goal = None
+                        self.last_published_goal = None
+                        rospy.logerr(
+                            "Final goal unreachable after %d failed recovery attempts: "
+                            "target=(%.2f,%.2f) status=%s; holding position until "
+                            "the target changes",
+                            self.final_goal_failure_count, self.goal[0], self.goal[1],
+                            terminal_statuses,
+                        )
+            else:
+                rospy.loginfo("Frontier goal completed or failed; selecting the next reachable frontier")
             self.active_goal = None
             self.active_goal_time = None
+            self.active_goal_best_distance = None
+            self.active_goal_last_progress_time = None
 
     @staticmethod
     def _inflate(occupied, cells):
@@ -236,6 +291,12 @@ class FrontierGoalManager:
             and safe_free[goal_local_row, goal_local_col]
             and connected[goal_local_row, goal_local_col]
         )
+        if self.final_goal_unreachable:
+            # The current clicked target already exhausted move_base recovery.
+            # Holding here prevents the publisher's periodic replay from
+            # recreating a high-rate recovery loop. A different click resets
+            # this state in on_final_goal().
+            return
         if goal_is_safe_and_connected:
             if not self.final_goal_dispatched:
                 rospy.loginfo(
@@ -253,6 +314,8 @@ class FrontierGoalManager:
                 # which makes move_base preempt the old waypoint.
                 self.active_goal = None
                 self.active_goal_time = None
+                self.active_goal_best_distance = None
+                self.active_goal_last_progress_time = None
             return
         if self.final_goal_dispatched:
             return
@@ -317,11 +380,45 @@ class FrontierGoalManager:
                 # A direct final-goal action is never replaced by a frontier
                 # timeout.  Its terminal state above determines any retry.
                 return
-            if elapsed < self.max_subgoal_seconds:
+            active_distance = float(np.linalg.norm(self.pose - self.active_goal)) if self.pose is not None else float("inf")
+            pending_changed = (
+                np.linalg.norm(self.pending_goal - self.active_goal)
+                >= self.frontier_replacement_distance
+            )
+            no_progress_seconds = (
+                (rospy.Time.now() - self.active_goal_last_progress_time).to_sec()
+                if self.active_goal_last_progress_time is not None else 0.0
+            )
+            # This is deliberately restricted to the terminal approach to a
+            # frontier. A route that temporarily increases its Euclidean
+            # distance while going around a wall remains under move_base's
+            # ordinary 45-second action timeout.
+            if (pending_changed
+                    and active_distance <= self.frontier_stall_proximity
+                    and no_progress_seconds >= self.frontier_stall_seconds):
+                rospy.logwarn(
+                    "Frontier subgoal stalled near endpoint: active=(%.2f,%.2f) "
+                    "distance=%.2f no_progress=%.1fs replacement=(%.2f,%.2f); "
+                    "preempting stale action",
+                    self.active_goal[0], self.active_goal[1], active_distance,
+                    no_progress_seconds, self.pending_goal[0], self.pending_goal[1],
+                )
+                # Publishing a new simple goal preempts the old move_base
+                # action. Do not send a blanket cancel here: it could cancel
+                # the replacement action when actionlib processes messages in
+                # a different order.
+                self.active_goal = None
+                self.active_goal_time = None
+                self.active_goal_best_distance = None
+                self.active_goal_last_progress_time = None
+            elif elapsed < self.max_subgoal_seconds:
                 return
-            rospy.logwarn("Frontier goal timed out after %.1f s; trying a new reachable frontier", elapsed)
-            self.active_goal = None
-            self.active_goal_time = None
+            else:
+                rospy.logwarn("Frontier goal timed out after %.1f s; trying a new reachable frontier", elapsed)
+                self.active_goal = None
+                self.active_goal_time = None
+                self.active_goal_best_distance = None
+                self.active_goal_last_progress_time = None
         if (self.last_published_goal is not None
                 and np.linalg.norm(self.pending_goal - self.last_published_goal) < 0.05):
             return
@@ -334,6 +431,10 @@ class FrontierGoalManager:
         self.last_published_goal = self.pending_goal.copy()
         self.active_goal = self.pending_goal.copy()
         self.active_goal_time = rospy.Time.now()
+        self.active_goal_best_distance = (
+            float(np.linalg.norm(self.pose - self.active_goal)) if self.pose is not None else None
+        )
+        self.active_goal_last_progress_time = self.active_goal_time
         if self.final_goal_dispatched:
             rospy.loginfo("Published fixed final goal=(%.2f, %.2f)", *self.pending_goal)
         else:

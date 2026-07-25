@@ -31,4 +31,3 @@
 | 文档 | 内容 |
 | --- | --- |
 | [open_vocabulary_detector_research_07232026.md](research/open_vocabulary_detector_research_07232026.md) | 开放词汇检测器的调研和选型 |
-

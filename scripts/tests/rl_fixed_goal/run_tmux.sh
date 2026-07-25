@@ -47,8 +47,10 @@ NAVIGATION_MAX_LINEAR_SPEED="${CFG_NAVIGATION_MAX_LINEAR_SPEED:-0.50}"
 RECOVERY_MODE="${CFG_RECOVERY_MODE:-policy_only}"
 CONTROLLER_MODE="${CFG_CONTROLLER_MODE:-$RECOVERY_MODE}"
 ALLOW_GAZEBO_CLICK_GOAL="${CFG_ALLOW_GAZEBO_CLICK_GOAL:-false}"
+FINAL_GOAL_MAX_FAILURES="${CFG_FINAL_GOAL_MAX_FAILURES:-3}"
 LOCAL_PLANNER_PLUGIN="${CFG_LOCAL_PLANNER_PLUGIN:-teb_local_planner/TebLocalPlannerROS}"
 CONTROLLER_METHOD="${CFG_CONTROLLER_METHOD:-}"
+LIVE_RVIZ="${CFG_LIVE_RVIZ:-true}"
 LOG_RETENTION_DAYS="${CFG_LOG_RETENTION_DAYS:-15}"
 
 # A single comparison config can select the controller while retaining one
@@ -160,10 +162,14 @@ new_window goal_sphere "$WS" \
 PYTHON_SITE="$($PYTHON_BIN -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 if [[ "$CONTROLLER_MODE" == "ros_navigation" ]]; then
   new_window navigation_goal "$WS" \
-    "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom; do sleep 1; done; python3 $TEST_DIR/frontier_goal_manager.py _goal_x:=$GOAL_X _goal_y:=$GOAL_Y" \
+    "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom; do sleep 1; done; python3 -u $TEST_DIR/frontier_goal_manager.py _goal_x:=$GOAL_X _goal_y:=$GOAL_Y _max_final_goal_failures:=$FINAL_GOAL_MAX_FAILURES" \
     "frontier_manager"
   new_window navigation "$WS" \
     "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom && rostopic list | grep -qx /pro3/rlscan; do sleep 1; done; roslaunch $TEST_DIR/ros_navigation.launch local_planner_plugin:=$LOCAL_PLANNER_PLUGIN max_linear_speed:=$NAVIGATION_MAX_LINEAR_SPEED"
+  if [[ "${LIVE_RVIZ,,}" == "true" ]]; then
+    new_window live_rviz "$WS" \
+      "$WAIT_ROS; until rostopic list | grep -qx /map; do sleep 1; done; rviz -d $TEST_DIR/live_navigation.rviz"
+  fi
 else
   new_window sappo "$RUNTIME_DIR" \
     "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom && rostopic list | grep -qx /pro3/rlscan && rostopic list | grep -qx /rl_fixed_goal_test/final_goal; do sleep 1; done; PYTHONPATH=$PYTHON_SITE:$WS/devel/lib/python3/dist-packages:/opt/ros/noetic/lib/python3/dist-packages:/usr/lib/python3/dist-packages $PYTHON_BIN $TEST_DIR/sappo_test.py _linear_speed_scale:=$SAPPO_SPEED _goal_x:=$GOAL_X _goal_y:=$GOAL_Y _goal_topic:=/rl_fixed_goal_test/final_goal _cmd_vel_topic:=/cmd_vel _wait_for_goal:=true _subscribe_gp_subgoal:=false _recovery_mode:=$RECOVERY_MODE _controller_mode:=$CONTROLLER_MODE"

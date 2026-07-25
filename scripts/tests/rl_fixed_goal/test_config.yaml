@@ -15,11 +15,20 @@ GOAL_X: 12.95
 GOAL_Y: -6.51
 ALLOW_GAZEBO_CLICK_GOAL: true
 
+# A final target may fail once while SLAM/costmaps catch up. After this many
+# complete move_base recovery failures, hold position and mark it unreachable.
+# Set to 1 to stop after the first failure.
+FINAL_GOAL_MAX_FAILURES: 3
+
 # Select exactly one controller:
 # - teb: online SLAM + Navfn global planner + TEB local planner.
 # - dwa: online SLAM + Navfn global planner + DWA local planner.
 # - rl:  SA-PPO controller, without move_base or a global map planner.
 CONTROLLER_METHOD: teb
+
+# Start the test-only Live RViz window for TEB/DWA. It displays data emitted by
+# gmapping, Navfn, and the selected local planner on this isolated ROS master.
+LIVE_RVIZ: true
 
 # Shared forward-speed setting for TEB and DWA, in m/s.
 NAVIGATION_MAX_LINEAR_SPEED: 1.00

@@ -34,6 +34,10 @@
     <remap from="odom" to="$(arg odom_topic)"/>
     <param name="base_global_planner" value="navfn/NavfnROS"/>
     <param name="base_local_planner" value="$(arg local_planner_plugin)"/>
+    <!-- Publish Navfn's actual Dijkstra potential array as PointCloud2 for
+         the live RViz explanation. This is planner output, not a recreated
+         heatmap in the visualization layer. -->
+    <param name="NavfnROS/visualize_potential" value="true"/>
     <param name="global_costmap/global_frame" value="map"/>
     <param name="global_costmap/robot_base_frame" value="base_footprint"/>
     <param name="global_costmap/robot_radius" value="0.30"/>
