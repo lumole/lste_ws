@@ -52,6 +52,11 @@ LOCAL_PLANNER_PLUGIN="${CFG_LOCAL_PLANNER_PLUGIN:-teb_local_planner/TebLocalPlan
 CONTROLLER_METHOD="${CFG_CONTROLLER_METHOD:-}"
 LIVE_RVIZ="${CFG_LIVE_RVIZ:-true}"
 LOG_RETENTION_DAYS="${CFG_LOG_RETENTION_DAYS:-15}"
+SCREEN_RECORD="${CFG_SCREEN_RECORD:-false}"
+SCREEN_RECORD_START_DELAY_SECONDS="${CFG_SCREEN_RECORD_START_DELAY_SECONDS:-18}"
+SCREEN_RECORD_DURATION_SECONDS="${CFG_SCREEN_RECORD_DURATION_SECONDS:-75}"
+SCREEN_RECORD_FPS="${CFG_SCREEN_RECORD_FPS:-30}"
+SCREEN_RECORD_WINDOW="${CFG_SCREEN_RECORD_WINDOW:-RViz}"
 
 # A single comparison config can select the controller while retaining one
 # shared world, spawn pose, goal publisher, and lifecycle. Older configs that
@@ -118,6 +123,9 @@ mkdir -p "$LOG_DIR"
 ln -sfn "$LOG_DIR" "$RUNTIME_DIR/current_log"
 LIFECYCLE_LOG="$LOG_DIR/${RUN_TIMESTAMP}_lifecycle.log"
 
+VIDEO_ROOT="$RUNTIME_DIR/videos"
+VIDEO_DIR="$VIDEO_ROOT/$RUN_TIMESTAMP"
+
 lifecycle_log() {
   printf '%s [INFO] [launcher] run_timestamp=%s event=%s\n' \
     "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$RUN_TIMESTAMP" "$1" >> "$LIFECYCLE_LOG"
@@ -129,9 +137,21 @@ lifecycle_log() {
     "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$CONFIG"
   sed 's/^/[CONFIG] /' "$CONFIG"
   printf '%s [INFO] [launcher] config_end\n' "$(date '+%Y-%m-%d %H:%M:%S.%3N')"
-  printf '%s [INFO] [launcher] world=%s controller_method=%s controller_mode=%s local_planner=%s max_linear_speed=%s sappo_speed=%s initial_pose=(%s,%s,%s,%s) goal=(%s,%s) ros_port=%s gazebo_port=%s git_revision=%s\n' \
-    "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$WORLD" "${CONTROLLER_METHOD:-legacy}" "$CONTROLLER_MODE" "$LOCAL_PLANNER_PLUGIN" "$NAVIGATION_MAX_LINEAR_SPEED" "$SAPPO_SPEED" "$INITIAL_X" "$INITIAL_Y" "$INITIAL_Z" "$INITIAL_YAW" "$GOAL_X" "$GOAL_Y" "$ROS_PORT" "$GAZEBO_PORT" "$(git -C "$WS" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  printf '%s [INFO] [launcher] world=%s controller_method=%s controller_mode=%s local_planner=%s max_linear_speed=%s sappo_speed=%s initial_pose=(%s,%s,%s,%s) goal=(%s,%s) ros_port=%s gazebo_port=%s screen_record=%s git_revision=%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$WORLD" "${CONTROLLER_METHOD:-legacy}" "$CONTROLLER_MODE" "$LOCAL_PLANNER_PLUGIN" "$NAVIGATION_MAX_LINEAR_SPEED" "$SAPPO_SPEED" "$INITIAL_X" "$INITIAL_Y" "$INITIAL_Z" "$INITIAL_YAW" "$GOAL_X" "$GOAL_Y" "$ROS_PORT" "$GAZEBO_PORT" "$SCREEN_RECORD" "$(git -C "$WS" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 } >> "$LIFECYCLE_LOG"
+
+if [[ "${SCREEN_RECORD,,}" == "true" ]]; then
+  if ! [[ "$SCREEN_RECORD_START_DELAY_SECONDS" =~ ^[0-9]+$ && "$SCREEN_RECORD_DURATION_SECONDS" =~ ^[1-9][0-9]*$ && "$SCREEN_RECORD_FPS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[error] Screen-recording delay, duration, and FPS must be integers." >&2
+    exit 1
+  fi
+  mkdir -p "$VIDEO_DIR"
+  find "$VIDEO_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime "+$LOG_RETENTION_DAYS" -exec rm -rf {} +
+  printf 'run_timestamp: %s\ncontroller_method: %s\ncontroller_mode: %s\nworld: %s\ninitial_pose: [%s, %s, %s, %s]\ngoal: [%s, %s]\nrecording_window: %s\nrecording_start_delay_seconds: %s\nrecording_duration_seconds: %s\nrecording_fps: %s\ngit_revision: %s\n' \
+    "$RUN_TIMESTAMP" "${CONTROLLER_METHOD:-legacy}" "$CONTROLLER_MODE" "$WORLD" "$INITIAL_X" "$INITIAL_Y" "$INITIAL_Z" "$INITIAL_YAW" "$GOAL_X" "$GOAL_Y" "$SCREEN_RECORD_WINDOW" "$SCREEN_RECORD_START_DELAY_SECONDS" "$SCREEN_RECORD_DURATION_SECONDS" "$SCREEN_RECORD_FPS" "$(git -C "$WS" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+    > "$VIDEO_DIR/${RUN_TIMESTAMP}_recording_manifest.yaml"
+fi
 
 ln -sfn "$POLICY_DIR" "$RUNTIME_DIR/policy"
 
@@ -173,9 +193,33 @@ if [[ "$CONTROLLER_MODE" == "ros_navigation" ]]; then
 else
   new_window sappo "$RUNTIME_DIR" \
     "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom && rostopic list | grep -qx /pro3/rlscan && rostopic list | grep -qx /rl_fixed_goal_test/final_goal; do sleep 1; done; PYTHONPATH=$PYTHON_SITE:$WS/devel/lib/python3/dist-packages:/opt/ros/noetic/lib/python3/dist-packages:/usr/lib/python3/dist-packages $PYTHON_BIN $TEST_DIR/sappo_test.py _linear_speed_scale:=$SAPPO_SPEED _goal_x:=$GOAL_X _goal_y:=$GOAL_Y _goal_topic:=/rl_fixed_goal_test/final_goal _cmd_vel_topic:=/cmd_vel _wait_for_goal:=true _subscribe_gp_subgoal:=false _recovery_mode:=$RECOVERY_MODE _controller_mode:=$CONTROLLER_MODE"
+  if [[ "${LIVE_RVIZ,,}" == "true" ]]; then
+    new_window live_rviz "$WS" \
+      "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom && rostopic list | grep -qx /pro3/rlscan; do sleep 1; done; rviz -d $TEST_DIR/live_rl.rviz"
+  fi
 fi
 new_window monitor "$WS" \
   "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom; do sleep 1; done; python3 $TEST_DIR/monitor.py _log_dir:=$RUNTIME_DIR/traces"
+
+if [[ "${SCREEN_RECORD,,}" == "true" ]]; then
+  if [[ "$CONTROLLER_MODE" == "ros_navigation" ]]; then
+    VIDEO_SPEED="$NAVIGATION_MAX_LINEAR_SPEED"
+  else
+    VIDEO_SPEED="$SAPPO_SPEED"
+  fi
+  VIDEO_METHOD="${CONTROLLER_METHOD:-legacy}"
+  if [[ "$CONTROLLER_MODE" != "ros_navigation" ]]; then
+    VIDEO_METHOD="${VIDEO_METHOD}_${CONTROLLER_MODE}"
+  fi
+  VIDEO_VIEW="$(tr '[:upper:]' '[:lower:]' <<<"$SCREEN_RECORD_WINDOW" | sed 's/[^a-z0-9_-]/_/g')"
+  VIDEO_FILE="$VIDEO_DIR/${RUN_TIMESTAMP}_${VIDEO_METHOD}_${VIDEO_VIEW}.mp4"
+  # Keep this argument shell-safe because new_window embeds the command in a
+  # tmux shell string. Parentheses and spaces are not safe unquoted here.
+  VIDEO_LABEL="method=${VIDEO_METHOD}_start=${INITIAL_X},${INITIAL_Y}_goal=${GOAL_X},${GOAL_Y}_speed=${VIDEO_SPEED}mps"
+  lifecycle_log "screen_record_scheduled output=$VIDEO_FILE window=$SCREEN_RECORD_WINDOW delay_seconds=$SCREEN_RECORD_START_DELAY_SECONDS duration_seconds=$SCREEN_RECORD_DURATION_SECONDS fps=$SCREEN_RECORD_FPS"
+  new_window screen_record "$WS" \
+    "sleep $SCREEN_RECORD_START_DELAY_SECONDS; $TEST_DIR/record_desktop.sh --output $VIDEO_FILE --duration $SCREEN_RECORD_DURATION_SECONDS --fps $SCREEN_RECORD_FPS --label $VIDEO_LABEL --window-name $SCREEN_RECORD_WINDOW"
+fi
 
 echo "[rl-fixed-goal-test] Started session '$SESSION' detached."
 echo "  robot: ($INITIAL_X, $INITIAL_Y, $INITIAL_Z), yaw=$INITIAL_YAW"
@@ -187,4 +231,7 @@ fi
 echo "  ROS master: $ROS_URI, Gazebo master: $GAZEBO_URI"
 echo "  monitor: tmux capture-pane -pJ -t $SESSION:monitor -S -80"
 echo "  logs: $LOG_DIR"
+if [[ "${SCREEN_RECORD,,}" == "true" ]]; then
+  echo "  video: $VIDEO_FILE"
+fi
 lifecycle_log "run_started"

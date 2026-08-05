@@ -30,6 +30,15 @@ CONTROLLER_METHOD: teb
 # gmapping, Navfn, and the selected local planner on this isolated ROS master.
 LIVE_RVIZ: true
 
+# Keep false for normal interactive tests. rlrecord turns this on in a separate
+# runtime config and records the real RViz window into an MP4. Available values
+# are RViz (map, robot, plans), Gazebo (physical scene), and desktop.
+SCREEN_RECORD: false
+SCREEN_RECORD_WINDOW: RViz
+SCREEN_RECORD_START_DELAY_SECONDS: 18
+SCREEN_RECORD_DURATION_SECONDS: 75
+SCREEN_RECORD_FPS: 30
+
 # Shared forward-speed setting for TEB and DWA, in m/s.
 NAVIGATION_MAX_LINEAR_SPEED: 1.00
 
