@@ -109,6 +109,13 @@ class NavigationMetrics:
         self.turn_only_start_wall = None
         self.turn_only_duration_total = 0.0
         self.last_brake_wall = 0.0
+        # Raw velocity changes have no inherent cause.  Retain recent action
+        # lifecycle events so post-run analysis can separate a legitimate
+        # terminal/turn boundary from an unexplained clear-path brake.
+        self.lifecycle_event_wall = {}
+        self.last_move_base_status = "UNKNOWN"
+        self.brake_reason_counts = {}
+        self.stop_reason_counts = {}
         self.last_status_text = ""
         self.last_status_signature = None
         self.teb_status = "not_available"
@@ -134,6 +141,15 @@ class NavigationMetrics:
         self.scan_forward_minimum = float("nan")
         self.scan_left_minimum = float("nan")
         self.scan_right_minimum = float("nan")
+        # A forward laser arc alone is not a collision certificate for a
+        # circular base that may be turning. Use the physical footprint plus
+        # TEB's hard obstacle clearance when classifying a command brake.
+        self.discontinuity_obstacle_clearance = max(
+            0.05,
+            float(rospy.get_param("/move_base/local_costmap/robot_radius", 0.30))
+            + float(rospy.get_param("/move_base/TebLocalPlannerROS/min_obstacle_dist", 0.22))
+            + 0.05,
+        )
         self.target = None
         self.scores = None
         self.map_stats = None
@@ -145,6 +161,7 @@ class NavigationMetrics:
         self.goal_delta_sum = 0.0
         self.goal_delta_max = 0.0
         self.goal_last_change_ros = None
+        self.goal_last_change_wall = None
         self.last_goal_xy = None
         self.dispatch_count = 0
         self.dispatch_last_xy = None
@@ -185,6 +202,7 @@ class NavigationMetrics:
         self.target_route_holds = 0
         self.target_route_failures = 0
         self.target_route_releases = 0
+        self.target_approach_terminals = 0
         self.last_detection_stamp = None
         self.min_clearance = float("inf")
         self.sample_count = 0
@@ -426,6 +444,10 @@ class NavigationMetrics:
         )
 
     def _write(self, level, event, **fields):
+        # Earlier event records omitted simulated time, making diagnostic
+        # traces appear at t=0 despite their wall-clock timestamps.  Preserve
+        # an explicitly supplied value and stamp every other event here.
+        fields.setdefault("ros_time", round(rospy.Time.now().to_sec(), 3))
         payload = json.dumps(fields, sort_keys=True, separators=(",", ":"), default=str)
         line = "%s level=%s process=%s event=%s data=%s\n" % (
             datetime.datetime.now().isoformat(timespec="milliseconds"),
@@ -475,6 +497,7 @@ class NavigationMetrics:
                 if math.isfinite(delta) and delta > 0.03:
                     self.goal_changes += 1
                     self.goal_last_change_ros = rospy.Time.now().to_sec()
+                    self.goal_last_change_wall = time.monotonic()
                     previous_goal = self.last_goal_xy
                     pose = self._pose_xy_in_frame_locked(frame)
                     previous_distance = (
@@ -583,6 +606,7 @@ class NavigationMetrics:
             payload = {"event": "invalid", "raw": message.data}
         with self.lock:
             event = str(payload.get("event", "unknown"))
+            self.lifecycle_event_wall["turn_%s" % event] = time.monotonic()
             self.teb_turn_supervisor_status = payload
             if event != self.teb_turn_supervisor_last_event:
                 self.teb_turn_supervisor_events += 1
@@ -634,6 +658,8 @@ class NavigationMetrics:
                 self.status_seen.add(key)
                 code = int(status.status)
                 name = STATUS_NAMES.get(code, "STATUS_%d" % code)
+                self.last_move_base_status = name
+                self.lifecycle_event_wall["move_base_%s" % name.lower()] = time.monotonic()
                 self.status_counts[name] = self.status_counts.get(name, 0) + 1
                 if code == 2:
                     self.preemptions += 1
@@ -651,6 +677,78 @@ class NavigationMetrics:
                     preemptions=self.preemptions,
                     aborts=self.aborts,
                 )
+
+    @staticmethod
+    def _recent_lifecycle_event(events, names, now, window=0.8):
+        """Return the newest named lifecycle event inside ``window`` seconds."""
+        newest_name = None
+        newest_age = None
+        for name in names:
+            stamp = events.get(name)
+            if stamp is None:
+                continue
+            age = max(0.0, now - stamp)
+            if age <= window and (newest_age is None or age < newest_age):
+                newest_name = name
+                newest_age = age
+        return newest_name, newest_age
+
+    def _command_discontinuity_reason_locked(self, now):
+        """Classify a command gap without influencing navigation control.
+
+        This is an observability boundary: its purpose is to prove whether a
+        visible stop belongs to a real topology/action transition, a deliberate
+        in-place turn, an obstacle response, or an unexplained clear-space
+        interruption before changing the execution architecture.
+        """
+        if self.task_done:
+            return "task_complete", None
+        event, age = self._recent_lifecycle_event(
+            self.lifecycle_event_wall,
+            ("turn_turn_started", "turn_turning", "turn_turn_completed"),
+            now,
+        )
+        if event is not None:
+            return "explicit_turn", age
+        event, age = self._recent_lifecycle_event(
+            self.lifecycle_event_wall,
+            ("terminal", "move_base_succeeded"),
+            now,
+        )
+        if event is not None:
+            return "action_terminal", age
+        event, age = self._recent_lifecycle_event(
+            self.lifecycle_event_wall,
+            ("cancel", "frontier_route_invalidated", "handoff_requested"),
+            now,
+        )
+        if event is not None:
+            return "route_recovery", age
+        event, age = self._recent_lifecycle_event(
+            self.lifecycle_event_wall,
+            ("dispatch",),
+            now,
+            window=0.45,
+        )
+        if event is not None:
+            return "action_dispatch", age
+        if (
+            self.goal_last_change_wall is not None
+            and now - self.goal_last_change_wall <= 0.8
+        ):
+            return "goal_transition", now - self.goal_last_change_wall
+        if (
+            math.isfinite(self.scan_minimum)
+            and self.scan_minimum <= self.discontinuity_obstacle_clearance
+        ):
+            return "near_obstacle", None
+        if math.isfinite(self.scan_forward_minimum):
+            return "unexplained_clear_path", None
+        return "unknown_clearance", None
+
+    @staticmethod
+    def _increment_reason(counter, reason):
+        counter[reason] = int(counter.get(reason, 0)) + 1
 
     def on_cmd(self, message):
         with self.lock:
@@ -700,6 +798,8 @@ class NavigationMetrics:
                 else:
                     self.brake_events_near += 1
                 now = time.monotonic()
+                brake_reason, lifecycle_age = self._command_discontinuity_reason_locked(now)
+                self._increment_reason(self.brake_reason_counts, brake_reason)
                 if now - self.last_brake_wall >= 0.15:
                     self.last_brake_wall = now
                     self._write(
@@ -714,8 +814,17 @@ class NavigationMetrics:
                         controller_reason=self.controller_reason,
                         scan_forward_min=None if not math.isfinite(self.scan_forward_minimum) else round(self.scan_forward_minimum, 4),
                         scan_min=None if not math.isfinite(self.scan_minimum) else round(self.scan_minimum, 4),
+                        obstacle_clearance_threshold=round(
+                            self.discontinuity_obstacle_clearance, 4
+                        ),
                         pose=None if self.pose is None else [round(value, 3) for value in self.pose],
                         goal=None if self.goal is None else [round(value, 3) for value in self.goal],
+                        reason=brake_reason,
+                        lifecycle_age_seconds=(
+                            None if lifecycle_age is None else round(lifecycle_age, 4)
+                        ),
+                        move_base_status=self.last_move_base_status,
+                        bridge_event=self.bridge_last_event,
                     )
             was_turn_only = abs(previous_linear) <= 0.01 and abs(previous_angular) > 0.05
             is_turn_only = abs(current_linear) <= 0.01 and abs(angular) > 0.05
@@ -747,6 +856,10 @@ class NavigationMetrics:
             if was_moving and is_zero:
                 self.stop_events += 1
                 self.zero_start_wall = time.monotonic()
+                stop_reason, lifecycle_age = self._command_discontinuity_reason_locked(
+                    self.zero_start_wall
+                )
+                self._increment_reason(self.stop_reason_counts, stop_reason)
                 self._write(
                     "WARN",
                     "command_stop",
@@ -756,6 +869,10 @@ class NavigationMetrics:
                     controller_reason=self.controller_reason,
                     teb_status=self.teb_status,
                     bridge_event=self.bridge_last_event,
+                    reason=stop_reason,
+                    lifecycle_age_seconds=(
+                        None if lifecycle_age is None else round(lifecycle_age, 4)
+                    ),
                     move_base_status=(
                         None
                         if self.move_base_feedback_state is None
@@ -823,6 +940,7 @@ class NavigationMetrics:
             payload = {"event": "invalid", "raw": message.data}
         with self.lock:
             event = str(payload.get("event", "unknown"))
+            self.lifecycle_event_wall[event] = time.monotonic()
             self.bridge_events += 1
             self.bridge_last_event = event
             self.bridge_active = bool(payload.get("active", False))
@@ -1122,6 +1240,8 @@ class NavigationMetrics:
                 self.target_route_holds += 1
             elif event == "target_route_released":
                 self.target_route_releases += 1
+            elif event == "target_approach_terminal":
+                self.target_approach_terminals += 1
             record = dict(payload)
             record.pop("event", None)
             self._write("INFO" if event != "target_route_rejected" else "WARN",
@@ -1346,6 +1466,8 @@ class NavigationMetrics:
             ),
             "linear_brake_events": self.linear_brake_events,
             "linear_brake_rate_per_minute": round(brake_rate_per_minute, 3),
+            "brake_reason_counts": dict(self.brake_reason_counts),
+            "stop_reason_counts": dict(self.stop_reason_counts),
             "goal_change_rate_per_minute": round(goal_change_rate_per_minute, 3),
             "turn_only_events": self.turn_only_events,
             "turn_only_duration_seconds": round(self.turn_only_duration_total, 3),
@@ -1383,7 +1505,11 @@ class NavigationMetrics:
             "target_route_holds": self.target_route_holds,
             "target_route_failures": self.target_route_failures,
             "target_route_releases": self.target_route_releases,
+            "target_approach_terminals": self.target_approach_terminals,
             "min_scan_clearance": None if not math.isfinite(self.min_clearance) else round(self.min_clearance, 4),
+            "discontinuity_obstacle_clearance": round(
+                self.discontinuity_obstacle_clearance, 4
+            ),
             "map": self.map_stats,
         }
 

@@ -245,6 +245,10 @@ class GlobalFrontierExplorer:
         # turn-in-place goal with a pose whose yaw silently resets to zero.
         self.active_last_waypoint_yaw = None
         self.active_route_kind = "frontier_endpoint"
+        # Stable identity for an exploration route transaction. It changes
+        # only when a new BFS branch is selected; an early handoff preserves
+        # it only after the discrete path-prefix test proves continuity.
+        self.active_route_id = 0
         # A turn connector is a committed execution phase. Keep its pose and
         # tangent frozen until the supervisor reports completion.
         self.turn_connector_released = True
@@ -309,6 +313,7 @@ class GlobalFrontierExplorer:
             "active": self.active_frontier is not None,
             "pending": self.prefetched_frontier is not None,
             "turn_supervisor_state": self.turn_supervisor_state,
+            "route_id": int(self.active_route_id),
         }
         payload.update(fields)
         try:
@@ -1043,7 +1048,8 @@ class GlobalFrontierExplorer:
         )
 
     def promote_prefetched_frontier(
-        self, message, steps, robot_map, now, validation=None
+        self, message, steps, robot_map, now, validation=None,
+        preserve_route_id=False,
     ):
         """Promote a pending branch after the previous frontier is inspected."""
         if self.prefetched_frontier is None:
@@ -1085,6 +1091,8 @@ class GlobalFrontierExplorer:
             return None
         row, col = reassociated
         self.active_frontier = (row, col, x, y)
+        if not preserve_route_id:
+            self.active_route_id += 1
         self.active_since = now
         self.active_best_distance = math.hypot(x - robot_map[0], y - robot_map[1])
         self.active_best_path_distance = (
@@ -1476,6 +1484,7 @@ class GlobalFrontierExplorer:
                         early_promoted = self.promote_prefetched_frontier(
                             message, route_steps, robot_map, now,
                             validation=validation,
+                            preserve_route_id=True,
                         )
                         if early_promoted is not None:
                             self.mark_frontier_completed(previous_x, previous_y)
@@ -1712,6 +1721,7 @@ class GlobalFrontierExplorer:
             row, col, x, y, path_distance, information, structure, score = active_cell
             if self.active_frontier is None:
                 self.active_frontier = (row, col, x, y)
+                self.active_route_id += 1
                 self.active_since = now
                 self.active_best_distance = float(path_distance)
                 self.active_best_path_distance = float(path_distance)
@@ -1909,6 +1919,7 @@ class GlobalFrontierExplorer:
             self.publish_status(
                 "route_command",
                 route_kind=self.active_route_kind,
+                route_id=int(self.active_route_id),
                 command_goal=[round(float(map_xy[0]), 3), round(float(map_xy[1]), 3)],
                 command_yaw=(
                     None if command_yaw is None else round(float(command_yaw), 3)

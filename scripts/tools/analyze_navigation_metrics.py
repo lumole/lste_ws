@@ -131,8 +131,11 @@ def summarize(path):
         "target_route_holds": last.get("target_route_holds"),
         "target_route_failures": last.get("target_route_failures"),
         "target_route_releases": last.get("target_route_releases"),
+        "target_approach_terminals": last.get("target_approach_terminals"),
         "linear_brake_events": last.get("linear_brake_events"),
         "linear_brake_rate_per_minute": last.get("linear_brake_rate_per_minute"),
+        "brake_reason_counts": last.get("brake_reason_counts") or {},
+        "stop_reason_counts": last.get("stop_reason_counts") or {},
         "retry_dispatches": retry_dispatches,
         "dispatch_reasons": dispatch_reasons,
         "preemption_ratio": round(preemptions / max(1, dispatches), 3),
@@ -197,11 +200,12 @@ def print_human(result):
         result["bridge_target_goal_replacements"],
         json.dumps(result["bridge_replacement_kinds"], sort_keys=True),
     ))
-    print("  target route: accepted=%s rejected=%s deferred=%s held=%s failures=%s releases=%s" % (
+    print("  target route: accepted=%s rejected=%s deferred=%s held=%s terminals=%s failures=%s releases=%s" % (
         result["target_route_accepts"],
         result["target_route_rejections"],
         result["target_route_deferrals"],
         result["target_route_holds"],
+        result["target_approach_terminals"],
         result["target_route_failures"],
         result["target_route_releases"],
     ))
@@ -223,6 +227,10 @@ def print_human(result):
         (result["angular_sign_flips"] or 0) / max(0.01, result["forward_distance_m"] or 0.0),
         result["brakes_per_m"] or 0.0,
         result["brake_events_clear_fraction"] or 0.0,
+    ))
+    print("  discontinuity causes: brakes=%s stops=%s" % (
+        json.dumps(result["brake_reason_counts"], sort_keys=True),
+        json.dumps(result["stop_reason_counts"], sort_keys=True),
     ))
     print("  goal churn: retries=%s preemption_ratio=%.2f reasons=%s" % (
         result["retry_dispatches"],
@@ -318,19 +326,23 @@ def diagnose(path):
             ))
         elif event == "linear_brake":
             clear = record.get("scan_forward_min")
-            print("BRAKE  t=%.1f %.2f->%.2f m/s w=%.2f fwd_clear=%s goal_dist=%s src=%s/%s" % (
+            print("BRAKE  t=%.1f %.2f->%.2f m/s w=%.2f fwd_clear=%s reason=%s age=%s goal_dist=%s src=%s/%s" % (
                 record.get("ros_time") or 0.0,
                 record.get("previous_linear") or 0.0,
                 record.get("current_linear") or 0.0,
                 record.get("angular") or 0.0,
                 clear,
+                record.get("reason", "legacy_unknown"),
+                record.get("lifecycle_age_seconds"),
                 record.get("robot_goal_distance") if "robot_goal_distance" in record else record.get("goal"),
                 record.get("controller_source"),
                 record.get("controller_reason"),
             ))
         elif event == "command_stop":
-            print("STOP   t=%.1f mode=%s src=%s teb_status=%s mb=%s" % (
+            print("STOP   t=%.1f reason=%s age=%s mode=%s src=%s teb_status=%s mb=%s" % (
                 record.get("ros_time") or 0.0,
+                record.get("reason", "legacy_unknown"),
+                record.get("lifecycle_age_seconds"),
                 record.get("controller_mode"),
                 record.get("controller_source"),
                 record.get("teb_status"),

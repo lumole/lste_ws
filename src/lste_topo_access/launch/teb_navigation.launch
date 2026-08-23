@@ -47,10 +47,13 @@
        swap never lands inside TEB's terminal tolerance or a band-reinit jump,
        and action generations discard callbacks from the replaced goal. -->
   <arg name="allow_in_place_replacement" default="false"/>
-  <!-- Narrow production policy: only adjacent, validated frontier route
-       segments may be handed over inside the current action. Visual targets,
-       branch changes, and controller transitions remain terminal-driven. -->
-  <arg name="allow_route_continuation_replacement" default="true"/>
+  <!-- Experimental only. Even a topologically continuous replacement enters
+       move_base through a new actionlib goal; ROS1 TEB can reset its temporal
+       band with ``timediff<=0`` at that boundary. Production therefore keeps
+       one action transaction through its terminal result, then dispatches the
+       queued route after the bridge's one-cycle follow-up. Visual targets,
+       branch changes, and controller transitions are always terminal-driven. -->
+  <arg name="allow_route_continuation_replacement" default="false"/>
   <!-- Action health, not controller tuning: a newer frontier intent is
        handed off only after the active move_base action makes no feedback
        progress. A higher-priority target intent may take over immediately;
@@ -230,10 +233,14 @@
     <param name="TebLocalPlannerROS/allow_init_with_backwards_motion" value="false"/>
     <param name="TebLocalPlannerROS/feasibility_check_no_poses" value="3"/>
     <param name="TebLocalPlannerROS/xy_goal_tolerance" value="0.35"/>
-    <!-- Route commands carry the BFS path tangent.  Keeping an explicit
-         orientation contract lets frontier_turn_connector complete its
-         in-place turn before the next translational segment is released. -->
-    <param name="TebLocalPlannerROS/yaw_goal_tolerance" value="0.35"/>
+    <!-- A frontier endpoint's yaw is a path tangent, not an arrival contract.
+         Requiring a circular base to meet that yaw after it reaches the XY
+         point creates a zero-speed terminal rotation, and the bridge can
+         eventually mistake that legitimate orientation phase for a stalled
+         action. TEB therefore completes endpoint actions on XY arrival. The
+         separate turn supervisor keeps its own 0.35-rad tolerance for the
+         rare explicit in-place turn transaction. -->
+    <param name="TebLocalPlannerROS/yaw_goal_tolerance" value="3.14159"/>
     <!-- Short visual/frontier segments should not force a full stop at every
          handoff. The task_done mux gate still performs the final stop. -->
     <param name="TebLocalPlannerROS/free_goal_vel" value="true"/>

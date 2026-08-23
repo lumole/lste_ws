@@ -326,6 +326,7 @@ class TebGoalBridge:
         self.latest_intent_source = "unknown"
         self.latest_intent_priority = 0
         self.latest_route_kind = ""
+        self.latest_route_id = 0
         self.latest_target_epoch = 0
         self.latest_target_track_id = ""
         # Goal Manager publishes intent metadata immediately before the pose,
@@ -337,6 +338,7 @@ class TebGoalBridge:
         self.active_intent_source = "unknown"
         self.active_intent_priority = 0
         self.active_route_kind = ""
+        self.active_route_id = 0
         self.active_target_epoch = 0
         self.active_target_track_id = ""
         self.turn_supervisor_state = "UNKNOWN"
@@ -425,6 +427,8 @@ class TebGoalBridge:
             ),
             "active_route_kind": self.active_route_kind,
             "latest_route_kind": self.latest_route_kind,
+            "active_route_id": int(self.active_route_id),
+            "latest_route_id": int(self.latest_route_id),
             "active_goal": (
                 None
                 if self.active_goal_global is None
@@ -531,6 +535,7 @@ class TebGoalBridge:
             self.latest_intent_source,
             int(self.latest_intent_priority),
             self.latest_route_kind,
+            int(self.latest_route_id),
             int(self.latest_target_epoch),
         )
 
@@ -679,6 +684,7 @@ class TebGoalBridge:
         source = "unknown"
         priority = 0
         route_kind = ""
+        route_id = 0
         intent_goal = None
         target_epoch = 0
         target_track_id = ""
@@ -688,6 +694,7 @@ class TebGoalBridge:
                 source = str(payload.get("source", source)).strip().lower() or source
                 priority = int(payload.get("priority", priority))
                 route_kind = str(payload.get("route_kind", "")).strip().lower()
+                route_id = max(0, int(payload.get("route_id", 0) or 0))
                 target_epoch = max(0, int(payload.get("target_epoch", 0)))
                 target_track_id = str(payload.get("target_track_id", "")).strip()
                 raw_goal = payload.get("goal")
@@ -702,6 +709,7 @@ class TebGoalBridge:
             self.latest_intent_source = source
             self.latest_intent_priority = max(0, min(3, priority))
             self.latest_route_kind = route_kind
+            self.latest_route_id = route_id
             self.latest_intent_goal = intent_goal
             self.latest_target_epoch = target_epoch
             self.latest_target_track_id = target_track_id
@@ -760,6 +768,7 @@ class TebGoalBridge:
             self.latest_intent_source = "waiting_global_slam_frontier"
             self.latest_intent_priority = 0
             self.latest_route_kind = ""
+            self.latest_route_id = 0
             self.latest_intent_goal = None
             self.publish_bridge_status(
                 "frontier_route_invalidated",
@@ -914,6 +923,7 @@ class TebGoalBridge:
         self.active_intent_source = "unknown"
         self.active_intent_priority = 0
         self.active_route_kind = ""
+        self.active_route_id = 0
         self.active_target_epoch = 0
         self.active_target_track_id = ""
 
@@ -1231,15 +1241,16 @@ class TebGoalBridge:
             self.active_intent_priority == 0
             and pending_delta > self.frontier_replacement_max_delta
         )
-        # The online frontier planner now labels each command as a point on a
-        # validated connected route.  A route connector may turn sharply at a
-        # doorway, but that turn is part of the same map path and must not be
-        # mistaken for an unrelated branch replacement.  Keep the normal
-        # distance/hot-start gates; only remove the old bearing gate for this
-        # explicit route contract.
+        # Route kind is insufficient: two unrelated branches are both usually
+        # labelled ``frontier_endpoint``. Global Frontier preserves route_id
+        # only after its discrete BFS path-prefix test proves continuation.
         route_continuation = (
             self.active_intent_priority == 0
+            and self.latest_intent_priority == 0
+            and self.active_intent_source == "global_slam_frontier"
             and self.latest_intent_source == "global_slam_frontier"
+            and self.active_route_id > 0
+            and self.active_route_id == self.latest_route_id
             and self.latest_route_kind in (
                 "frontier_connector",
                 "frontier_turn_connector",
@@ -1251,6 +1262,10 @@ class TebGoalBridge:
                 "frontier_endpoint",
             )
         )
+        # A new branch is an action boundary. Do not let a generic launch
+        # compatibility flag bypass this topology contract near an endpoint.
+        if self.active_intent_priority == 0 and not route_continuation:
+            return False
         minimum_distance = (
             self.frontier_early_handoff_min_distance
             if frontier_branch
@@ -1413,6 +1428,8 @@ class TebGoalBridge:
             and self.latest_intent_source == "global_slam_frontier"
             and self.active_route_kind in route_kinds
             and self.latest_route_kind in route_kinds
+            and self.active_route_id > 0
+            and self.active_route_id == self.latest_route_id
             and self.latest_route_kind != "frontier_turn_connector"
         )
 
@@ -1647,6 +1664,7 @@ class TebGoalBridge:
         self.active_intent_source = self.latest_intent_source
         self.active_intent_priority = self.latest_intent_priority
         self.active_route_kind = self.latest_route_kind
+        self.active_route_id = int(self.latest_route_id)
         self.active_target_epoch = int(self.latest_target_epoch)
         self.active_target_track_id = self.latest_target_track_id
         self.handoff_requested = False

@@ -177,6 +177,15 @@ class GoalManager:
         self.target_done_max_detection_age = max(
             0.0, float(gp("~target_done_max_detection_age", 0.75))
         )
+        # A detector box describes image appearance, not physical task
+        # completion.  For a navigation task, require the car to have reached
+        # at least one validated visual approach action before close-box votes
+        # may stop the robot.  This prevents a small, distant high-confidence
+        # mug from terminating the mission before the TEB controller moves.
+        require_approach = gp("~target_done_require_approach_terminal", True)
+        self.target_done_require_approach_terminal = str(require_approach).strip().lower() in (
+            "1", "true", "yes", "on",
+        )
         # Detector inference is slower than the Goal Manager timer. Keep a
         # qualifying target frame briefly even if the next detector message is
         # empty, then discard an unconfirmed candidate instead of chasing a
@@ -400,6 +409,11 @@ class GoalManager:
         # forwarded with the goal intent so the TEB bridge can perform an
         # atomic handoff only for a continuous map route.
         self.global_frontier_route_kind = "frontier_endpoint"
+        # Route ids come from the frontier planner's BFS transaction. A goal
+        # coordinate alone cannot tell the TEB bridge whether a map update is
+        # a continuous path extension or an unrelated branch.
+        self.global_frontier_route_id = 0
+        self.global_frontier_route_ids_by_goal = {}
         # Keep the last map-connected waypoint separate from the currently
         # published visual/context segment. This lets a stale target segment
         # release cleanly after handoff instead of leaving the controller
@@ -482,6 +496,7 @@ class GoalManager:
         # detector cycle without leaving the scene; the completion counter must
         # survive that dip instead of resetting to zero.
         self.target_close_last_seen: Optional[float] = None
+        self.target_completed_segments = 0
         self.task_done_published = False
         self.current_task_id = ""
         self.ctx_start_time: Optional[float] = None
@@ -859,6 +874,7 @@ class GoalManager:
             self.current_task_id = task_id
             self.task_done_published = False
             self.reset_target_close_confirmation()
+            self.target_completed_segments = 0
             self.clear_target_memory()
             self.set_navigation_hold(False, "new_task")
             # task_done is latched so consumers such as the velocity mux must
@@ -902,6 +918,15 @@ class GoalManager:
             return
         self.latest_global_frontier_goal = msg
         self.last_frontier_goal = msg
+        key = (
+            round(float(msg.pose.position.x), 3),
+            round(float(msg.pose.position.y), 3),
+        )
+        route_id = self.global_frontier_route_ids_by_goal.get(key)
+        # Never carry the previous route identity across an unmatched pose.
+        # Topic delivery order may occasionally deliver the PoseStamped before
+        # its status; withholding hot handoff is safe, reusing an old id is not.
+        self.global_frontier_route_id = 0 if route_id is None else int(route_id)
 
     def on_global_frontier_status(self, message: String):
         """Synchronize mission ownership when the explorer abandons a route."""
@@ -918,6 +943,20 @@ class GoalManager:
             "frontier_endpoint",
         ):
             self.global_frontier_route_kind = route_kind
+        route_id = int(payload.get("route_id", 0) or 0)
+        command_goal = payload.get("command_goal")
+        if (
+            route_id > 0
+            and isinstance(command_goal, (list, tuple))
+            and len(command_goal) >= 2
+        ):
+            key = (round(float(command_goal[0]), 3), round(float(command_goal[1]), 3))
+            self.global_frontier_route_ids_by_goal[key] = route_id
+            # The topic pair is normally emitted status -> pose in one frontier
+            # cycle. Retain only a small current history to bound this lookup.
+            if len(self.global_frontier_route_ids_by_goal) > 32:
+                oldest = next(iter(self.global_frontier_route_ids_by_goal))
+                self.global_frontier_route_ids_by_goal.pop(oldest, None)
         if payload.get("event") == "replan_ready":
             request_id = int(payload.get("replan_request_id", 0) or 0)
             if (
@@ -952,6 +991,7 @@ class GoalManager:
         self.latest_global_frontier_goal = None
         self.last_frontier_goal = None
         self.global_frontier_route_kind = "frontier_endpoint"
+        self.global_frontier_route_id = 0
         self.teb_terminal_goal = None
         self.teb_frontier_goal_history = []
         self.frontier_goal_sent_at = None
@@ -1048,14 +1088,29 @@ class GoalManager:
                 )
             if target_distance <= max(self.target_goal_reached_radius, 0.30):
                 self.target_segment_terminal_ready = True
+                self.target_completed_segments += 1
                 self.target_goal_detection_stamp = None
                 self.target_execution_state = "TARGET_CANDIDATE"
+                # Completion votes must describe the post-approach view, not
+                # the distant box that triggered this segment before movement.
+                self.reset_target_close_confirmation()
                 self.next_update_time = 0.0
+                self.publish_goal_arbitration(
+                    "target_approach_terminal",
+                    target_track_id=self.target_track_id,
+                    completed_segments=self.target_completed_segments,
+                    goal=[
+                        round(float(msg.pose.position.x), 3),
+                        round(float(msg.pose.position.y), 3),
+                    ],
+                )
                 rospy.loginfo(
                     "GoalManager: TEB terminal committed target segment "
-                    "(%.2f,%.2f); next segment waits for timer boundary",
+                    "(%.2f,%.2f); completed_segments=%d; next segment waits "
+                    "for timer boundary",
                     msg.pose.position.x,
                     msg.pose.position.y,
+                    self.target_completed_segments,
                 )
             return
         if self.last_goal_source != "global_slam_frontier":
@@ -2006,6 +2061,15 @@ class GoalManager:
         if self.target_done_require_locked and self.current_state != STATE_LOCKED:
             self.reset_target_close_confirmation()
             return
+        if (
+            self.target_done_require_approach_terminal
+            and self.target_completed_segments < 1
+        ):
+            # Never accumulate a distant image's votes while the first target
+            # segment is still queued or executing. The next fresh detector
+            # frames after a real terminal event start a new completion window.
+            self.reset_target_close_confirmation()
+            return
         det = self.target_detection_for_track(self.latest_dets)
         if self.latest_dets is None:
             self.reset_target_close_confirmation()
@@ -2561,6 +2625,7 @@ class GoalManager:
         }
         if self.goal_source == "global_slam_frontier":
             intent["route_kind"] = self.global_frontier_route_kind
+            intent["route_id"] = int(self.global_frontier_route_id)
         if self.goal_source.startswith("target_"):
             intent["target_epoch"] = int(self.target_observation_epoch)
             intent["target_track_id"] = self.target_track_id

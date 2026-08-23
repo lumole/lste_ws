@@ -77,6 +77,11 @@ TARGET_DONE_MIN_HOLD_TIME: 0.30
 TARGET_DONE_MIN_FRESH_HITS: 3
 # Ignore a close box if the detector has stopped publishing for this long.
 TARGET_DONE_MAX_DETECTION_AGE: 0.75
+# A close 2-D box alone is not proof that the car reached the object. When
+# true, task completion starts counting only after TEB has successfully
+# completed a validated target-approach segment. Set false only for a static
+# inspection task whose robot intentionally starts beside the target.
+TARGET_DONE_REQUIRE_APPROACH_TERMINAL: true
 # Target-follow evidence is separate from task completion. A qualifying small
 # box is kept briefly so a slower detector cannot be lost between Goal Manager
 # timer ticks. The candidate timeout limits one-frame false positives; a
