@@ -168,6 +168,9 @@ CONTEXT_FOLLOW_COOLDOWN: 30.0
 # Disable only for comparison with the legacy local GP exploration route.
 GLOBAL_FRONTIER_ENABLED: true
 GLOBAL_FRONTIER_TOPIC: /lste/global_frontier_goal
+# Target execution never resumes a cached exploration endpoint. This topic
+# requests a fresh map-connected frontier selected from the current robot pose.
+GLOBAL_FRONTIER_REPLAN_REQUEST_TOPIC: /lste/global_frontier/replan_request
 # TEB emits one PoseStamped terminal event for the frontier action it just
 # completed or rejected. Goal Manager uses the matching pose to advance to the
 # next frontier even when that waypoint changed by less than the jump threshold.

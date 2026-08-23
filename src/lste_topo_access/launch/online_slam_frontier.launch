@@ -22,6 +22,7 @@
        It releases an invalidated action before the explorer selects another
        connected branch. -->
   <arg name="status_topic" default="/lste/global_frontier/status"/>
+  <arg name="replan_request_topic" default="/lste/global_frontier/replan_request"/>
   <arg name="turn_status_topic" default="/lste/teb_turn_supervisor/status"/>
   <arg name="task_done_topic" default="/lste/task_done"/>
   <!-- Route-safe clearance: 0.30 m robot radius + 0.22 m TEB minimum
@@ -108,6 +109,7 @@
     <param name="pose_topic" value="$(arg pose_topic)"/>
     <param name="goal_topic" value="$(arg goal_topic)"/>
     <param name="status_topic" value="$(arg status_topic)"/>
+    <param name="replan_request_topic" value="$(arg replan_request_topic)"/>
     <param name="turn_status_topic" value="$(arg turn_status_topic)"/>
     <param name="task_done_topic" value="$(arg task_done_topic)"/>
     <param name="clearance" value="$(arg clearance)"/>

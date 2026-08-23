@@ -51,6 +51,9 @@ class GlobalFrontierExplorer:
         self.status_topic = gp(
             "~status_topic", "/lste/global_frontier/status"
         )
+        self.replan_request_topic = gp(
+            "~replan_request_topic", "/lste/global_frontier/replan_request"
+        )
         self.turn_status_topic = gp(
             "~turn_status_topic", "/lste/teb_turn_supervisor/status"
         )
@@ -251,6 +254,11 @@ class GlobalFrontierExplorer:
         self.last_status_mission_map = None
         self.prefetched_frontier = None
         self.prefetched_goal_map = None
+        # A replan request is issued when target execution relinquishes
+        # exploration ownership. The following endpoint must be selected from
+        # the robot's then-current map pose, not recovered from this cache.
+        self.pending_replan_request_id = 0
+        self.pending_replan_reason = ""
         self.last_planning_wall = 0.0
         self.rejected_frontiers = collections.deque(maxlen=24)
         self.completed_frontiers = collections.deque(maxlen=self.completed_limit)
@@ -269,6 +277,9 @@ class GlobalFrontierExplorer:
             queue_size=10,
         )
         rospy.Subscriber(self.pose_topic, Pose2D, self.on_pose, queue_size=1)
+        rospy.Subscriber(
+            self.replan_request_topic, String, self.on_replan_request, queue_size=10
+        )
         rospy.Subscriber(self.task_done_topic, Bool, self.on_task_done, queue_size=1)
         rospy.Subscriber(
             self.turn_status_topic,
@@ -398,6 +409,54 @@ class GlobalFrontierExplorer:
             rospy.loginfo("Global frontier paused: task_done=true")
         else:
             rospy.loginfo("Global frontier resumed: task_done=false")
+
+    def on_replan_request(self, message):
+        """Discard cached route ownership and rebuild from the current pose."""
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict) or payload.get("event") != "replan_request":
+            return
+        request_id = max(0, int(payload.get("request_id", 0) or 0))
+        if request_id <= 0 or self.task_done:
+            return
+        old_goal = self.active_frontier
+        self.pending_replan_request_id = request_id
+        self.pending_replan_reason = str(payload.get("reason", "unknown"))
+        self.active_frontier = None
+        self.active_since = 0.0
+        self.active_best_distance = None
+        self.active_best_path_distance = None
+        self.active_progress_time = 0.0
+        self.active_last_robot_xy = None
+        self.active_unreachable_since = None
+        self.active_last_waypoint_map = None
+        self.active_last_waypoint_yaw = None
+        self.active_route_kind = "frontier_endpoint"
+        self.turn_connector_released = True
+        self.last_status_command_map = None
+        self.last_status_command_yaw = None
+        self.last_status_mission_map = None
+        self.prefetched_frontier = None
+        self.prefetched_goal_map = None
+        self.last_planning_wall = 0.0
+        self.publish_status(
+            "replan_acknowledged",
+            replan_request_id=request_id,
+            reason=self.pending_replan_reason,
+            previous_goal=(
+                None
+                if old_goal is None
+                else [round(float(old_goal[2]), 3), round(float(old_goal[3]), 3)]
+            ),
+        )
+        rospy.loginfo(
+            "Global frontier accepted replan request id=%d reason=%s old=%s",
+            request_id,
+            self.pending_replan_reason,
+            old_goal,
+        )
 
     def on_turn_status(self, message):
         """Receive the execution adapter's atomic-turn state."""
@@ -1134,6 +1193,23 @@ class GlobalFrontierExplorer:
         terminal = math.atan2(final_y - previous_y, final_x - previous_x)
         return initial, terminal
 
+    def prefetched_route_continues_active(
+        self, steps, seed, active_cell, pending_cell
+    ):
+        """Return whether a pending endpoint genuinely extends this route.
+
+        An endpoint that happens to be near the robot is not necessarily the
+        continuation of the action currently owned by move_base.  Replacing
+        the action before its endpoint is reached is safe only when the new
+        deterministic map route contains the full active route as a prefix.
+        This is a topological contract, not a heading or distance tuning gate.
+        """
+        active_path = self.route_path(steps, seed, active_cell)
+        pending_path = self.route_path(steps, seed, pending_cell)
+        if len(active_path) < 2 or len(pending_path) <= len(active_path):
+            return False
+        return pending_path[:len(active_path)] == active_path
+
     def nearest_reachable_cell(self, message, steps, x, y):
         """Reassociate a remembered world-space frontier with a new map grid.
 
@@ -1387,21 +1463,41 @@ class GlobalFrontierExplorer:
                     self.prefetched_frontier is not None
                     and distance <= self.early_handoff_distance
                 ):
-                    previous_x, previous_y = x, y
-                    early_promoted = self.promote_prefetched_frontier(
-                        message, route_steps, robot_map, now,
-                        validation=validation,
+                    pending_row, pending_col, pending_x, pending_y = (
+                        self.prefetched_frontier
                     )
-                    if early_promoted is not None:
-                        self.mark_frontier_completed(previous_x, previous_y)
-                        rospy.loginfo(
-                            "Global frontier early handoff old=(%.2f,%.2f) "
-                            "new=(%.2f,%.2f) distance=%.2fm",
-                            previous_x,
-                            previous_y,
-                            early_promoted[2],
-                            early_promoted[3],
-                            distance,
+                    if self.prefetched_route_continues_active(
+                        route_steps,
+                        seed,
+                        (row, col),
+                        (pending_row, pending_col),
+                    ):
+                        previous_x, previous_y = x, y
+                        early_promoted = self.promote_prefetched_frontier(
+                            message, route_steps, robot_map, now,
+                            validation=validation,
+                        )
+                        if early_promoted is not None:
+                            self.mark_frontier_completed(previous_x, previous_y)
+                            rospy.loginfo(
+                                "Global frontier early handoff along continuous route "
+                                "old=(%.2f,%.2f) new=(%.2f,%.2f) distance=%.2fm",
+                                previous_x,
+                                previous_y,
+                                early_promoted[2],
+                                early_promoted[3],
+                                distance,
+                            )
+                    else:
+                        rospy.loginfo_throttle(
+                            3.0,
+                            "Global frontier defers prefetched branch until terminal: "
+                            "active=(%.2f,%.2f) pending=(%.2f,%.2f) "
+                            "because the pending route diverges before the endpoint",
+                            x,
+                            y,
+                            pending_x,
+                            pending_y,
                         )
                 if early_promoted is not None:
                     promoted_row, promoted_col, promoted_x, promoted_y = early_promoted
@@ -1648,6 +1744,22 @@ class GlobalFrontierExplorer:
                     information=round(float(information), 3),
                     structure=round(float(structure), 3),
                 )
+                if self.pending_replan_request_id > 0:
+                    self.publish_status(
+                        "replan_ready",
+                        replan_request_id=self.pending_replan_request_id,
+                        reason=self.pending_replan_reason,
+                        goal=[round(float(x), 3), round(float(y), 3)],
+                        path_distance=round(float(path_distance), 3),
+                    )
+                    rospy.loginfo(
+                        "Global frontier replan ready id=%d goal=(%.2f,%.2f)",
+                        self.pending_replan_request_id,
+                        x,
+                        y,
+                    )
+                    self.pending_replan_request_id = 0
+                    self.pending_replan_reason = ""
         row, col = active_cell[0], active_cell[1]
         # After an early promotion this is the new active branch. Otherwise
         # the committed endpoint remains stable until a normal terminal or a

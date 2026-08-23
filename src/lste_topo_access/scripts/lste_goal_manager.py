@@ -253,6 +253,18 @@ class GoalManager:
         self.global_frontier_status_topic = gp(
             "~global_frontier_status_topic", "/lste/global_frontier/status"
         )
+        # A target segment and an exploration route are separate mission
+        # transactions.  When target ownership ends, the previous frontier
+        # endpoint can be far behind the robot.  Request a new branch from the
+        # current map pose instead of treating that cached endpoint as a safe
+        # fallback.
+        self.global_frontier_replan_request_topic = gp(
+            "~global_frontier_replan_request_topic",
+            "/lste/global_frontier/replan_request",
+        )
+        self.frontier_replan_request_id = 0
+        self.frontier_replan_pending_id = 0
+        self.frontier_replan_ready_id = 0
         self.teb_goal_terminal_topic = gp(
             "~teb_goal_terminal_topic", "/lste/teb_goal_terminal"
         )
@@ -528,6 +540,9 @@ class GoalManager:
         )
         self.pub_goal_arbitration = rospy.Publisher(
             self.goal_arbitration_topic, String, queue_size=10
+        )
+        self.pub_global_frontier_replan = rospy.Publisher(
+            self.global_frontier_replan_request_topic, String, queue_size=10
         )
         self.pub_access_mode = rospy.Publisher("/lste/access_topo/active_mode", String, queue_size=1, latch=True)
         self.pub_task_done = rospy.Publisher("/lste/task_done", Bool, queue_size=1, latch=True)
@@ -903,6 +918,26 @@ class GoalManager:
             "frontier_endpoint",
         ):
             self.global_frontier_route_kind = route_kind
+        if payload.get("event") == "replan_ready":
+            request_id = int(payload.get("replan_request_id", 0) or 0)
+            if (
+                self.frontier_replan_pending_id > 0
+                and request_id == self.frontier_replan_pending_id
+            ):
+                self.frontier_replan_ready_id = request_id
+                self.next_update_time = 0.0
+                self.publish_goal_arbitration(
+                    "frontier_replan_ready",
+                    replan_request_id=request_id,
+                    reason=str(payload.get("reason", "unknown")),
+                    goal=payload.get("goal"),
+                )
+                rospy.loginfo(
+                    "GoalManager: received fresh frontier replan id=%d goal=%s",
+                    request_id,
+                    payload.get("goal"),
+                )
+            return
         if payload.get("event") != "route_invalidated":
             return
         with_status_goal = payload.get("goal")
@@ -928,6 +963,52 @@ class GoalManager:
             self.last_goal_source = "waiting_global_slam_frontier"
         self.goal_source = "waiting_global_slam_frontier"
         self.next_update_time = 0.0
+
+    def request_global_frontier_replan(self, reason: str, **fields):
+        """Require a frontier branch recomputed from the current robot pose.
+
+        This is an ownership boundary, rather than a timing heuristic.  A
+        target-route terminal must never resume the endpoint that was cached
+        before the target diverted the robot.  The explorer replies with a
+        matching ``replan_ready`` status before this manager accepts another
+        frontier pose.
+        """
+        if not self.global_frontier_enabled:
+            return 0
+        if (
+            self.frontier_replan_pending_id > 0
+            and self.frontier_replan_ready_id != self.frontier_replan_pending_id
+        ):
+            return self.frontier_replan_pending_id
+        self.frontier_replan_request_id += 1
+        request_id = self.frontier_replan_request_id
+        self.frontier_replan_pending_id = request_id
+        self.frontier_replan_ready_id = 0
+        # Do not accidentally re-publish a latched goal while the frontier
+        # explorer is rebuilding its connected route from the latest map.
+        self.latest_global_frontier_goal = None
+        self.last_frontier_goal = None
+        payload = {
+            "event": "replan_request",
+            "request_id": request_id,
+            "reason": str(reason),
+        }
+        payload.update(fields)
+        self.pub_global_frontier_replan.publish(
+            String(data=json.dumps(payload, sort_keys=True))
+        )
+        self.publish_goal_arbitration(
+            "frontier_replan_requested",
+            replan_request_id=request_id,
+            reason=str(reason),
+            **fields
+        )
+        rospy.loginfo(
+            "GoalManager: requested fresh global frontier replan id=%d reason=%s",
+            request_id,
+            reason,
+        )
+        return request_id
 
     def on_teb_goal_terminal(self, msg: PoseStamped):
         """Release exactly one committed segment after a TEB terminal result.
@@ -1147,23 +1228,18 @@ class GoalManager:
             ],
             blocked_goal_frame=blocked_goal.header.frame_id,
         )
-        frontier = self.fresh_global_frontier_goal(now)
-        if frontier is None:
-            frontier = self.last_frontier_goal
-        if frontier is not None:
-            self.goal_source = "global_slam_frontier"
-            self.publish_goal(frontier)
-            rospy.logwarn(
-                "GoalManager: target route failed; released to frontier "
-                "goal=(%.2f,%.2f) and blocked target until frontier terminal",
-                frontier.pose.position.x,
-                frontier.pose.position.y,
-            )
-        else:
-            rospy.logwarn(
-                "GoalManager: target route failed with no frontier available; "
-                "waiting for a new map-connected waypoint"
-            )
+        self.request_global_frontier_replan(
+            "target_route_failed",
+            target_track_id=failure_track_id or self.target_track_id,
+            blocked_goal=[
+                round(float(blocked_goal.pose.position.x), 3),
+                round(float(blocked_goal.pose.position.y), 3),
+            ],
+        )
+        rospy.logwarn(
+            "GoalManager: target route failed; wait for a frontier branch "
+            "recomputed from the current pose"
+        )
 
     def on_controller_mode(self, msg: String):
         mode = (msg.data or "").strip().lower()
@@ -1339,16 +1415,6 @@ class GoalManager:
                 if global_frontier is not None:
                     self.goal_source = "global_slam_frontier"
                     return global_frontier
-                if self.last_frontier_goal is not None:
-                    self.goal_source = "global_slam_frontier"
-                    rospy.logwarn_throttle(
-                        5.0,
-                        "GoalManager: frontier update is stale; hold last map waypoint "
-                        "goal=(%.2f,%.2f)",
-                        self.last_frontier_goal.pose.position.x,
-                        self.last_frontier_goal.pose.position.y,
-                    )
-                    return self.last_frontier_goal
             # Context detections are deliberately lower priority than an
             # active map-connected route.  The state node can briefly enter
             # Sus-B when a monitor/desk pair is visible; replacing the
@@ -1537,12 +1603,15 @@ class GoalManager:
             self.goal_source = "target_route_blocked"
             if self.global_frontier_enabled:
                 frontier = self.fresh_global_frontier_goal(now)
-                if frontier is None:
-                    frontier = self.last_frontier_goal
                 if frontier is not None:
                     self.goal_source = "global_slam_frontier"
                     return frontier
-            return self.last_goal
+                self.request_global_frontier_replan("target_route_blocked")
+            # The target action has failed and was cancelled by the bridge.
+            # Re-publishing its pose under another source would quietly turn a
+            # recovery wait into a retry. Keep the executor idle until the
+            # matching frontier replan becomes ready.
+            return None
         # The candidate must be confirmed before it can steer the vehicle.
         # A first weak box is retained for diagnostics, but it must not replace
         # a valid frontier route until an independent frame confirms it.
@@ -1648,30 +1717,36 @@ class GoalManager:
     def release_target_follow_to_frontier(self, now: float) -> Optional[PoseStamped]:
         """Release a completed visual segment without leaving a stale goal.
 
-        The frontier node may be between publications when a visual segment is
-        reached. Prefer its fresh waypoint, then the last known map waypoint,
-        so the controller never receives an artificial stop caused by a
-        target/frontier state handoff race.
+        A frontier saved before the visual approach may now be far behind the
+        robot.  Request a new map-connected branch instead of resuming that
+        stale endpoint.  The short replan wait is intentional and observable;
+        a long unvalidated reverse route is not.
         """
         frontier = self.fresh_global_frontier_goal(now)
-        used_stale = False
-        if frontier is None and self.last_frontier_goal is not None:
-            frontier = self.last_frontier_goal
-            used_stale = True
         previous_target = self.target_last_goal
         self.clear_target_memory()
         if frontier is None:
+            self.request_global_frontier_replan(
+                "target_segment_complete",
+                previous_target=(
+                    None
+                    if previous_target is None
+                    else [
+                        round(float(previous_target.pose.position.x), 3),
+                        round(float(previous_target.pose.position.y), 3),
+                    ]
+                ),
+            )
             rospy.logwarn(
-                "GoalManager: visual segment reached but no frontier waypoint is available"
+                "GoalManager: visual segment reached; waiting for fresh frontier replan"
             )
             return None
         self.goal_source = "global_slam_frontier"
         rospy.loginfo(
-            "GoalManager: release completed target segment to frontier "
-            "goal=(%.2f,%.2f) stale=%s previous_target=(%.2f,%.2f)",
+            "GoalManager: release completed target segment to fresh frontier "
+            "goal=(%.2f,%.2f) previous_target=(%.2f,%.2f)",
             frontier.pose.position.x,
             frontier.pose.position.y,
-            used_stale,
             previous_target.pose.position.x if previous_target is not None else float("nan"),
             previous_target.pose.position.y if previous_target is not None else float("nan"),
         )
@@ -1901,6 +1976,11 @@ class GoalManager:
         return None
 
     def fresh_global_frontier_goal(self, now: float) -> Optional[PoseStamped]:
+        if (
+            self.frontier_replan_pending_id > 0
+            and self.frontier_replan_ready_id != self.frontier_replan_pending_id
+        ):
+            return None
         if not self.global_frontier_enabled or self.latest_global_frontier_goal is None:
             return None
         stamp = self.latest_global_frontier_goal.header.stamp
