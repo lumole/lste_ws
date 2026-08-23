@@ -10,7 +10,7 @@ from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
 from rosgraph_msgs.msg import Clock
 from std_srvs.srv import Empty
-from std_msgs.msg import Int8
+from std_msgs.msg import Int8, Bool
 from model.utils import test_init_pose, test_goal_point
 from tf.transformations import *
 
@@ -34,7 +34,20 @@ class StageWorld():
 
         # used in generate goal point
         self.map_size = np.array([8., 8.], dtype=np.float32)  # 20x20m
-        self.goal_size = 0.8
+        # The original training environment used an 0.8 m terminal radius.
+        # In the live LSTE pipeline, visual-servo and map waypoints are often
+        # only 1--2 m away, so that radius can end a controller episode before
+        # the robot has made useful progress. Keep the legacy default while
+        # making the live tolerance an explicit controller parameter.
+        self.goal_size = max(0.05, float(rospy.get_param('~goal_size', 0.8)))
+        # Exploration publishes short odom waypoints.  They are handoff
+        # points, not the final visual-task terminal, so use a slightly wider
+        # radius to avoid spinning in place when the robot is already beside
+        # a waypoint but a stale lidar cell keeps the exact point unreachable.
+        self.intermediate_goal_size = max(
+            self.goal_size,
+            float(rospy.get_param('~intermediate_goal_size', 0.45)),
+        )
 
         self.robot_value = 10.
         self.goal_value = 0.
@@ -49,6 +62,19 @@ class StageWorld():
         self.wait_for_goal = rospy.get_param('~wait_for_goal', False)
         self.goal_update_epsilon = rospy.get_param('~goal_update_epsilon', 0.05)
         self.subscribe_gp_subgoal = rospy.get_param('~subscribe_gp_subgoal', False)
+        # Normal LSTE goals are short frontier/visual waypoints.  Reaching one
+        # must not terminate the SA-PPO process: Goal Manager will publish the
+        # next segment.  Fixed-goal validation leaves this disabled and keeps
+        # the legacy terminal-radius behavior.
+        self.allow_intermediate_goals = bool(rospy.get_param(
+            '~allow_intermediate_goals', False
+        ))
+        self.task_done = False
+        self.task_done_received = False
+        # The old implementation appended every odometry sample to three text
+        # files forever. Formal experiments use timestamped launcher logs;
+        # retain this legacy trace only when someone explicitly asks for it.
+        self.legacy_trace_enabled = rospy.get_param('~legacy_trace_enabled', False)
         self.goal_received = not self.wait_for_goal
 
         # scenea
@@ -177,6 +203,12 @@ class StageWorld():
         self.sim_clock = rospy.Subscriber('clock', Clock, self.sim_clock_callback)
 
         self.sub_local_goal = rospy.Subscriber(self.goal_topic, PoseStamped, self.rlgetlocalgoal)
+        self.sub_task_done = rospy.Subscriber(
+            rospy.get_param('~task_done_topic', '/lste/task_done'),
+            Bool,
+            self.task_done_callback,
+            queue_size=1,
+        )
         self.rl_cmd_vel = rospy.Publisher(self.cmd_vel_topic, Twist, queue_size=10)
         rospy.loginfo('Subscribed goal topic: %s (wait_for_goal=%s)',
                       self.goal_topic, self.wait_for_goal)
@@ -219,17 +251,18 @@ class StageWorld():
         self.speed = [odometry.twist.twist.linear.x, odometry.twist.twist.angular.z]
         statex = float(self.statex)
         statey = float(self.statey)
-        with open("./sappo_path.txt", 'a') as path:
-             path.write(str(statex))
-             path.write(',')
-             path.write(str(statey))
-             path.write(',')
-        with open("./sappo_linear.txt", 'a') as linear:
-             linear.write(str(odometry.twist.twist.linear.x))
-             linear.write(',')
-        with open("./sappo_angular.txt", 'a') as angular:
-             angular.write(str(odometry.twist.twist.angular.z))
-             angular.write(',')
+        if self.legacy_trace_enabled:
+            with open("./sappo_path.txt", 'a') as path:
+                path.write(str(statex))
+                path.write(',')
+                path.write(str(statey))
+                path.write(',')
+            with open("./sappo_linear.txt", 'a') as linear:
+                linear.write(str(odometry.twist.twist.linear.x))
+                linear.write(',')
+            with open("./sappo_angular.txt", 'a') as angular:
+                angular.write(str(odometry.twist.twist.angular.z))
+                angular.write(',')
 
 
 
@@ -411,7 +444,11 @@ class StageWorld():
 
         is_crash = self.get_crash_state()
 
-        if self.distance < self.goal_size:
+        goal_radius = (
+            self.intermediate_goal_size
+            if self.allow_intermediate_goals else self.goal_size
+        )
+        if self.distance < goal_radius:
             terminate = True
             reward_g = 15
             result = 'Reach Goal'
@@ -525,6 +562,11 @@ class StageWorld():
             rospy.loginfo('Accepted goal from %s: x=%.2f y=%.2f frame=%s',
                           self.goal_topic, goalx, goaly,
                           goal_msg.header.frame_id or '<unspecified>')
+
+    def task_done_callback(self, message):
+        """Track final task completion separately from waypoint arrival."""
+        self.task_done_received = True
+        self.task_done = bool(message.data)
 
     def get_goal_based_state(self):
         return [self.goal_basedx,self.goal_basedy,self.goal_basedtheta]

@@ -4,12 +4,45 @@ set -euo pipefail
 WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 export LSTE_NO_ATTACH=1
 
+# A complete startup spans the environment and node sessions.  Serialize that
+# sequence so two quick `runall` invocations cannot both observe a missing
+# session and race while creating the same tmux session.
+if [[ "${LSTE_LIFECYCLE_LOCK_HELD:-0}" != "1" ]]; then
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "[error] flock is required to serialize LSTE startup." >&2
+    exit 1
+  fi
+  LOCK_DIR="$WS/runtime/lifecycle"
+  mkdir -p "$LOCK_DIR"
+  exec 9>"$LOCK_DIR/lifecycle.lock"
+  if ! flock -n 9; then
+    echo "[error] Another LSTE lifecycle command is already starting or stopping the system." >&2
+    exit 75
+  fi
+  export LSTE_LIFECYCLE_LOCK_HELD=1
+fi
+
+# Do not let the tmux server inherit the lifecycle lock descriptor.  A tmux
+# server outlives this shell; inheriting fd 9 would keep the flock held until
+# the entire session is killed and would make a later `stopall` fail.
+tmux() { command tmux "$@" 9>&-; }
+
 if tmux has-session -t "=sappo-lste" 2>/dev/null; then
   echo "[all] Stopping the conflicting standalone SA-PPO session."
   tmux kill-session -t "=sappo-lste"
 fi
 
 "$WS/scripts/lifecycle/run_env_tmux.sh"
+
+nodes_session_ready() {
+  local window node
+  for window in goal teb_nav controller_switch cmd_vel_mux health; do
+    tmux list-windows -t "=lste" -F '#{window_name}' 2>/dev/null | grep -qx "$window" || return 1
+  done
+  for node in /lste_goal_manager /lste_teb_goal_bridge /lste_controller_switch /lste_cmd_vel_mux /move_base; do
+    rosnode list 2>/dev/null | grep -qx "$node" || return 1
+  done
+}
 
 if ! tmux has-session -t "=lste" 2>/dev/null; then
   source "$WS/scripts/config/pipeline_env.sh"
@@ -25,16 +58,21 @@ if ! tmux has-session -t "=lste" 2>/dev/null; then
     exit 1
   fi
   "$WS/scripts/lifecycle/run_nodes_tmux.sh"
-else
+elif nodes_session_ready; then
   echo "[all] Reusing the existing 'lste' session."
   source "$WS/scripts/config/pipeline_env.sh"
   if rosnode list 2>/dev/null | grep -qx /StageEnv_0; then
-    "$WS/scripts/lifecycle/switch_controller.sh" sappo
+    "$WS/scripts/lifecycle/switch_controller.sh" teb
   elif rosnode list 2>/dev/null | grep -qx /teleop_twist_keyboard_reset; then
     "$WS/scripts/lifecycle/switch_controller.sh" teleop
   else
-    "$WS/scripts/lifecycle/switch_controller.sh" sappo
+    "$WS/scripts/lifecycle/switch_controller.sh" teb
   fi
+else
+  echo "[all] Existing 'lste' session is incomplete; rebuilding the node session."
+  tmux kill-session -t "=lste"
+  source "$WS/scripts/config/pipeline_env.sh"
+  "$WS/scripts/lifecycle/run_nodes_tmux.sh"
 fi
 
 for session in lste-env lste lste-teleop; do
@@ -48,6 +86,6 @@ echo ""
 echo "============================================"
 echo "  LSTE complete system is ready"
 echo "  Environment:  tmux attach -t lste-env"
-echo "  Brain/RL:     tmux attach -t lste"
+echo "  Brain/TEB:    tmux attach -t lste"
 echo "  Keyboard:     teleop"
 echo "============================================"

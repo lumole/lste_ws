@@ -10,7 +10,9 @@ INITIAL_Y: -8.45
 INITIAL_Z: 0.1
 INITIAL_YAW: -1.57079632679
 
-# Default target. During a running GUI test, Shift + left-click replaces it.
+# Default target. It is published by the production Goal Manager on
+# /lste/final_goal, so every controller test exercises the same global-goal
+# interface as the normal LSTE pipeline. Shift + left-click replaces it.
 GOAL_X: 12.95
 GOAL_Y: -6.51
 ALLOW_GAZEBO_CLICK_GOAL: true

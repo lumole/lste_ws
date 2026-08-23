@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(gazebo_click_point)
 
-find_package(catkin REQUIRED COMPONENTS geometry_msgs roscpp std_msgs)
+find_package(catkin REQUIRED COMPONENTS geometry_msgs roscpp std_msgs std_srvs)
 find_package(gazebo REQUIRED)
 find_package(Qt5 REQUIRED COMPONENTS Widgets)
 

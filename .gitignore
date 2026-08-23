@@ -12,6 +12,9 @@ ros_logs/
 log/
 runtime/
 
+# ROS tf2_tools view_frames output
+frames.gv
+
 # Runtime topology snapshots
 src/lste_topo_access/topo_tree/tree/**/access_topo_*.json
 

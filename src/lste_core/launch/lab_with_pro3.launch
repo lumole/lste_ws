@@ -29,5 +29,9 @@
     <arg name="z" value="$(arg z)"/>
     <arg name="yaw" value="$(arg yaw)"/>
     <arg name="spawn_model" value="$(arg spawn_pro3)"/>
+    <!-- In the split lifecycle, run_nodes_tmux owns these nodes after Gazebo
+         is ready. Keeping them off here when spawn_pro3 is false prevents a
+         delayed duplicate robot_state_publisher from breaking sensor TF. -->
+    <arg name="start_support_nodes" value="$(arg spawn_pro3)"/>
   </include>
 </launch>

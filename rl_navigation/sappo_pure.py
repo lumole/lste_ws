@@ -68,7 +68,9 @@ def enjoy(comm, env, policy, action_bound):
             else:
                 real_action[0] = 0
                 real_action[1] = 0.5
-        if env.terminate == True:
+        if env.terminate == True and not (
+                env.allow_intermediate_goals and not env.task_done
+        ):
             real_action[0] = 0
             real_action[1] = 0
         # if terminal == True:

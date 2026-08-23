@@ -1,10 +1,11 @@
-# LSTE 与 SA-PPO 启动指南
+# LSTE 启动指南（SA-PPO、TEB、Teleop）
 
 ## 控制模式
 
 `run_nodes_tmux.sh` 通过 `LSTE_CONTROLLER` 选择车辆控制器：
 
-- `LSTE_CONTROLLER=sappo`：完整自主链路，也是默认模式。LSTE 大脑发布 `/lste/final_goal`，SA-PPO 订阅该目标并发布 `/cmd_vel`。
+- `LSTE_CONTROLLER=teb`：默认自主链路。gmapping 在线建图，frontier 提供探索 waypoint，Navfn 计算全局路线，TEB 发布局部速度到 `/lste/cmd_vel/teb`。
+- `LSTE_CONTROLLER=sappo`：SA-PPO 对照链路。LSTE 大脑发布 `/lste/final_goal`，SA-PPO 订阅该目标并发布 `/cmd_vel`。
 - `LSTE_CONTROLLER=teleop`：调试模式，由键盘遥控发布 `/cmd_vel`。
 - **SA-PPO 独立验证**：将 Ouster 点云转为激光 `/pro3/rlscan`，SA-PPO 根据手动目标 `/move_base/current_goal` 发布 `/cmd_vel`。
 
@@ -60,7 +61,7 @@ cd /home/yhq/dh_ws/lste_ws
 | 会话 | 内容 |
 | --- | --- |
 | `lste-env` | ROS master、Gazebo server 和带操作插件的 Gazebo GUI |
-| `lste` | LSTE 大脑、持续健康检查、点云转激光、速度 mux、控制器切换节点和 SA-PPO |
+| `lste` | LSTE 大脑、持续健康检查、点云转激光、速度 mux、控制器切换节点、SA-PPO，以及可选的在线 SLAM + Navfn + TEB |
 | `lste-teleop` | 始终运行的键盘控制进程 |
 
 脚本可重复执行：已运行的环境会被复用，缺失的会话会被创建，Gazebo GUI 插件
@@ -91,17 +92,32 @@ Gazebo GUI 是必需组件，启动脚本会始终加载 `libgazebo_click_point.
 
 脚本会附着到该会话。确认 Gazebo 打开后，按 `Ctrl+B`，再按 `D`，从 tmux 分离回普通终端。
 
-再启动大脑、车辆与 SA-PPO：
+再启动大脑、车辆和默认的 TEB：
 
 ```bash
 cd /home/yhq/dh_ws/lste_ws
 ./scripts/lifecycle/run_nodes_tmux.sh
 ```
 
-无需设置额外参数：控制器默认使用键盘遥控，速度倍率默认为 `0.50`。SA-PPO 仍会常驻运行，
-可通过 Gazebo 插件或 `Ctrl+Shift+K` 热切换。
+控制器默认读取 `pipeline_defaults.yaml` 中的 `LSTE_CONTROLLER: teb`，TEB 最大线速度为
+`0.50 m/s`。SA-PPO、TEB 和 teleop 进程都会常驻运行，只有 mux 的输入源会改变。
 
-脚本创建 tmux 会话 `lste`，只生成一辆 Pro3，并启动任务、VLLM、Goal Manager、VLM Prompt、开放词汇检测器、评分、状态、可视化、球面投影、GP frontier、Frontier RViz、点云转激光和 SA-PPO。
+需要做 SA-PPO 对照时，显式选择 SA-PPO：
+
+```bash
+LSTE_CONTROLLER=sappo ./scripts/lifecycle/run_nodes_tmux.sh
+```
+
+也可以把同样的变量加到一键启动命令：
+
+```bash
+LSTE_CONTROLLER=sappo ./scripts/lifecycle/run_all_tmux.sh
+```
+
+启动后，SA-PPO 和 teleop 可通过 Gazebo 插件或 `Ctrl+Shift+K` 热切换；TEB 可通过
+`./scripts/lifecycle/switch_controller.sh teb` 选择。任何切换都不会重启 Gazebo、SLAM 或大脑。
+
+脚本创建 tmux 会话 `lste`，只生成一辆 Pro3，并启动任务、VLLM、Goal Manager、VLM Prompt、开放词汇检测器、评分、状态、可视化、球面投影、在线 SLAM frontier、TEB、点云转激光和 SA-PPO。旧 GP frontier 和其 RViz 默认不启动；需要旧拓扑对照时，将 `LEGACY_GP_FRONTIER_ENABLED` 改为 `true`。
 
 ### 检测器选择
 
@@ -153,6 +169,8 @@ WeDetect 的中文类别映射、阈值、NMS 和 FP16 设置也位于同一配�
 
 `lste_goal_manager.py` 是 `/lste/final_goal` 的唯一发布者。该消息类型为 `geometry_msgs/PoseStamped`，坐标系为 `odom`。SA-PPO 使用同一 `odom` 坐标系下的 `/pro3/wheel_odom` 计算车体局部目标，并输出 `/cmd_vel`。
 
+如需绕过大脑、检测与 GP 来验证控制器，可在 `scripts/config/pipeline_defaults.yaml` 将 `GLOBAL_GOAL_SOURCE` 改为 `fixed`，并设置 `FIXED_GLOBAL_GOAL_X/Y/YAW`。固定模式仍由同一个 Goal Manager 发布 `/lste/final_goal`；详细配置、Gazebo 点击更新和已验证路径见 [固定 Global Goal 接入说明](../navigation/fixed_global_goal_integration_08052026.md)。
+
 SA-PPO 在收到第一条 `/lste/final_goal` 之前只发布零速度。到达目标后，Goal Manager 对同一目标的周期性重发不会重新启动车辆；大脑发布位置发生变化的新目标时，控制器会重新开始运动。
 
 ### 3. 确认全局目标
@@ -166,7 +184,7 @@ source devel/setup.bash
 rostopic echo /lste/final_goal
 ```
 
-收到消息后应看到 `header.frame_id: "odom"` 和目标的 `pose.position.x/y`。若一直没有消息，先查看 `lste` 会话中的 `goal`、`oc_srfc` 和 `gp_frontier` 窗口；Goal Manager 依赖机器人位姿、状态和相应感知结果。
+收到消息后应看到 `header.frame_id: "odom"` 和目标的 `pose.position.x/y`。若一直没有消息，先查看 `lste` 会话中的 `goal`、`oc_srfc` 和 `global_frontier` 窗口；旧的 `gp_frontier` 默认不会启动。Goal Manager 依赖机器人位姿、状态和相应感知结果。
 
 确认目标与控制器已经连接：
 

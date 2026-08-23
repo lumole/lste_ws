@@ -36,21 +36,428 @@ ACCESS_TOPO_CONFIG_SUS_C: src/lste_topo_access/topo_tree/cfgs/access_topo_sus_c.
 ACCESS_TOPO_TEST_NAME: 2601
 ACCESS_TOPO_RUN_NAME: topo_3.0_catch_mode
 GP_FRONTIER_RVIZ: src/lste_topo_access/launch/gp_frontier.rviz
+# The legacy GP frontier is redundant when online SLAM + Navfn + TEB is
+# enabled: lste_global_frontier already supplies the connected exploration
+# waypoint. Keep this false for the production TEB pipeline. Set true only
+# for legacy GP/SA-PPO comparison experiments; it also starts its RViz.
+LEGACY_GP_FRONTIER_ENABLED: false
 
 # Number of consecutive suspicious observations before the state machine changes
 # behavior. Larger values resist one-frame noise but react more slowly.
 SUSPICIOUS_WINDOW: 5
+# Require this many consecutive frames before a suspicious context subtype
+# changes (Sus-B <-> Sus-C). This stops detector label noise from re-routing
+# the car while preserving immediate target (Sus-A) promotion.
+STATE_SUBTYPE_SWITCH_MIN_HITS: 3
 # Seconds for which a locked target must remain complete before Goal Manager
 # treats the follow action as done. Larger values reduce premature completion.
 FOLLOW_LOCKED_DONE_TIME: 4.0
+# Stable visual lock policy. A small target may score below 0.6 in one frame,
+# so LOCKED requires many target-positive frames instead of one very high score.
+# The current WeDetect-Large yellow-cup view produces target scores around 0.2.
+TARGET_LOCK_TOTAL_MIN: 0.58
+TARGET_LOCK_SCORE_MIN: 0.20
+TARGET_LOCK_WINDOW: 10
+TARGET_LOCK_MIN_HITS: 8
+TARGET_LOCK_EXIT_TOTAL_MIN: 0.55
+TARGET_LOCK_EXIT_SCORE_MIN: 0.18
+TARGET_LOCK_EXIT_UNSTABLE_FRAMES: 15
+# /lste/task_done fires when a target is visibly close (at least one normalized
+# box dimension reaches this size) in several distinct detector messages.
+# Completion itself commands the mux to stop immediately, so it must not wait
+# for a controller that is still moving toward the object. Set either size to
+# 0 to disable that individual dimension; the other dimension remains.
+TARGET_DONE_MIN_BOX_WIDTH: 0.05
+TARGET_DONE_MIN_BOX_HEIGHT: 0.05
+TARGET_DONE_MIN_SCORE: 0.40
+TARGET_DONE_MIN_HOLD_TIME: 0.30
+# Number of distinct detector messages that must satisfy the close-range rule.
+# This blocks a one-frame false positive while avoiding continued driving after
+# a clearly reached object turns temporarily out of view.
+TARGET_DONE_MIN_FRESH_HITS: 3
+# Ignore a close box if the detector has stopped publishing for this long.
+TARGET_DONE_MAX_DETECTION_AGE: 0.75
+# Target-follow evidence is separate from task completion. A qualifying small
+# box is kept briefly so a slower detector cannot be lost between Goal Manager
+# timer ticks. The candidate timeout limits one-frame false positives; a
+# second detector message in the confirmation window promotes it to long-lived
+# follow mode. Score and box size are normalized to [0, 1].
+TARGET_FOLLOW_MIN_SCORE: 0.20
+TARGET_FOLLOW_MIN_BOX_SIZE: 0.01
+TARGET_FOLLOW_CANDIDATE_TIMEOUT: 8.0
+TARGET_FOLLOW_CONFIRM_HITS: 2
+TARGET_FOLLOW_CONFIRM_WINDOW: 20.0
+# Weak target boxes (low score and smaller than 5% of the image) need a
+# longer, spatially consistent run. This prevents a tiny false WeDetect box
+# from taking over the frontier route after only two inference frames.
+TARGET_FOLLOW_WEAK_CONFIRM_HITS: 5
+TARGET_FOLLOW_WEAK_MIN_AVERAGE_SCORE: 0.24
+TARGET_FOLLOW_SPATIAL_TOLERANCE: 0.10
+# After the first (or a close-range) target hit, hold the vehicle at its
+# current pose while the slow detector obtains another independent frame.
+# This prevents a small object seen at the edge of the camera from being lost
+# during the 3-5 second WeDetect inference interval. Set to 0 to disable.
+TARGET_OBSERVATION_HOLD: 4.5
+# Valid values: true, false. false (recommended) lets close, multi-frame
+# visual evidence complete the task even if the exploratory state machine has
+# not accumulated all LOCKED hits before the object leaves the camera. true
+# restores the stricter legacy rule that completion requires STATE_LOCKED.
+TARGET_DONE_REQUIRE_LOCKED: false
+# Reject an inference result whose camera frame is older than this many seconds
+# when it completes. This prevents startup/backlog images from steering the
+# current vehicle. Set <= 0 only for offline replay, never for live driving.
+DETECTION_MAX_SOURCE_IMAGE_AGE: 1.0
+# Cadence for checking a target-follow segment. A new detector frame, not this
+# timer, is allowed to change the visual ray; repeated checks reuse the same
+# goal until the robot reaches it.
+FOLLOW_GOAL_PUBLISH_PERIOD: 0.50
+# Target tracking is updated once per distinct detector message. The normalized
+# box centre and odom bearing are exponentially smoothed and limited per frame
+# so one noisy WeDetect box cannot swing the vehicle or preempt TEB.
+TARGET_BBOX_ALPHA: 0.35
+TARGET_HEADING_ALPHA: 0.30
+TARGET_MAX_HEADING_STEP_DEG: 25.0
+# Replace the active action with the next visual-servo segment before TEB
+# reaches its 0.35 m terminal tolerance. The action server keeps its execute
+# loop alive, so this avoids a zero-velocity action gap.
+TARGET_GOAL_REACHED_RADIUS: 0.75
+TARGET_GOAL_HEADING_UPDATE_THRESHOLD_DEG: 35.0
+# Maximum blind one-metre continuations during a detector gap. After this many
+# segments Goal Manager holds the last goal until fresh target evidence arrives.
+TARGET_CACHE_MAX_ADVANCES: 2
+# RGB-only target tracking advances by bounded segments, then re-observes. The
+# 1.5 m segment is still far below GOAL_DIST_DET (the old 5 m blind projection)
+# but reduces repeated move_base replacements while the target bearing is stable.
+FOLLOW_TARGET_STEP_DISTANCE: 1.5
+# false (default): let the local planner route a visual step around desks/chairs.
+# true: clip that step at the first lidar obstacle, useful only when comparing
+# the raw policy without its local safety planner.
+FOLLOW_TARGET_USE_SCAN_CLIP: false
+# When a previously detected target drops out of the forward camera, make
+# bounded SA-PPO turn-and-look attempts before returning to global frontier
+# coverage. Set duration to 0 to disable this visual reacquisition behavior.
+TARGET_REACQUIRE_DURATION: 12.0
+TARGET_REACQUIRE_DISTANCE: 0.8
+TARGET_REACQUIRE_MAX_ATTEMPTS: 2
+# A real small target can disappear for several WeDetect cycles while the
+# robot passes a desk edge. Keep the last evidence-backed target ray active for
+# this long before returning to frontier exploration. This is a timeout, not a
+# target coordinate or a map prior.
+FOLLOW_TARGET_LOST_TIMEOUT: 12.0
+# Keep a Sus-B context mode through short state-node flicker. A confirmed
+# target still preempts it immediately; after this dwell, PASS/Sus-C resumes.
+CONTEXT_STATE_HOLD_TIME: 4.0
+# A confirmed task-context pair (for yellow cup: monitor + monitor) is checked
+# with this short step before returning to SLAM coverage. It is deliberately
+# independent from the target step because context does not provide range.
+FOLLOW_CONTEXT_STEP_DISTANCE: 1.5
+# Hold the context inspection segment until the robot is close enough to it.
+# A larger value prevents a monitor/desk pair from becoming a moving target;
+# a materially different fresh bearing can still refresh it.
+CONTEXT_GOAL_REACHED_RADIUS: 0.55
+CONTEXT_GOAL_HEADING_UPDATE_THRESHOLD_DEG: 35.0
+# After that short observation, keep exploring for this many seconds before the
+# same monitor/desk context can redirect the robot again. Target detections are
+# never delayed by this cooldown.
+CONTEXT_FOLLOW_COOLDOWN: 30.0
+# Online SLAM global-frontier exploration is used only before a target is
+# visible. gmapping builds /map from the live 2D lidar and the frontier node
+# chooses unknown-space boundaries reachable through known, clearance-safe
+# cells. The node publishes a stable odom-frame frontier endpoint; Goal Manager
+# keeps sole ownership of /lste/final_goal and TEB is the primary controller.
+# Disable only for comparison with the legacy local GP exploration route.
+GLOBAL_FRONTIER_ENABLED: true
+GLOBAL_FRONTIER_TOPIC: /lste/global_frontier_goal
+# TEB emits one PoseStamped terminal event for the frontier action it just
+# completed or rejected. Goal Manager uses the matching pose to advance to the
+# next frontier even when that waypoint changed by less than the jump threshold.
+TEB_GOAL_TERMINAL_TOPIC: /lste/teb_goal_terminal
+# TEB publishes one terminal event when a frontier waypoint succeeds and one
+# failure event when a visual target action makes no progress or is aborted.
+# Goal Manager uses the failure event to release target ownership back to the
+# frontier planner; it must not be treated as a retry trigger.
+TEB_GOAL_FAILURE_TOPIC: /lste/teb_goal_failure
+# A stale frontier must not steer the robot after SLAM or the explorer exits.
+GLOBAL_FRONTIER_MAX_AGE: 3.0
+# Re-evaluate the online map at this cadence. The committed frontier endpoint
+# stays stable while its move_base action is active.
+GLOBAL_FRONTIER_PERIOD: 1.0
+# Keep the current frontier endpoint until the robot is genuinely near it.
+# This prevents the 1 Hz map update from becoming a moving controller target.
+GLOBAL_FRONTIER_UPDATE_RADIUS: 0.90
+# Promote a validated pending frontier this far before the current endpoint.
+# This gives the TEB bridge time to queue a smooth continuation and replace it
+# in its 0.85-1.3 m hot-start window; sharp or oversized branches are still
+# deferred by the bridge's direction/distance gates.  Promoting at 2.0 m
+# leaves the bridge 0.7 m of runway before the endpoint terminal.
+GLOBAL_FRONTIER_EARLY_HANDOFF_RADIUS: 2.00
+# Minimum dwell after accepting a frontier waypoint. Large branch jumps and
+# TEB terminal events bypass this dwell; ordinary SLAM refreshes do not.
+GLOBAL_FRONTIER_MIN_HOLD_TIME: 2.5
+# In TEB mode, hold a frontier action until its bridge reports SUCCEEDED. If
+# move_base is genuinely stuck and no terminal result arrives, release the
+# goal after this many seconds so global exploration can choose another branch.
+# RL/SA-PPO keeps the distance-based update rule above.
+# A normal TEB frontier action can take about 15 s at 0.5 m/s. Give move_base
+# one additional planning interval to return SUCCEEDED instead of replacing a
+# nearly reached goal solely because the old 15 s wall clock expired.
+GLOBAL_FRONTIER_TERMINAL_HOLD_TIMEOUT: 30.0
+# Action-health contract between Goal Manager and TEB bridge. These are not
+# TEB optimizer knobs: they decide when a stale move_base frontier action may
+# hand off to the newest map intent. A normal handoff requires both a
+# materially new goal and no feedback progress. A confirmed target is a
+# higher-priority mission intent and may take over through the same bridge.
+TEB_ACTION_HANDOFF_DISTANCE: 1.00
+# Retained for launch compatibility and diagnostics. Near-endpoint handoff is
+# disabled; move_base owns normal SUCCEEDED detection.
+TEB_ACTION_HANDOFF_RADIUS: 0.30
+TEB_ACTION_PROGRESS_TIMEOUT: 12.0
+TEB_ACTION_PROGRESS_EPSILON: 0.12
+TEB_ACTION_HANDOFF_MIN_INTERVAL: 4.0
+# Navfn's default is true: unknown cells are high-cost but traversable. Keep it
+# enabled for confirmed visual targets just outside the current SLAM map. The
+# online frontier node still chooses goals from known, clearance-safe cells,
+# while TEB and the rolling lidar costmap enforce physical collision safety.
+TEB_NAVFN_ALLOW_UNKNOWN: true
+# A visual ray is accepted as a TEB destination only after the live Navfn
+# service returns a connected plan. false is useful only for raw visual-ray
+# comparisons; true keeps an unreachable target from preempting exploration.
+TARGET_ROUTE_VALIDATION: true
+TARGET_ROUTE_VALIDATION_TIMEOUT: 0.05
+TARGET_ROUTE_VALIDATION_TOLERANCE: 0.20
+TARGET_ROUTE_VALIDATION_PERIOD: 1.0
+# Confirmed visual target segments are bounded approach goals. When the active
+# segment is this close and the next segment differs by at least the minimum
+# delta, TEB is handed off before move_base stops at its terminal tolerance.
+# Frontier actions never use this early-handoff path.
+TEB_TARGET_EARLY_HANDOFF_DISTANCE: 0.70
+TEB_TARGET_EARLY_HANDOFF_MIN_DELTA: 0.40
+# Frontier branch goals larger than this are dispatched after the current TEB
+# action succeeds. Keeping only short, continuous updates on the hot-start
+# path prevents an almost-reached goal from being replaced by a sharp branch
+# turn and causing a visible brake.
+TEB_FRONTIER_REPLACEMENT_MAX_DELTA: 1.00
+# Keep one move_base transaction for each validated frontier route. This is
+# narrower than generic in-place replacement: target takeovers and branch
+# changes still wait for an action terminal.
+TEB_ALLOW_ROUTE_CONTINUATION_REPLACEMENT: true
+# A branch larger than TEB_FRONTIER_REPLACEMENT_MAX_DELTA is hot-started only
+# when its local bearing change is <= this angle. Sharp branches wait for the
+# current move_base action result, removing abrupt brake/turn resets.
+TEB_FRONTIER_EARLY_HANDOFF_MAX_HEADING_DEG: 75.0
+# Near-endpoint sharp-branch recovery: wait this long after the normal
+# no-progress timeout, then replace the move_base action in-place instead of
+# issuing cancel+dispatch (which creates a visible zero-velocity pulse).
+TEB_FRONTIER_STALE_RECOVERY_GRACE: 4.0
+TEB_FRONTIER_STALE_RECOVERY_MAX_DISTANCE: 1.50
+# A large jump is treated as a changed branch, but is held until the current
+# frontier endpoint is reached within GLOBAL_FRONTIER_JUMP_RELEASE_RADIUS.
+GLOBAL_FRONTIER_JUMP_DISTANCE: 2.0
+# Even a changed branch must not preempt the current RL waypoint while the car
+# is still far from it. Accept a large jump once this distance is met.
+GLOBAL_FRONTIER_JUMP_RELEASE_RADIUS: 1.20
+# Context (Sus-B) detections are allowed to preempt an active frontier route.
+# A high-suspicion room entrance (state node entered Sus-B because the task's
+# context pair, e.g. monitor+monitor, is visible) is exactly where the target
+# is likely to be; sending the robot to an arbitrary frontier instead wastes
+# the strong perceptual evidence.  The short inspection step (1.5 m) and the
+# 30 s context cooldown keep this bounded, so the robot looks into the
+# suspicious room once and then returns to frontier coverage instead of
+# chasing the same monitor pair forever.
+GLOBAL_FRONTIER_PREEMPT_CONTEXT: true
+# Map-safe route parameters. CLEARANCE is the minimum distance from occupied
+# map cells for every published approach goal. The production value is the
+# robot radius (0.30 m) plus TEB's minimum obstacle distance (0.22 m).
+GLOBAL_FRONTIER_CLEARANCE: 0.62
+# Kept under the historical name for launch compatibility. This is only the
+# looser mask used to detect an information boundary; it is never used to
+# route or publish a goal. The explorer chooses a route-safe approach cell
+# within GLOBAL_FRONTIER_APPROACH_DISTANCE of that boundary.  The approach
+# point sits 1.5 m short of the unknown boundary, so with the 0.52 m route
+# clearance the published endpoint is usually ~2 m from a wall: TEB reaches
+# the endpoint at cruising speed instead of throttling in the obstacle-
+# proximity band on every approach.
+GLOBAL_FRONTIER_APPROACH_DISTANCE: 1.5
+GLOBAL_FRONTIER_MIN_PATH_DISTANCE: 1.2
+# Retained for launch compatibility. Frontier navigation sends one terminal
+# endpoint to move_base so TEB can optimize the complete Navfn route; slicing
+# it into move_base sub-goals creates a zero-velocity pulse at every handoff.
+GLOBAL_FRONTIER_LOOKAHEAD_DISTANCE: 4.0
+# Keep the global explorer's committed odom endpoint until the vehicle is close;
+# this is independent of the frontier-cell completion radius.
+GLOBAL_FRONTIER_WAYPOINT_RELEASE_RADIUS: 1.20
+# The local controller may slow to ~0.17m/s around furniture. A frontier route
+# can therefore take longer than 120s even while progress is healthy. The node
+# uses ACTIVE_TIMEOUT only as a final guard after STALL_TIMEOUT has also
+# elapsed; a route that keeps moving is allowed to finish. A doorway route may
+# spend several seconds turning before its frontier distance decreases, so
+# STALL_TIMEOUT is intentionally longer than a single turn.
+GLOBAL_FRONTIER_ACTIVE_TIMEOUT: 60.0
+GLOBAL_FRONTIER_STALL_TIMEOUT: 20.0
+# Map integration can briefly disconnect an active frontier. Hold the last
+# safe endpoint this long before abandoning that branch and selecting another.
+GLOBAL_FRONTIER_UNREACHABLE_GRACE: 20.0
+# A route that truly stalls stays suppressed while other connected branches are
+# explored. It is not deleted from the map and may be retried after this time.
+GLOBAL_FRONTIER_REJECTED_TIMEOUT: 180.0
+# Radius around a reached frontier remembered for the full task. This prevents
+# the explorer from revisiting an already inspected doorway after its short
+# temporary-stall retry timeout has expired.
+GLOBAL_FRONTIER_COMPLETED_RADIUS: 1.25
+# Indoor-search bias: frontiers near observed walls tend to be doors, corridor
+# turns, or rooms; a max-range boundary across an empty floor has little local
+# structure. These values guide coverage without using object coordinates.
+GLOBAL_FRONTIER_STRUCTURE_RADIUS_CELLS: 10
+GLOBAL_FRONTIER_STRUCTURE_WEIGHT: 0.16
+GLOBAL_FRONTIER_MIN_STRUCTURE_CELLS: 3
+# Soft heading-continuity cost for the online frontier scorer. A candidate
+# directly behind the robot pays up to 2 * this value; zero restores the
+# information/structure/path-only score. This does not forbid necessary turns.
+GLOBAL_FRONTIER_HEADING_WEIGHT: 2.5
+# During prefetch, prefer candidates within this bearing change when any
+# connected alternative exists. Set 0 to disable the hard bound.
+GLOBAL_FRONTIER_HEADING_HARD_LIMIT_DEG: 115.0
+# Minimum wall-clock interval between expensive full map/costmap frontier
+# searches while the committed endpoint is far away and making progress.
+GLOBAL_FRONTIER_PLANNING_PERIOD: 1.5
+# Goal Manager publishes this machine-readable mission ownership signal before
+# each /lste/final_goal. The TEB bridge uses it to let confirmed target intent
+# take over exploration without exposing another controller tuning parameter.
+GOAL_INTENT_TOPIC: /lste/goal_intent
+# TEB is the production controller. TEB's optimizer keeps a small positive
+# reverse bound internally; the mux clamps that residual reverse command so a
+# blocked goal is handled by an in-place turn. Set false only for a deliberate
+# reverse-motion comparison experiment.
+TEB_FORWARD_ONLY: true
 # true writes one GOAL_DIAG line for every /lste/final_goal publication. It
 # records the decision source, state, robot pose, scores, detections, frontier
 # vote and goal delta. Set false after diagnosing goal movement/flicker.
 GOAL_DEBUG_LOG: true
 
-# Initial speed-mux selection. Valid values: teleop, sappo. Both processes stay
-# alive; this only selects the initial source. It can be hot-switched later.
-LSTE_CONTROLLER: sappo
+# Select the only source allowed to publish /lste/final_goal:
+#   brain - normal LSTE decision path: state + detections + GP/frontier.
+#   fixed - hold FIXED_GLOBAL_GOAL_* as one stable odom-frame target. This is
+#           useful for controller validation because no perception or brain
+#           update can move the goal. The normal default is brain.
+GLOBAL_GOAL_SOURCE: brain
+# Values used only when GLOBAL_GOAL_SOURCE is fixed. Coordinates are metres in
+# the odom/Gazebo-world frame; yaw is radians. The established fixed-goal route
+# starts at (15.79, -8.45, -pi/2) and targets (12.95, -6.51).
+FIXED_GLOBAL_GOAL_X: 12.95
+FIXED_GLOBAL_GOAL_Y: -6.51
+FIXED_GLOBAL_GOAL_YAW: 0.0
+# Re-publish the unchanged target for late/restarted controllers. This does not
+# create a new goal or reset a controller that has already reached it.
+FIXED_GLOBAL_GOAL_PUBLISH_PERIOD: 1.0
+# With fixed mode enabled, Gazebo Shift + left-click can replace the target
+# immediately. Keep this false for a strictly repeatable benchmark.
+FIXED_GLOBAL_GOAL_ALLOW_CLICK_OVERRIDE: true
+
+# Initial speed-mux selection. Valid values: teleop, sappo, teb. TEB,
+# keyboard, and the optional SA-PPO controller can be selected independently.
+# The default keeps SA-PPO lazy so TEB experiments do not spend resources on a
+# controller that is not selected. Switching to sappo starts it on demand.
+LSTE_CONTROLLER: teb
+SAPPO_BACKGROUND_ENABLED: false
+# SA-PPO execution mode when the `sappo` process starts:
+#   rl_grid_guard - production checkpoint plus controller-local 2D-lidar
+#                   safety recovery; it preserves /lste/final_goal and is the
+#                   validated default for the yellow-cup task.
+#   policy_only   - original checkpoint action with no recovery, for comparison.
+#   stabilized_recovery | rl_dwa_guard | rl_mppi_guard - experimental variants.
+SAPPO_CONTROLLER_MODE: rl_grid_guard
+# Controller-side hysteresis. Pure turn commands use a bounded deceleration;
+# only an explicit emergency stop clears linear velocity immediately. Bug2
+# keeps its selected boundary side and waits before re-entering after a
+# route-alignment turn.
+SAPPO_IN_PLACE_TURN_ANGULAR_THRESHOLD: 0.12
+SAPPO_MAX_LINEAR_ACTION_STEP: 0.12
+# Separate deceleration limit. A smaller value avoids repeated sharp braking
+# when a lidar guard changes from forward motion to a turn at a safe distance.
+SAPPO_MAX_LINEAR_ACTION_DECEL: 0.06
+# Angular slew limit. Lower than the old 0.28 action step to suppress small
+# left/right sign changes on straight corridor segments while retaining the
+# same final angular bound.
+SAPPO_MAX_ANGULAR_ACTION_STEP: 0.16
+# Ignore a small opposite-sign steering request until the current correction
+# has decayed through zero. Larger turns still switch immediately.
+SAPPO_ANGULAR_SIGN_SWITCH_THRESHOLD: 0.26
+SAPPO_BOUNDARY_TURN_LOCK_TIME: 3.0
+# A boundary turn is a bounded scan maneuver, not a permanent recovery mode.
+# It ends after this many seconds or degrees, and at most this many turns are
+# attempted before the controller follows the selected wall tangent.
+SAPPO_BOUNDARY_TURN_MAX_DURATION: 2.8
+SAPPO_BOUNDARY_TURN_MAX_ANGLE_DEG: 112.0
+SAPPO_BOUNDARY_TURN_MAX_ATTEMPTS: 2
+SAPPO_BOUNDARY_REENTRY_COOLDOWN: 1.5
+# If Bug2 has travelled away from a frontier without reducing its distance for
+# this long, it tries the opposite wall tangent once and then releases to A*.
+SAPPO_BOUNDARY_PROGRESS_TIMEOUT: 10.0
+SAPPO_BOUNDARY_PROGRESS_MARGIN: 0.45
+# Bug2 wall-follow feedback. The controller keeps the selected side about
+# 0.72 m from the lidar contour and steers from the front/rear range slope;
+# this avoids the old fixed-heading drift around corners.
+SAPPO_BOUNDARY_WALL_DISTANCE: 0.72
+# Ignore side/front/rear lidar endpoints beyond this range when estimating the
+# contour. A missing wall must release Bug2 instead of using a stale far wall.
+SAPPO_BOUNDARY_WALL_MAX_RANGE: 1.80
+SAPPO_BOUNDARY_WALL_KP: 0.45
+SAPPO_BOUNDARY_WALL_HEADING_KP: 0.35
+SAPPO_BOUNDARY_WALL_MAX_LINEAR: 0.28
+SAPPO_BOUNDARY_WALL_FILTER_ALPHA: 0.28
+SAPPO_BOUNDARY_WALL_ANGULAR_STEP: 0.08
+SAPPO_BOUNDARY_WALL_ANGULAR_DEADBAND: 0.035
+# A goal behind the robot is normal while Bug2 is tracing a wall. Only an
+# almost-opposite replacement invalidates that boundary commitment.
+SAPPO_BOUNDARY_GOAL_CANCEL_ANGLE_DEG: 165.0
+# A boundary route is re-anchored when the world-frame goal changes by this
+# much. The wall side is preserved, but the old hit point is discarded so a
+# normal frontier waypoint advance cannot drag the car along an obsolete
+# heading. A goal moving behind the robot alone never triggers this.
+SAPPO_BOUNDARY_GOAL_CANCEL_DISTANCE: 0.75
+# Hold a collision-free local A* waypoint in the odom frame until it is close,
+# blocked, or behind the robot. This prevents scan quantization from toggling
+# between +/- one grid cell in a straight corridor.
+SAPPO_WAYPOINT_HOLD_RADIUS: 0.40
+SAPPO_WAYPOINT_SWITCH_DISTANCE: 0.75
+# Local grid inflation is separate from the hard rollout safety margin. The
+# 0.48m radius keeps a 0.30m robot plus a small mapping buffer without making
+# ordinary corridors appear topologically closed.
+SAPPO_GRID_OBSTACLE_RADIUS: 0.48
+SAPPO_GRID_EDGE_CLEARANCE: 0.42
+# If a requested turn is made with a wall already inside this clearance,
+# enter wall-follow recovery rather than repeatedly rotating toward an
+# occluded goal. Increase only when the robot has a larger footprint.
+SAPPO_REORIENT_OBSTACLE_CLEARANCE: 0.72
+# SA-PPO considers a waypoint reached inside this radius. Keep it below the
+# 1.0m target visual-servo step; otherwise the controller can terminate after
+# only a few centimetres and never approach a small distant object.
+SAPPO_GOAL_TOLERANCE: 0.30
+# Radius used only for online exploration/visual-servo segment handoff. The
+# final task completion remains controlled by Goal Manager's fresh detections.
+SAPPO_INTERMEDIATE_GOAL_TOLERANCE: 0.45
+# TEB maximum forward speed in the production online-SLAM navigation stack.
+# TEB itself is always started on /lste/cmd_vel/teb, but the mux forwards it
+# only when LSTE_CONTROLLER is teb. Keep this at or below the platform's safe
+# indoor speed; fixed-goal comparisons use their own test_config value.
+TEB_MAX_LINEAR_SPEED: 0.50
+# Suppress only small opposite-sign TEB angular corrections. A +/-0.05 rad/s
+# command around a straight path is usually map quantization, not a meaningful
+# turn; the mux outputs zero until the opposite command exceeds this threshold.
+# Large turns and all linear safety braking pass through unchanged.
+TEB_ANGULAR_SIGN_SWITCH_THRESHOLD: 0.12
+# Remove sub-two-degree angular noise from the final command. Set to 0 to
+# disable this deadband for a raw TEB comparison.
+TEB_ANGULAR_DEADBAND: 0.02
+# Forward-collision velocity governor at the mux (the sole /cmd_vel publisher).
+# This is a hard safety invariant, not a planner tuning knob: the commanded
+# forward speed is capped so the robot can always stop within the measured
+# lidar clearance ahead, v_max = sqrt(2*decel*max(0, clearance - min_gap)).
+# DECEL is the achievable braking deceleration; MIN_GAP the closest distance
+# the robot is allowed to reach; MAX_SPEED the ceiling (normally TEB max).
+MUX_GOVERNOR_DECEL: 0.60
+MUX_GOVERNOR_MIN_GAP: 0.45
+MUX_GOVERNOR_MAX_SPEED: 0.50
 # Select exactly one detector profile. This is the only key needed to change
 # detector model:
 #   groundingdino  - original DINO node; two prompt passes; lower FPS.

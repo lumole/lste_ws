@@ -14,6 +14,7 @@ from actionlib_msgs.msg import GoalID, GoalStatusArray
 class FrontierGoalManager:
     def __init__(self):
         self.goal = np.array([rospy.get_param("~goal_x"), rospy.get_param("~goal_y")], dtype=float)
+        self.goal_topic = rospy.get_param("~goal_topic", "/rl_fixed_goal_test/final_goal")
         self.pose = None
         self.last_goal = None
         self.pending_goal = None
@@ -59,9 +60,7 @@ class FrontierGoalManager:
         self.map_service = rospy.ServiceProxy("/dynamic_map", GetMap)
         rospy.Subscriber("/map", OccupancyGrid, self.on_map, queue_size=1)
         rospy.Subscriber("/pro3/wheel_odom", Odometry, self.on_odom, queue_size=1)
-        rospy.Subscriber(
-            "/rl_fixed_goal_test/final_goal", PoseStamped, self.on_final_goal, queue_size=1
-        )
+        rospy.Subscriber(self.goal_topic, PoseStamped, self.on_final_goal, queue_size=1)
         rospy.Subscriber("/move_base/status", GoalStatusArray, self.on_move_base_status, queue_size=1)
         # gmapping does not promise a map replay to a late subscriber. Keep the
         # latest candidate and republish it when move_base connects instead of
@@ -93,10 +92,10 @@ class FrontierGoalManager:
             rospy.logwarn_throttle(5.0, "Waiting for current SLAM map: %s", error)
 
     def on_final_goal(self, message):
-        """Restart exploration when the test publisher accepts a Shift-click goal."""
+        """Restart exploration when the LSTE global-goal source changes."""
         new_goal = np.array([message.pose.position.x, message.pose.position.y], dtype=float)
         if np.linalg.norm(new_goal - self.goal) < 0.05:
-            # publish_goal.py republishes the current target every second.
+            # The fixed Goal Manager republishes the current target every second.
             # Do not let that periodic message revive an unreachable target.
             return
         old_goal = self.goal.copy()

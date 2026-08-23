@@ -175,14 +175,14 @@ new_window world "$WS" \
 new_window scan "$WS" \
   "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom; do sleep 1; done; roslaunch pointcloud_to_laserscan lste_pro3_to_scan.launch"
 new_window fixed_goal "$WS" \
-  "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom; do sleep 1; done; python3 $TEST_DIR/publish_goal.py _goal_x:=$GOAL_X _goal_y:=$GOAL_Y _allow_click_goal:=$ALLOW_GAZEBO_CLICK_GOAL"
+  "$WAIT_ROS; rosrun lste_topo_access lste_goal_manager.py _global_goal_source:=fixed _fixed_goal_x:=$GOAL_X _fixed_goal_y:=$GOAL_Y _fixed_goal_yaw:=0.0 _fixed_goal_publish_period:=1.0 _fixed_goal_allow_click_override:=$ALLOW_GAZEBO_CLICK_GOAL _debug_goal_log:=true"
 new_window goal_sphere "$WS" \
-  "$WAIT_ROS; until rostopic list | grep -qx /rl_fixed_goal_test/final_goal; do sleep 1; done; python3 $TEST_DIR/gazebo_goal_sphere.py"
+  "$WAIT_ROS; until rostopic list | grep -qx /lste/final_goal; do sleep 1; done; python3 $TEST_DIR/gazebo_goal_sphere.py _goal_topic:=/lste/final_goal"
 
 PYTHON_SITE="$($PYTHON_BIN -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 if [[ "$CONTROLLER_MODE" == "ros_navigation" ]]; then
   new_window navigation_goal "$WS" \
-    "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom; do sleep 1; done; python3 -u $TEST_DIR/frontier_goal_manager.py _goal_x:=$GOAL_X _goal_y:=$GOAL_Y _max_final_goal_failures:=$FINAL_GOAL_MAX_FAILURES" \
+    "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom && rostopic list | grep -qx /lste/final_goal; do sleep 1; done; python3 -u $TEST_DIR/frontier_goal_manager.py _goal_x:=$GOAL_X _goal_y:=$GOAL_Y _goal_topic:=/lste/final_goal _max_final_goal_failures:=$FINAL_GOAL_MAX_FAILURES" \
     "frontier_manager"
   new_window navigation "$WS" \
     "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom && rostopic list | grep -qx /pro3/rlscan; do sleep 1; done; roslaunch $TEST_DIR/ros_navigation.launch local_planner_plugin:=$LOCAL_PLANNER_PLUGIN max_linear_speed:=$NAVIGATION_MAX_LINEAR_SPEED"
@@ -192,14 +192,14 @@ if [[ "$CONTROLLER_MODE" == "ros_navigation" ]]; then
   fi
 else
   new_window sappo "$RUNTIME_DIR" \
-    "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom && rostopic list | grep -qx /pro3/rlscan && rostopic list | grep -qx /rl_fixed_goal_test/final_goal; do sleep 1; done; PYTHONPATH=$PYTHON_SITE:$WS/devel/lib/python3/dist-packages:/opt/ros/noetic/lib/python3/dist-packages:/usr/lib/python3/dist-packages $PYTHON_BIN $TEST_DIR/sappo_test.py _linear_speed_scale:=$SAPPO_SPEED _goal_x:=$GOAL_X _goal_y:=$GOAL_Y _goal_topic:=/rl_fixed_goal_test/final_goal _cmd_vel_topic:=/cmd_vel _wait_for_goal:=true _subscribe_gp_subgoal:=false _recovery_mode:=$RECOVERY_MODE _controller_mode:=$CONTROLLER_MODE"
+    "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom && rostopic list | grep -qx /pro3/rlscan && rostopic list | grep -qx /lste/final_goal; do sleep 1; done; PYTHONPATH=$PYTHON_SITE:$WS/devel/lib/python3/dist-packages:/opt/ros/noetic/lib/python3/dist-packages:/usr/lib/python3/dist-packages $PYTHON_BIN $TEST_DIR/sappo_test.py _linear_speed_scale:=$SAPPO_SPEED _goal_x:=$GOAL_X _goal_y:=$GOAL_Y _goal_topic:=/lste/final_goal _cmd_vel_topic:=/cmd_vel _wait_for_goal:=true _subscribe_gp_subgoal:=false _recovery_mode:=$RECOVERY_MODE _controller_mode:=$CONTROLLER_MODE"
   if [[ "${LIVE_RVIZ,,}" == "true" ]]; then
     new_window live_rviz "$WS" \
       "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom && rostopic list | grep -qx /pro3/rlscan; do sleep 1; done; rviz -d $TEST_DIR/live_rl.rviz"
   fi
 fi
 new_window monitor "$WS" \
-  "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom; do sleep 1; done; python3 $TEST_DIR/monitor.py _log_dir:=$RUNTIME_DIR/traces"
+  "$WAIT_ROS; until rostopic list | grep -qx /pro3/wheel_odom; do sleep 1; done; python3 $TEST_DIR/monitor.py _log_dir:=$RUNTIME_DIR/traces _goal_topic:=/lste/final_goal"
 
 if [[ "${SCREEN_RECORD,,}" == "true" ]]; then
   if [[ "$CONTROLLER_MODE" == "ros_navigation" ]]; then

@@ -48,10 +48,20 @@ class StateNode:
         # 细分 subtype 的检测阈值
         self.sus_a_score_thresh = float(gp("~sus_a_score_thresh", 0.4))
 
-        # 放宽 LOCKED 进入条件（总分/目标分阈值下降，连续帧数减少）
+        # LOCKED is a temporal confirmation, not a one-frame confidence test.
+        # Small real targets often have modest per-frame confidence but remain
+        # spatially consistent for many frames.  ``lock_enter_min_hits`` lets
+        # a few dropped frames pass without promoting a transient false hit.
         self.lock_enter_total = float(gp("~lock_total_enter", 0.6))
         self.lock_enter_target = float(gp("~lock_target_enter", 0.6))
         self.lock_enter_frames = int(gp("~lock_enter_frames", 2))
+        self.lock_enter_min_hits = max(
+            1,
+            min(
+                self.lock_enter_frames,
+                int(gp("~lock_enter_min_hits", self.lock_enter_frames)),
+            ),
+        )
 
         self.lock_exit_total = float(gp("~lock_total_exit", 0.60))
         self.lock_exit_target = float(gp("~lock_target_exit", 0.60))
@@ -63,6 +73,12 @@ class StateNode:
         self.susp_exit_target = float(gp("~susp_exit_target", 0.50))
         self.susp_exit_env = float(gp("~susp_exit_env", 0.25))
         self.susp_exit_ctx = float(gp("~susp_exit_ctx", 0.25))
+        # Context labels can alternate for adjacent detector frames. Require a
+        # short run of the new subtype before Goal Manager is allowed to change
+        # its interpretation of the same scene.
+        self.subtype_switch_min_hits = max(
+            1, int(gp("~subtype_switch_min_hits", 3))
+        )
 
         self.exh_window = int(gp("~exhausted_window", 30))
         self.exh_min_scores = int(gp("~exhausted_min_scores", 30))
@@ -82,9 +98,12 @@ class StateNode:
         self.last_promising_time: Optional[float] = None
         self.total_scores_count = 0
         self.locked_unstable_count = 0
+        self.pending_subtype = None
+        self.pending_subtype_hits = 0
         self.latest_dets: Optional[LsteDetections] = None
         self.latest_task_msg: Optional[LsteTask] = None
         self.scores_short: Deque[ScoreSample] = collections.deque(maxlen=self.susp_window)
+        self.lock_samples: Deque[ScoreSample] = collections.deque(maxlen=self.lock_enter_frames)
         self.scores_long: Deque[ScoreSample] = collections.deque(maxlen=self.exh_window)
         self.last_published_time = 0.0
 
@@ -137,7 +156,10 @@ class StateNode:
         self.last_promising_time = None
         self.total_scores_count = 0
         self.locked_unstable_count = 0
+        self.pending_subtype = None
+        self.pending_subtype_hits = 0
         self.scores_short.clear()
+        self.lock_samples.clear()
         self.scores_long.clear()
         self.last_published_time = 0.0
         self.latest_dets = None
@@ -147,6 +169,7 @@ class StateNode:
     def ingest_sample(self, sample: ScoreSample):
         self.total_scores_count += 1
         self.scores_short.append(sample)
+        self.lock_samples.append(sample)
         self.scores_long.append(sample)
         if self.first_score_time is None:
             self.first_score_time = sample.stamp
@@ -195,13 +218,35 @@ class StateNode:
         # 3) SUSPICIOUS handling
         if self.should_suspicious():
             self.current_state = STATE_SUSPICIOUS
-            self.current_subtype = self.pick_suspicious_subtype(sample)
+            candidate_subtype = self.pick_suspicious_subtype(sample)
+            if (
+                prev_state == STATE_SUSPICIOUS
+                and prev_subtype
+                and candidate_subtype != prev_subtype
+                and candidate_subtype != "Sus-A"
+            ):
+                if self.pending_subtype == candidate_subtype:
+                    self.pending_subtype_hits += 1
+                else:
+                    self.pending_subtype = candidate_subtype
+                    self.pending_subtype_hits = 1
+                if self.pending_subtype_hits < self.subtype_switch_min_hits:
+                    candidate_subtype = prev_subtype
+                else:
+                    self.pending_subtype = None
+                    self.pending_subtype_hits = 0
+            else:
+                self.pending_subtype = None
+                self.pending_subtype_hits = 0
+            self.current_subtype = candidate_subtype
             self.maybe_publish(now, prev_state, prev_subtype)
             return
 
         # 4) PASS
         self.current_state = STATE_PASS
         self.current_subtype = ""
+        self.pending_subtype = None
+        self.pending_subtype_hits = 0
         self.maybe_publish(now, prev_state, prev_subtype)
 
     # ---- Helpers for locked / suspicious / exhausted ----
@@ -222,12 +267,17 @@ class StateNode:
             # Fall through to downgrade if unstable for too long
 
         # Try to enter locked
-        if len(self.scores_short) < self.lock_enter_frames:
+        if len(self.lock_samples) < self.lock_enter_frames:
             return False
-        recent = list(self.scores_short)[-self.lock_enter_frames :]
-        for s in recent:
-            if not (s.s_total >= self.lock_enter_total and s.s_target >= self.lock_enter_target and s.detected):
-                return False
+        recent = list(self.lock_samples)
+        confirmed_hits = sum(
+            s.s_total >= self.lock_enter_total
+            and s.s_target >= self.lock_enter_target
+            and s.detected
+            for s in recent
+        )
+        if confirmed_hits < self.lock_enter_min_hits:
+            return False
         self.locked_unstable_count = 0
         return True
 

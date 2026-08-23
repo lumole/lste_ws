@@ -55,6 +55,11 @@ class DetectionNodeBase:
         self.interval_locked = float(rospy.get_param("~interval_locked", 1.5))
         self.interval_exhausted = float(rospy.get_param("~interval_exhausted", 3.0))
         self.min_inference_interval = float(rospy.get_param("~min_inference_interval", 1.5))
+        # A model can finish its initial load after Gazebo has already advanced
+        # several seconds.  Publishing that queued image would turn an old
+        # camera ray into a new navigation command, so bound source-frame age
+        # independently of inference cadence.  Set <= 0 only for offline use.
+        self.max_source_image_age = float(rospy.get_param("~max_source_image_age", 1.0))
         self.current_task = None
         self.task_parsed = None
         self.current_prompts = None
@@ -218,6 +223,17 @@ class DetectionNodeBase:
             except Exception as exc:
                 rospy.logerr_throttle(1.0, "%s exception: %s", self.detector_name, exc)
                 self.publish_empty_dets(header, "exception: %s" % type(exc).__name__)
+                return
+            stamp = header.stamp.to_sec() if isinstance(header, Header) else 0.0
+            age = rospy.Time.now().to_sec() - stamp if stamp > 0.0 else 0.0
+            if self.max_source_image_age > 0.0 and age > self.max_source_image_age:
+                rospy.logwarn_throttle(
+                    1.0,
+                    "Discard %s result from stale image: age=%.2fs limit=%.2fs",
+                    self.detector_name,
+                    age,
+                    self.max_source_image_age,
+                )
                 return
             target_boxes, target_scores, target_labels, env_boxes, env_scores, env_labels = result
             self._publish(

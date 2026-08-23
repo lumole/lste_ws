@@ -76,7 +76,7 @@ LSTE 大脑：       “我应该去哪里？”
                        固定目标 (12.95, -6.51)
                                   |
                                   v
-                          fixed_goal 节点
+                    Goal Manager（fixed source）
                                   |
                                   v
                     frontier_goal_manager（是否已知可达？）
@@ -384,8 +384,7 @@ LOCAL_PLANNER_PLUGIN: teb_local_planner/TebLocalPlannerROS
 
 ```bash
 cd /home/yhq/dh_ws/lste_ws
-RL_FIXED_GOAL_CONFIG=scripts/tests/rl_fixed_goal/ros_navigation_config.yaml \
-  ./scripts/tests/rl_fixed_goal/run_tmux.sh
+rltest
 ```
 
 会打开 Gazebo GUI。场景中的目标球就是最终目标位置。它是一个视觉标记，帮助人看结果；
@@ -447,14 +446,16 @@ LIBGL_ALWAYS_SOFTWARE=1
 
 | 文件 | 用途 | 是否影响生产 LSTE |
 | --- | --- | --- |
-| `scripts/tests/rl_fixed_goal/ros_navigation_config.yaml` | 固定起点、固定目标、GUI 和 planner | 否 |
+| `scripts/tests/rl_fixed_goal/test_config.yaml` | 固定起点、固定目标、GUI 和 planner | 否 |
 | `scripts/tests/rl_fixed_goal/run_tmux.sh` | 创建独立测试 tmux、ROS 和 Gazebo 会话 | 否 |
+| `src/lste_topo_access/scripts/lste_goal_manager.py` | 正式 `/lste/final_goal` 发布者，测试中以 `fixed` source 运行 | 是，共用代码；默认仍为 `brain` |
 | `scripts/tests/rl_fixed_goal/frontier_goal_manager.py` | 选临时前沿，并在安全连通时切换真实目标 | 否 |
 | `scripts/tests/rl_fixed_goal/ros_navigation.launch` | SLAM、地图成本、Navfn、DWA 和 TEB 参数 | 否 |
 | `scripts/tests/rl_fixed_goal/sappo_test.py` | SA-PPO 与多种 safety guard 的独立实验 | 否 |
 
-特别说明：生产 LSTE global goal 的生成逻辑仍然在原有节点中；本测试没有改它。这个隔离
-边界是故意保留的，因为当前我们要先确认控制问题，再把大脑与控制层连接起来。
+特别说明：测试不启动 LSTE 大脑、检测或 GP，但会以 `fixed` source 启动正式的
+`lste_goal_manager.py`。因此固定坐标和正常大脑都通过同一个 `/lste/final_goal`
+接口进入控制器；隔离的只是目标的决策来源，而不是 global-goal 的接口。
 
 ---
 

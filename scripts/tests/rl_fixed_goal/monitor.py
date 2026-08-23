@@ -41,7 +41,8 @@ class Monitor:
         self.trace_file.flush()
 
         rospy.Subscriber("/pro3/wheel_odom", Odometry, self.on_odom, queue_size=1)
-        rospy.Subscriber("/rl_fixed_goal_test/final_goal", PoseStamped, self.on_goal, queue_size=1)
+        goal_topic = rospy.get_param("~goal_topic", "/rl_fixed_goal_test/final_goal")
+        rospy.Subscriber(goal_topic, PoseStamped, self.on_goal, queue_size=1)
         rospy.Subscriber("/cmd_vel", Twist, self.on_command, queue_size=1)
         rospy.Subscriber("/rl_fixed_goal_test/controller_status", String, self.on_controller_status, queue_size=1)
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.on_subgoal, queue_size=1)

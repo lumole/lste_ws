@@ -225,7 +225,7 @@ Visualization Manager:
       Shaft Length: 0.3799999952316284
       Shaft Radius: 0.03999999910593033
       Shape: Arrow
-      Topic: /rl_fixed_goal_test/final_goal
+      Topic: /lste/final_goal
       Unreliable: false
       Value: true
     - Alpha: 1

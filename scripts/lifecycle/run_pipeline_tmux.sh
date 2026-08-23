@@ -9,6 +9,25 @@ if [ -z "${WS:-}" ]; then
 fi
 LSTE_WS="$WS"
 SESSION=${SESSION:-lste}
+
+if [[ "${LSTE_LIFECYCLE_LOCK_HELD:-0}" != "1" ]]; then
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "[error] flock is required to serialize LSTE lifecycle commands." >&2
+    exit 1
+  fi
+  LOCK_DIR="$WS/runtime/lifecycle"
+  mkdir -p "$LOCK_DIR"
+  exec 9>"$LOCK_DIR/lifecycle.lock"
+  if ! flock -n 9; then
+    echo "[error] Another LSTE lifecycle command is already starting or stopping the system." >&2
+    exit 75
+  fi
+  export LSTE_LIFECYCLE_LOCK_HELD=1
+fi
+
+# The tmux server outlives this shell and must not keep the lifecycle lock.
+tmux() { command tmux "$@" 9>&-; }
+
 # 可选 YAML 配置：通过 PIPELINE_CONFIG 指定；存在时为未显式设置的变量提供默认值
 PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}
 if [[ -f "$PIPELINE_CONFIG" ]]; then
@@ -153,9 +172,62 @@ ACCESS_TOPO_CONFIG_SUS_C=${ACCESS_TOPO_CONFIG_SUS_C:-$(_resolve "${CFG_ACCESS_TO
 ACCESS_TOPO_TEST_NAME=${ACCESS_TOPO_TEST_NAME:-${CFG_ACCESS_TOPO_TEST_NAME:-default_test}}
 ACCESS_TOPO_RUN_NAME=${ACCESS_TOPO_RUN_NAME:-${CFG_ACCESS_TOPO_RUN_NAME:-$ACCESS_TOPO_TEST_NAME}}
 GP_FRONTIER_RVIZ=${GP_FRONTIER_RVIZ:-$(_resolve "${CFG_GP_FRONTIER_RVIZ:-src/lste_topo_access/launch/gp_frontier.rviz}")}
+LEGACY_GP_FRONTIER_ENABLED=${LEGACY_GP_FRONTIER_ENABLED:-${CFG_LEGACY_GP_FRONTIER_ENABLED:-false}}
 SUSPICIOUS_WINDOW=${SUSPICIOUS_WINDOW:-${CFG_SUSPICIOUS_WINDOW:-5}}
 FOLLOW_LOCKED_DONE_TIME=${FOLLOW_LOCKED_DONE_TIME:-${CFG_FOLLOW_LOCKED_DONE_TIME:-4.0}}
+TARGET_LOCK_TOTAL_MIN=${TARGET_LOCK_TOTAL_MIN:-${CFG_TARGET_LOCK_TOTAL_MIN:-0.60}}
+TARGET_LOCK_SCORE_MIN=${TARGET_LOCK_SCORE_MIN:-${CFG_TARGET_LOCK_SCORE_MIN:-0.60}}
+TARGET_LOCK_WINDOW=${TARGET_LOCK_WINDOW:-${CFG_TARGET_LOCK_WINDOW:-2}}
+TARGET_LOCK_MIN_HITS=${TARGET_LOCK_MIN_HITS:-${CFG_TARGET_LOCK_MIN_HITS:-2}}
+TARGET_LOCK_EXIT_TOTAL_MIN=${TARGET_LOCK_EXIT_TOTAL_MIN:-${CFG_TARGET_LOCK_EXIT_TOTAL_MIN:-0.60}}
+TARGET_LOCK_EXIT_SCORE_MIN=${TARGET_LOCK_EXIT_SCORE_MIN:-${CFG_TARGET_LOCK_EXIT_SCORE_MIN:-0.60}}
+TARGET_LOCK_EXIT_UNSTABLE_FRAMES=${TARGET_LOCK_EXIT_UNSTABLE_FRAMES:-${CFG_TARGET_LOCK_EXIT_UNSTABLE_FRAMES:-5}}
+TARGET_DONE_MIN_BOX_WIDTH=${TARGET_DONE_MIN_BOX_WIDTH:-${CFG_TARGET_DONE_MIN_BOX_WIDTH:-0.06}}
+TARGET_DONE_MIN_BOX_HEIGHT=${TARGET_DONE_MIN_BOX_HEIGHT:-${CFG_TARGET_DONE_MIN_BOX_HEIGHT:-0.06}}
+TARGET_DONE_MIN_SCORE=${TARGET_DONE_MIN_SCORE:-${CFG_TARGET_DONE_MIN_SCORE:-0.40}}
+TARGET_DONE_MIN_HOLD_TIME=${TARGET_DONE_MIN_HOLD_TIME:-${CFG_TARGET_DONE_MIN_HOLD_TIME:-0.30}}
+TARGET_DONE_MIN_FRESH_HITS=${TARGET_DONE_MIN_FRESH_HITS:-${CFG_TARGET_DONE_MIN_FRESH_HITS:-3}}
+TARGET_DONE_MAX_DETECTION_AGE=${TARGET_DONE_MAX_DETECTION_AGE:-${CFG_TARGET_DONE_MAX_DETECTION_AGE:-0.75}}
+DETECTION_MAX_SOURCE_IMAGE_AGE=${DETECTION_MAX_SOURCE_IMAGE_AGE:-${CFG_DETECTION_MAX_SOURCE_IMAGE_AGE:-1.0}}
+FOLLOW_GOAL_PUBLISH_PERIOD=${FOLLOW_GOAL_PUBLISH_PERIOD:-${CFG_FOLLOW_GOAL_PUBLISH_PERIOD:-0.30}}
+FOLLOW_TARGET_STEP_DISTANCE=${FOLLOW_TARGET_STEP_DISTANCE:-${CFG_FOLLOW_TARGET_STEP_DISTANCE:-1.0}}
+FOLLOW_TARGET_USE_SCAN_CLIP=${FOLLOW_TARGET_USE_SCAN_CLIP:-${CFG_FOLLOW_TARGET_USE_SCAN_CLIP:-false}}
+TARGET_REACQUIRE_DURATION=${TARGET_REACQUIRE_DURATION:-${CFG_TARGET_REACQUIRE_DURATION:-6.0}}
+TARGET_REACQUIRE_DISTANCE=${TARGET_REACQUIRE_DISTANCE:-${CFG_TARGET_REACQUIRE_DISTANCE:-1.0}}
+TARGET_REACQUIRE_MAX_ATTEMPTS=${TARGET_REACQUIRE_MAX_ATTEMPTS:-${CFG_TARGET_REACQUIRE_MAX_ATTEMPTS:-1}}
+FOLLOW_CONTEXT_STEP_DISTANCE=${FOLLOW_CONTEXT_STEP_DISTANCE:-${CFG_FOLLOW_CONTEXT_STEP_DISTANCE:-1.5}}
+GLOBAL_FRONTIER_ENABLED=${GLOBAL_FRONTIER_ENABLED:-${CFG_GLOBAL_FRONTIER_ENABLED:-true}}
+GLOBAL_FRONTIER_TOPIC=${GLOBAL_FRONTIER_TOPIC:-${CFG_GLOBAL_FRONTIER_TOPIC:-/lste/global_frontier_goal}}
+TEB_GOAL_TERMINAL_TOPIC=${TEB_GOAL_TERMINAL_TOPIC:-${CFG_TEB_GOAL_TERMINAL_TOPIC:-/lste/teb_goal_terminal}}
+TEB_GOAL_FAILURE_TOPIC=${TEB_GOAL_FAILURE_TOPIC:-${CFG_TEB_GOAL_FAILURE_TOPIC:-/lste/teb_goal_failure}}
+GOAL_INTENT_TOPIC=${GOAL_INTENT_TOPIC:-${CFG_GOAL_INTENT_TOPIC:-/lste/goal_intent}}
+GLOBAL_FRONTIER_MAX_AGE=${GLOBAL_FRONTIER_MAX_AGE:-${CFG_GLOBAL_FRONTIER_MAX_AGE:-3.0}}
+GLOBAL_FRONTIER_PERIOD=${GLOBAL_FRONTIER_PERIOD:-${CFG_GLOBAL_FRONTIER_PERIOD:-1.0}}
+GLOBAL_FRONTIER_UPDATE_RADIUS=${GLOBAL_FRONTIER_UPDATE_RADIUS:-${CFG_GLOBAL_FRONTIER_UPDATE_RADIUS:-0.75}}
+GLOBAL_FRONTIER_EARLY_HANDOFF_RADIUS=${GLOBAL_FRONTIER_EARLY_HANDOFF_RADIUS:-${CFG_GLOBAL_FRONTIER_EARLY_HANDOFF_RADIUS:-0.95}}
+GLOBAL_FRONTIER_JUMP_DISTANCE=${GLOBAL_FRONTIER_JUMP_DISTANCE:-${CFG_GLOBAL_FRONTIER_JUMP_DISTANCE:-2.0}}
+GLOBAL_FRONTIER_CLEARANCE=${GLOBAL_FRONTIER_CLEARANCE:-${CFG_GLOBAL_FRONTIER_CLEARANCE:-0.52}}
+GLOBAL_FRONTIER_FALLBACK_CLEARANCE=${GLOBAL_FRONTIER_FALLBACK_CLEARANCE:-${CFG_GLOBAL_FRONTIER_FALLBACK_CLEARANCE:-0.30}}
+GLOBAL_FRONTIER_APPROACH_DISTANCE=${GLOBAL_FRONTIER_APPROACH_DISTANCE:-${CFG_GLOBAL_FRONTIER_APPROACH_DISTANCE:-1.0}}
+GLOBAL_FRONTIER_MIN_PATH_DISTANCE=${GLOBAL_FRONTIER_MIN_PATH_DISTANCE:-${CFG_GLOBAL_FRONTIER_MIN_PATH_DISTANCE:-1.2}}
+GLOBAL_FRONTIER_LOOKAHEAD_DISTANCE=${GLOBAL_FRONTIER_LOOKAHEAD_DISTANCE:-${CFG_GLOBAL_FRONTIER_LOOKAHEAD_DISTANCE:-4.0}}
+GLOBAL_FRONTIER_WAYPOINT_RELEASE_RADIUS=${GLOBAL_FRONTIER_WAYPOINT_RELEASE_RADIUS:-${CFG_GLOBAL_FRONTIER_WAYPOINT_RELEASE_RADIUS:-1.20}}
+GLOBAL_FRONTIER_ACTIVE_TIMEOUT=${GLOBAL_FRONTIER_ACTIVE_TIMEOUT:-${CFG_GLOBAL_FRONTIER_ACTIVE_TIMEOUT:-45.0}}
+GLOBAL_FRONTIER_STALL_TIMEOUT=${GLOBAL_FRONTIER_STALL_TIMEOUT:-${CFG_GLOBAL_FRONTIER_STALL_TIMEOUT:-12.0}}
+GLOBAL_FRONTIER_COMPLETED_RADIUS=${GLOBAL_FRONTIER_COMPLETED_RADIUS:-${CFG_GLOBAL_FRONTIER_COMPLETED_RADIUS:-1.25}}
+GLOBAL_FRONTIER_STRUCTURE_RADIUS_CELLS=${GLOBAL_FRONTIER_STRUCTURE_RADIUS_CELLS:-${CFG_GLOBAL_FRONTIER_STRUCTURE_RADIUS_CELLS:-10}}
+GLOBAL_FRONTIER_STRUCTURE_WEIGHT=${GLOBAL_FRONTIER_STRUCTURE_WEIGHT:-${CFG_GLOBAL_FRONTIER_STRUCTURE_WEIGHT:-0.16}}
+GLOBAL_FRONTIER_MIN_STRUCTURE_CELLS=${GLOBAL_FRONTIER_MIN_STRUCTURE_CELLS:-${CFG_GLOBAL_FRONTIER_MIN_STRUCTURE_CELLS:-3}}
+GLOBAL_FRONTIER_HEADING_WEIGHT=${GLOBAL_FRONTIER_HEADING_WEIGHT:-${CFG_GLOBAL_FRONTIER_HEADING_WEIGHT:-2.5}}
+GLOBAL_FRONTIER_HEADING_HARD_LIMIT_DEG=${GLOBAL_FRONTIER_HEADING_HARD_LIMIT_DEG:-${CFG_GLOBAL_FRONTIER_HEADING_HARD_LIMIT_DEG:-115.0}}
+GLOBAL_FRONTIER_PLANNING_PERIOD=${GLOBAL_FRONTIER_PLANNING_PERIOD:-${CFG_GLOBAL_FRONTIER_PLANNING_PERIOD:-1.5}}
 GOAL_DEBUG_LOG=${GOAL_DEBUG_LOG:-${CFG_GOAL_DEBUG_LOG:-false}}
+GLOBAL_GOAL_SOURCE=${GLOBAL_GOAL_SOURCE:-${CFG_GLOBAL_GOAL_SOURCE:-brain}}
+FIXED_GLOBAL_GOAL_X=${FIXED_GLOBAL_GOAL_X:-${CFG_FIXED_GLOBAL_GOAL_X:-0.0}}
+FIXED_GLOBAL_GOAL_Y=${FIXED_GLOBAL_GOAL_Y:-${CFG_FIXED_GLOBAL_GOAL_Y:-0.0}}
+FIXED_GLOBAL_GOAL_YAW=${FIXED_GLOBAL_GOAL_YAW:-${CFG_FIXED_GLOBAL_GOAL_YAW:-0.0}}
+FIXED_GLOBAL_GOAL_PUBLISH_PERIOD=${FIXED_GLOBAL_GOAL_PUBLISH_PERIOD:-${CFG_FIXED_GLOBAL_GOAL_PUBLISH_PERIOD:-1.0}}
+FIXED_GLOBAL_GOAL_ALLOW_CLICK_OVERRIDE=${FIXED_GLOBAL_GOAL_ALLOW_CLICK_OVERRIDE:-${CFG_FIXED_GLOBAL_GOAL_ALLOW_CLICK_OVERRIDE:-false}}
 FRONTIER_LOG=${FRONTIER_LOG:-${CFG_FRONTIER_LOG:-true}}
 # The Gazebo click-coordinate plugin is part of the required operator UI.
 GUI=true
@@ -242,7 +314,35 @@ tmux_new_window 3 "$WS/model/MiniCPM/test" "vllm" \
 # 4: 全局目标（/lste/final_goal）
 tmux_new_window 4 "$WS" "goal" \
   "$WAIT_ROSCORE; rosrun lste_topo_access lste_goal_manager.py \
-    _follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME _debug_goal_log:=$GOAL_DEBUG_LOG"
+    _follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME _debug_goal_log:=$GOAL_DEBUG_LOG \
+    _target_done_min_box_width:=$TARGET_DONE_MIN_BOX_WIDTH \
+    _target_done_min_box_height:=$TARGET_DONE_MIN_BOX_HEIGHT \
+    _target_done_min_score:=$TARGET_DONE_MIN_SCORE \
+    _target_done_min_hold_time:=$TARGET_DONE_MIN_HOLD_TIME \
+    _target_done_min_fresh_hits:=$TARGET_DONE_MIN_FRESH_HITS \
+    _target_done_max_detection_age:=$TARGET_DONE_MAX_DETECTION_AGE \
+    _follow_goal_publish_period:=$FOLLOW_GOAL_PUBLISH_PERIOD \
+    _follow_target_step_distance:=$FOLLOW_TARGET_STEP_DISTANCE \
+    _follow_target_use_scan_clip:=$FOLLOW_TARGET_USE_SCAN_CLIP \
+    _target_reacquire_duration:=$TARGET_REACQUIRE_DURATION \
+    _target_reacquire_distance:=$TARGET_REACQUIRE_DISTANCE \
+    _target_reacquire_max_attempts:=$TARGET_REACQUIRE_MAX_ATTEMPTS \
+    _follow_context_step_distance:=$FOLLOW_CONTEXT_STEP_DISTANCE \
+    _global_frontier_enabled:=$GLOBAL_FRONTIER_ENABLED \
+    _global_frontier_topic:=$GLOBAL_FRONTIER_TOPIC \
+    _teb_goal_terminal_topic:=$TEB_GOAL_TERMINAL_TOPIC \
+    _teb_goal_failure_topic:=$TEB_GOAL_FAILURE_TOPIC \
+    _goal_intent_topic:=$GOAL_INTENT_TOPIC \
+    _global_frontier_max_age:=$GLOBAL_FRONTIER_MAX_AGE \
+    _global_frontier_period:=$GLOBAL_FRONTIER_PERIOD \
+    _global_frontier_update_radius:=$GLOBAL_FRONTIER_UPDATE_RADIUS \
+    _global_frontier_early_handoff_radius:=$GLOBAL_FRONTIER_EARLY_HANDOFF_RADIUS \
+    _global_frontier_jump_distance:=$GLOBAL_FRONTIER_JUMP_DISTANCE \
+    _global_goal_source:=$GLOBAL_GOAL_SOURCE \
+    _fixed_goal_x:=$FIXED_GLOBAL_GOAL_X _fixed_goal_y:=$FIXED_GLOBAL_GOAL_Y \
+    _fixed_goal_yaw:=$FIXED_GLOBAL_GOAL_YAW \
+    _fixed_goal_publish_period:=$FIXED_GLOBAL_GOAL_PUBLISH_PERIOD \
+    _fixed_goal_allow_click_override:=$FIXED_GLOBAL_GOAL_ALLOW_CLICK_OVERRIDE"
 
 # 5: prompt 节点先查缓存，仅在 miss 时等待 VLLM
 tmux_new_window 5 "$WS" "prompt" \
@@ -259,8 +359,9 @@ tmux_new_window 5 "$WS" "prompt" \
 tmux_new_window 6 "$WS" "detector" \
   "$WAIT_ROSCORE; conda activate dino; export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7; \
    export LD_LIBRARY_PATH=\"\$CONDA_PREFIX/lib/python3.9/site-packages/tensorrt_libs:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cudnn/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cublas/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cufft/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/curand/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cusolver/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cusparse/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cuda_runtime/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cuda_nvrtc/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/nvjitlink/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/torch/lib:\${LD_LIBRARY_PATH:-}\"; \
-   rosrun lste_core $DETECTOR_NODE \
-     _min_inference_interval:=$DETECTOR_MIN_INTERVAL \
+    rosrun lste_core $DETECTOR_NODE \
+      _min_inference_interval:=$DETECTOR_MIN_INTERVAL \
+      _max_source_image_age:=$DETECTION_MAX_SOURCE_IMAGE_AGE \
      _interval_pass:=$DETECTOR_INTERVAL_PASS \
      _interval_suspicious:=$DETECTOR_INTERVAL_SUSPICIOUS \
      _interval_locked:=$DETECTOR_INTERVAL_LOCKED \
@@ -277,7 +378,12 @@ tmux_new_window 7 "$WS" "score" \
 
 # 8: state
 tmux_new_window 8 "$WS" "state" \
-  "$WAIT_ROSCORE; rosrun lste_core lste_state_node.py _suspicious_window:=$SUSPICIOUS_WINDOW"
+  "$WAIT_ROSCORE; rosrun lste_core lste_state_node.py \
+    _suspicious_window:=$SUSPICIOUS_WINDOW \
+    _lock_total_enter:=$TARGET_LOCK_TOTAL_MIN _lock_target_enter:=$TARGET_LOCK_SCORE_MIN \
+    _lock_enter_frames:=$TARGET_LOCK_WINDOW _lock_enter_min_hits:=$TARGET_LOCK_MIN_HITS \
+    _lock_total_exit:=$TARGET_LOCK_EXIT_TOTAL_MIN _lock_target_exit:=$TARGET_LOCK_EXIT_SCORE_MIN \
+    _lock_exit_unstable_frames:=$TARGET_LOCK_EXIT_UNSTABLE_FRAMES"
 
 # 9: 可视化（叠加图 + RViz）
 tmux_new_window 9 "$WS" "vis" \
@@ -291,23 +397,54 @@ tmux_new_window 9 "$WS" "vis" \
 tmux_new_window 10 "$WS" "oc_srfc" \
   "$WAIT_ROSCORE; roslaunch lste_oc_srfc oc_srfc_proj.launch"
 
-# 11: topo frontier（需 vsgp 环境）
-tmux_new_window 11 "$WS" "gp_frontier" \
-  "$WAIT_ROSCORE; conda activate vsgp; roslaunch lste_topo_access gp_frontier.launch \
-    access_topo_config:=$ACCESS_TOPO_CONFIG \
-    access_topo_config_pass:=$ACCESS_TOPO_CONFIG_PASS \
-    access_topo_config_sus_c:=$ACCESS_TOPO_CONFIG_SUS_C \
-    access_topo_test_name:=$ACCESS_TOPO_TEST_NAME \
-    access_topo_run_name:=$ACCESS_TOPO_RUN_NAME \
-    follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME \
-    frontier_log:=$FRONTIER_LOG"
+# 11: Legacy topo frontier（需 vsgp 环境；默认关闭）
+if [[ "${LEGACY_GP_FRONTIER_ENABLED,,}" == "true" || "$LEGACY_GP_FRONTIER_ENABLED" == "1" ]]; then
+  tmux_new_window 11 "$WS" "gp_frontier" \
+    "$WAIT_ROSCORE; conda activate vsgp; roslaunch lste_topo_access gp_frontier.launch \
+      access_topo_config:=$ACCESS_TOPO_CONFIG \
+      access_topo_config_pass:=$ACCESS_TOPO_CONFIG_PASS \
+      access_topo_config_sus_c:=$ACCESS_TOPO_CONFIG_SUS_C \
+      access_topo_test_name:=$ACCESS_TOPO_TEST_NAME \
+      access_topo_run_name:=$ACCESS_TOPO_RUN_NAME \
+      follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME \
+      frontier_log:=$FRONTIER_LOG \
+      launch_goal_manager:=false"
+else
+  echo "[pipeline] Legacy GP frontier disabled; online SLAM frontier remains active."
+fi
 
-# 12: frontier RViz
-tmux_new_window 12 "$WS" "rviz_frontier" \
-  "$WAIT_ROSCORE; rviz -d $GP_FRONTIER_RVIZ"
+# 12: Online SLAM plus globally connected frontier route. It only provides
+# intermediate exploration waypoints; Goal Manager still owns /lste/final_goal.
+if [[ "${GLOBAL_FRONTIER_ENABLED,,}" == "true" || "$GLOBAL_FRONTIER_ENABLED" == "1" ]]; then
+  tmux_new_window 12 "$WS" "global_frontier" \
+    "$WAIT_ROSCORE; roslaunch lste_topo_access online_slam_frontier.launch \
+      goal_topic:=$GLOBAL_FRONTIER_TOPIC \
+      clearance:=$GLOBAL_FRONTIER_CLEARANCE \
+      fallback_clearance:=$GLOBAL_FRONTIER_FALLBACK_CLEARANCE \
+      frontier_approach_distance:=$GLOBAL_FRONTIER_APPROACH_DISTANCE \
+      min_path_distance:=$GLOBAL_FRONTIER_MIN_PATH_DISTANCE \
+      lookahead_distance:=$GLOBAL_FRONTIER_LOOKAHEAD_DISTANCE \
+      waypoint_release_radius:=$GLOBAL_FRONTIER_WAYPOINT_RELEASE_RADIUS \
+      early_handoff_distance:=$GLOBAL_FRONTIER_EARLY_HANDOFF_RADIUS \
+      active_timeout:=$GLOBAL_FRONTIER_ACTIVE_TIMEOUT \
+      stall_timeout:=$GLOBAL_FRONTIER_STALL_TIMEOUT \
+      completed_radius:=$GLOBAL_FRONTIER_COMPLETED_RADIUS \
+      structure_radius_cells:=$GLOBAL_FRONTIER_STRUCTURE_RADIUS_CELLS \
+      structure_weight:=$GLOBAL_FRONTIER_STRUCTURE_WEIGHT \
+      min_structure_cells:=$GLOBAL_FRONTIER_MIN_STRUCTURE_CELLS \
+      heading_weight:=$GLOBAL_FRONTIER_HEADING_WEIGHT \
+      heading_hard_limit_deg:=$GLOBAL_FRONTIER_HEADING_HARD_LIMIT_DEG \
+      planning_period:=$GLOBAL_FRONTIER_PLANNING_PERIOD"
+fi
 
-# 13: teleop keyboard
-tmux_new_window 13 "$WS" "teleop" \
+# 13: legacy frontier RViz
+if [[ "${LEGACY_GP_FRONTIER_ENABLED,,}" == "true" || "$LEGACY_GP_FRONTIER_ENABLED" == "1" ]]; then
+  tmux_new_window 13 "$WS" "rviz_frontier" \
+    "$WAIT_ROSCORE; rviz -d $GP_FRONTIER_RVIZ"
+fi
+
+# 14: teleop keyboard
+tmux_new_window 14 "$WS" "teleop" \
   "$WAIT_ROSCORE; rosrun teleop_twist_keyboard teleop_twist_keyboard.py cmd_vel:=/cmd_vel"
 
 if [[ -t 0 ]]; then

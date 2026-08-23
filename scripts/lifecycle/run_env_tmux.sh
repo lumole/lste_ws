@@ -13,6 +13,24 @@ if [ -z "${WS:-}" ]; then
 fi
 LSTE_WS="$WS"
 SESSION=lste-env
+
+if [[ "${LSTE_LIFECYCLE_LOCK_HELD:-0}" != "1" ]]; then
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "[error] flock is required to serialize LSTE lifecycle commands." >&2
+    exit 1
+  fi
+  LOCK_DIR="$WS/runtime/lifecycle"
+  mkdir -p "$LOCK_DIR"
+  exec 9>"$LOCK_DIR/lifecycle.lock"
+  if ! flock -n 9; then
+    echo "[error] Another LSTE lifecycle command is already starting or stopping the system." >&2
+    exit 75
+  fi
+  export LSTE_LIFECYCLE_LOCK_HELD=1
+fi
+
+# The tmux server is long-lived, so it must not retain the startup lock fd.
+tmux() { command tmux "$@" 9>&-; }
 PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}
 if [[ -f "$PIPELINE_CONFIG" ]]; then
   eval "$(
@@ -119,7 +137,7 @@ echo "[env] Gazebo world started (window 1)"
 echo ""
 echo "============================================"
 echo "  环境已启动（场景无小车）。运行以下命令："
-echo "  ./scripts/lifecycle/run_nodes_tmux.sh                         （大脑 + SA-PPO）"
+echo "  ./scripts/lifecycle/run_nodes_tmux.sh                         （大脑 + TEB）"
 echo "  LSTE_CONTROLLER=teleop ./scripts/lifecycle/run_nodes_tmux.sh  （大脑 + 键盘遥控）"
 echo "============================================"
 

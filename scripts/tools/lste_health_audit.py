@@ -17,6 +17,7 @@ import rosgraph
 import rospy
 from geometry_msgs.msg import PoseStamped
 from lste_msgs.msg import LsteDetections, LstePrompts, LsteScores
+from std_msgs.msg import Bool
 
 
 DEFAULT_NODES = [
@@ -65,6 +66,12 @@ FRESH_TOPIC_TYPES = {
     "/lste/prompts": LstePrompts,
     "/lste/scores": LsteScores,
 }
+
+# Goal Manager intentionally stops publishing a new global goal after the
+# target has been confirmed.  This is a successful terminal state, not a
+# stale-data failure.  The latched /lste/task_done flag tells the audit when
+# this exception applies.
+COMPLETION_OPTIONAL_TOPICS = {"/lste/final_goal"}
 
 
 class _TimeoutTransport(xmlrpc.client.Transport):
@@ -152,6 +159,7 @@ class HealthAudit:
         self.cuda_detail = "not checked"
         self.unreachable_nodes: List[str] = []
         self.ready_once = False
+        self.task_done = False
         self.last_signature = ""
         self.last_healthy_log = 0.0
         self.last_payload: Dict[str, object] = {}
@@ -167,6 +175,9 @@ class HealthAudit:
             )
             for topic in self.fresh_topics
         ]
+        self.task_done_subscriber = rospy.Subscriber(
+            "/lste/task_done", Bool, self._task_done_callback, queue_size=1
+        )
         rospy.on_shutdown(self._write_stopped)
         print(
             "[health] sidecar started: grace=%.1fs interval=%.1fs status=%s"
@@ -176,6 +187,9 @@ class HealthAudit:
 
     def _message_callback(self, _message: rospy.AnyMsg, topic: str) -> None:
         self.last_messages[topic] = time.monotonic()
+
+    def _task_done_callback(self, message: Bool) -> None:
+        self.task_done = bool(message.data)
 
     def _system_state(self) -> Tuple[Set[str], Set[str], str]:
         try:
@@ -271,11 +285,14 @@ class HealthAudit:
             last_seen = self.last_messages.get(topic)
             if last_seen is None:
                 message_ages[topic] = None
-                stale_topics.append(topic)
+                if not (self.task_done and topic in COMPLETION_OPTIONAL_TOPICS):
+                    stale_topics.append(topic)
                 continue
             age = max(0.0, now - last_seen)
             message_ages[topic] = round(age, 3)
-            if age > threshold:
+            if age > threshold and not (
+                self.task_done and topic in COMPLETION_OPTIONAL_TOPICS
+            ):
                 stale_topics.append(topic)
 
         failures = []
@@ -314,6 +331,7 @@ class HealthAudit:
             "sidecar_pid": os.getpid(),
             "uptime_seconds": round(now - self.started_at, 3),
             "startup_grace_seconds": self.startup_grace,
+            "task_done": self.task_done,
             "failures": failures,
             "cuda": {
                 "ok": self.cuda_ok,

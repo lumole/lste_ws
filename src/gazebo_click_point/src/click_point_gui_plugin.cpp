@@ -2,8 +2,10 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <ros/callback_queue.h>
 #include <ros/ros.h>
+#include <std_msgs/Bool.h>
 #include <std_msgs/Empty.h>
 #include <std_msgs/String.h>
+#include <std_srvs/Empty.h>
 
 #include <cstdlib>
 #include <memory>
@@ -49,6 +51,8 @@ public:
     this->gazeboNode_->Init();
     this->saveControlPublisher_ =
         this->gazeboNode_->Advertise<msgs::ServerControl>("/gazebo/server/control");
+    this->pauseClient_ = this->node_->serviceClient<std_srvs::Empty>("/gazebo/pause_physics");
+    this->unpauseClient_ = this->node_->serviceClient<std_srvs::Empty>("/gazebo/unpause_physics");
 
     this->controllerButton_ = new QToolButton(this);
     this->controllerButton_->setText("RL / KB");
@@ -64,18 +68,41 @@ public:
     QObject::connect(this->saveButton_, &QToolButton::clicked,
                      [this]() { this->SaveCurrentWorld(); });
 
+    // Pause/resume: the Space bar or this button toggles Gazebo physics so the
+    // operator can freeze the scene and explain a problem while the debug
+    // console inspects the paused state.  The same state is exposed on
+    // /lste/pause (std_msgs/Bool) so the console can pause/resume remotely.
+    this->pauseButton_ = new QToolButton(this);
+    this->pauseButton_->setText("Pause");
+    this->pauseButton_->setToolTip("Pause / resume simulation (Space)");
+    this->pauseButton_->setCheckable(true);
+    this->pauseButton_->setChecked(false);
+    this->pauseButton_->setFixedSize(52, 28);
+    QObject::connect(this->pauseButton_, &QToolButton::clicked,
+                     [this](bool checked) { this->TogglePause(checked); });
+
     auto *layout = new QHBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(2);
     layout->addWidget(this->controllerButton_);
     layout->addWidget(this->saveButton_);
+    layout->addWidget(this->pauseButton_);
     this->setLayout(layout);
-    this->setFixedSize(130, 28);
+    this->setFixedSize(185, 28);
     this->move(10, 10);
 
     this->controllerShortcut_ = new QShortcut(QKeySequence("Ctrl+Shift+K"), this);
     this->controllerShortcut_->setContext(Qt::ApplicationShortcut);
     QObject::connect(this->controllerShortcut_, &QShortcut::activated,
                      [this]() { this->PublishControllerToggle(); });
+
+    this->pauseShortcut_ = new QShortcut(QKeySequence(Qt::Key_Space), this);
+    this->pauseShortcut_->setContext(Qt::ApplicationShortcut);
+    QObject::connect(this->pauseShortcut_, &QShortcut::activated, [this]() {
+      this->TogglePause(!this->isPaused_);
+    });
+    this->pauseSubscriber_ = this->node_->subscribe(
+        "/lste/pause", 1, &ClickPointGuiPlugin::OnPauseCommand, this);
 
     this->rosSpinTimer_ = new QTimer(this);
     QObject::connect(this->rosSpinTimer_, &QTimer::timeout, [this]()
@@ -144,6 +171,29 @@ private:
     std_msgs::Empty message;
     this->controllerTogglePublisher_.publish(message);
     QToolTip::showText(QCursor::pos(), "Switching controller...");
+  }
+
+  void TogglePause(bool pause)
+  {
+    this->isPaused_ = pause;
+    this->pauseButton_->setChecked(pause);
+    // std_srvs::Empty is the service type; call(srv) uses srv.request/response
+    // internally.  Passing two service objects to call() would try to
+    // serialize the service container, which has no serialization methods.
+    std_srvs::Empty srv;
+    const auto client =
+        pause ? &this->pauseClient_ : &this->unpauseClient_;
+    if (!client->isValid() || !client->call(srv))
+      return;
+    const auto text = pause ? QString("Simulation paused (Space to resume)")
+                            : QString("Simulation resumed");
+    QToolTip::showText(QCursor::pos(), text, this);
+    QTimer::singleShot(1200, []() { QToolTip::hideText(); });
+  }
+
+  void OnPauseCommand(const std_msgs::Bool::ConstPtr &message)
+  {
+    this->TogglePause(message->data);
   }
 
   void OnControllerMode(const std_msgs::String::ConstPtr &message)
@@ -232,12 +282,18 @@ private:
   ros::Publisher goalPublisher_;
   ros::Publisher controllerTogglePublisher_;
   ros::Subscriber controllerModeSubscriber_;
+  ros::Subscriber pauseSubscriber_;
   transport::NodePtr gazeboNode_;
   transport::PublisherPtr saveControlPublisher_;
+  ros::ServiceClient pauseClient_;
+  ros::ServiceClient unpauseClient_;
   QToolButton *controllerButton_ = nullptr;
   QToolButton *saveButton_ = nullptr;
+  QToolButton *pauseButton_ = nullptr;
   QShortcut *controllerShortcut_ = nullptr;
+  QShortcut *pauseShortcut_ = nullptr;
   QTimer *rosSpinTimer_ = nullptr;
+  bool isPaused_ = false;
   std::string currentControllerMode_;
   std::string pendingControllerMode_;
   ignition::math::Vector3d selectedPoint_;

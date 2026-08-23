@@ -18,6 +18,8 @@
 | [gp_subgoal_business_flow_07232026.md](navigation/gp_subgoal_business_flow_07232026.md) | GP subgoal 的业务流程 |
 | [s_env_math_07232026.md](navigation/s_env_math_07232026.md) | S-env 的运行时数学说明 |
 | [fixed_goal_navigation_debugging_07232026.md](navigation/fixed_goal_navigation_debugging_07232026.md) | 固定目标绕墙测试、故障定位和 TEB 基线 |
+| [fixed_global_goal_integration_08052026.md](navigation/fixed_global_goal_integration_08052026.md) | 固定坐标接入正式 `/lste/final_goal`、配置与验证证据 |
+| [online_slam_teb_navigation_08062026.md](navigation/online_slam_teb_navigation_08062026.md) | 未知环境在线 SLAM、frontier、Navfn、TEB 接入和端到端验证 |
 
 ## perception
 

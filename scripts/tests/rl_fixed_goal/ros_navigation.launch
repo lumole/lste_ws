@@ -4,6 +4,10 @@
   <arg name="scan_topic" default="/pro3/rlscan"/>
   <arg name="odom_topic" default="/pro3/wheel_odom"/>
   <arg name="max_linear_speed" default="0.50"/>
+  <!-- Compare TEB's single-band and multi-topology architectures in the
+       isolated fixed-goal experiment.  The production pipeline uses the same
+       capability switch in teb_navigation.launch. -->
+  <arg name="teb_homotopy_class_planning" default="false"/>
   <!-- Keep the local planner selectable for isolated controller comparisons.
        DWA remains available as dwa_local_planner/DWAPlannerROS. -->
   <arg name="local_planner_plugin" default="teb_local_planner/TebLocalPlannerROS"/>
@@ -125,10 +129,17 @@
          safety limit; this larger range only makes wall-hugging expensive. -->
     <param name="TebLocalPlannerROS/inflation_dist" value="0.80"/>
     <param name="TebLocalPlannerROS/include_costmap_obstacles" value="true"/>
-    <!-- Navfn already selects the global side of each obstacle. Replanning
-         alternate local homotopy classes on every changing SLAM update was
-         the source of left/right steering flips on this fixed route. -->
-    <param name="TebLocalPlannerROS/enable_homotopy_class_planning" value="false"/>
+    <!-- The local planner evaluates both sides of a blocking obstacle from
+         the live lidar costmap.  Deterministic left/right exploration keeps
+         the candidate set stable across map updates. -->
+    <param name="TebLocalPlannerROS/enable_homotopy_class_planning" value="$(arg teb_homotopy_class_planning)"/>
+    <param name="TebLocalPlannerROS/enable_multithreading" value="true"/>
+    <param name="TebLocalPlannerROS/simple_exploration" value="true"/>
+    <param name="TebLocalPlannerROS/max_number_classes" value="5"/>
+    <!-- Keep the Navfn route as the preferred candidate while allowing an
+         alternate topology to leave its via-points when the online map is
+         stale or incomplete. -->
+    <param name="TebLocalPlannerROS/viapoints_all_candidates" value="false"/>
     <param name="TebLocalPlannerROS/weight_kinematics_nh" value="1000.0"/>
     <param name="TebLocalPlannerROS/weight_kinematics_forward_drive" value="1000.0"/>
     <param name="TebLocalPlannerROS/weight_obstacle" value="50.0"/>

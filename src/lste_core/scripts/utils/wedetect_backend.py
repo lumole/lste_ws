@@ -40,7 +40,9 @@ class WeDetectBackend:
     # translated.
     DEFAULT_LABEL_MAP = {
         "blue mug": "蓝色杯子",
+        "blue cup": "蓝色杯子",
         "yellow mug": "黄色杯子",
+        "yellow cup": "黄色杯子",
         "mug": "杯子",
         "cup": "杯子",
         "desk": "书桌",

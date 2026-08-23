@@ -5,14 +5,14 @@ import rospy
 from std_msgs.msg import Empty, String
 
 
-VALID_MODES = ("sappo", "teleop")
+VALID_MODES = ("sappo", "teleop", "teb")
 
 
 class ControllerSwitchNode:
     def __init__(self):
         rospy.init_node("lste_controller_switch")
-        initial_mode = rospy.get_param("~initial_mode", "sappo")
-        self.mode = initial_mode if initial_mode in VALID_MODES else "sappo"
+        initial_mode = rospy.get_param("~initial_mode", "teb")
+        self.mode = initial_mode if initial_mode in VALID_MODES else "teb"
         self.lock = threading.Lock()
         self.mode_pub = rospy.Publisher("/lste/controller_mode", String, queue_size=1, latch=True)
         self.toggle_sub = rospy.Subscriber(
@@ -43,7 +43,10 @@ class ControllerSwitchNode:
         rospy.loginfo("Controller switched: %s -> %s", previous, mode)
 
     def on_toggle(self, _message):
-        target = "teleop" if self.mode == "sappo" else "sappo"
+        # The Gazebo hotkey is intentionally a quick RL/keyboard toggle. TEB
+        # remains selectable by the explicit controller command, while a
+        # safety toggle from TEB always lands on keyboard control.
+        target = "teleop" if self.mode in ("sappo", "teb") else "sappo"
         self.set_mode(target)
 
     def on_select(self, message):

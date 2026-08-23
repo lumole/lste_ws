@@ -1,0 +1,136 @@
+<launch>
+  <!-- Online map only: no prebuilt map and no move_base controller. -->
+  <arg name="scan_topic" default="/pro3/rlscan"/>
+  <arg name="odom_topic" default="/pro3/wheel_odom"/>
+  <arg name="pose_topic" default="/rbt_pose"/>
+  <!-- Candidate validation follows the same inflated grid used by Navfn. -->
+  <arg name="costmap_topic" default="/move_base/global_costmap/costmap"/>
+  <arg name="costmap_updates_topic" default="/move_base/global_costmap/costmap_updates"/>
+  <arg name="costmap_max_age" default="3.0"/>
+  <!-- Connectivity validation is throttled because the rolling local
+       costmap/TEB checks every command at a higher rate. -->
+  <arg name="costmap_validation_period" default="2.0"/>
+  <!-- Validate only selected/prefetched candidates with the live Navfn
+       service. A false response means the candidate has no executable global
+       path even if a simplified occupancy BFS considered it connected. -->
+  <arg name="navfn_plan_validation" default="true"/>
+  <arg name="navfn_make_plan_service" default="/move_base/NavfnROS/make_plan"/>
+  <arg name="navfn_make_plan_timeout" default="0.05"/>
+  <arg name="navfn_make_plan_tolerance" default="0.20"/>
+  <arg name="goal_topic" default="/lste/global_frontier_goal"/>
+  <!-- Lifecycle event consumed by Goal Manager and the TEB action bridge.
+       It releases an invalidated action before the explorer selects another
+       connected branch. -->
+  <arg name="status_topic" default="/lste/global_frontier/status"/>
+  <arg name="turn_status_topic" default="/lste/teb_turn_supervisor/status"/>
+  <arg name="task_done_topic" default="/lste/task_done"/>
+  <!-- Route-safe clearance: 0.30 m robot radius + 0.22 m TEB minimum
+       obstacle distance. Frontier cells themselves may be closer; the node
+       publishes a safe approach point instead of the boundary cell. -->
+  <arg name="clearance" default="0.52"/>
+  <!-- Kept under the old argument name for launch compatibility. This is the
+       information-boundary detection clearance, never a route relaxation. -->
+  <arg name="fallback_clearance" default="0.30"/>
+  <arg name="frontier_approach_distance" default="1.0"/>
+  <arg name="min_path_distance" default="1.2"/>
+  <!-- Retained for launch compatibility; the explorer now publishes the
+       selected frontier endpoint instead of slicing a short lookahead goal. -->
+  <arg name="lookahead_distance" default="2.0"/>
+  <arg name="waypoint_release_radius" default="0.40"/>
+  <!-- Mission-layer contract: publish one validated frontier endpoint per
+       action. Navfn/TEB replan the path online; rolling short waypoints are
+       retained only for isolated legacy experiments. -->
+  <arg name="mission_endpoint_only" default="true"/>
+  <!-- Select the next branch before the current frontier is reached. This is
+       a pending intent only; the TEB bridge still decides when it is safe to
+       replace the active action.  The 2.5 m prefetch gives the explorer two
+       or three map cycles to validate a continuation before the bridge's
+       1.3 m hot-start window opens. -->
+  <arg name="prefetch_distance" default="2.5"/>
+  <!-- Publish/promote a validated pending branch early enough for the TEB
+       bridge to hot-start it inside its 0.85-1.3 m handoff window.  Promoting
+       at 2.0 m leaves the bridge 0.7 m of runway so a healthy continuation is
+       almost always in place before the endpoint forces a terminal stop. -->
+  <arg name="early_handoff_distance" default="2.0"/>
+  <arg name="active_timeout" default="45.0"/>
+  <arg name="stall_timeout" default="12.0"/>
+  <arg name="unreachable_grace" default="20.0"/>
+  <arg name="rejected_timeout" default="180.0"/>
+  <arg name="completed_radius" default="1.25"/>
+  <arg name="structure_radius_cells" default="10"/>
+  <arg name="structure_weight" default="0.16"/>
+  <arg name="min_structure_cells" default="3"/>
+  <!-- Soft preference for candidates near the robot's current heading.
+       Larger values reduce abrupt branch U-turns; zero restores the old
+       information/structure/path-only score. -->
+  <arg name="heading_weight" default="2.5"/>
+  <!-- Prefetch candidates above this bearing change only when no connected
+       alternative exists. Set 0 to disable the hard bound. -->
+  <arg name="heading_hard_limit_deg" default="115.0"/>
+  <!-- Dead-end detection: within this distance of the active frontier, if no
+       unknown remains within dead_end_unknown_cells of the frontier cell, the
+       route ends at a resolved wall.  Mark it inspected and pick a passage. -->
+  <arg name="dead_end_check_distance" default="4.0"/>
+  <arg name="dead_end_unknown_cells" default="15"/>
+  <!-- Do not rebuild the expensive map/costmap BFS while a healthy active
+       route is far from its frontier. Near-endpoint and stall checks wake it
+       immediately. -->
+  <arg name="planning_period" default="1.5"/>
+
+  <node pkg="gmapping" type="slam_gmapping" name="lste_online_slam" output="screen">
+    <remap from="scan" to="$(arg scan_topic)"/>
+    <remap from="odom" to="$(arg odom_topic)"/>
+    <param name="base_frame" value="base_footprint"/>
+    <param name="odom_frame" value="odom"/>
+    <param name="map_update_interval" value="1.0"/>
+    <param name="linearUpdate" value="0.15"/>
+    <param name="angularUpdate" value="0.15"/>
+    <param name="maxUrange" value="10.0"/>
+    <!-- env04 occupies roughly x=[-2, 25], y=[-15, 7]. At 10 cm this keeps
+         the Python connected-frontier search below 80k cells per cycle. -->
+    <param name="delta" value="0.10"/>
+    <param name="xmin" value="-3.0"/>
+    <param name="xmax" value="27.0"/>
+    <param name="ymin" value="-16.0"/>
+    <param name="ymax" value="9.0"/>
+  </node>
+
+  <node pkg="lste_topo_access" type="lste_global_frontier_node.py" name="lste_global_frontier" output="screen">
+    <param name="map_topic" value="/map"/>
+    <param name="costmap_topic" value="$(arg costmap_topic)"/>
+    <param name="costmap_updates_topic" value="$(arg costmap_updates_topic)"/>
+    <param name="costmap_max_age" value="$(arg costmap_max_age)"/>
+    <param name="costmap_validation_period" value="$(arg costmap_validation_period)"/>
+    <param name="navfn_plan_validation" value="$(arg navfn_plan_validation)"/>
+    <param name="navfn_make_plan_service" value="$(arg navfn_make_plan_service)"/>
+    <param name="navfn_make_plan_timeout" value="$(arg navfn_make_plan_timeout)"/>
+    <param name="navfn_make_plan_tolerance" value="$(arg navfn_make_plan_tolerance)"/>
+    <param name="pose_topic" value="$(arg pose_topic)"/>
+    <param name="goal_topic" value="$(arg goal_topic)"/>
+    <param name="status_topic" value="$(arg status_topic)"/>
+    <param name="turn_status_topic" value="$(arg turn_status_topic)"/>
+    <param name="task_done_topic" value="$(arg task_done_topic)"/>
+    <param name="clearance" value="$(arg clearance)"/>
+    <param name="fallback_clearance" value="$(arg fallback_clearance)"/>
+    <param name="frontier_approach_distance" value="$(arg frontier_approach_distance)"/>
+    <param name="min_path_distance" value="$(arg min_path_distance)"/>
+    <param name="lookahead_distance" value="$(arg lookahead_distance)"/>
+    <param name="waypoint_release_radius" value="$(arg waypoint_release_radius)"/>
+    <param name="mission_endpoint_only" value="$(arg mission_endpoint_only)"/>
+    <param name="prefetch_distance" value="$(arg prefetch_distance)"/>
+    <param name="early_handoff_distance" value="$(arg early_handoff_distance)"/>
+    <param name="active_timeout" value="$(arg active_timeout)"/>
+    <param name="stall_timeout" value="$(arg stall_timeout)"/>
+    <param name="unreachable_grace" value="$(arg unreachable_grace)"/>
+    <param name="rejected_timeout" value="$(arg rejected_timeout)"/>
+    <param name="completed_radius" value="$(arg completed_radius)"/>
+    <param name="structure_radius_cells" value="$(arg structure_radius_cells)"/>
+    <param name="structure_weight" value="$(arg structure_weight)"/>
+    <param name="min_structure_cells" value="$(arg min_structure_cells)"/>
+    <param name="heading_weight" value="$(arg heading_weight)"/>
+    <param name="heading_hard_limit_deg" value="$(arg heading_hard_limit_deg)"/>
+    <param name="dead_end_check_distance" value="$(arg dead_end_check_distance)"/>
+    <param name="dead_end_unknown_cells" value="$(arg dead_end_unknown_cells)"/>
+    <param name="planning_period" value="$(arg planning_period)"/>
+  </node>
+</launch>

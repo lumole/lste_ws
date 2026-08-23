@@ -1810,7 +1810,12 @@
   </state>
   <gui fullscreen='0'>
     <camera name='user_camera'>
-      <pose>20.5062 -5.80459 1.37176 0 0.241796 1.3634</pose>
+      <!-- High top-down startup view centred on the env04 map
+           (x in [-3,27], y in [-16,9]; centre ~(12,-3.5)).  pitch ~84 deg
+           gives a near-vertical overlook while keeping the orbit controller
+           away from the straight-down singularity.  The camera target is
+           shifted 4 m along -X so the map sits 4 m higher in the frame. -->
+      <pose>7 -3.5 45 0 1.4708 0</pose>
       <view_controller>orbit</view_controller>
       <projection_type>perspective</projection_type>
     </camera>
