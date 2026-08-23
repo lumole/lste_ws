@@ -33,6 +33,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [open_vocabulary_detector_research_07232026.md](research/open_vocabulary_detector_research_07232026.md) | 开放词汇检测器的调研和选型 |
+| [semantic_navigation_architecture_survey_08232026.md](research/semantic_navigation_architecture_survey_08232026.md) | 保留 LSTE global goal 的语义导航架构调研与实施建议 |
 
 ## reporting
 
