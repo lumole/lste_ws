@@ -305,6 +305,27 @@ TARGET_ROUTE_VALIDATION: true
 TARGET_ROUTE_VALIDATION_TIMEOUT: 0.05
 TARGET_ROUTE_VALIDATION_TOLERANCE: 0.20
 TARGET_ROUTE_VALIDATION_PERIOD: 1.0
+# Route continuity for a confirmed visual target. Navfn still decides whether
+# every visual-ray endpoint is reachable; this policy chooses among those
+# reachable ladder points using Navfn's first route tangent relative to the
+# car's current heading.
+# true: prefer a target viewpoint whose route can begin as a curve rather than
+# an avoidable stop-and-spin. false: retain the historical first-reachable
+# ladder policy for comparison.
+TARGET_ROUTE_CONTINUITY_ENABLED: true
+# The first Navfn plan displacement used to estimate its entry tangent (m).
+TARGET_ROUTE_CONTINUITY_ENTRY_LOOKAHEAD: 0.35
+# A route within this initial heading difference is considered continuous.
+TARGET_ROUTE_CONTINUITY_SMOOTH_HEADING_DEG: 45.0
+# On initial target lock only, retain a healthy frontier action until its
+# natural terminal when the target route needs at least this much immediate
+# turn. This preserves target identity and retries from that terminal pose;
+# it never bypasses Navfn or the local safety controller.
+TARGET_ROUTE_CONTINUITY_TAKEOVER_HEADING_DEG: 70.0
+TARGET_ROUTE_CONTINUITY_DEFER_SHARP_TAKEOVER: true
+# Across the full viewpoint ladder, a nearer point must improve entry heading
+# by roughly this amount before it wins over the longer target horizon.
+TARGET_ROUTE_CONTINUITY_DISTANCE_TRADEOFF_DEG: 20.0
 # Confirmed visual target segments are bounded approach goals. The bridge may
 # replace one with an already validated successor before move_base stops at
 # its terminal tolerance. It never invents that successor itself.

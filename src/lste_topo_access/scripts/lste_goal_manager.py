@@ -166,6 +166,33 @@ class GoalManager:
         self.target_route_validation_period = max(
             1.0, float(gp("~target_route_validation_period", 1.0))
         )
+        # Reachability alone is not sufficient for a smooth visual-target
+        # takeover: a connected Navfn route can still begin behind the base.
+        # Keep the detector ray as evidence, but use Navfn's actual entry
+        # tangent when selecting a reachable point from the viewpoint ladder.
+        route_continuity = gp("~target_route_continuity_enabled", True)
+        self.target_route_continuity_enabled = str(route_continuity).strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        self.target_route_continuity_entry_lookahead = max(
+            0.05, float(gp("~target_route_continuity_entry_lookahead", 0.35))
+        )
+        self.target_route_continuity_smooth_heading = math.radians(max(
+            1.0, float(gp("~target_route_continuity_smooth_heading_deg", 45.0))
+        ))
+        self.target_route_continuity_takeover_heading = math.radians(max(
+            float(gp("~target_route_continuity_smooth_heading_deg", 45.0)),
+            float(gp("~target_route_continuity_takeover_heading_deg", 70.0)),
+        ))
+        # A shorter visual horizon is selected only when it materially improves
+        # the route-entry angle. This is a route-choice cost, not a TEB gain.
+        self.target_route_continuity_distance_tradeoff = math.radians(max(
+            0.0, float(gp("~target_route_continuity_distance_tradeoff_deg", 20.0))
+        ))
+        defer_takeover = gp("~target_route_continuity_defer_sharp_takeover", True)
+        self.target_route_continuity_defer_sharp_takeover = str(
+            defer_takeover
+        ).strip().lower() in ("1", "true", "yes", "on")
         self.target_cache_max_advances = max(
             0, int(gp("~target_cache_max_advances", 2))
         )
@@ -553,6 +580,12 @@ class GoalManager:
         # with the validation result so the mission and persistent planner use
         # precisely the same endpoint.
         self.target_route_validation_last_endpoint: Optional[PoseStamped] = None
+        # This plan is diagnostic/selection input only. Streaming Navfn and
+        # TEB remain the execution authorities after the goal is committed.
+        self.target_route_validation_last_plan: List[PoseStamped] = []
+        self.target_route_validation_last_start_heading: Optional[float] = None
+        self.target_route_continuity_deferred = False
+        self.target_route_continuity_deferred_goal: Optional[PoseStamped] = None
         self.target_route_hold_last_emit = 0.0
         self.navigation_hold_active = False
         self.target_reacquire_goal: Optional[PoseStamped] = None
@@ -1838,7 +1871,22 @@ class GoalManager:
             self.target_terminal_reobserve_pending
             and self.target_last_goal is not None
         )
-        if target_recent or target_segment_active or target_terminal_pending:
+        # A continuity-deferred lock owns a *frontier* action until its
+        # terminal. It is neither a detector freshness timeout nor a blind
+        # retry: dropping it here would lose a valid target merely because the
+        # healthy route to the next observation boundary took longer than one
+        # detector timeout.
+        target_takeover_deferred = bool(
+            self.target_route_continuity_deferred
+            and self.last_goal is not None
+            and self.last_goal_source == "global_slam_frontier"
+        )
+        if (
+            target_recent
+            or target_segment_active
+            or target_terminal_pending
+            or target_takeover_deferred
+        ):
             # Never let legacy access-topology recovery preempt a current (or
             # just-lost) visual target ray.  goal_from_target_follow preserves
             # the last short visual-servo goal through a brief detector gap.
@@ -1973,6 +2021,87 @@ class GoalManager:
         return EXPLORE_PASS_MODE
 
     # -------------------- Follow helpers --------------------
+    def target_route_entry_heading(self) -> Optional[float]:
+        """Return the first meaningful Navfn tangent for the last validation.
+
+        GoalManager never executes this plan.  It uses the first tangent only
+        to decide whether two equally reachable visual viewpoints have a
+        materially different handoff cost for the still-moving base.
+        """
+        if (
+            not self.target_route_validation_last_plan
+            or self.target_route_validation_last_start_heading is None
+        ):
+            return None
+        first = self.target_route_validation_last_plan[0]
+        start_x = float(first.pose.position.x)
+        start_y = float(first.pose.position.y)
+        for pose in self.target_route_validation_last_plan[1:]:
+            dx = float(pose.pose.position.x) - start_x
+            dy = float(pose.pose.position.y) - start_y
+            if math.hypot(dx, dy) >= self.target_route_continuity_entry_lookahead:
+                return math.atan2(dy, dx)
+        return None
+
+    def target_route_continuity(self, distance: float, desired_distance: float):
+        """Score the just-validated route against the current map-frame yaw."""
+        entry_heading = self.target_route_entry_heading()
+        current_heading = self.target_route_validation_last_start_heading
+        heading_error = None
+        if entry_heading is not None and current_heading is not None:
+            heading_error = abs(wrap_angle(entry_heading - current_heading))
+
+        # Preserve the longer observation horizon unless the nearer endpoint
+        # buys a significant reduction in immediate steering. This prevents a
+        # nominally smooth policy from always picking the shortest rung and
+        # multiplying terminal/re-observation transitions.
+        distance_penalty = 0.0
+        ladder_span = max(
+            1e-3,
+            desired_distance - self.target_minimum_viewpoint_distance(),
+        )
+        if desired_distance > distance:
+            distance_penalty = self.target_route_continuity_distance_tradeoff * (
+                (desired_distance - distance) / ladder_span
+            )
+        score = (heading_error if heading_error is not None else math.pi) + distance_penalty
+        tier = "unknown"
+        if heading_error is not None:
+            tier = (
+                "smooth"
+                if heading_error <= self.target_route_continuity_smooth_heading
+                else "sharp"
+            )
+        return entry_heading, heading_error, distance_penalty, score, tier
+
+    def should_defer_sharp_target_takeover(
+        self,
+        source: str,
+        entry_heading_error: Optional[float],
+    ) -> bool:
+        """Keep a healthy frontier action when target lock would force a U-turn.
+
+        This applies only to the first target takeover. Subsequent visual
+        segments are terminal-driven, so delaying them here would strand the
+        robot at a target observation boundary instead of solving a genuine
+        route bend.
+        """
+        if (
+            not self.target_route_continuity_enabled
+            or not self.target_route_continuity_defer_sharp_takeover
+            or source != "target_follow"
+            or entry_heading_error is None
+            or entry_heading_error < self.target_route_continuity_takeover_heading
+            or self.last_goal is None
+            or self.last_goal_source != "global_slam_frontier"
+            or self.teb_terminal_goal is not None
+        ):
+            return False
+        distance_to_frontier = self.goal_robot_distance(self.last_goal)
+        if distance_to_frontier is None:
+            return False
+        return distance_to_frontier > self.target_continuous_handoff_distance
+
     def commit_target_segment(self, now: float, source: str, advance: bool = False) -> Optional[PoseStamped]:
         """Commit one visual-servo horizon as an atomic navigation intent.
 
@@ -1987,9 +2116,16 @@ class GoalManager:
         selected_requested_goal = None
         selected_distance = None
         selected_index = None
+        selected_entry_heading = None
+        selected_entry_heading_error = None
+        selected_distance_penalty = None
+        selected_continuity_score = None
+        selected_continuity_tier = "unknown"
         last_requested_goal = None
         rejected_distances = []
         route_status = None
+        desired_distance = self.target_segment_distance()
+        reachable_candidates = []
         for candidate_index, distance in enumerate(self.target_segment_distances()):
             x = self.latest_pose.x + distance * math.cos(self.target_last_heading)
             y = self.latest_pose.y + distance * math.sin(self.target_last_heading)
@@ -2026,13 +2162,49 @@ class GoalManager:
                 if self.target_route_validation_last_endpoint is None:
                     route_status = None
                     break
-                selected_goal = copy.deepcopy(
+                returned_goal = copy.deepcopy(
                     self.target_route_validation_last_endpoint
                 )
-                selected_requested_goal = copy.deepcopy(candidate_goal)
-                selected_distance = distance
-                selected_index = candidate_index
-                break
+                (
+                    entry_heading,
+                    entry_heading_error,
+                    distance_penalty,
+                    continuity_score,
+                    continuity_tier,
+                ) = self.target_route_continuity(distance, desired_distance)
+                reachable_candidates.append({
+                    "goal": returned_goal,
+                    "requested_goal": copy.deepcopy(candidate_goal),
+                    "distance": float(distance),
+                    "index": int(candidate_index),
+                    "entry_heading": entry_heading,
+                    "entry_heading_error": entry_heading_error,
+                    "distance_penalty": distance_penalty,
+                    "continuity_score": continuity_score,
+                    "continuity_tier": continuity_tier,
+                })
+                self.publish_goal_arbitration(
+                    "target_viewpoint_evaluated",
+                    target_track_id=self.target_track_id,
+                    strategy=self.target_approach_strategy,
+                    candidate_index=int(candidate_index),
+                    distance=round(float(distance), 3),
+                    navfn_entry_heading=(
+                        None if entry_heading is None else round(float(entry_heading), 4)
+                    ),
+                    navfn_entry_heading_error=(
+                        None
+                        if entry_heading_error is None
+                        else round(float(entry_heading_error), 4)
+                    ),
+                    continuity_distance_penalty=round(float(distance_penalty), 4),
+                    continuity_score=round(float(continuity_score), 4),
+                    continuity_tier=continuity_tier,
+                )
+                # Test the whole bounded ladder before committing.  The old
+                # first-reachable rule had no way to prefer a route that
+                # preserves the car's current tangent.
+                continue
             if route_status is None:
                 break
             rejected_distances.append(round(float(distance), 3))
@@ -2044,6 +2216,27 @@ class GoalManager:
                 distance=round(float(distance), 3),
                 heading=round(float(self.target_last_heading), 4),
             )
+        if reachable_candidates:
+            if self.target_route_continuity_enabled:
+                selected = min(
+                    reachable_candidates,
+                    key=lambda item: (
+                        0 if item["continuity_tier"] == "smooth" else 1,
+                        float(item["continuity_score"]),
+                        -float(item["distance"]),
+                    ),
+                )
+            else:
+                selected = reachable_candidates[0]
+            selected_goal = selected["goal"]
+            selected_requested_goal = selected["requested_goal"]
+            selected_distance = selected["distance"]
+            selected_index = selected["index"]
+            selected_entry_heading = selected["entry_heading"]
+            selected_entry_heading_error = selected["entry_heading_error"]
+            selected_distance_penalty = selected["distance_penalty"]
+            selected_continuity_score = selected["continuity_score"]
+            selected_continuity_tier = selected["continuity_tier"]
         if selected_goal is None:
             self.goal_source = (
                 "global_slam_frontier"
@@ -2093,6 +2286,44 @@ class GoalManager:
         requested_goal = selected_requested_goal or candidate_goal
         distance = selected_distance
         endpoint_adjustment = self.pose_distance(requested_goal, candidate_goal)
+        if self.should_defer_sharp_target_takeover(
+            source, selected_entry_heading_error
+        ):
+            # Target identity remains locked, but its first Navfn route would
+            # make the robot brake and rotate away from a healthy frontier
+            # trajectory. Retain that action until its normal terminal, then
+            # re-evaluate from the terminal pose with fresh visual evidence.
+            self.target_route_continuity_deferred = True
+            self.target_route_continuity_deferred_goal = copy.deepcopy(candidate_goal)
+            self.target_execution_state = "TARGET_ROUTE_DEFERRED_FOR_CONTINUITY"
+            self.goal_source = "global_slam_frontier"
+            self.publish_goal_arbitration(
+                "target_takeover_deferred_for_continuity",
+                target_track_id=self.target_track_id,
+                active_frontier_goal=[
+                    round(float(self.last_goal.pose.position.x), 3),
+                    round(float(self.last_goal.pose.position.y), 3),
+                ],
+                active_frontier_distance=round(
+                    float(self.goal_robot_distance(self.last_goal) or 0.0), 3
+                ),
+                deferred_target_goal=[
+                    round(float(candidate_goal.pose.position.x), 3),
+                    round(float(candidate_goal.pose.position.y), 3),
+                ],
+                navfn_entry_heading_error=round(
+                    float(selected_entry_heading_error), 4
+                ),
+                takeover_heading_limit=round(
+                    float(self.target_route_continuity_takeover_heading), 4
+                ),
+            )
+            rospy.loginfo(
+                "GoalManager: defer sharp visual takeover entry_error=%.1fdeg "
+                "until frontier terminal",
+                math.degrees(selected_entry_heading_error),
+            )
+            return None
         self.target_last_goal = candidate_goal
         self.target_execution_state = "TARGET_ROUTE_VALIDATED"
         if advance:
@@ -2117,6 +2348,21 @@ class GoalManager:
             viewpoint_rejected_distances=rejected_distances,
             segment_distance=round(float(distance), 3),
             heading=round(float(self.target_last_heading), 4),
+            navfn_entry_heading=(
+                None
+                if selected_entry_heading is None
+                else round(float(selected_entry_heading), 4)
+            ),
+            navfn_entry_heading_error=(
+                None
+                if selected_entry_heading_error is None
+                else round(float(selected_entry_heading_error), 4)
+            ),
+            continuity_distance_penalty=round(
+                float(selected_distance_penalty or 0.0), 4
+            ),
+            continuity_score=round(float(selected_continuity_score or 0.0), 4),
+            continuity_tier=selected_continuity_tier,
             # ``goal`` is the actual mission endpoint. The original visual
             # ray remains explicit evidence for diagnosing a tolerance-based
             # Navfn adjustment without misleading downstream log consumers.
@@ -2236,10 +2482,37 @@ class GoalManager:
             self.goal_source = "target_candidate_pending"
             return self.goal_from_frontiers_prior()
 
+        if self.target_route_continuity_deferred:
+            # The initial target lock was deliberately admitted as evidence
+            # without preempting a healthy, incompatible frontier route. Do
+            # not revalidate/relog the same visual ray every timer tick; wait
+            # for the normal frontier terminal, then form a new target route
+            # from that physically meaningful boundary.
+            if (
+                self.last_goal is not None
+                and self.last_goal_source == "global_slam_frontier"
+                and self.teb_terminal_goal is None
+            ):
+                self.goal_source = "global_slam_frontier"
+                return self.last_goal
+            self.target_route_continuity_deferred = False
+            self.target_route_continuity_deferred_goal = None
+            self.publish_goal_arbitration(
+                "target_takeover_continuity_boundary_reached",
+                target_track_id=self.target_track_id,
+            )
+
         if self.target_last_goal is None:
             candidate = self.commit_target_segment(now, "target_follow")
             if candidate is not None:
                 return candidate
+            if (
+                self.target_route_continuity_deferred
+                and self.last_goal is not None
+                and self.last_goal_source == "global_slam_frontier"
+            ):
+                self.goal_source = "global_slam_frontier"
+                return self.last_goal
             # A rejected visual ray must not interrupt the map-connected
             # exploration transaction.  Keep the detector track alive so the
             # same target can be reconsidered after SLAM reveals a route.
@@ -2653,6 +2926,8 @@ class GoalManager:
         if start_map is None or goal_map is None:
             self.target_route_validation_last_result = "unavailable"
             self.target_route_validation_last_endpoint = None
+            self.target_route_validation_last_plan = []
+            self.target_route_validation_last_start_heading = None
             self.publish_goal_arbitration(
                 "target_route_deferred",
                 reason="tf_unavailable",
@@ -2668,6 +2943,8 @@ class GoalManager:
         except (rospy.ROSException, rospy.ROSInterruptException):
             self.target_route_validation_last_result = "unavailable"
             self.target_route_validation_last_endpoint = None
+            self.target_route_validation_last_plan = []
+            self.target_route_validation_last_start_heading = None
             self.publish_goal_arbitration(
                 "target_route_deferred",
                 reason="navfn_service_unavailable",
@@ -2684,6 +2961,8 @@ class GoalManager:
         except (rospy.ServiceException, rospy.ROSException) as exc:
             self.target_route_validation_last_result = "unavailable"
             self.target_route_validation_last_endpoint = None
+            self.target_route_validation_last_plan = []
+            self.target_route_validation_last_start_heading = None
             self.publish_goal_arbitration(
                 "target_route_deferred",
                 reason="navfn_service_error",
@@ -2694,6 +2973,8 @@ class GoalManager:
             return None
         reachable = bool(response.plan.poses)
         self.target_route_validation_last_result = "reachable" if reachable else "blocked"
+        self.target_route_validation_last_plan = []
+        self.target_route_validation_last_start_heading = None
         if reachable:
             # Navfn is queried in map coordinates. Its final plan pose is the
             # only endpoint it has actually proven reachable, including the
@@ -2725,6 +3006,12 @@ class GoalManager:
                 float(returned_endpoint.pose.position.y) - float(goal_map.pose.position.y),
             )
             self.target_route_validation_last_endpoint = returned_endpoint
+            self.target_route_validation_last_plan = copy.deepcopy(
+                list(response.plan.poses)
+            )
+            self.target_route_validation_last_start_heading = self.yaw_from_pose(
+                start_map
+            )
             self.target_route_validation_failures = 0
             self.publish_goal_arbitration(
                 "target_route_accepted",
@@ -3048,6 +3335,10 @@ class GoalManager:
         self.target_route_validation_last_result = "not_checked"
         self.target_route_validation_last_goal = None
         self.target_route_validation_last_endpoint = None
+        self.target_route_validation_last_plan = []
+        self.target_route_validation_last_start_heading = None
+        self.target_route_continuity_deferred = False
+        self.target_route_continuity_deferred_goal = None
         self.target_route_hold_last_emit = 0.0
 
     def target_segment_distance(self) -> float:
