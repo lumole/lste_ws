@@ -10,7 +10,7 @@ from typing import Iterable, Sequence
 import rospy
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 
 from lste_msgs.msg import LsteDetection, LsteDetections, LstePrompts, LsteState, LsteTask
 from utils import detector as det_utils
@@ -60,6 +60,15 @@ class DetectionNodeBase:
         # camera ray into a new navigation command, so bound source-frame age
         # independently of inference cadence.  Set <= 0 only for offline use.
         self.max_source_image_age = float(rospy.get_param("~max_source_image_age", 1.0))
+        # Inference can run at 10 Hz. Keep evidence at a useful diagnostic
+        # cadence without turning a long search into gigabytes of repeated
+        # identical JSON records. Outcome transitions always bypass this cap.
+        self.perception_decision_period = max(
+            0.0, float(rospy.get_param("~perception_decision_period", 1.0))
+        )
+        self._last_perception_decision_wall = 0.0
+        self._last_perception_decision_event = ""
+        self._suppressed_perception_decisions = 0
         self.current_task = None
         self.task_parsed = None
         self.current_prompts = None
@@ -74,6 +83,13 @@ class DetectionNodeBase:
         self.sub_image = rospy.Subscriber(self.image_topic, Image, self.on_image, queue_size=1)
         self.sub_state = rospy.Subscriber("/lste/state", LsteState, self.on_state, queue_size=1)
         self.pub = rospy.Publisher("/lste/detections", LsteDetections, queue_size=5)
+        # The final detection message intentionally contains only accepted
+        # boxes. Publish a compact companion record for every inference so a
+        # failed search can distinguish model rejection from later filtering
+        # or a stale source frame without recording camera images to disk.
+        self.perception_decision_pub = rospy.Publisher(
+            "/lste/perception_decision", String, queue_size=20
+        )
 
     def on_task(self, msg: LsteTask):
         self.current_task = msg
@@ -101,6 +117,63 @@ class DetectionNodeBase:
         self._publish(header, "", [], [], [], [], [])
         if reason:
             rospy.logwarn_throttle(1.0, "Publish empty detections (%s)", reason)
+
+    def publish_perception_decision(
+        self,
+        header,
+        event: str,
+        prompt_a: str = "",
+        prompt_b_terms=(),
+        force: bool = False,
+        **details
+    ):
+        """Publish one auditable outcome for an attempted detector inference."""
+        now_wall = time.monotonic()
+        same_outcome = str(event) == self._last_perception_decision_event
+        if (
+            not force
+            and same_outcome
+            and self.perception_decision_period > 0.0
+            and now_wall - self._last_perception_decision_wall
+            < self.perception_decision_period
+        ):
+            self._suppressed_perception_decisions += 1
+            return
+        stamp = 0.0
+        sequence = None
+        frame_id = ""
+        if isinstance(header, Header):
+            stamp = header.stamp.to_sec()
+            sequence = int(header.seq)
+            frame_id = str(header.frame_id)
+        now = rospy.Time.now().to_sec()
+        payload = {
+            "event": str(event),
+            "detector": self.detector_name,
+            "task_id": self.current_task.task_id if self.current_task else "",
+            "source_image_seq": sequence,
+            "source_image_stamp": round(stamp, 6),
+            "source_image_age_seconds": round(max(0.0, now - stamp), 4) if stamp > 0.0 else None,
+            "source_image_frame": frame_id,
+            "state": int(self.current_state),
+            "prompt_a": str(prompt_a),
+            "prompt_b_terms": [str(term) for term in prompt_b_terms],
+            "suppressed_same_outcome_count": self._suppressed_perception_decisions,
+        }
+        payload.update(details)
+        self.perception_decision_pub.publish(
+            String(data=json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        )
+        self._last_perception_decision_wall = now_wall
+        self._last_perception_decision_event = str(event)
+        self._suppressed_perception_decisions = 0
+
+    @staticmethod
+    def _candidate_summary(scores, labels, limit: int = 3):
+        pairs = []
+        for score, label in zip(DetectionNodeBase._as_list(scores), labels):
+            pairs.append({"label": str(label), "score": round(float(score), 4)})
+        return sorted(pairs, key=lambda item: item["score"], reverse=True)[:limit]
 
     def _publish(self, header, prompt_a, prompt_b_terms, target_boxes, target_scores, target_labels,
                  env_boxes, env_scores=None, env_labels=None):
@@ -210,18 +283,32 @@ class DetectionNodeBase:
                 return
             header, image_bgr = self.latest_image
             if image_bgr is None:
+                self.publish_perception_decision(header, "empty_image")
                 self.publish_empty_dets(header, "empty image frame")
                 return
             prompt_a = self.current_prompts.prompt_a
             prompt_b_terms = list(self.current_prompts.prompt_b_terms)
             if not prompt_a or not prompt_b_terms:
+                self.publish_perception_decision(
+                    header, "empty_prompt", prompt_a, prompt_b_terms
+                )
                 self.publish_empty_dets(header, "empty prompt")
                 return
             try:
-                result = self.infer(image_bgr, prompt_a, prompt_b_terms)
-                result = self._postprocess(*result)
+                raw_result = self.infer(image_bgr, prompt_a, prompt_b_terms)
+                inference_metadata = self.inference_metadata()
+                raw_target_boxes, raw_target_scores, raw_target_labels = raw_result[1:4]
+                raw_env_boxes, raw_env_scores, raw_env_labels = raw_result[4:7]
+                result = self._postprocess(*raw_result)
             except Exception as exc:
                 rospy.logerr_throttle(1.0, "%s exception: %s", self.detector_name, exc)
+                self.publish_perception_decision(
+                    header,
+                    "inference_exception",
+                    prompt_a,
+                    prompt_b_terms,
+                    exception=type(exc).__name__,
+                )
                 self.publish_empty_dets(header, "exception: %s" % type(exc).__name__)
                 return
             stamp = header.stamp.to_sec() if isinstance(header, Header) else 0.0
@@ -234,8 +321,48 @@ class DetectionNodeBase:
                     age,
                     self.max_source_image_age,
                 )
+                self.publish_perception_decision(
+                    header,
+                    "stale_source_image",
+                    prompt_a,
+                    prompt_b_terms,
+                    model_target_candidates=len(raw_target_boxes),
+                    model_env_candidates=len(raw_env_boxes),
+                    model_env_top=self._candidate_summary(raw_env_scores, raw_env_labels),
+                    published_target_candidates=len(result[0]),
+                    published_env_candidates=len(result[3]),
+                    published_env_top=self._candidate_summary(result[4], result[5]),
+                    max_source_image_age_seconds=self.max_source_image_age,
+                    force=bool(inference_metadata.get("small_object_tile_search_ran")),
+                    **inference_metadata,
+                )
                 return
             target_boxes, target_scores, target_labels, env_boxes, env_scores, env_labels = result
+            raw_target_count = len(raw_target_boxes)
+            target_count = len(target_boxes)
+            outcome = (
+                "model_no_target_candidate"
+                if raw_target_count == 0
+                else "target_removed_by_postprocess"
+                if target_count == 0
+                else "target_published"
+            )
+            self.publish_perception_decision(
+                header,
+                outcome,
+                prompt_a,
+                prompt_b_terms,
+                model_target_candidates=raw_target_count,
+                model_env_candidates=len(raw_env_boxes),
+                model_target_top=self._candidate_summary(raw_target_scores, raw_target_labels),
+                model_env_top=self._candidate_summary(raw_env_scores, raw_env_labels),
+                published_target_candidates=target_count,
+                published_env_candidates=len(env_boxes),
+                published_target_top=self._candidate_summary(target_scores, target_labels),
+                published_env_top=self._candidate_summary(env_scores, env_labels),
+                force=bool(inference_metadata.get("small_object_tile_search_ran")),
+                **inference_metadata,
+            )
             self._publish(
                 header, prompt_a, prompt_b_terms,
                 self._as_list(target_boxes), self._as_list(target_scores), [str(v) for v in target_labels],
@@ -253,3 +380,12 @@ class DetectionNodeBase:
 
     def infer(self, image_bgr, prompt_a: str, prompt_b_terms: Sequence[str]):
         raise NotImplementedError
+
+    def inference_metadata(self):
+        """Return detector-specific, JSON-safe observability fields.
+
+        A detector may use a conditional second pass without changing the
+        common ROS message contract. The fields are diagnostic only and are
+        published with the perception decision, never consumed as control.
+        """
+        return {}

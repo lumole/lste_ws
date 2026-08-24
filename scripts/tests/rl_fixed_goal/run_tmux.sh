@@ -21,6 +21,7 @@ fi
 eval "$(
   python3 - "$CONFIG" <<'PY'
 import sys
+import shlex
 import yaml
 
 with open(sys.argv[1], encoding="utf-8") as stream:
@@ -28,7 +29,7 @@ with open(sys.argv[1], encoding="utf-8") as stream:
 for key, value in data.items():
     if not isinstance(value, (str, int, float, bool)):
         raise SystemExit(f"Only scalar config values are supported: {key}")
-    print(f"CFG_{key}={value}")
+    print(f"CFG_{key}={shlex.quote(str(value))}")
 PY
 )"
 

@@ -33,7 +33,7 @@ PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}
 if [[ -f "$PIPELINE_CONFIG" ]]; then
   eval "$(
     python - "$PIPELINE_CONFIG" <<'PY' || true
-import sys, json
+import sys, json, shlex
 path = sys.argv[1]
 try:
     import yaml
@@ -43,8 +43,9 @@ with open(path, 'r', encoding='utf-8') as f:
     data = yaml.safe_load(f) or {}
 for k, v in data.items():
     if isinstance(v, (str, int, float)):
-        # 简单输出 KEY=VALUE 供 bash eval，只支持标量
-        print(f'CFG_{k}={v}')
+        # The values are consumed through bash eval; quote every scalar so a
+        # label or path containing whitespace remains a single assignment.
+        print(f'CFG_{k}={shlex.quote(str(v))}')
 PY
   )"
 fi
@@ -208,6 +209,7 @@ GLOBAL_FRONTIER_EARLY_HANDOFF_RADIUS=${GLOBAL_FRONTIER_EARLY_HANDOFF_RADIUS:-${C
 GLOBAL_FRONTIER_JUMP_DISTANCE=${GLOBAL_FRONTIER_JUMP_DISTANCE:-${CFG_GLOBAL_FRONTIER_JUMP_DISTANCE:-2.0}}
 GLOBAL_FRONTIER_CLEARANCE=${GLOBAL_FRONTIER_CLEARANCE:-${CFG_GLOBAL_FRONTIER_CLEARANCE:-0.52}}
 GLOBAL_FRONTIER_FALLBACK_CLEARANCE=${GLOBAL_FRONTIER_FALLBACK_CLEARANCE:-${CFG_GLOBAL_FRONTIER_FALLBACK_CLEARANCE:-0.30}}
+GLOBAL_FRONTIER_NAVFN_OBSERVATION_RECOVERY_ENABLED=${GLOBAL_FRONTIER_NAVFN_OBSERVATION_RECOVERY_ENABLED:-${CFG_GLOBAL_FRONTIER_NAVFN_OBSERVATION_RECOVERY_ENABLED:-true}}
 GLOBAL_FRONTIER_APPROACH_DISTANCE=${GLOBAL_FRONTIER_APPROACH_DISTANCE:-${CFG_GLOBAL_FRONTIER_APPROACH_DISTANCE:-1.0}}
 GLOBAL_FRONTIER_MIN_PATH_DISTANCE=${GLOBAL_FRONTIER_MIN_PATH_DISTANCE:-${CFG_GLOBAL_FRONTIER_MIN_PATH_DISTANCE:-1.2}}
 GLOBAL_FRONTIER_LOOKAHEAD_DISTANCE=${GLOBAL_FRONTIER_LOOKAHEAD_DISTANCE:-${CFG_GLOBAL_FRONTIER_LOOKAHEAD_DISTANCE:-4.0}}
@@ -421,6 +423,7 @@ if [[ "${GLOBAL_FRONTIER_ENABLED,,}" == "true" || "$GLOBAL_FRONTIER_ENABLED" == 
       goal_topic:=$GLOBAL_FRONTIER_TOPIC \
       clearance:=$GLOBAL_FRONTIER_CLEARANCE \
       fallback_clearance:=$GLOBAL_FRONTIER_FALLBACK_CLEARANCE \
+      navfn_observation_recovery_enabled:=$GLOBAL_FRONTIER_NAVFN_OBSERVATION_RECOVERY_ENABLED \
       frontier_approach_distance:=$GLOBAL_FRONTIER_APPROACH_DISTANCE \
       min_path_distance:=$GLOBAL_FRONTIER_MIN_PATH_DISTANCE \
       lookahead_distance:=$GLOBAL_FRONTIER_LOOKAHEAD_DISTANCE \

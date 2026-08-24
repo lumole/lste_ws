@@ -13,6 +13,7 @@ PIPELINE_CONFIG="${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}"
 if [[ -f "$PIPELINE_CONFIG" ]]; then
   eval "$(python - "$PIPELINE_CONFIG" <<'PY' || true
 import sys
+import shlex
 try:
     import yaml
 except ImportError:
@@ -20,7 +21,10 @@ except ImportError:
 with open(sys.argv[1], 'r', encoding='utf-8') as stream:
     for key, value in (yaml.safe_load(stream) or {}).items():
         if isinstance(value, (str, int, float)):
-            print(f'CFG_{key}={value}')
+            # These assignments are evaluated by the parent shell. Quote every
+            # scalar so labels such as "yellow cup,yellow mug" remain one
+            # configuration value during a hot controller switch.
+            print(f'CFG_{key}={shlex.quote(str(value))}')
 PY
   )"
 fi

@@ -36,6 +36,7 @@ if [[ -f "$PIPELINE_CONFIG" ]]; then
   eval "$(
     python - "$PIPELINE_CONFIG" <<'PY' || true
 import sys
+import shlex
 path = sys.argv[1]
 try:
     import yaml
@@ -45,7 +46,7 @@ with open(path, 'r', encoding='utf-8') as f:
     data = yaml.safe_load(f) or {}
 for k, v in data.items():
     if isinstance(v, (str, int, float)):
-        print(f'CFG_{k}={v}')
+        print(f'CFG_{k}={shlex.quote(str(v))}')
 PY
   )"
 fi

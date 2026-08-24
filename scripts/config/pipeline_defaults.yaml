@@ -134,6 +134,15 @@ TARGET_CACHE_MAX_ADVANCES: 2
 # 1.5 m segment is still far below GOAL_DIST_DET (the old 5 m blind projection)
 # but reduces repeated move_base replacements while the target bearing is stable.
 FOLLOW_TARGET_STEP_DISTANCE: 1.5
+# How a confirmed RGB target bearing becomes a Navfn endpoint:
+#   reachable_viewpoint_ladder (default): try the visual horizon, then up to
+#   three nearer points on the same bearing. Every candidate needs a fresh
+#   Navfn proof, so a desk/doorway cannot make the target controller choose an
+#   unreachable endpoint. Near completion-sized boxes also shorten the horizon
+#   to avoid passing the object before it can be confirmed.
+#   legacy_ray: one fixed FOLLOW_TARGET_STEP_DISTANCE endpoint, retained only
+#   for A/B comparison with the former implementation.
+TARGET_APPROACH_STRATEGY: reachable_viewpoint_ladder
 # false (default): let the local planner route a visual step around desks/chairs.
 # true: clip that step at the first lidar obstacle, useful only when comparing
 # the raw policy without its local safety planner.
@@ -165,13 +174,21 @@ CONTEXT_GOAL_HEADING_UPDATE_THRESHOLD_DEG: 35.0
 # same monitor/desk context can redirect the robot again. Target detections are
 # never delayed by this cooldown.
 CONTEXT_FOLLOW_COOLDOWN: 30.0
-# Online SLAM global-frontier exploration is used only before a target is
-# visible. gmapping builds /map from the live 2D lidar and the frontier node
-# chooses unknown-space boundaries reachable through known, clearance-safe
-# cells. The node publishes a stable odom-frame frontier endpoint; Goal Manager
-# keeps sole ownership of /lste/final_goal and TEB is the primary controller.
-# Disable only for comparison with the legacy local GP exploration route.
+# Online SLAM and global-frontier dispatch are separate concerns. gmapping
+# builds /map from the live 2D lidar; Navfn needs that map even in a
+# target-approach-only experiment where autonomous frontier goals are disabled.
+# Keep this true for normal runs and controlled visual-target tests.
+ONLINE_SLAM_ENABLED: true
+# The frontier node chooses unknown-space boundaries reachable through known,
+# clearance-safe cells. Goal Manager keeps sole ownership of /lste/final_goal
+# and TEB is the primary controller. Set false to keep SLAM/Navfn running while
+# preventing frontier endpoints from taking navigation ownership.
 GLOBAL_FRONTIER_ENABLED: true
+# With global-frontier dispatch disabled, leave the base stationary until a
+# click, legacy local frontier, or confirmed visual target supplies an explicit
+# goal. Set true only for the old comparison behavior that drives 10 m forward
+# from the spawn pose before any navigation evidence exists.
+STARTUP_FORWARD_ENABLED: false
 GLOBAL_FRONTIER_TOPIC: /lste/global_frontier_goal
 # Target execution never resumes a cached exploration endpoint. This topic
 # requests a fresh map-connected frontier selected from the current robot pose.
@@ -187,17 +204,26 @@ TEB_GOAL_TERMINAL_TOPIC: /lste/teb_goal_terminal
 TEB_GOAL_FAILURE_TOPIC: /lste/teb_goal_failure
 # A stale frontier must not steer the robot after SLAM or the explorer exits.
 GLOBAL_FRONTIER_MAX_AGE: 3.0
+# On a hot node restart the Navfn service may be registered before its global
+# costmap has a valid plan. Empty responses during this short window are
+# retried, not treated as unreachable branches and blacklisted.
+GLOBAL_FRONTIER_NAVFN_EMPTY_WARMUP_SECONDS: 5.0
+# Startup gate for online SLAM: before the first frontier is issued, Navfn
+# must return a path from the robot to a connected free cell about this far
+# away (metres). It prevents a latched /map from being mistaken for a ready
+# map->odom + global-costmap + Navfn chain. Keep it above one map cell.
+GLOBAL_FRONTIER_NAVFN_STARTUP_PROBE_DISTANCE: 0.40
 # Re-evaluate the online map at this cadence. The committed frontier endpoint
 # stays stable while its move_base action is active.
 GLOBAL_FRONTIER_PERIOD: 1.0
 # Keep the current frontier endpoint until the robot is genuinely near it.
 # This prevents the 1 Hz map update from becoming a moving controller target.
 GLOBAL_FRONTIER_UPDATE_RADIUS: 0.90
-# Promote a validated pending frontier this far before the current endpoint.
-# This gives the TEB bridge time to queue a smooth continuation and replace it
-# in its 0.85-1.3 m hot-start window; sharp or oversized branches are still
-# deferred by the bridge's direction/distance gates.  Promoting at 2.0 m
-# leaves the bridge 0.7 m of runway before the endpoint terminal.
+# Legacy segmented-waypoint handoff distance. Production TEB uses one atomic
+# endpoint action: it only prefetches and validates a successor here, then
+# promotes it from the matching move_base terminal callback. This preserves
+# one route identity across the frontier node and action bridge, avoiding an
+# old endpoint's recovery invalidating a newer pending branch.
 GLOBAL_FRONTIER_EARLY_HANDOFF_RADIUS: 2.00
 # Minimum dwell after accepting a frontier waypoint. Large branch jumps and
 # TEB terminal events bypass this dwell; ordinary SLAM refreshes do not.
@@ -222,6 +248,51 @@ TEB_ACTION_HANDOFF_RADIUS: 0.30
 TEB_ACTION_PROGRESS_TIMEOUT: 12.0
 TEB_ACTION_PROGRESS_EPSILON: 0.12
 TEB_ACTION_HANDOFF_MIN_INTERVAL: 4.0
+# A frontier goal is an observation region, whereas a visual target remains a
+# precise approach goal. When an already validated next frontier is waiting,
+# TEB completes the current exploration route inside this radius instead of
+# spending the no-progress timeout trying to settle on its exact map cell.
+# Set 0 only to compare with the former point-goal-only behavior.
+# A frontier is an observation boundary, not a parking point. Once the base is
+# within this radius and GlobalFrontier has prevalidated a successor, the bridge
+# atomically replaces the MoveBase action. TEB remains the sole velocity owner;
+# it can keep moving through a corridor or decelerate naturally for a turn.
+TEB_FRONTIER_OBSERVATION_COMPLETION_RADIUS: 0.85
+# Maximum actual TEB linear speed for a frontier endpoint terminal. The bridge
+# reads the raw TEB planner output, rather than a possibly stale predicted
+# trajectory, before allowing the successor to replace this route.
+TEB_FRONTIER_OBSERVATION_COMPLETION_MAX_LINEAR_SPEED: 0.15
+# Require this long a continuous low-speed raw command before a terminal. At
+# the 20 Hz controller rate this rejects a one-cycle timing gap without adding
+# the previous multi-second pause before a prefetched successor is released.
+TEB_FRONTIER_OBSERVATION_STATIONARY_HOLD: 0.10
+# Experimental actionlib replacement for a prefetched frontier successor.
+# It is disabled in the production endpoint-action architecture: publishing a
+# logical terminal and replacing the old action creates two competing terminal
+# lifecycles, so a late callback from the old action can be associated with the
+# new route. The normal path still prefetches, then atomically promotes the
+# successor from the one real terminal callback. Enable only for a controlled
+# seamless-handoff experiment with separate route-transaction support.
+TEB_FRONTIER_CONTINUOUS_PREFETCH_HANDOFF_ENABLED: false
+# Seconds allowed for GlobalFrontier to validate and publish that exact
+# prefetched successor. A timeout falls back to the audited terminal path.
+TEB_FRONTIER_CONTINUOUS_PREFETCH_HANDOFF_TIMEOUT: 1.50
+# A TEB endpoint may require a legitimate in-place obstacle/corner turn. The
+# action bridge accepts that as progress only when the selected TEB trajectory
+# requests near-zero linear motion plus angular motion AND wheel odometry yaw
+# actually changes. This is a bounded lifecycle exemption, not a controller:
+# stale feedback, a stopped yaw, or this budget expiring uses normal recovery.
+TEB_NATIVE_REORIENTATION_ENABLED: true
+TEB_NATIVE_REORIENTATION_LINEAR_THRESHOLD: 0.03
+TEB_NATIVE_REORIENTATION_ANGULAR_THRESHOLD: 0.15
+TEB_NATIVE_REORIENTATION_YAW_PROGRESS: 0.10
+TEB_NATIVE_REORIENTATION_STAGNATION_TIMEOUT: 1.50
+TEB_NATIVE_REORIENTATION_MAX_EXTENSION: 8.0
+TEB_NATIVE_REORIENTATION_FEEDBACK_TIMEOUT: 0.50
+# false keeps TEB as the only local controller for online-SLAM frontier
+# endpoints. true reenables the historical external pre-route rotation only
+# for an A/B comparison; it can conflict with TEB near changing obstacle maps.
+TEB_FRONTIER_PRE_ROUTE_ALIGNMENT: false
 # Navfn's default is true: unknown cells are high-cost but traversable. Keep it
 # enabled for confirmed visual targets just outside the current SLAM map. The
 # online frontier node still chooses goals from known, clearance-safe cells,
@@ -234,12 +305,18 @@ TARGET_ROUTE_VALIDATION: true
 TARGET_ROUTE_VALIDATION_TIMEOUT: 0.05
 TARGET_ROUTE_VALIDATION_TOLERANCE: 0.20
 TARGET_ROUTE_VALIDATION_PERIOD: 1.0
-# Confirmed visual target segments are bounded approach goals. When the active
-# segment is this close and the next segment differs by at least the minimum
-# delta, TEB is handed off before move_base stops at its terminal tolerance.
-# Frontier actions never use this early-handoff path.
+# Confirmed visual target segments are bounded approach goals. The bridge may
+# replace one with an already validated successor before move_base stops at
+# its terminal tolerance. It never invents that successor itself.
 TEB_TARGET_EARLY_HANDOFF_DISTANCE: 0.70
 TEB_TARGET_EARLY_HANDOFF_MIN_DELTA: 0.40
+# GoalManager prepares that successor only in this near-endpoint window and
+# only after the specified number of distinct detector frames newer than the
+# active segment. Disable to restore strict terminal -> re-observe -> advance.
+# A visibly close target always uses the terminal completion contract instead.
+TARGET_CONTINUOUS_HANDOFF_ENABLED: true
+TARGET_CONTINUOUS_HANDOFF_DISTANCE: 0.95
+TARGET_CONTINUOUS_HANDOFF_MIN_NEW_FRAMES: 2
 # Frontier branch goals larger than this are dispatched after the current TEB
 # action succeeds. Keeping only short, continuous updates on the hot-start
 # path prevents an almost-reached goal from being replaced by a sharp branch
@@ -252,7 +329,7 @@ TEB_ALLOW_ROUTE_CONTINUATION_REPLACEMENT: true
 # A branch larger than TEB_FRONTIER_REPLACEMENT_MAX_DELTA is hot-started only
 # when its local bearing change is <= this angle. Sharp branches wait for the
 # current move_base action result, removing abrupt brake/turn resets.
-TEB_FRONTIER_EARLY_HANDOFF_MAX_HEADING_DEG: 75.0
+TEB_FRONTIER_EARLY_HANDOFF_MAX_HEADING_DEG: 45.0
 # Near-endpoint sharp-branch recovery: wait this long after the normal
 # no-progress timeout, then replace the move_base action in-place instead of
 # issuing cancel+dispatch (which creates a visible zero-velocity pulse).
@@ -264,32 +341,60 @@ GLOBAL_FRONTIER_JUMP_DISTANCE: 2.0
 # Even a changed branch must not preempt the current RL waypoint while the car
 # is still far from it. Accept a large jump once this distance is met.
 GLOBAL_FRONTIER_JUMP_RELEASE_RADIUS: 1.20
-# Context (Sus-B) detections are allowed to preempt an active frontier route.
-# A high-suspicion room entrance (state node entered Sus-B because the task's
-# context pair, e.g. monitor+monitor, is visible) is exactly where the target
-# is likely to be; sending the robot to an arbitrary frontier instead wastes
-# the strong perceptual evidence.  The short inspection step (1.5 m) and the
-# 30 s context cooldown keep this bounded, so the robot looks into the
-# suspicious room once and then returns to frontier coverage instead of
-# chasing the same monitor pair forever.
-GLOBAL_FRONTIER_PREEMPT_CONTEXT: true
-# Map-safe route parameters. CLEARANCE is the minimum distance from occupied
-# map cells for every published approach goal. The production value is the
-# robot radius (0.30 m) plus TEB's minimum obstacle distance (0.22 m).
+# Context (Sus-B) detections are search evidence, not navigation ownership.
+# With online SLAM, an active frontier route remains committed until its TEB
+# action finishes. This prevents transient desk/monitor observations from
+# replacing the route with repeated short ctx_pair_follow goals, which causes
+# avoidable stop/restart pulses and heading jumps. A confirmed task-object
+# target still preempts the frontier route through the higher-priority target
+# transaction; set this true only for an explicit legacy-context comparison.
+GLOBAL_FRONTIER_PREEMPT_CONTEXT: false
+# Raw-map clearance for normal full-path routes. The production value is the
+# robot radius (0.30 m) plus TEB's minimum obstacle distance (0.22 m), with an
+# additional SLAM-margin cell. Live costmap + exact Navfn, followed by TEB,
+# are the hard route and collision gates for every published goal.
 GLOBAL_FRONTIER_CLEARANCE: 0.62
-# Kept under the historical name for launch compatibility. This is only the
-# looser mask used to detect an information boundary; it is never used to
-# route or publish a goal. The explorer chooses a route-safe approach cell
-# within GLOBAL_FRONTIER_APPROACH_DISTANCE of that boundary.  The approach
-# point sits 1.5 m short of the unknown boundary, so with the 0.52 m route
-# clearance the published endpoint is usually ~2 m from a wall: TEB reaches
-# the endpoint at cruising speed instead of throttling in the obstacle-
-# proximity band on every approach.
+# Do not falsely terminate exploration at a narrow doorway. When no normal
+# strict route remains, recovery can use looser topology *between strict
+# endpoints* only after live costmap connectivity and exact Navfn validation.
+# It never publishes a looser, wall-adjacent endpoint; TEB remains the final
+# collision authority.
+GLOBAL_FRONTIER_NAVFN_OBSERVATION_RECOVERY_ENABLED: true
+# Kept under the historical name for launch compatibility. This is the looser
+# known-free observation mask used to detect information boundaries. Normally
+# the stricter preferred approach wins; only recovery may publish a looser
+# point after costmap and Navfn both approve it. The approach point is within
+# GLOBAL_FRONTIER_APPROACH_DISTANCE of that boundary, so the lidar can expose
+# a doorway before the robot attempts to cross it.
+GLOBAL_FRONTIER_FALLBACK_CLEARANCE: 0.30
 GLOBAL_FRONTIER_APPROACH_DISTANCE: 1.5
 GLOBAL_FRONTIER_MIN_PATH_DISTANCE: 1.2
-# Retained for launch compatibility. Frontier navigation sends one terminal
-# endpoint to move_base so TEB can optimize the complete Navfn route; slicing
-# it into move_base sub-goals creates a zero-velocity pulse at every handoff.
+# Turn ownership for online frontier routes:
+#   native_teb       - default. One TEB trajectory owns bends and in-place
+#                      turns, avoiding a separate MoveBase action/velocity
+#                      owner and its stop-restart boundary.
+#   legacy_connector - comparison mode that inserts a supervised turn action
+#                      for a near-U-turn first tangent. It is less smooth in
+#                      the online-SLAM runs and should not be the default.
+GLOBAL_FRONTIER_TURN_EXECUTION_MODE: native_teb
+# Used only when GLOBAL_FRONTIER_TURN_EXECUTION_MODE is legacy_connector. A
+# validated Navfn first tangent at or beyond this angle creates the connector.
+# Valid values are 90-180 degrees.
+GLOBAL_FRONTIER_EXPLICIT_TURN_CONNECTOR_THRESHOLD_DEG: 135.0
+# The connector sits on the first verified Navfn path cells, just beyond TEB's
+# 0.35 m endpoint tolerance. This keeps its MoveBase action alive while the
+# turn supervisor completes the yaw phase, without commanding an arbitrary
+# off-path point.
+GLOBAL_FRONTIER_TURN_CONNECTOR_DISTANCE: 0.50
+# Frontier action contract. true sends one validated frontier endpoint to
+# move_base and is the production default: TEB sees the whole Navfn path and
+# can preserve its band. false enables the legacy rolling-path experiment,
+# which publishes 2.8 m connector segments and may reduce long endpoint
+# decisions but can introduce additional action boundaries. Keep true unless
+# an experiment log demonstrates a net smoothness improvement.
+GLOBAL_FRONTIER_MISSION_ENDPOINT_ONLY: true
+# Retained for launch compatibility and for the rolling-path experiment. With
+# the production endpoint contract it is not used to slice a route.
 GLOBAL_FRONTIER_LOOKAHEAD_DISTANCE: 4.0
 # Keep the global explorer's committed odom endpoint until the vehicle is close;
 # this is independent of the frontier-cell completion radius.
@@ -302,6 +407,12 @@ GLOBAL_FRONTIER_WAYPOINT_RELEASE_RADIUS: 1.20
 # STALL_TIMEOUT is intentionally longer than a single turn.
 GLOBAL_FRONTIER_ACTIVE_TIMEOUT: 60.0
 GLOBAL_FRONTIER_STALL_TIMEOUT: 20.0
+# After a TEB pre-route turn completes, this is the time allowed for the base
+# to physically launch. It uses odometry translation (not SLAM-map distance),
+# then hands the route back to the normal 20-second stall watchdog. This avoids
+# switching a healthy doorway route just because online SLAM corrected its map
+# pose. Set <= 0 only to disable the launch watchdog for comparison.
+GLOBAL_FRONTIER_POST_TURN_STALL_TIMEOUT: 6.0
 # Map integration can briefly disconnect an active frontier. Hold the last
 # safe endpoint this long before abandoning that branch and selecting another.
 GLOBAL_FRONTIER_UNREACHABLE_GRACE: 20.0
@@ -325,6 +436,12 @@ GLOBAL_FRONTIER_HEADING_WEIGHT: 2.5
 # During prefetch, prefer candidates within this bearing change when any
 # connected alternative exists. Set 0 to disable the hard bound.
 GLOBAL_FRONTIER_HEADING_HARD_LIMIT_DEG: 115.0
+# A locked visual target can lie behind a known wall. After Navfn rejects the
+# direct ray, the next replan softly favours a reachable frontier nearer that
+# direction, so search continues toward a doorway rather than waiting in place.
+# Set weight to 0 to disable the preference. It never relaxes safety or Navfn.
+GLOBAL_FRONTIER_SEMANTIC_HINT_WEIGHT: 0.35
+GLOBAL_FRONTIER_SEMANTIC_HINT_MAX_DISTANCE: 12.0
 # Minimum wall-clock interval between expensive full map/costmap frontier
 # searches while the committed endpoint is far away and making progress.
 GLOBAL_FRONTIER_PLANNING_PERIOD: 1.5
@@ -332,6 +449,10 @@ GLOBAL_FRONTIER_PLANNING_PERIOD: 1.5
 # each /lste/final_goal. The TEB bridge uses it to let confirmed target intent
 # take over exploration without exposing another controller tuning parameter.
 GOAL_INTENT_TOPIC: /lste/goal_intent
+# GoalManager -> TEB execution input. Unlike FINAL_GOAL plus GOAL_INTENT this
+# single transaction cannot pair a stale latched pose with fresh metadata on a
+# hot node restart. FINAL_GOAL and GOAL_INTENT remain public observer topics.
+GOAL_COMMAND_TOPIC: /lste/mission_goal
 # TEB is the production controller. TEB's optimizer keeps a small positive
 # reverse bound internally; the mux clamps that residual reverse command so a
 # blocked goal is handled by an in-place turn. Set false only for a deliberate
@@ -367,6 +488,48 @@ FIXED_GLOBAL_GOAL_ALLOW_CLICK_OVERRIDE: true
 # controller that is not selected. Switching to sappo starts it on demand.
 LSTE_CONTROLLER: teb
 SAPPO_BACKGROUND_ENABLED: false
+# TEB navigation execution architecture:
+#   endpoint_action  - one move_base action per validated frontier endpoint.
+#   persistent_stream - experimental: one action stays active while a
+#                       pluginized Navfn/TEB pair receives mission-path updates.
+# Use the one-action stream for normal navigation. It has completed a natural
+# target-search trial without a move_base preemption or abort; maintaining a
+# single action lease removes the endpoint-action stop between safe frontier
+# successors. Keep endpoint_action available only as an explicit A/B baseline.
+TEB_EXECUTION_ARCHITECTURE: persistent_stream
+# Persistent-stream route corridor radius (m). Navfn replans begin at the
+# newest SLAM pose, so an unchanged corridor can move by one or two 0.1 m map
+# cells. Paths with the same exact endpoint that remain inside this tube reuse
+# TEB's elastic band; a distinct branch/detour still creates a new version.
+# This is evaluated only when TEB_EXECUTION_ARCHITECTURE=persistent_stream.
+TEB_PERSISTENT_CORRIDOR_RADIUS: 0.25
+# RouteCorridor's optional pre-admitted frontier handoff. When true in the
+# experimental persistent_stream architecture, the bridge replaces a reached
+# observation endpoint before TEB emits its terminal zero only after Navfn and
+# the current lidar local-costmap agree on the successor's first 2 m. A failed
+# admission preserves the existing endpoint and falls back to a safe stop.
+# Admit only a fresh Navfn route whose local costmap prefix and entry tangent
+# prove it is a continuation. The bridge rejects sharp successors, so enabling
+# this cannot carry velocity through a blind corner; it only removes the action
+# terminal between verified corridor continuations.
+TEB_PERSISTENT_FRONTIER_LOOKAHEAD_HANDOFF_ENABLED: true
+# Remaining route distance (m) at which the experimental bridge may install a
+# pre-admitted successor. It is independent of the observation completion
+# radius, which is normally zero and must stay zero in production.
+TEB_PERSISTENT_FRONTIER_LOOKAHEAD_TRIGGER_DISTANCE: 1.0
+TEB_PERSISTENT_FRONTIER_ADMISSION_HORIZON: 2.0
+TEB_PERSISTENT_FRONTIER_ADMISSION_MAX_COSTMAP_AGE: 0.50
+TEB_PERSISTENT_FRONTIER_ADMISSION_BLOCKED_COST: 100
+TEB_PERSISTENT_FRONTIER_ADMISSION_SERVICE_TIMEOUT: 0.10
+TEB_PERSISTENT_FRONTIER_ADMISSION_ENDPOINT_EPSILON: 0.20
+# Route transition classes in persistent_stream:
+#   <= TEB_FRONTIER_EARLY_HANDOFF_MAX_HEADING_DEG: smooth_handoff.
+#   up to this value: curve_handoff, where TEB receives the new Navfn path
+#   while there is still 1 m of runway and may keep a positive forward speed.
+#   above this value: terminal_then_native_teb_reorientation; the current
+#   endpoint completes and native TEB may stop and reorient on the successor.
+#   This remains part of the total stop metric. Valid range is 45-89 degrees.
+TEB_PERSISTENT_FRONTIER_CURVE_HANDOFF_MAX_HEADING_DEG: 65.0
 # SA-PPO execution mode when the `sappo` process starts:
 #   rl_grid_guard - production checkpoint plus controller-local 2D-lidar
 #                   safety recovery; it preserves /lste/final_goal and is the
@@ -449,6 +612,27 @@ SAPPO_INTERMEDIATE_GOAL_TOLERANCE: 0.45
 # only when LSTE_CONTROLLER is teb. Keep this at or below the platform's safe
 # indoor speed; fixed-goal comparisons use their own test_config value.
 TEB_MAX_LINEAR_SPEED: 0.50
+# Evaluate distinct local route topologies (for example, pass an obstacle on
+# its left or right) instead of optimizing only one elastic band inherited
+# from Navfn. It is retained for controlled experiments, but stays off by
+# default: the current blocked case has a deterministic pre-route alignment
+# defect, which must be evaluated independently before adding candidates.
+TEB_HOMOTOPY_CLASS_PLANNING: false
+# Convert the rolling local costmap's occupied cells into clustered convex
+# obstacles before TEB optimizes. This reduces scan/cell quantization wobble
+# and local oscillation in indoor corridors. Set the plugin to `disabled` only
+# for a controlled raw-local-costmap comparison. The DBSMCCH line plugin
+# was tested and rejected because it crashes move_base in this configuration.
+TEB_COSTMAP_CONVERTER_PLUGIN: disabled
+# Run conversion in its own callback thread. This keeps the 5 Hz polygon
+# update from blocking move_base's 20 Hz control callback when SLAM enlarges a
+# costmap. It was verified in the online-SLAM TEB run: the controller loop
+# remained on schedule and the action bridge completed consecutive endpoints
+# without a clear-path stop. Set false only for a controlled fallback test.
+TEB_COSTMAP_CONVERTER_SPIN_THREAD: true
+# Hz; local costmap updates at 10 Hz, so 5 Hz intentionally filters one-scan
+# noise while retaining responsive static-wall geometry.
+TEB_COSTMAP_CONVERTER_RATE: 5
 # Suppress only small opposite-sign TEB angular corrections. A +/-0.05 rad/s
 # command around a straight path is usually map quantization, not a meaningful
 # turn; the mux outputs zero until the opposite command exceeds this threshold.
@@ -526,6 +710,86 @@ WDETECT_INTERVAL_PASS: 0.10
 WDETECT_INTERVAL_SUSPICIOUS: 0.10
 WDETECT_INTERVAL_LOCKED: 0.10
 WDETECT_INTERVAL_EXHAUSTED: 0.30
+# Small-object search uses the same fixed TensorRT engine on overlapping source
+# crops only when the normal full frame contains no target candidate. It is
+# useful for distant cups that become too few pixels after full-frame resize.
+# LAYOUT selects either uniform_grid (the legacy GRID x GRID crop pass) or
+# center_band (square crops over the camera's central band). center_band is
+# recommended for landscape cameras and small tabletop objects: at 1280x720,
+# four 0.72-height square crops make an item about 2.5x larger than the whole
+# frame without exceeding the existing four-forward TensorRT budget. It is
+# still only a fallback after a target-free full-frame result. GRID and OVERLAP
+# apply only to uniform_grid. CENTER_BAND_HEIGHT_RATIO and CENTER_BAND_CROPS
+# apply only to center_band. INTERVAL limits this fallback independently of the
+# fast full-frame detector cadence.
+WDETECT_SMALL_OBJECT_TILE_SEARCH_ENABLED: true
+WDETECT_SMALL_OBJECT_TILE_LAYOUT: center_band
+WDETECT_SMALL_OBJECT_TILE_GRID: 2
+WDETECT_SMALL_OBJECT_TILE_OVERLAP: 0.20
+WDETECT_SMALL_OBJECT_CENTER_BAND_HEIGHT_RATIO: 0.72
+WDETECT_SMALL_OBJECT_CENTER_BAND_CROPS: 4
+WDETECT_SMALL_OBJECT_TILE_INTERVAL: 2.0
+
+# Simulator-only detector evaluation. This never publishes a goal, command,
+# parameter update, or perception decision: it is consumed solely by the
+# navigation metrics observer to distinguish an unexplored target from a
+# geometrically exposed-but-missed target. Set ENABLED false outside Gazebo.
+TARGET_EVAL_ENABLED: true
+# Gazebo model names for this yellow-cup task. They are evaluation truth, not
+# detector prompts and not inputs to GoalManager or TEB.
+TARGET_EVAL_GAZEBO_TARGET_MODEL: cup_yellow
+TARGET_EVAL_GAZEBO_ROBOT_MODEL: pro3
+TARGET_EVAL_WORLD_FRAME: world
+TARGET_EVAL_ODOM_FRAME: odom
+TARGET_EVAL_CAMERA_FRAME: kinect_rgb_optical_frame
+TARGET_EVAL_CAMERA_INFO_TOPIC: /kinect/hd/camera_info
+# Optional second-stage truth check. A projected target is considered
+# depth-confirmed visible only when this registered/aligned compressedDepth
+# image has enough pixels at the Gazebo target's expected depth. It is an
+# observer-only metric and never affects goal selection or vehicle control.
+# Keep it enabled in a depth-capable world. If the configured topic has no
+# depth messages, logs report "depth_frame_unavailable" rather than calling a
+# frustum-only projection visible or occluded.
+TARGET_EVAL_DEPTH_ENABLED: true
+TARGET_EVAL_DEPTH_TOPIC: /kinect/hd/image_color_rect/compressedDepth
+# The source timestamps of detector and depth images may differ because model
+# inference is asynchronous. Frames farther apart than this are not compared.
+TARGET_EVAL_DEPTH_MAX_SOURCE_AGE_S: 0.25
+# An interior N x N support grid is sampled from the projected target box.
+# At least MIN_VALID samples must be real depth values, and at least
+# MIN_MATCHING must fall inside the predicted target depth interval. These
+# thresholds only classify experiment evidence; they cannot tune the detector
+# or the controller.
+TARGET_EVAL_DEPTH_SAMPLE_GRID: 5
+TARGET_EVAL_DEPTH_MIN_VALID_SAMPLES: 3
+TARGET_EVAL_DEPTH_MIN_MATCHING_SAMPLES: 2
+# Expected depth comes from the configured target cuboid. The tolerance is the
+# larger of this absolute value and RELATIVE_TOLERANCE times target depth.
+TARGET_EVAL_DEPTH_ABS_TOLERANCE_M: 0.12
+TARGET_EVAL_DEPTH_RELATIVE_TOLERANCE: 0.05
+TARGET_EVAL_DETECTIONS_TOPIC: /lste/detections
+# Comma-separated because the shell YAML loader exports scalar values only.
+# Labels are normalized case-insensitively and '_' is treated as a space.
+TARGET_EVAL_TARGET_LABELS: "yellow cup,yellow mug"
+# Target bounds in the Gazebo model frame. They approximate the physical cup
+# for spatial IoU evaluation; they never alter detector or controller boxes.
+TARGET_EVAL_TARGET_CENTER_M: "0,0,0.08"
+TARGET_EVAL_TARGET_SIZE_M: "0.12,0.12,0.16"
+# A frame is geometrically exposed when the projected bound overlaps the image,
+# its center lies beyond this edge margin, and its center depth is in range.
+TARGET_EVAL_MIN_DEPTH_M: 0.20
+TARGET_EVAL_MAX_DEPTH_M: 12.0
+TARGET_EVAL_EDGE_MARGIN_PX: 8
+# Gazebo ModelStates has no timestamp. Reject stale or source-time-mismatched
+# samples rather than fabricating a recall result. EXPOSURE_HOLD avoids
+# counting one-frame edge flashes as a test episode; EPISODE_GAP ends it.
+TARGET_EVAL_MAX_GAZEBO_STATE_AGE_S: 0.50
+TARGET_EVAL_EXPOSURE_HOLD_S: 0.25
+TARGET_EVAL_EPISODE_GAP_S: 0.75
+# A target-label detection counts only when score and spatial IoU both pass.
+# These thresholds affect logs only, never model post-processing or control.
+TARGET_EVAL_MIN_MATCH_IOU: 0.10
+TARGET_EVAL_MIN_SCORE: 0.20
 
 # GroundingDINO scheduling, in seconds. The original DINO path performs two
 # model passes per result. 1.5 s is the practical RTX 3060 floor while Gazebo

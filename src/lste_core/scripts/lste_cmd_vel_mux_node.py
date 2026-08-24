@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import copy
+import json
 import math
 import threading
 
@@ -46,6 +47,16 @@ class CmdVelMuxNode:
         self.navigation_hold = False
         self.lock = threading.Lock()
         self.output_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+        # This is an observer contract for the real actuator boundary.  It is
+        # intentionally separate from /cmd_vel: consumers can attribute a
+        # zero or speed cap to the mux without inferring it from a different
+        # lidar sector or a later controller callback.
+        self.status_pub = rospy.Publisher(
+            rospy.get_param("~status_topic", "/lste/cmd_vel_mux/status"),
+            String,
+            queue_size=50,
+        )
+        self.status_sequence = 0
         # Forward-collision velocity governor: a hard safety invariant at the
         # sole /cmd_vel publisher.  Whatever TEB, the goal, or the global path
         # command, the commanded forward speed is capped so the robot can
@@ -65,6 +76,9 @@ class CmdVelMuxNode:
             0.0, float(rospy.get_param("~governor_max_speed", 0.50))
         )
         self.scan_forward_min = float("inf")
+        self.scan_stamp = None
+        self.scan_received_time = None
+        self.teb_last_filter_reason = "none"
         self.scan_sub = rospy.Subscriber(
             self.scan_topic, LaserScan, self.on_scan, queue_size=1
         )
@@ -110,6 +124,7 @@ class CmdVelMuxNode:
         self.teb_micro_hold_cycles = 0
         self.teb_turn_hint = 0.0
         self.teb_turn_hint_wall = 0.0
+        self.teb_last_filter_reason = "reset"
 
     def filter_teb_angular(self, command):
         """Drop only quantization-scale opposite steering corrections.
@@ -126,6 +141,7 @@ class CmdVelMuxNode:
             command.angular.z = 0.0
             self.teb_last_output_angular = 0.0
             self.teb_micro_hold_cycles = 0
+            self.teb_last_filter_reason = "angular_deadband"
             return command
         sign = 1 if angular > 0.0 else -1 if angular < 0.0 else 0
         if (
@@ -145,10 +161,12 @@ class CmdVelMuxNode:
                 # the robot actually receives.
                 command.angular.z = self.teb_last_output_angular
                 self.teb_micro_hold_cycles += 1
+                self.teb_last_filter_reason = "angular_micro_reversal_held"
             else:
                 command.angular.z = 0.0
                 self.teb_last_output_angular = 0.0
                 self.teb_micro_hold_cycles = 0
+                self.teb_last_filter_reason = "angular_micro_reversal_suppressed"
             rospy.loginfo_throttle(
                 2.0,
                 "TEB micro-reversal held/suppressed (count=%d raw=%.3f "
@@ -165,6 +183,7 @@ class CmdVelMuxNode:
             self.teb_last_angular_sign = sign
         self.teb_last_output_angular = float(command.angular.z)
         self.teb_micro_hold_cycles = 0
+        self.teb_last_filter_reason = "none"
         return command
 
     def on_mode(self, message):
@@ -177,6 +196,16 @@ class CmdVelMuxNode:
         if changed:
             self.reset_teb_filter()
             self.output_pub.publish(Twist())
+            self.publish_status(
+                source="none",
+                input_command=None,
+                output_command=Twist(),
+                active=False,
+                block_reason="controller_mode_switch",
+                governor_reason="not_evaluated",
+                governor_limit=None,
+                filter_reason="reset",
+            )
             rospy.loginfo("Command velocity source switched to %s", mode)
 
     def on_scan(self, message):
@@ -187,7 +216,11 @@ class CmdVelMuxNode:
             if math.isfinite(value) and value > 0.01 and abs(angle) <= math.radians(25.0):
                 forward = min(forward, float(value))
             angle += float(message.angle_increment)
-        self.scan_forward_min = forward
+        with self.lock:
+            self.scan_forward_min = forward
+            stamp = message.header.stamp.to_sec()
+            self.scan_stamp = stamp if stamp > 0.0 else None
+            self.scan_received_time = rospy.get_time()
 
     def _governed_linear(self, linear):
         """Cap forward speed by the braking distance available ahead.
@@ -198,32 +231,120 @@ class CmdVelMuxNode:
         matter what upstream layer commanded the motion.
         """
         if linear <= 0.0:
-            return linear
-        clearance = self.scan_forward_min
+            return linear, None, "not_forward"
+        with self.lock:
+            clearance = self.scan_forward_min
         if not math.isfinite(clearance) or clearance <= 0.0:
-            return linear
+            return linear, None, "forward_scan_unavailable"
         margin = max(0.0, float(clearance) - self.governor_min_gap)
         max_v = min(
             self.governor_max_speed,
             math.sqrt(2.0 * self.governor_decel * margin),
         )
-        return min(linear, max_v) if linear > max_v else linear
+        if linear > max_v:
+            return max_v, max_v, "governor_limited"
+        return linear, max_v, "within_governor_limit"
 
-    def forward(self, source, message):
+    @staticmethod
+    def _command_payload(command):
+        if command is None:
+            return None
+        return {
+            "linear_x": round(float(command.linear.x), 5),
+            "angular_z": round(float(command.angular.z), 5),
+        }
+
+    def publish_status(
+        self,
+        source,
+        input_command,
+        output_command,
+        active,
+        block_reason,
+        governor_reason,
+        governor_limit,
+        filter_reason,
+    ):
+        """Publish the exact mode/safety decision associated with one output."""
+        with self.lock:
+            self.status_sequence += 1
+            scan_forward_min = self.scan_forward_min
+            scan_age = None
+            if self.scan_stamp is not None:
+                scan_age = max(0.0, rospy.get_time() - self.scan_stamp)
+            payload = {
+                "event": "actuator_command",
+                "sequence": self.status_sequence,
+                "source": str(source),
+                "selected_mode": self.mode,
+                "active": bool(active),
+                "task_done": bool(self.task_done),
+                "navigation_hold": bool(self.navigation_hold),
+                "block_reason": str(block_reason or "none"),
+                "input": self._command_payload(input_command),
+                "output": self._command_payload(output_command),
+                "filter_reason": str(filter_reason or "none"),
+                "governor_reason": str(governor_reason or "not_evaluated"),
+                "governor_linear_limit": (
+                    None if governor_limit is None else round(float(governor_limit), 5)
+                ),
+                "scan_forward_min": (
+                    None if not math.isfinite(scan_forward_min)
+                    else round(float(scan_forward_min), 5)
+                ),
+                "scan_age_seconds": (
+                    None if scan_age is None else round(float(scan_age), 5)
+                ),
+            }
+        self.status_pub.publish(String(data=json.dumps(payload, sort_keys=True)))
+
+    def forward(self, source, message, filter_reason="none", input_command=None):
+        if input_command is None:
+            input_command = message
         with self.lock:
             active = (
                 source == self.mode
                 and not self.task_done
                 and not self.navigation_hold
             )
+            if source != self.mode:
+                block_reason = "source_not_selected"
+            elif self.task_done:
+                block_reason = "task_complete"
+            elif self.navigation_hold:
+                block_reason = "navigation_hold"
+            else:
+                block_reason = "none"
         if not active:
+            self.publish_status(
+                source=source,
+                input_command=input_command,
+                output_command=None,
+                active=False,
+                block_reason=block_reason,
+                governor_reason="not_evaluated",
+                governor_limit=None,
+                filter_reason=filter_reason,
+            )
             return
         # Apply the forward-collision governor to every selected source (TEB,
         # SA-PPO, teleop) at the actuator boundary.  ``message`` is copied so
         # the source's own command object is never mutated.
         governed = copy.deepcopy(message)
-        governed.linear.x = self._governed_linear(float(governed.linear.x))
+        governed.linear.x, governor_limit, governor_reason = self._governed_linear(
+            float(governed.linear.x)
+        )
         self.output_pub.publish(governed)
+        self.publish_status(
+            source=source,
+            input_command=input_command,
+            output_command=governed,
+            active=True,
+            block_reason="none",
+            governor_reason=governor_reason,
+            governor_limit=governor_limit,
+            filter_reason=filter_reason,
+        )
 
     def on_task_done(self, message):
         with self.lock:
@@ -234,6 +355,16 @@ class CmdVelMuxNode:
             # selected controller. Stop both autonomous and keyboard commands.
             self.output_pub.publish(Twist())
             self.reset_teb_filter()
+            self.publish_status(
+                source="none",
+                input_command=None,
+                output_command=Twist(),
+                active=False,
+                block_reason="task_complete",
+                governor_reason="not_evaluated",
+                governor_limit=None,
+                filter_reason="reset",
+            )
             if changed:
                 rospy.loginfo("Command velocity output locked at zero: task complete")
         elif changed:
@@ -249,6 +380,16 @@ class CmdVelMuxNode:
         if self.navigation_hold:
             self.output_pub.publish(Twist())
             self.reset_teb_filter()
+            self.publish_status(
+                source="none",
+                input_command=None,
+                output_command=Twist(),
+                active=False,
+                block_reason="navigation_hold",
+                governor_reason="not_evaluated",
+                governor_limit=None,
+                filter_reason="reset",
+            )
         rospy.loginfo(
             "Command velocity observation gate %s",
             "closed" if self.navigation_hold else "opened",
@@ -262,6 +403,7 @@ class CmdVelMuxNode:
 
     def on_teb_cmd(self, message):
         command = copy.deepcopy(message)
+        filter_reason = "none"
         if self.teb_forward_only and message.linear.x < 0.0:
             # TEB enforces a small positive reverse lower bound internally
             # (typically 0.01 m/s), even when the launch file requests a
@@ -271,6 +413,7 @@ class CmdVelMuxNode:
             # Clamping only the mux output preserves TEB's angular command and
             # gives the vehicle an in-place turn without changing the planner.
             command.linear.x = 0.0
+            filter_reason = "forward_only_reverse_clamp"
             # A negative first sample is TEB's way of entering a turn when
             # forward motion is infeasible. The next points already contain
             # the turn, so use that fresh planner intent to avoid one zero
@@ -297,7 +440,14 @@ class CmdVelMuxNode:
                 message.linear.x,
             )
         command = self.filter_teb_angular(command)
-        self.forward("teb", command)
+        if self.teb_last_filter_reason != "none":
+            filter_reason = self.teb_last_filter_reason
+        self.forward(
+            "teb",
+            command,
+            filter_reason=filter_reason,
+            input_command=message,
+        )
 
     def on_teb_feedback(self, message):
         """Cache the next angular motion in TEB's selected trajectory.

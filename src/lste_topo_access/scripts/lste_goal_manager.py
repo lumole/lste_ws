@@ -132,6 +132,18 @@ class GoalManager:
         self.target_goal_heading_update_threshold = math.radians(max(
             1.0, float(gp("~target_goal_heading_update_threshold_deg", 35.0))
         ))
+        target_approach_strategy = str(
+            gp("~target_approach_strategy", "reachable_viewpoint_ladder")
+        ).strip().lower()
+        if target_approach_strategy not in (
+            "legacy_ray", "reachable_viewpoint_ladder",
+        ):
+            rospy.logwarn(
+                "Unsupported target approach strategy %r; using reachable_viewpoint_ladder.",
+                target_approach_strategy,
+            )
+            target_approach_strategy = "reachable_viewpoint_ladder"
+        self.target_approach_strategy = target_approach_strategy
         # A detector ray is an observation, not proof that the corresponding
         # point is a navigable destination.  Before a confirmed visual target
         # can take ownership from the map route, ask the same Navfn instance
@@ -156,6 +168,22 @@ class GoalManager:
         )
         self.target_cache_max_advances = max(
             0, int(gp("~target_cache_max_advances", 2))
+        )
+        # A target segment may be promoted shortly before its endpoint only
+        # after independent, newer visual evidence arrives. This gives the TEB
+        # bridge a validated successor to hot-replace, while preserving the
+        # terminal re-observation path for stale, weak, or already-close
+        # targets. It is a mission lifecycle rule, not a rolling image goal.
+        continuous_handoff = gp("~target_continuous_handoff_enabled", True)
+        self.target_continuous_handoff_enabled = str(continuous_handoff).strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        self.target_continuous_handoff_distance = max(
+            self.target_goal_reached_radius + 0.05,
+            float(gp("~target_continuous_handoff_distance", 0.95)),
+        )
+        self.target_continuous_handoff_min_new_frames = max(
+            1, int(gp("~target_continuous_handoff_min_new_frames", 2))
         )
         self.follow_locked_done_time = float(gp("~follow_locked_done_time", 10.0))
         self.follow_goal_publish_period = max(
@@ -258,7 +286,19 @@ class GoalManager:
         self.global_frontier_enabled = str(global_frontier_enabled).strip().lower() in (
             "1", "true", "yes", "on",
         )
+        startup_forward_enabled = gp("~startup_forward_enabled", False)
+        self.startup_forward_enabled = str(startup_forward_enabled).strip().lower() in (
+            "1", "true", "yes", "on",
+        )
         self.global_frontier_topic = gp("~global_frontier_topic", "/lste/global_frontier_goal")
+        self.global_frontier_command_topic = gp(
+            "~global_frontier_command_topic",
+            "/lste/global_frontier/route_command",
+        )
+        command_enabled = gp("~global_frontier_command_enabled", True)
+        self.global_frontier_command_enabled = str(command_enabled).strip().lower() in (
+            "1", "true", "yes", "on",
+        )
         self.global_frontier_status_topic = gp(
             "~global_frontier_status_topic", "/lste/global_frontier/status"
         )
@@ -353,6 +393,10 @@ class GoalManager:
         # may take over an exploration action, while ordinary frontier/context
         # refreshes remain queued until the current action finishes.
         self.goal_intent_topic = gp("~goal_intent_topic", "/lste/goal_intent")
+        # Compatibility consumers still observe final_goal and goal_intent.
+        # The action bridge executes the single transaction below instead, so
+        # a hot restart cannot combine two independently latched messages.
+        self.goal_command_topic = gp("~goal_command_topic", "/lste/mission_goal")
         # Observation is a mission state, not a new navigation destination.
         # The mux consumes this latch and temporarily gates the selected
         # controller while the detector collects fresh frames.
@@ -413,6 +457,9 @@ class GoalManager:
         # coordinate alone cannot tell the TEB bridge whether a map update is
         # a continuous path extension or an unrelated branch.
         self.global_frontier_route_id = 0
+        self.global_frontier_transition_kind = "initial"
+        self.global_frontier_predecessor_route_id = 0
+        self.global_frontier_transition_distance = None
         self.global_frontier_route_ids_by_goal = {}
         # Keep the last map-connected waypoint separate from the currently
         # published visual/context segment. This lets a stale target segment
@@ -441,6 +488,10 @@ class GoalManager:
         self.target_last_goal: Optional[PoseStamped] = None
         self.target_last_update: float = 0.0
         self.target_last_heading: Optional[float] = None
+        # A visual ray is valid at the camera exposure time, not when the
+        # detector finishes. Keep this alongside the accepted world heading
+        # so every committed segment can be traced to its source image.
+        self.target_last_heading_source_stamp: Optional[float] = None
         self.target_filtered_cx: Optional[float] = None
         self.target_filtered_cy: Optional[float] = None
         self.target_filtered_heading: Optional[float] = None
@@ -451,11 +502,24 @@ class GoalManager:
         # action reaches a terminal result; detector frames only update this
         # track state and cannot replace an active TEB action mid-segment.
         self.target_segment_terminal_ready = False
+        # A target action terminal is an observation boundary. The target can
+        # be much larger and at a different bearing after a short approach,
+        # while the first post-terminal detector frame is often a weak or
+        # partially occluded box. Keep ownership for fresh evidence instead
+        # of immediately handing one rejected image ray back to the frontier.
+        self.target_terminal_reobserve_pending = False
+        self.target_terminal_reobserve_epoch = 0
+        self.target_terminal_reobserve_min_epoch = 0
+        self.target_terminal_reobserve_until = 0.0
         self.target_track_label = ""
         # A detector epoch changes for every inference frame. This id remains
         # stable for one continuous visual target track.
         self.target_track_sequence = 0
         self.target_track_id = ""
+        # This is deliberately separate from continuous handoffs.  The budget
+        # limits only post-terminal movement without a newly committed visual
+        # successor; fresh detector-backed handoffs must not consume it.
+        self.target_terminal_blind_advances = 0
         self.target_cache_advances = 0
         self.frontier_goal_sent_at: Optional[float] = None
         self.target_observation_hold_goal: Optional[PoseStamped] = None
@@ -473,6 +537,7 @@ class GoalManager:
         # from reclaiming the controller on every detector frame.
         self.target_execution_state = "TARGET_CANDIDATE"
         self.target_observation_epoch = 0
+        self.target_segment_commit_epoch = 0
         self.target_blocked = False
         self.target_blocked_goal: Optional[PoseStamped] = None
         self.target_blocked_since: Optional[float] = None
@@ -483,6 +548,12 @@ class GoalManager:
         self.target_route_validation_failures = 0
         self.target_route_validation_last_result = "not_checked"
         self.target_route_validation_last_goal = None
+        # A non-empty Navfn response can end on the request tolerance boundary
+        # rather than the requested visual-ray point. Keep that returned pose
+        # with the validation result so the mission and persistent planner use
+        # precisely the same endpoint.
+        self.target_route_validation_last_endpoint: Optional[PoseStamped] = None
+        self.target_route_hold_last_emit = 0.0
         self.navigation_hold_active = False
         self.target_reacquire_goal: Optional[PoseStamped] = None
         self.target_reacquire_started: Optional[float] = None
@@ -497,7 +568,13 @@ class GoalManager:
         # survive that dip instead of resetting to zero.
         self.target_close_last_seen: Optional[float] = None
         self.target_completed_segments = 0
+        # Completion evidence belongs to one visual track.  A later target
+        # candidate must never inherit a previous track's arrival terminal.
+        self.target_approach_track_id = ""
         self.task_done_published = False
+        # Monotonic within this GoalManager process. It is diagnostic identity
+        # for one execution transaction, not a frontier route id.
+        self.goal_command_id = 0
         self.current_task_id = ""
         self.ctx_start_time: Optional[float] = None
         self.ctx_state_hold_until = 0.0
@@ -550,6 +627,9 @@ class GoalManager:
         self.pub_goal_intent = rospy.Publisher(
             self.goal_intent_topic, String, queue_size=1, latch=True
         )
+        self.pub_goal_command = rospy.Publisher(
+            self.goal_command_topic, String, queue_size=1, latch=True
+        )
         self.goal_arbitration_topic = gp(
             "~goal_arbitration_topic", "/lste/goal_arbitration"
         )
@@ -581,6 +661,13 @@ class GoalManager:
             self.sub_global_frontier = rospy.Subscriber(
                 self.global_frontier_topic, PoseStamped, self.on_global_frontier, queue_size=1
             )
+            if self.global_frontier_command_enabled:
+                self.sub_global_frontier_command = rospy.Subscriber(
+                    self.global_frontier_command_topic,
+                    String,
+                    self.on_global_frontier_command,
+                    queue_size=10,
+                )
             self.sub_global_frontier_status = rospy.Subscriber(
                 self.global_frontier_status_topic,
                 String,
@@ -713,6 +800,14 @@ class GoalManager:
             return
 
         now = rospy.Time.now().to_sec()
+        image_stamp = msg.header.stamp
+        image_stamp_seconds = image_stamp.to_sec() if image_stamp else 0.0
+        # A zero stamp is an explicitly legacy/externally produced message.
+        # Real detector output carries its original camera header and must be
+        # projected using historical TF.
+        projection_stamp = (
+            image_stamp if image_stamp_seconds > 0.0 else rospy.Time(0)
+        )
         source_stamp = (
             msg.header.stamp.secs,
             msg.header.stamp.nsecs,
@@ -776,6 +871,17 @@ class GoalManager:
                 self.target_track_label or "target",
                 self.target_track_sequence,
             )
+            # A target track is the unit of evidence for a visual approach.
+            # Emit its creation explicitly so telemetry never combines the
+            # discovery of one image-track with the completion of another.
+            self.publish_goal_arbitration(
+                "target_track_started",
+                target_track_id=self.target_track_id,
+                label=self.target_track_label,
+                score=round(float(score), 4),
+                box=[round(float(det.w), 4), round(float(det.h), 4)],
+                center=[round(float(det.cx), 4), round(float(det.cy), 4)],
+            )
         self.target_candidate_last_seen = now
         self.target_candidate_source_stamp = source_stamp
         self.target_candidate_anchor_cx = float(det.cx)
@@ -798,8 +904,8 @@ class GoalManager:
         filtered_det = self.clone_detection(det)
         filtered_det.cx = self.target_filtered_cx
         filtered_det.cy = self.target_filtered_cy
-        raw_heading = self.det_heading_world(det)
-        filtered_heading = self.det_heading_world(filtered_det)
+        raw_heading = self.det_heading_world(det, projection_stamp)
+        filtered_heading = self.det_heading_world(filtered_det, projection_stamp)
         if filtered_heading is not None:
             if self.target_filtered_heading is None:
                 self.target_filtered_heading = filtered_heading
@@ -813,9 +919,22 @@ class GoalManager:
                     self.target_filtered_heading + self.target_heading_alpha * delta
                 )
             self.target_last_heading = self.target_filtered_heading
+            self.target_last_heading_source_stamp = image_stamp_seconds
         elif raw_heading is not None and self.target_filtered_heading is None:
             self.target_filtered_heading = raw_heading
             self.target_last_heading = raw_heading
+            self.target_last_heading_source_stamp = image_stamp_seconds
+        elif raw_heading is None:
+            # Never transform a historical image ray with current TF. During a
+            # turn that turns latency into a false world-space target.
+            rospy.logwarn_throttle(
+                1.0,
+                "GoalManager: ignoring target evidence without %s camera TF "
+                "(image_stamp=%.6f)",
+                "source-stamped" if image_stamp_seconds > 0.0 else "latest",
+                image_stamp_seconds,
+            )
+            return
 
         # Do not build a new navigation goal here.  This callback receives
         # asynchronous detector frames while TEB is optimizing its current
@@ -842,6 +961,26 @@ class GoalManager:
                     float(det.w),
                     float(det.h),
                     center_delta if math.isfinite(center_delta) else float("nan"),
+                )
+                self.publish_goal_arbitration(
+                    "target_follow_confirmed",
+                    target_track_id=self.target_track_id,
+                    hits=int(self.target_candidate_hits),
+                    average_score=round(float(candidate_average_score), 4),
+                    score=round(float(score), 4),
+                    box=[round(float(det.w), 4), round(float(det.h), 4)],
+                    center=[round(float(det.cx), 4), round(float(det.cy), 4)],
+                    confirmation=(
+                        "strong_detection"
+                        if high_quality
+                        else "weak_consistent_detection"
+                    ),
+                    source_image_stamp=round(float(image_stamp_seconds), 6),
+                    projection_tf_mode=(
+                        "source_stamp"
+                        if image_stamp_seconds > 0.0
+                        else "latest_for_unstamped_message"
+                    ),
                 )
             self.target_follow_confirmed = True
             self.target_last_seen = now
@@ -910,6 +1049,11 @@ class GoalManager:
         self.latest_frontiers = msg
 
     def on_global_frontier(self, msg: PoseStamped):
+        # The normal online planner publishes a complete route-command
+        # transaction. Retain this topic only for RViz and old integrations;
+        # accepting both would restore the cross-topic metadata race.
+        if self.global_frontier_command_enabled:
+            return
         frame = (msg.header.frame_id or "odom").strip().lstrip("/")
         if frame not in ("odom", "map"):
             rospy.logwarn_throttle(
@@ -922,11 +1066,145 @@ class GoalManager:
             round(float(msg.pose.position.x), 3),
             round(float(msg.pose.position.y), 3),
         )
-        route_id = self.global_frontier_route_ids_by_goal.get(key)
-        # Never carry the previous route identity across an unmatched pose.
-        # Topic delivery order may occasionally deliver the PoseStamped before
-        # its status; withholding hot handoff is safe, reusing an old id is not.
-        self.global_frontier_route_id = 0 if route_id is None else int(route_id)
+        # The explorer includes its stable route transaction in header.seq.
+        # This is an atomic PoseStamped delivery, unlike the older status plus
+        # rounded-coordinate lookup which could see the pose first and silently
+        # downgrade a valid continuation to route_id=0.
+        embedded_route_id = int(msg.header.seq or 0)
+        if embedded_route_id > 0:
+            self.global_frontier_route_id = embedded_route_id
+        else:
+            route_id = self.global_frontier_route_ids_by_goal.get(key)
+            # Keep the legacy lookup for external or old frontier publishers.
+            self.global_frontier_route_id = 0 if route_id is None else int(route_id)
+        # A terminal means the next fresh frontier message is actionable now.
+        if self.teb_terminal_goal is not None:
+            self.next_update_time = 0.0
+
+    def on_global_frontier_command(self, message: String):
+        """Consume an atomic online-frontier route transaction."""
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict) or payload.get("event") != "route_command":
+            return
+        goal_xy = payload.get("goal")
+        if not isinstance(goal_xy, (list, tuple)) or len(goal_xy) < 2:
+            return
+        try:
+            x, y = float(goal_xy[0]), float(goal_xy[1])
+            route_id = max(0, int(payload.get("route_id", 0) or 0))
+        except (TypeError, ValueError):
+            return
+        frame = str(payload.get("frame_id", "map")).strip().lstrip("/") or "map"
+        if frame not in ("odom", "map"):
+            rospy.logwarn_throttle(
+                3.0, "Ignoring global frontier command in unsupported frame: %s", frame
+            )
+            return
+        yaw = payload.get("yaw")
+        goal = PoseStamped()
+        goal.header.stamp = rospy.Time.now()
+        goal.header.frame_id = frame
+        goal.pose.position.x = x
+        goal.pose.position.y = y
+        if yaw is None:
+            goal.pose.orientation.w = 1.0
+        else:
+            try:
+                yaw = float(yaw)
+            except (TypeError, ValueError):
+                return
+            goal.pose.orientation.z = math.sin(0.5 * yaw)
+            goal.pose.orientation.w = math.cos(0.5 * yaw)
+        self.latest_global_frontier_goal = goal
+        self.last_frontier_goal = goal
+        self.global_frontier_route_id = route_id
+        self.global_frontier_transition_kind = str(
+            payload.get("transition_kind", "unknown")
+        ).strip().lower() or "unknown"
+        try:
+            self.global_frontier_predecessor_route_id = max(
+                0, int(payload.get("predecessor_route_id", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            self.global_frontier_predecessor_route_id = 0
+        try:
+            transition_distance = payload.get(
+                "transition_distance_to_previous_endpoint"
+            )
+            self.global_frontier_transition_distance = (
+                None if transition_distance is None else float(transition_distance)
+            )
+        except (TypeError, ValueError):
+            self.global_frontier_transition_distance = None
+        route_kind = str(payload.get("route_kind", "")).strip().lower()
+        if route_kind in (
+            "frontier_connector",
+            "frontier_turn_connector",
+            "frontier_endpoint",
+        ):
+            self.global_frontier_route_kind = route_kind
+        # This command follows a successful terminal. Publishing now avoids
+        # another Goal Manager timer period between two already validated
+        # frontier actions; publish_goal still preserves the bridge's atomic
+        # action ownership and will not preempt a healthy active route.
+        #
+        # A visual target terminal is deliberately different: its post-arrival
+        # observation window owns the mission until fresh detector evidence
+        # confirms completion, another target segment, or a safe release back
+        # to exploration.  Do not let this low-latency frontier shortcut
+        # bypass that state machine.  Doing so briefly published a frontier
+        # goal between target arrival and task_done, producing a visible stop
+        # and an otherwise misleading action preemption.
+        now = rospy.Time.now().to_sec()
+        target_active = self.target_tracking_active(now)
+        target_segment_active = self.target_segment_ownership_active()
+        target_ownership_active = (
+            self.target_terminal_reobserve_pending
+            or self.navigation_hold_active
+            or target_active
+            or target_segment_active
+        )
+        terminal_frontier_fast_path = (
+            self.teb_terminal_goal is not None
+            and self.controller_mode == "teb"
+            and self.last_goal_source == "global_slam_frontier"
+        )
+        if terminal_frontier_fast_path and target_ownership_active:
+            target_age = None
+            if self.target_last_seen is not None:
+                target_age = round(max(0.0, now - self.target_last_seen), 3)
+            self.next_update_time = 0.0
+            self.publish_goal_arbitration(
+                "frontier_command_deferred_target_ownership",
+                candidate_goal=[round(x, 3), round(y, 3)],
+                candidate_route_id=route_id,
+                candidate_route_kind=route_kind,
+                target_track_id=self.target_track_id,
+                target_active=bool(target_active),
+                target_segment_active=bool(target_segment_active),
+                target_terminal_reobserve_pending=bool(
+                    self.target_terminal_reobserve_pending
+                ),
+                navigation_hold=bool(self.navigation_hold_active),
+                target_age_seconds=target_age,
+            )
+            rospy.loginfo(
+                "GoalManager: defer frontier route=%d while target owns "
+                "terminal observation (track=%s active=%s hold=%s)",
+                route_id,
+                self.target_track_id or "-",
+                target_active,
+                self.navigation_hold_active,
+            )
+            return
+        if terminal_frontier_fast_path:
+            self.goal_source = "global_slam_frontier"
+            self.publish_goal(goal)
+        else:
+            self.next_update_time = 0.0
 
     def on_global_frontier_status(self, message: String):
         """Synchronize mission ownership when the explorer abandons a route."""
@@ -977,11 +1255,13 @@ class GoalManager:
                     payload.get("goal"),
                 )
             return
-        if payload.get("event") != "route_invalidated":
+        event = str(payload.get("event", "")).strip()
+        if event not in ("route_invalidated", "frontier_exhausted"):
             return
         with_status_goal = payload.get("goal")
         rospy.logwarn(
-            "GoalManager: invalidating frontier route reason=%s goal=%s",
+            "GoalManager: releasing frontier ownership event=%s reason=%s goal=%s",
+            event,
             payload.get("reason", "unknown"),
             with_status_goal,
         )
@@ -998,6 +1278,7 @@ class GoalManager:
         if (
             self.last_goal_source == "global_slam_frontier"
             and not self.target_tracking_active(rospy.Time.now().to_sec())
+            and not self.target_segment_ownership_active()
         ):
             self.last_goal = None
             self.last_goal_source = "waiting_global_slam_frontier"
@@ -1089,8 +1370,28 @@ class GoalManager:
             if target_distance <= max(self.target_goal_reached_radius, 0.30):
                 self.target_segment_terminal_ready = True
                 self.target_completed_segments += 1
+                self.target_approach_track_id = self.target_track_id
                 self.target_goal_detection_stamp = None
                 self.target_execution_state = "TARGET_CANDIDATE"
+                self.target_terminal_reobserve_pending = True
+                self.target_terminal_reobserve_epoch = int(
+                    self.target_observation_epoch
+                )
+                # Two independent post-arrival detector frames avoid making a
+                # route decision from the distant pre-arrival image. The
+                # existing observation window is also the bounded fallback
+                # for slower detector backends.
+                self.target_terminal_reobserve_min_epoch = (
+                    self.target_terminal_reobserve_epoch + 2
+                )
+                self.target_terminal_reobserve_until = (
+                    rospy.Time.now().to_sec() + self.target_observation_hold
+                )
+                self.target_observation_hold_until = max(
+                    self.target_observation_hold_until,
+                    self.target_terminal_reobserve_until,
+                )
+                self.set_navigation_hold(True, "target_terminal_reobserve")
                 # Completion votes must describe the post-approach view, not
                 # the distant box that triggered this segment before movement.
                 self.reset_target_close_confirmation()
@@ -1098,6 +1399,7 @@ class GoalManager:
                 self.publish_goal_arbitration(
                     "target_approach_terminal",
                     target_track_id=self.target_track_id,
+                    approach_track_id=self.target_approach_track_id,
                     completed_segments=self.target_completed_segments,
                     goal=[
                         round(float(msg.pose.position.x), 3),
@@ -1149,6 +1451,10 @@ class GoalManager:
             )
             return
         self.teb_terminal_goal = msg
+        # The successor is selected by the online frontier node. Release this
+        # node's normal cadence immediately so its new route command reaches
+        # the bridge on the first callback instead of one cycle later.
+        self.next_update_time = 0.0
         if self.target_blocked:
             # A successful frontier action is the explicit map-progress event
             # that reopens a previously failed visual hypothesis.  A detector
@@ -1267,6 +1573,15 @@ class GoalManager:
         self.target_goal_detection_stamp = None
         self.target_segment_terminal_ready = False
         self.target_cache_advances = 0
+        self.target_terminal_blind_advances = 0
+        # A loss-driven reacquisition pose may have been prepared while the
+        # failed target action was still running. It belongs to the same visual
+        # transaction, so it must not preempt the recovery frontier after this
+        # failure event. Only a completed frontier route or a genuinely new
+        # visual track may reopen target ownership.
+        self.target_reacquire_goal = None
+        self.target_reacquire_started = None
+        self.target_reacquire_attempts = self.target_reacquire_max_attempts
         self.effective_mode = EXPLORE_SUS_C_MODE
         self.pub_access_mode.publish(String(data=self.effective_mode))
         self.goal_source = "target_route_failed"
@@ -1344,11 +1659,54 @@ class GoalManager:
     # -------------------- Timer --------------------
     def on_timer(self, _event):
         now = rospy.Time.now().to_sec()
-        if self.navigation_hold_active and (
-            now >= self.target_observation_hold_until
-            or self.effective_mode != CATCH_TARGET_MODE
-        ):
-            self.set_navigation_hold(False, "observation_window_complete")
+        if self.navigation_hold_active:
+            # A target terminal is a perception barrier, not a fixed dwell.
+            # The terminal callback records the current detector epoch and
+            # requires two *new* target frames.  Previously this hold was
+            # released only at its timeout, while ``compute_goal`` returned
+            # early for every held tick.  Fast detectors therefore collected
+            # many valid post-arrival images but still parked for the complete
+            # fallback window.  Release as soon as the evidence barrier is
+            # satisfied; the normal target route validation below still owns
+            # whether it is safe to move again.
+            post_terminal_frames_ready = (
+                self.target_terminal_reobserve_pending
+                and self.target_observation_epoch
+                >= self.target_terminal_reobserve_min_epoch
+            )
+            if post_terminal_frames_ready:
+                # A close confirmation belongs to the just-arrived target
+                # transaction. Do not release its perception barrier merely
+                # because the lower two-frame re-observation gate is also
+                # satisfied: a failed *next* viewpoint would clear this track
+                # and discard its already valid close votes before
+                # maybe_publish_task_done() can observe them. Once close
+                # evidence becomes stale, maybe_publish_task_done() resets
+                # target_close_since and this existing branch resumes the
+                # ordinary validated-route or frontier fallback path.
+                if self.target_close_since is None:
+                    self.set_navigation_hold(False, "post_terminal_frames_ready")
+                    self.publish_goal_arbitration(
+                        "target_terminal_reobserve_ready",
+                        observed_epoch=int(self.target_observation_epoch),
+                        required_epoch=int(self.target_terminal_reobserve_min_epoch),
+                        remaining_seconds=round(
+                            max(0.0, self.target_terminal_reobserve_until - now),
+                            3,
+                        ),
+                    )
+            # ``effective_mode`` may legitimately change while the vehicle is
+            # approaching a visual target: a context detection can temporarily
+            # select CATCH_CTX_MODE before the next target frame arrives.  A
+            # terminal re-observation is an owned transaction, so releasing
+            # its hold on that unrelated state transition makes this timer
+            # clear the hold and ``goal_from_target_follow`` restore it every
+            # 0.2 s.  The supervisor maps each restoration to a zero command.
+            # Only the evidence barrier above or this bounded timeout may end
+            # the transaction; clear_target_memory/new-task paths explicitly
+            # cancel it when ownership is genuinely lost.
+            elif now >= self.target_observation_hold_until:
+                self.set_navigation_hold(False, "observation_window_complete")
         if self.global_goal_source == "fixed":
             # A fixed target must not wait for state, detections, frontier
             # output, or /rbt_pose.  Publishing it at a bounded rate lets late
@@ -1382,12 +1740,17 @@ class GoalManager:
                     self.publish_goal(goal)
                     self.next_update_time = now + self.pass_period
                 return
-            goal = self.build_goal_from_pose(self.start_pose, self.forward_dist)
-            if goal:
-                self.goal_source = "startup_forward"
-                self.publish_goal(goal)
-                self.next_update_time = now + self.pass_period
-            return
+            if self.startup_forward_enabled:
+                goal = self.build_goal_from_pose(self.start_pose, self.forward_dist)
+                if goal:
+                    self.goal_source = "startup_forward"
+                    self.publish_goal(goal)
+                    self.next_update_time = now + self.pass_period
+                return
+            # Without autonomous frontier dispatch, an arbitrary forward ray
+            # would steal control from an impending visual target. Continue to
+            # normal arbitration below; it remains idle until another source
+            # supplies an explicit goal.
 
         period = self.state_period()
         if now < self.next_update_time and not self.force_update_due_state():
@@ -1443,6 +1806,15 @@ class GoalManager:
         # dominates the old local GP/access recovery until a visual target ray
         # is available; visual target following remains higher priority.
         now = rospy.Time.now().to_sec()
+        # A visual terminal is not a frontier terminal.  During this bounded
+        # re-observation hold, the next detector frames must decide whether to
+        # continue, confirm close range, or release the target. Once that
+        # bounded hold ends, ``goal_from_target_follow`` owns the pending
+        # transition; returning here for the pending flag would deadlock that
+        # state machine before it can consume the fresh frames.
+        if self.navigation_hold_active:
+            self.goal_source = "target_reobserving"
+            return None
         # A fresh target ray remains the only reason to suppress global map
         # coverage. Context-only states previously let a chair/monitor pair
         # keep the robot in one corridor indefinitely, even though the target
@@ -1450,13 +1822,35 @@ class GoalManager:
         # non-target state; as soon as target detections resume, the existing
         # target-follow path takes priority again.
         target_recent = self.target_tracking_active(now)
-        if target_recent:
+        # A committed visual segment is a mission transaction, not a live
+        # detector callback. Its ownership must survive an ordinary detector
+        # freshness timeout until TEB reports its terminal or Navfn reports a
+        # route failure. Otherwise a single detector gap can replace an
+        # already validated target path with an unvalidated reacquisition ray.
+        target_segment_active = self.target_segment_ownership_active()
+        # A target-segment terminal starts a separate observation transaction.
+        # Its ownership must likewise survive the ordinary detector freshness
+        # timeout: WeDetect can legitimately produce the first post-terminal
+        # frame just after that timeout, and falling through to a frontier here
+        # would clear the track before ``goal_from_target_follow`` can validate
+        # the new ray or release it through the semantic-frontier path.
+        target_terminal_pending = bool(
+            self.target_terminal_reobserve_pending
+            and self.target_last_goal is not None
+        )
+        if target_recent or target_segment_active or target_terminal_pending:
             # Never let legacy access-topology recovery preempt a current (or
             # just-lost) visual target ray.  goal_from_target_follow preserves
             # the last short visual-servo goal through a brief detector gap.
             target_goal = self.goal_from_target_follow(now)
             if target_goal is not None:
                 return target_goal
+            # While the terminal transaction remains pending, ``None`` means
+            # that its bounded observation decision is still in progress, not
+            # that normal frontier exploration may seize the controller.
+            if self.target_terminal_reobserve_pending:
+                self.goal_source = "target_reobserving"
+                return None
         if not target_recent:
             # With online SLAM enabled, context boxes are inspection evidence,
             # not a second global planner. Keep the map-connected waypoint as
@@ -1589,68 +1983,229 @@ class GoalManager:
         """
         if self.latest_pose is None or self.target_last_heading is None:
             return None
-        distance = self.target_segment_distance()
-        x = self.latest_pose.x + distance * math.cos(self.target_last_heading)
-        y = self.latest_pose.y + distance * math.sin(self.target_last_heading)
-        candidate_goal_odom = self.make_goal_pose(
-            (x, y, 0.0), self.target_last_heading
-        )
-        # Visual rays are measured in odom, but a committed TEB action must
-        # have one stable world-frame identity. Transform once at the mission
-        # boundary; do not let subsequent SLAM map->odom updates reinterpret
-        # an active target segment.
-        candidate_goal = self._pose_in_frame(candidate_goal_odom, "map")
-        if candidate_goal is None:
-            self.target_execution_state = "TARGET_ROUTE_PENDING"
-            route_status = None
-        else:
-            route_status = self.validate_target_route(candidate_goal, now)
-        if route_status is not True:
+        selected_goal = None
+        selected_requested_goal = None
+        selected_distance = None
+        selected_index = None
+        last_requested_goal = None
+        rejected_distances = []
+        route_status = None
+        for candidate_index, distance in enumerate(self.target_segment_distances()):
+            x = self.latest_pose.x + distance * math.cos(self.target_last_heading)
+            y = self.latest_pose.y + distance * math.sin(self.target_last_heading)
+            candidate_goal_odom = self.make_goal_pose(
+                (x, y, 0.0), self.target_last_heading
+            )
+            # Visual rays are measured in odom, but a committed TEB action
+            # must have one stable world-frame identity. Transform once at the
+            # mission boundary; do not let subsequent SLAM map->odom updates
+            # reinterpret an active target segment.
+            candidate_goal = self._pose_in_frame(candidate_goal_odom, "map")
+            if candidate_goal is None:
+                self.target_execution_state = "TARGET_ROUTE_PENDING"
+                route_status = None
+                break
+            last_requested_goal = copy.deepcopy(candidate_goal)
+            # The farther point can be occupied by a desk or lie beyond a
+            # doorway even though a nearer observation point on the identical
+            # visual bearing is valid. A bounded candidate ladder is one
+            # transaction: do not let the normal one-second route-validation
+            # cache prevent it from checking that safer fallback.
+            route_status = self.validate_target_route(
+                candidate_goal,
+                now,
+                force=(candidate_index > 0),
+            )
+            if route_status is True:
+                # ``validate_target_route`` validates a *path*, not only the
+                # requested point. Navfn is allowed to return a nearby free
+                # endpoint within its tolerance. Publishing the original ray
+                # endpoint here would create a different mission contract and
+                # make StreamingNavfnPlanner correctly reject the target as
+                # inexact. Commit the returned map endpoint instead.
+                if self.target_route_validation_last_endpoint is None:
+                    route_status = None
+                    break
+                selected_goal = copy.deepcopy(
+                    self.target_route_validation_last_endpoint
+                )
+                selected_requested_goal = copy.deepcopy(candidate_goal)
+                selected_distance = distance
+                selected_index = candidate_index
+                break
+            if route_status is None:
+                break
+            rejected_distances.append(round(float(distance), 3))
+            self.publish_goal_arbitration(
+                "target_viewpoint_rejected",
+                target_track_id=self.target_track_id,
+                strategy=self.target_approach_strategy,
+                candidate_index=int(candidate_index),
+                distance=round(float(distance), 3),
+                heading=round(float(self.target_last_heading), 4),
+            )
+        if selected_goal is None:
             self.goal_source = (
                 "global_slam_frontier"
                 if self.last_goal is not None
                 and self.last_goal_source == "global_slam_frontier"
                 else "target_waiting_navfn_route"
             )
-            self.publish_goal_arbitration(
-                "target_route_held",
-                reason=(
-                    "navfn_empty_plan"
-                    if route_status is False
-                    else "route_validation_unavailable"
-                ),
-                goal=[round(float(x), 3), round(float(y), 3)],
-                fallback_goal=(
-                    None
-                    if self.last_goal is None
-                    else [
-                        round(float(self.last_goal.pose.position.x), 3),
-                        round(float(self.last_goal.pose.position.y), 3),
-                    ]
-                ),
+            # Goal Manager runs at 5 Hz while Navfn is sampled at 1 Hz. Keep
+            # formal logs decision-oriented: one hold per validation period,
+            # not one duplicate event for every timer wakeup.
+            if (
+                now - self.target_route_hold_last_emit
+                >= self.target_route_validation_period
+            ):
+                self.target_route_hold_last_emit = now
+                self.publish_goal_arbitration(
+                    "target_route_held",
+                    reason=(
+                        "navfn_empty_plan"
+                        if route_status is False
+                        else "route_validation_unavailable"
+                    ),
+                    goal=(
+                        None
+                        if last_requested_goal is None
+                        else [
+                            round(float(last_requested_goal.pose.position.x), 3),
+                            round(float(last_requested_goal.pose.position.y), 3),
+                        ]
+                    ),
+                    goal_frame=(
+                        "map"
+                        if last_requested_goal is None
+                        else (last_requested_goal.header.frame_id or "map")
+                    ),
+                    fallback_goal=(
+                        None
+                        if self.last_goal is None
+                        else [
+                            round(float(self.last_goal.pose.position.x), 3),
+                            round(float(self.last_goal.pose.position.y), 3),
+                        ]
+                    ),
             )
             return None
+        candidate_goal = selected_goal
+        requested_goal = selected_requested_goal or candidate_goal
+        distance = selected_distance
+        endpoint_adjustment = self.pose_distance(requested_goal, candidate_goal)
         self.target_last_goal = candidate_goal
         self.target_execution_state = "TARGET_ROUTE_VALIDATED"
         if advance:
             self.target_cache_advances += 1
         else:
             self.target_cache_advances = 0
+            self.target_terminal_blind_advances = 0
+        if source == "target_terminal_advance":
+            self.target_terminal_blind_advances += 1
         self.target_last_update = now
         self.target_goal_detection_stamp = self.target_last_detection_stamp
         self.target_segment_terminal_ready = False
         self.goal_source = source
+        self.target_segment_commit_epoch = int(self.target_observation_epoch)
+        self.publish_goal_arbitration(
+            "target_segment_committed",
+            target_track_id=self.target_track_id,
+            advance=bool(advance),
+            segment_index=int(self.target_cache_advances),
+            approach_strategy=self.target_approach_strategy,
+            viewpoint_candidate_index=int(selected_index),
+            viewpoint_rejected_distances=rejected_distances,
+            segment_distance=round(float(distance), 3),
+            heading=round(float(self.target_last_heading), 4),
+            # ``goal`` is the actual mission endpoint. The original visual
+            # ray remains explicit evidence for diagnosing a tolerance-based
+            # Navfn adjustment without misleading downstream log consumers.
+            goal=[
+                round(float(candidate_goal.pose.position.x), 3),
+                round(float(candidate_goal.pose.position.y), 3),
+            ],
+            goal_frame=(candidate_goal.header.frame_id or "map"),
+            requested_visual_goal=[
+                round(float(requested_goal.pose.position.x), 3),
+                round(float(requested_goal.pose.position.y), 3),
+            ],
+            navfn_returned_goal=[
+                round(float(candidate_goal.pose.position.x), 3),
+                round(float(candidate_goal.pose.position.y), 3),
+            ],
+            navfn_endpoint_adjustment=round(float(endpoint_adjustment or 0.0), 4),
+            navfn_endpoint_contract=True,
+            source_image_stamp=(
+                None
+                if self.target_last_heading_source_stamp is None
+                else round(float(self.target_last_heading_source_stamp), 6)
+            ),
+            projection_tf_mode=(
+                "source_stamp"
+                if self.target_last_heading_source_stamp
+                else "latest_for_unstamped_message"
+            ),
+        )
+        if source == "target_continuous_handoff":
+            self.publish_goal_arbitration(
+                "target_continuous_handoff_prepared",
+                target_track_id=self.target_track_id,
+                current_segment_epoch=int(self.target_segment_commit_epoch),
+                goal=[round(float(x), 3), round(float(y), 3)],
+            )
         rospy.loginfo(
-            "GoalManager: committed target segment source=%s advance=%d/%d "
-            "heading=%.3f goal=(%.2f,%.2f)",
+            "GoalManager: committed target segment source=%s strategy=%s "
+            "candidate=%d advance=%d/%d distance=%.2f heading=%.3f goal=(%.2f,%.2f)",
             source,
+            self.target_approach_strategy,
+            selected_index,
             self.target_cache_advances,
             self.target_cache_max_advances,
+            distance,
             self.target_last_heading,
             x,
             y,
         )
         return self.target_last_goal
+
+    def can_prepare_target_continuous_handoff(self, current_distance: float) -> bool:
+        """Return whether fresh target evidence can safely prefetch one successor.
+
+        The candidate is created only near a bounded segment endpoint. The
+        action remains the bridge's responsibility; it will replace in-place
+        only if TEB feedback still lies inside its own warm-start window.
+        """
+        if not self.target_continuous_handoff_enabled:
+            return False
+        if self.controller_mode != "teb" or self.target_segment_terminal_ready:
+            return False
+        if self.target_terminal_reobserve_pending:
+            return False
+        if self.target_last_heading is None:
+            return False
+        if self.target_cache_advances >= self.target_cache_max_advances:
+            return False
+        if not (
+            self.target_goal_reached_radius < current_distance
+            <= self.target_continuous_handoff_distance
+        ):
+            return False
+        if (
+            self.target_observation_epoch
+            < self.target_segment_commit_epoch
+            + self.target_continuous_handoff_min_new_frames
+        ):
+            return False
+        # A close visual target should terminate and use the explicit
+        # close-confirmation contract, not receive another forward segment.
+        det = self.target_detection_for_track(self.latest_dets)
+        if det is not None and float(det.score) >= self.target_done_min_score:
+            if (
+                float(det.w) >= self.target_done_min_box_width
+                or float(det.h) >= self.target_done_min_box_height
+            ):
+                return False
+        return True
 
     def goal_from_target_follow(self, now: float) -> Optional[PoseStamped]:
         if self.target_blocked:
@@ -1688,6 +2243,14 @@ class GoalManager:
             # A rejected visual ray must not interrupt the map-connected
             # exploration transaction.  Keep the detector track alive so the
             # same target can be reconsidered after SLAM reveals a route.
+            # A semantic replan may already have produced such a route. The
+            # target can remain visible behind the wall while that safe route
+            # drives toward a doorway; a future reachable target segment still
+            # preempts through the successful candidate branch above.
+            frontier = self.fresh_global_frontier_goal(now)
+            if frontier is not None:
+                self.goal_source = "global_slam_frontier"
+                return frontier
             if (
                 self.last_goal is not None
                 and self.last_goal_source == "global_slam_frontier"
@@ -1705,27 +2268,124 @@ class GoalManager:
                 measured_distance = self.goal_robot_distance(self.target_last_goal)
                 if measured_distance is not None:
                     current_distance = measured_distance
+            if self.can_prepare_target_continuous_handoff(current_distance):
+                fresh_frames = (
+                    self.target_observation_epoch - self.target_segment_commit_epoch
+                )
+                candidate = self.commit_target_segment(
+                    now, "target_continuous_handoff", advance=True
+                )
+                if candidate is not None:
+                    rospy.loginfo(
+                        "GoalManager: prepared continuous target successor "
+                        "distance=%.2fm new_frames=%d",
+                        current_distance,
+                        fresh_frames,
+                    )
+                    return candidate
             if current_distance <= self.target_goal_reached_radius:
-                # TEB owns an atomic move_base action.  Physical proximity is
-                # not enough to mutate its goal: wait for the matching
-                # SUCCEEDED terminal event so a detector frame cannot race the
-                # action callback and create a stop/restart pulse.
+                # No fresh, validated successor is available. Wait for the
+                # terminal re-observation boundary rather than manufacturing a
+                # visual ray from stale evidence.
                 if self.controller_mode == "teb" and not self.target_segment_terminal_ready:
                     self.goal_source = "target_waiting_terminal"
                     return self.target_last_goal
+
+                # The action has reached its visual horizon. Do not accept or
+                # reject the next world-frame ray until it is based on at
+                # least two new detector frames from this terminal pose. This
+                # is mission-state debouncing, not a velocity/controller
+                # parameter: it prevents target -> frontier -> target churn.
+                if (
+                    self.target_terminal_reobserve_pending
+                    and self.target_observation_epoch
+                    < self.target_terminal_reobserve_min_epoch
+                    and now < self.target_terminal_reobserve_until
+                ):
+                    self.target_execution_state = "TARGET_REOBSERVING"
+                    self.goal_source = "target_reobserving"
+                    self.set_navigation_hold(True, "await_post_terminal_frames")
+                    self.publish_goal_arbitration(
+                        "target_terminal_reobserve",
+                        observed_epoch=int(self.target_observation_epoch),
+                        required_epoch=int(self.target_terminal_reobserve_min_epoch),
+                        remaining_seconds=round(
+                            self.target_terminal_reobserve_until - now, 3
+                        ),
+                    )
+                    return None
 
                 # A detector gap is common with WeDetect-Large.  Permit only a
                 # bounded continuation on the last observed bearing; then
                 # release the stale visual lock to the map-connected route.
                 if (
                     self.target_last_heading is not None
-                    and self.target_cache_advances < self.target_cache_max_advances
+                    and self.target_terminal_blind_advances
+                    < self.target_cache_max_advances
                 ):
                     candidate = self.commit_target_segment(
                         now, "target_terminal_advance", advance=True
                     )
                     if candidate is not None:
+                        self.target_terminal_reobserve_pending = False
+                        self.set_navigation_hold(False, "post_terminal_route_validated")
                         return candidate
+                    # A live Navfn rejection after the post-terminal frames is
+                    # strong evidence that the target is on the other side of
+                    # known geometry. Do not sit at the observation boundary
+                    # for the rest of the timer window: hand the ray to the
+                    # global explorer as a *soft semantic hint*. It may select
+                    # only an independently safe, Navfn-reachable frontier,
+                    # which keeps moving toward a doorway without pretending
+                    # that the visual ray itself crosses the wall.
+                    if self.target_route_validation_last_result == "blocked":
+                        semantic_hint = self.target_semantic_hint_map()
+                        if semantic_hint is not None:
+                            self.target_terminal_reobserve_pending = False
+                            self.set_navigation_hold(
+                                False, "blocked_target_semantic_frontier"
+                            )
+                            self.publish_goal_arbitration(
+                                "target_route_semantic_replan",
+                                semantic_hint_map=[
+                                    round(float(semantic_hint[0]), 3),
+                                    round(float(semantic_hint[1]), 3),
+                                ],
+                            )
+                            frontier = self.release_target_follow_to_frontier(
+                                now,
+                                replan_reason="target_route_blocked_semantic_hint",
+                                semantic_hint_map=semantic_hint,
+                            )
+                            if frontier is not None:
+                                return frontier
+                            self.goal_source = "target_waiting_semantic_frontier"
+                            return None
+                    # A planner/TF gap or a single weak image ray is not proof
+                    # that the visual target was lost. Keep the robot at the
+                    # terminal pose until another independent frame arrives or
+                    # the bounded observation window expires.
+                    if now < self.target_terminal_reobserve_until:
+                        self.target_terminal_reobserve_pending = True
+                        self.target_terminal_reobserve_min_epoch = max(
+                            self.target_terminal_reobserve_min_epoch,
+                            int(self.target_observation_epoch) + 1,
+                        )
+                        self.target_execution_state = "TARGET_REOBSERVING"
+                        self.goal_source = "target_reobserving"
+                        self.set_navigation_hold(True, "post_terminal_navfn_reobserve")
+                        self.publish_goal_arbitration(
+                            "target_terminal_route_reobserve",
+                            observed_epoch=int(self.target_observation_epoch),
+                            required_epoch=int(self.target_terminal_reobserve_min_epoch),
+                            route_validation=self.target_route_validation_last_result,
+                            remaining_seconds=round(
+                                self.target_terminal_reobserve_until - now, 3
+                            ),
+                        )
+                        return None
+                    self.target_terminal_reobserve_pending = False
+                    self.set_navigation_hold(False, "post_terminal_reobserve_expired")
                     # The previous visual segment reached its terminal
                     # boundary, but its next ray is not map-connected. Drop
                     # the stale visual action and resume exploration instead
@@ -1769,7 +2429,39 @@ class GoalManager:
             self.clear_target_memory()
         return self.goal_from_frontiers_prior()
 
-    def release_target_follow_to_frontier(self, now: float) -> Optional[PoseStamped]:
+    def target_semantic_hint_map(self) -> Optional[Tuple[float, float]]:
+        """Project the latest confirmed visual bearing into the stable map frame.
+
+        The result is deliberately *not* a navigation goal. It is supplied to
+        the frontier selector only after Navfn rejects the same visual ray, so
+        it can prefer a reachable unknown-space boundary on the target side of
+        the known obstruction.
+        """
+        if self.latest_pose is None or self.target_last_heading is None:
+            return None
+        distance = self.target_segment_distance()
+        candidate = self.make_goal_pose(
+            (
+                self.latest_pose.x + distance * math.cos(self.target_last_heading),
+                self.latest_pose.y + distance * math.sin(self.target_last_heading),
+                0.0,
+            ),
+            self.target_last_heading,
+        )
+        candidate_map = self._pose_in_frame(candidate, "map")
+        if candidate_map is None:
+            return None
+        return (
+            float(candidate_map.pose.position.x),
+            float(candidate_map.pose.position.y),
+        )
+
+    def release_target_follow_to_frontier(
+        self,
+        now: float,
+        replan_reason: str = "target_segment_complete",
+        semantic_hint_map: Optional[Tuple[float, float]] = None,
+    ) -> Optional[PoseStamped]:
         """Release a completed visual segment without leaving a stale goal.
 
         A frontier saved before the visual approach may now be far behind the
@@ -1777,18 +2469,33 @@ class GoalManager:
         stale endpoint.  The short replan wait is intentional and observable;
         a long unvalidated reverse route is not.
         """
-        frontier = self.fresh_global_frontier_goal(now)
+        # A semantic hint must be applied to a newly selected branch. Reusing
+        # a latched frontier here would silently discard the hint and can send
+        # the robot back along a route selected before it saw the target.
+        frontier = (
+            None
+            if semantic_hint_map is not None
+            else self.fresh_global_frontier_goal(now)
+        )
         previous_target = self.target_last_goal
         self.clear_target_memory()
         if frontier is None:
             self.request_global_frontier_replan(
-                "target_segment_complete",
+                replan_reason,
                 previous_target=(
                     None
                     if previous_target is None
                     else [
                         round(float(previous_target.pose.position.x), 3),
                         round(float(previous_target.pose.position.y), 3),
+                    ]
+                ),
+                semantic_hint_map=(
+                    None
+                    if semantic_hint_map is None
+                    else [
+                        round(float(semantic_hint_map[0]), 3),
+                        round(float(semantic_hint_map[1]), 3),
                     ]
                 ),
             )
@@ -1817,6 +2524,7 @@ class GoalManager:
         """
         payload = {
             "event": str(event),
+            "task_id": str(self.current_task_id),
             "source": str(self.goal_source),
             "mode": str(self.effective_mode),
             "controller_mode": str(self.controller_mode),
@@ -1887,7 +2595,12 @@ class GoalManager:
             float(comparable.pose.position.y) - float(second.pose.position.y),
         )
 
-    def validate_target_route(self, goal: PoseStamped, now: float) -> Optional[bool]:
+    def validate_target_route(
+        self,
+        goal: PoseStamped,
+        now: float,
+        force: bool = False,
+    ) -> Optional[bool]:
         """Ask Navfn whether a visual approach point is currently connected.
 
         Return values are deliberately tri-state: ``True`` is a live route,
@@ -1905,8 +2618,25 @@ class GoalManager:
             round(float(goal.pose.position.x), 3),
             round(float(goal.pose.position.y), 3),
         )
-        if now < self.target_route_validation_next_time:
-            if self.target_route_validation_last_result == "reachable":
+        # A cached returned endpoint is valid only for the exact visual
+        # request that produced it. Reusing a nearby candidate's endpoint
+        # would silently pair two different sides of Navfn's tolerance rule.
+        cached_goal_matches = (
+            self.target_route_validation_last_goal is not None
+            and math.hypot(
+                float(goal_xy[0]) - float(self.target_route_validation_last_goal[0]),
+                float(goal_xy[1]) - float(self.target_route_validation_last_goal[1]),
+            ) <= 0.001
+        )
+        if (
+            not force
+            and cached_goal_matches
+            and now < self.target_route_validation_next_time
+        ):
+            if (
+                self.target_route_validation_last_result == "reachable"
+                and self.target_route_validation_last_endpoint is not None
+            ):
                 return True
             if self.target_route_validation_last_result == "blocked":
                 return False
@@ -1922,6 +2652,7 @@ class GoalManager:
         self.target_route_validation_last_goal = goal_xy
         if start_map is None or goal_map is None:
             self.target_route_validation_last_result = "unavailable"
+            self.target_route_validation_last_endpoint = None
             self.publish_goal_arbitration(
                 "target_route_deferred",
                 reason="tf_unavailable",
@@ -1936,6 +2667,7 @@ class GoalManager:
             )
         except (rospy.ROSException, rospy.ROSInterruptException):
             self.target_route_validation_last_result = "unavailable"
+            self.target_route_validation_last_endpoint = None
             self.publish_goal_arbitration(
                 "target_route_deferred",
                 reason="navfn_service_unavailable",
@@ -1951,6 +2683,7 @@ class GoalManager:
             response = self.target_route_validation_client(request)
         except (rospy.ServiceException, rospy.ROSException) as exc:
             self.target_route_validation_last_result = "unavailable"
+            self.target_route_validation_last_endpoint = None
             self.publish_goal_arbitration(
                 "target_route_deferred",
                 reason="navfn_service_error",
@@ -1962,14 +2695,50 @@ class GoalManager:
         reachable = bool(response.plan.poses)
         self.target_route_validation_last_result = "reachable" if reachable else "blocked"
         if reachable:
+            # Navfn is queried in map coordinates. Its final plan pose is the
+            # only endpoint it has actually proven reachable, including the
+            # configured tolerance behaviour. Preserve the visual candidate's
+            # desired yaw, while making that reachable point the target pose.
+            returned_endpoint = copy.deepcopy(response.plan.poses[-1])
+            returned_endpoint.header.frame_id = (
+                returned_endpoint.header.frame_id
+                or response.plan.header.frame_id
+                or goal_map.header.frame_id
+                or "map"
+            )
+            if self._frame_name(returned_endpoint.header.frame_id) != "map":
+                returned_endpoint = self._pose_in_frame(returned_endpoint, "map")
+            if returned_endpoint is None:
+                self.target_route_validation_last_result = "unavailable"
+                self.target_route_validation_last_endpoint = None
+                self.publish_goal_arbitration(
+                    "target_route_deferred",
+                    reason="navfn_endpoint_tf_unavailable",
+                    goal=list(goal_xy),
+                )
+                return None
+            returned_endpoint.header.frame_id = "map"
+            returned_endpoint.header.stamp = goal_map.header.stamp
+            returned_endpoint.pose.orientation = copy.deepcopy(goal_map.pose.orientation)
+            endpoint_adjustment = math.hypot(
+                float(returned_endpoint.pose.position.x) - float(goal_map.pose.position.x),
+                float(returned_endpoint.pose.position.y) - float(goal_map.pose.position.y),
+            )
+            self.target_route_validation_last_endpoint = returned_endpoint
             self.target_route_validation_failures = 0
             self.publish_goal_arbitration(
                 "target_route_accepted",
-                goal=list(goal_xy),
+                requested_goal=list(goal_xy),
+                navfn_returned_goal=[
+                    round(float(returned_endpoint.pose.position.x), 3),
+                    round(float(returned_endpoint.pose.position.y), 3),
+                ],
+                navfn_endpoint_adjustment=round(float(endpoint_adjustment), 4),
                 plan_poses=len(response.plan.poses),
                 plan_frame=response.plan.header.frame_id or "map",
             )
             return True
+        self.target_route_validation_last_endpoint = None
         self.target_route_validation_failures += 1
         self.publish_goal_arbitration(
             "target_route_rejected",
@@ -2002,7 +2771,12 @@ class GoalManager:
         pipeline abandon valid sightings near desks.
         """
         if (
-            self.target_reacquire_duration <= 0.0
+            self.target_blocked
+            # An active target segment already owns the same visual evidence.
+            # A loss-driven sweep must never preempt it merely because one
+            # detector interval exceeded the freshness threshold.
+            or self.target_last_goal is not None
+            or self.target_reacquire_duration <= 0.0
             or self.target_reacquire_attempts >= self.target_reacquire_max_attempts
             or self.target_last_seen is None
             or self.target_last_heading is None
@@ -2015,12 +2789,68 @@ class GoalManager:
             heading = self.target_last_heading
             x = self.latest_pose.x + self.target_reacquire_distance * math.cos(heading)
             y = self.latest_pose.y + self.target_reacquire_distance * math.sin(heading)
-            self.target_reacquire_goal = self.make_goal_pose((x, y, 0.0), heading)
+            requested_goal_odom = self.make_goal_pose((x, y, 0.0), heading)
+            requested_goal = self._pose_in_frame(requested_goal_odom, "map")
+            if requested_goal is None:
+                self.goal_source = "target_reacquisition_waiting_route"
+                self.publish_goal_arbitration(
+                    "target_reacquisition_deferred",
+                    reason="tf_unavailable",
+                )
+                return None
+            # Reacquisition is still a target mission, so it must meet the
+            # same Navfn endpoint contract as a normal visual segment. This
+            # also makes a dynamic map change observable before it is sent to
+            # the persistent planner rather than as a later route failure.
+            route_status = self.validate_target_route(
+                requested_goal, now, force=True
+            )
+            if (
+                route_status is not True
+                or self.target_route_validation_last_endpoint is None
+            ):
+                self.goal_source = "target_reacquisition_waiting_route"
+                self.publish_goal_arbitration(
+                    "target_reacquisition_deferred",
+                    reason=(
+                        "navfn_empty_plan"
+                        if route_status is False
+                        else "route_validation_unavailable"
+                    ),
+                    requested_goal=[
+                        round(float(requested_goal.pose.position.x), 3),
+                        round(float(requested_goal.pose.position.y), 3),
+                    ],
+                    goal_frame=(requested_goal.header.frame_id or "map"),
+                )
+                return None
+            self.target_reacquire_goal = copy.deepcopy(
+                self.target_route_validation_last_endpoint
+            )
             self.target_reacquire_started = now
             self.target_reacquire_attempts += 1
+            endpoint_adjustment = self.pose_distance(
+                requested_goal, self.target_reacquire_goal
+            )
+            self.publish_goal_arbitration(
+                "target_reacquisition_route_validated",
+                requested_goal=[
+                    round(float(requested_goal.pose.position.x), 3),
+                    round(float(requested_goal.pose.position.y), 3),
+                ],
+                navfn_returned_goal=[
+                    round(float(self.target_reacquire_goal.pose.position.x), 3),
+                    round(float(self.target_reacquire_goal.pose.position.y), 3),
+                ],
+                navfn_endpoint_adjustment=round(
+                    float(endpoint_adjustment or 0.0), 4
+                ),
+                navfn_endpoint_contract=True,
+            )
             rospy.loginfo(
-                "GoalManager: target lost; continue toward last target bearing %d/%d",
-                self.target_reacquire_attempts, self.target_reacquire_max_attempts,
+                "GoalManager: target lost; Navfn-validated continuation %d/%d",
+                self.target_reacquire_attempts,
+                self.target_reacquire_max_attempts,
             )
         if now - self.target_reacquire_started < self.target_reacquire_duration:
             self.goal_source = "target_reacquisition_sweep"
@@ -2063,7 +2893,11 @@ class GoalManager:
             return
         if (
             self.target_done_require_approach_terminal
-            and self.target_completed_segments < 1
+            and (
+                self.target_completed_segments < 1
+                or not self.target_track_id
+                or self.target_approach_track_id != self.target_track_id
+            )
         ):
             # Never accumulate a distant image's votes while the first target
             # segment is still queued or executing. The next fresh detector
@@ -2115,6 +2949,16 @@ class GoalManager:
         self.target_close_last_seen = now
         if self.target_close_since is None:
             self.target_close_since = now
+            self.publish_goal_arbitration(
+                "target_close_confirmation_started",
+                target_track_id=self.target_track_id,
+                approach_track_id=self.target_approach_track_id,
+                score=round(float(det.score), 4),
+                box=[round(float(det.w), 4), round(float(det.h), 4)],
+                hits=int(self.target_close_hits),
+                required_hits=int(self.target_done_min_fresh_hits),
+                required_hold_seconds=round(float(self.target_done_min_hold_time), 3),
+            )
             rospy.loginfo(
                 "GoalManager: close target confirmation started score=%.3f box=(%.3f,%.3f) hits=%d/%d",
                 float(det.score), float(det.w), float(det.h),
@@ -2125,6 +2969,27 @@ class GoalManager:
             self.target_close_hits >= self.target_done_min_fresh_hits
             and (now - self.target_close_since) >= self.target_done_min_hold_time
         ):
+            self.publish_goal_arbitration(
+                "target_close_confirmed",
+                target_track_id=self.target_track_id,
+                approach_track_id=self.target_approach_track_id,
+                score=round(float(det.score), 4),
+                box=[round(float(det.w), 4), round(float(det.h), 4)],
+                hits=int(self.target_close_hits),
+                hold_seconds=round(float(now - self.target_close_since), 3),
+            )
+            # ``/lste/task_done`` intentionally remains a Bool for the
+            # command mux. Publish identity-bearing completion evidence first
+            # so telemetry can attribute the completion to this exact track.
+            self.publish_goal_arbitration(
+                "target_task_completed",
+                target_track_id=self.target_track_id,
+                approach_track_id=self.target_approach_track_id,
+                score=round(float(det.score), 4),
+                box=[round(float(det.w), 4), round(float(det.h), 4)],
+                hits=int(self.target_close_hits),
+                hold_seconds=round(float(now - self.target_close_since), 3),
+            )
             rospy.loginfo(
                 "GoalManager: close target confirmed hits=%d hold=%.1fs, publish task_done",
                 self.target_close_hits, now - self.target_close_since,
@@ -2143,14 +3008,23 @@ class GoalManager:
         self.target_last_goal = None
         self.target_last_update = 0.0
         self.target_last_heading = None
+        self.target_last_heading_source_stamp = None
         self.target_filtered_cx = None
         self.target_filtered_cy = None
         self.target_filtered_heading = None
         self.target_last_detection_stamp = None
         self.target_goal_detection_stamp = None
         self.target_segment_terminal_ready = False
+        self.target_segment_commit_epoch = 0
+        self.target_terminal_reobserve_pending = False
+        self.target_terminal_reobserve_epoch = 0
+        self.target_terminal_reobserve_min_epoch = 0
+        self.target_terminal_reobserve_until = 0.0
         self.target_track_label = ""
         self.target_track_id = ""
+        self.target_terminal_blind_advances = 0
+        self.target_completed_segments = 0
+        self.target_approach_track_id = ""
         self.target_cache_advances = 0
         self.target_observation_hold_goal = None
         self.target_candidate = None
@@ -2173,26 +3047,74 @@ class GoalManager:
         self.target_route_validation_failures = 0
         self.target_route_validation_last_result = "not_checked"
         self.target_route_validation_last_goal = None
+        self.target_route_validation_last_endpoint = None
+        self.target_route_hold_last_emit = 0.0
 
     def target_segment_distance(self) -> float:
         """Return a controller-appropriate visual pursuit horizon.
 
-        A short visual waypoint is useful for a direct policy, but it is a
-        poor contract for TEB: reaching every 1.5 m waypoint completes the
-        ``move_base`` action and inserts a zero-velocity interval before the
-        detector has produced its next frame. TEB already performs local
-        obstacle avoidance, so give it a horizon of at least four arrival
-        radii (3 m with the production 0.75 m radius). This is derived from
-        the existing arrival contract rather than exposed as another tuning
-        parameter; SAPPO and teleop comparison runs retain the old segment
-        length.
+        A monocular detection supplies a bearing, not a trustworthy metric
+        range.  The goal must therefore stay within the configured visual
+        horizon even for TEB: a long ray can be Navfn-reachable while routing
+        around a wall to a place where the object never was.  Fresh detector
+        frames can use the native target handoff path, so keeping this short
+        no longer requires a terminal stop at every healthy segment boundary.
         """
-        if self.controller_mode != "teb":
-            return self.follow_target_step_distance
-        return max(
-            self.follow_target_step_distance,
-            4.0 * self.target_goal_reached_radius,
+        distance = self.follow_target_step_distance
+        if self.target_approach_strategy != "reachable_viewpoint_ladder":
+            return distance
+        # RGB detections do not give a metric range, but their normalized box
+        # scale is a stable, task-agnostic proxy for approach progress. Once
+        # a target is close to the completion scale, shrink the next visual
+        # horizon instead of driving the full 1.5 m past it and forcing a
+        # stop/reobserve/backtrack cycle.
+        det = self.target_detection_for_track(self.latest_dets)
+        if det is None:
+            return distance
+        observed_scale = max(float(det.w), float(det.h))
+        completion_scale = max(
+            1e-3,
+            min(self.target_done_min_box_width, self.target_done_min_box_height),
         )
+        near_scale = 0.5 * completion_scale
+        if observed_scale <= near_scale:
+            return distance
+        progress = min(
+            1.0,
+            (observed_scale - near_scale) / max(1e-3, completion_scale - near_scale),
+        )
+        minimum = self.target_minimum_viewpoint_distance()
+        return max(minimum, distance * (1.0 - 0.40 * progress))
+
+    def target_minimum_viewpoint_distance(self) -> float:
+        """Smallest new target endpoint that is outside the arrival radius."""
+        return min(
+            self.follow_target_step_distance,
+            max(self.target_goal_reached_radius + 0.20, 0.90),
+        )
+
+    def target_segment_distances(self) -> List[float]:
+        """Return bounded map-validation candidates for one visual heading.
+
+        ``legacy_ray`` preserves the former single fixed endpoint. The
+        default ladder tries at most three monotonically nearer endpoints. It
+        does not use target coordinates, simulator truth, or a controller
+        command; every candidate still requires the live Navfn route proof.
+        """
+        desired = self.target_segment_distance()
+        if self.target_approach_strategy == "legacy_ray":
+            return [desired]
+        minimum = self.target_minimum_viewpoint_distance()
+        if desired <= minimum + 1e-3:
+            return [minimum]
+        distances = [desired]
+        for ratio in (0.65, 0.35):
+            candidate = minimum + (desired - minimum) * ratio
+            if all(abs(candidate - existing) > 0.08 for existing in distances):
+                distances.append(candidate)
+        if all(abs(minimum - existing) > 0.08 for existing in distances):
+            distances.append(minimum)
+        return distances
 
     def goal_from_ctx_follow(self, now: float) -> Optional[PoseStamped]:
         if self.ctx_start_time is None:
@@ -2213,7 +3135,13 @@ class GoalManager:
             mid_det.cx = 0.5 * (float(left_det.cx) + float(right_det.cx))
             mid_det.cy = 0.5 * (float(left_det.cy) + float(right_det.cy))
             mid_det.w = mid_det.h = 0.0
-            heading_world = self.det_heading_world(mid_det)
+            detection_stamp = self.latest_dets.header.stamp
+            heading_world = self.det_heading_world(
+                mid_det,
+                detection_stamp
+                if detection_stamp and detection_stamp.to_sec() > 0.0
+                else rospy.Time(0),
+            )
             if heading_world is not None:
                 dist = self.clip_distance(heading_world, self.follow_context_step_distance)
                 if dist is not None:
@@ -2626,10 +3554,39 @@ class GoalManager:
         if self.goal_source == "global_slam_frontier":
             intent["route_kind"] = self.global_frontier_route_kind
             intent["route_id"] = int(self.global_frontier_route_id)
+            intent["transition_kind"] = self.global_frontier_transition_kind
+            intent["predecessor_route_id"] = int(
+                self.global_frontier_predecessor_route_id
+            )
+            intent["transition_distance_to_previous_endpoint"] = (
+                self.global_frontier_transition_distance
+            )
         if self.goal_source.startswith("target_"):
             intent["target_epoch"] = int(self.target_observation_epoch)
             intent["target_track_id"] = self.target_track_id
             intent["target_state"] = self.target_execution_state
+        # This is the execution boundary. Publishing pose and ownership in
+        # one latched message prevents a freshly restarted bridge from first
+        # receiving an obsolete final_goal and only later its replacement
+        # metadata. The two legacy publications below remain observer APIs.
+        self.goal_command_id += 1
+        # Carry the same monotonic transaction through the legacy pose topic.
+        # StreamingNavfnPlanner uses it to reject an older latched pose that
+        # arrives after a newer bridge-approved mission transaction.
+        goal.header.seq = int(self.goal_command_id) & 0xFFFFFFFF
+        command = dict(intent)
+        q = goal.pose.orientation
+        command.update({
+            "event": "mission_goal",
+            "transaction_id": int(self.goal_command_id),
+            "frame_id": (goal.header.frame_id or "odom").strip().lstrip("/") or "odom",
+            "yaw": round(math.atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+            ), 4),
+            "stamp": rospy.Time.now().to_sec(),
+        })
+        self.pub_goal_command.publish(String(data=json.dumps(command, sort_keys=True)))
         self.pub_goal_intent.publish(String(data=json.dumps(intent, sort_keys=True)))
         self.pub_goal.publish(goal)
         rospy.loginfo_throttle(2.0, "Publish /lste/final_goal: x=%.2f y=%.2f state=%s",
@@ -2799,6 +3756,10 @@ class GoalManager:
         )
         return (now - self.target_last_seen) < timeout
 
+    def target_segment_ownership_active(self) -> bool:
+        """Return whether a Navfn-validated visual segment still owns motion."""
+        return self.target_last_goal is not None and not self.target_blocked
+
     def pick_ctx_pair(self) -> Tuple[Optional[LsteDetection], Optional[LsteDetection]]:
         """
         返回左右各一个 ctx 检测（label 分别包含 ctx_left / ctx_right），选 2D 中心距离最近的一对。
@@ -2849,8 +3810,15 @@ class GoalManager:
         return wrap_angle(blended)
 
     # -------------------- Projection --------------------
-    def det_heading_world(self, det: LsteDetection) -> Optional[float]:
-        """无深度：返回检测射线在 odom 下的朝向（弧度）。"""
+    def det_heading_world(
+        self, det: LsteDetection, stamp: Optional[rospy.Time] = None
+    ) -> Optional[float]:
+        """Return an image ray's odom heading at its camera exposure time.
+
+        A nonzero detector stamp is never silently replaced with latest TF:
+        that would rotate a delayed frame into a false bearing while moving.
+        ``Time(0)`` is retained only for explicitly unstamped legacy input.
+        """
         if self.camera_info is None or self.camera_frame is None:
             rospy.logwarn_throttle(5.0, "GoalManager: camera info not ready")
             return None
@@ -2863,8 +3831,16 @@ class GoalManager:
         u = max(0, min(w - 1, u))
         v = max(0, min(h - 1, v))
         ray = self.camera_model.projectPixelTo3dRay((u, v))  # optical frame direction
-        tfm = self.lookup_transform("odom", self.camera_frame, rospy.Time(0))
+        tf_stamp = stamp if stamp is not None else rospy.Time(0)
+        tfm = self.lookup_transform("odom", self.camera_frame, tf_stamp)
         if tfm is None:
+            if tf_stamp.to_sec() > 0.0:
+                rospy.logwarn_throttle(
+                    1.0,
+                    "GoalManager: source-stamped camera TF unavailable; "
+                    "discarding projection stamp=%.6f",
+                    tf_stamp.to_sec(),
+                )
             return None
         rot = tfm.transform.rotation
         mat = quaternion_matrix([rot.x, rot.y, rot.z, rot.w])

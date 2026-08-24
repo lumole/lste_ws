@@ -312,3 +312,194 @@ class WeDetectBackend:
             normalized_scores.append(float(score))
             output_labels.append(self._cached_labels[int(index)])
         return normalized_boxes, normalized_scores, output_labels
+
+    @staticmethod
+    def _tile_axis_ranges(length: int, grid: int, overlap: float):
+        """Return evenly distributed, overlapping crop intervals for one axis."""
+        length = max(1, int(length))
+        grid = max(1, int(grid))
+        overlap = min(0.45, max(0.0, float(overlap)))
+        if grid == 1:
+            return [(0, length)]
+        # A 2x2 layout with 20% overlap uses each crop at 55.6% of the source
+        # dimension. Every pixel is covered while objects near a seam retain
+        # one non-truncated view.
+        tile_length = min(
+            length,
+            max(1, int(np.ceil(length / (grid - overlap * (grid - 1))))),
+        )
+        max_start = max(0, length - tile_length)
+        starts = sorted({
+            int(round(index * max_start / float(grid - 1)))
+            for index in range(grid)
+        })
+        return [(start, min(length, start + tile_length)) for start in starts]
+
+    def merge_normalized_detections(
+        self,
+        boxes: Sequence[Sequence[float]],
+        scores: Sequence[float],
+        labels: Sequence[str],
+    ) -> Tuple[List[List[float]], List[float], List[str]]:
+        """Apply one class-aware NMS after detector crops are remapped.
+
+        Individual crops already pass WeDetect NMS, but an object crossing a
+        crop seam can still appear once in each crop. This second NMS works in
+        source-normalized coordinates and preserves the detector's normal
+        class-aware suppression semantics.
+        """
+        if not boxes:
+            return [], [], []
+        label_ids = {label: index for index, label in enumerate(dict.fromkeys(labels))}
+        xyxy = []
+        valid_scores = []
+        valid_labels = []
+        classes = []
+        for box, score, label in zip(boxes, scores, labels):
+            if len(box) != 4:
+                continue
+            cx, cy, width, height = (float(value) for value in box)
+            x1 = max(0.0, min(1.0, cx - 0.5 * width))
+            y1 = max(0.0, min(1.0, cy - 0.5 * height))
+            x2 = max(0.0, min(1.0, cx + 0.5 * width))
+            y2 = max(0.0, min(1.0, cy + 0.5 * height))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            xyxy.append([x1, y1, x2, y2])
+            valid_scores.append(float(score))
+            valid_labels.append(str(label))
+            classes.append(label_ids[str(label)])
+        if not xyxy:
+            return [], [], []
+        box_tensor = torch.tensor(xyxy, dtype=torch.float32, device=self.device)
+        score_tensor = torch.tensor(valid_scores, dtype=torch.float32, device=self.device)
+        class_tensor = torch.tensor(classes, dtype=torch.int64, device=self.device)
+        kept = self._deployment.torchvision.ops.batched_nms(
+            box_tensor, score_tensor, class_tensor, self.nms_iou
+        )[:self.max_detections].cpu().tolist()
+        merged_boxes = []
+        merged_scores = []
+        merged_labels = []
+        for index in kept:
+            x1, y1, x2, y2 = xyxy[index]
+            merged_boxes.append([
+                0.5 * (x1 + x2),
+                0.5 * (y1 + y2),
+                x2 - x1,
+                y2 - y1,
+            ])
+            merged_scores.append(valid_scores[index])
+            merged_labels.append(valid_labels[index])
+        return merged_boxes, merged_scores, merged_labels
+
+    def detect_tiles(
+        self,
+        image: np.ndarray,
+        labels: Sequence[str],
+        grid: int = 2,
+        overlap: float = 0.20,
+    ) -> Tuple[List[List[float]], List[float], List[str], int]:
+        """Detect on overlapping source crops and remap boxes to full image.
+
+        This is intentionally an opt-in *search* primitive. It lets a fixed
+        square deployment resolve a small item before it is close enough to
+        dominate the full camera frame, without changing its ONNX input shape
+        or using simulator truth. Callers decide when the added GPU work is
+        warranted.
+        """
+        if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError("WeDetect tile search expects an HxWx3 RGB numpy array.")
+        source_height, source_width = image.shape[:2]
+        rows = self._tile_axis_ranges(source_height, grid, overlap)
+        columns = self._tile_axis_ranges(source_width, grid, overlap)
+        regions = [
+            (x0, y0, x1, y1)
+            for y0, y1 in rows
+            for x0, x1 in columns
+        ]
+        boxes, scores, labels = self.detect_regions(image, labels, regions)
+        return boxes, scores, labels, len(regions)
+
+    def detect_center_band(
+        self,
+        image: np.ndarray,
+        labels: Sequence[str],
+        crop_count: int = 4,
+        band_height_ratio: float = 0.72,
+    ) -> Tuple[List[List[float]], List[float], List[str], int]:
+        """Search square crops across the central visual band.
+
+        A landscape camera frame loses small objects when the whole frame is
+        resized to the square WeDetect deployment input.  Unlike a uniform
+        grid, this layout keeps each crop square and uses the requested band
+        height as its side length.  Four 512-pixel-class crops over a 1280x720
+        frame therefore provide about 2.5x the full-frame object scale while
+        retaining the existing four-forward TensorRT budget.
+
+        The horizontal overlap is intentionally derived from the image size:
+        it guarantees full central-band coverage even when ``crop_count`` and
+        square crop size would otherwise leave gaps.  This is a visual search
+        primitive only; callers decide when its additional inference cost is
+        appropriate.
+        """
+        if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError("WeDetect center-band search expects an HxWx3 RGB numpy array.")
+        source_height, source_width = image.shape[:2]
+        crop_count = max(1, int(crop_count))
+        band_height_ratio = min(1.0, max(0.10, float(band_height_ratio)))
+        side = max(1, min(
+            source_width,
+            int(round(source_height * band_height_ratio)),
+        ))
+        y0 = max(0, (source_height - side) // 2)
+        y1 = min(source_height, y0 + side)
+        max_x0 = max(0, source_width - side)
+        if crop_count == 1 or max_x0 == 0:
+            starts = [max_x0 // 2]
+        else:
+            starts = [
+                int(round(index * max_x0 / float(crop_count - 1)))
+                for index in range(crop_count)
+            ]
+        regions = [(x0, y0, min(source_width, x0 + side), y1) for x0 in starts]
+        boxes, scores, labels = self.detect_regions(image, labels, regions)
+        return boxes, scores, labels, len(regions)
+
+    def detect_regions(
+        self,
+        image: np.ndarray,
+        labels: Sequence[str],
+        regions: Sequence[Tuple[int, int, int, int]],
+    ) -> Tuple[List[List[float]], List[float], List[str]]:
+        """Detect explicit source-image regions and remap boxes once."""
+        if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError("WeDetect region search expects an HxWx3 RGB numpy array.")
+        source_height, source_width = image.shape[:2]
+        remapped_boxes: List[List[float]] = []
+        remapped_scores: List[float] = []
+        remapped_labels: List[str] = []
+        for x0, y0, x1, y1 in regions:
+            x0 = max(0, min(source_width, int(x0)))
+            x1 = max(0, min(source_width, int(x1)))
+            y0 = max(0, min(source_height, int(y0)))
+            y1 = max(0, min(source_height, int(y1)))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            crop = image[y0:y1, x0:x1]
+            boxes, scores, crop_labels = self.detect(crop, labels)
+            crop_width = float(x1 - x0)
+            crop_height = float(y1 - y0)
+            for box, score, label in zip(boxes, scores, crop_labels):
+                cx, cy, width, height = box
+                remapped_boxes.append([
+                    (float(x0) + float(cx) * crop_width) / source_width,
+                    (float(y0) + float(cy) * crop_height) / source_height,
+                    float(width) * crop_width / source_width,
+                    float(height) * crop_height / source_height,
+                ])
+                remapped_scores.append(float(score))
+                remapped_labels.append(str(label))
+        boxes, scores, labels = self.merge_normalized_detections(
+            remapped_boxes, remapped_scores, remapped_labels
+        )
+        return boxes, scores, labels

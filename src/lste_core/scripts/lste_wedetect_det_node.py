@@ -7,6 +7,7 @@ contract so it can be selected without changing the rest of LSTE.
 """
 
 import os
+import time
 
 import cv2
 import rospy
@@ -36,6 +37,39 @@ class WeDetectDetNode(DetectionNodeBase):
         label_map = rospy.get_param("~wedetect_label_map", {})
         if not isinstance(label_map, dict):
             raise ValueError("~wedetect_label_map must map English labels to Chinese labels")
+        tile_search = rospy.get_param("~wedetect_small_object_tile_search_enabled", True)
+        self.small_object_tile_search_enabled = str(tile_search).strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        self.small_object_tile_grid = max(
+            1, int(rospy.get_param("~wedetect_small_object_tile_grid", 2))
+        )
+        tile_layout = str(
+            rospy.get_param("~wedetect_small_object_tile_layout", "uniform_grid")
+        ).strip().lower()
+        if tile_layout not in ("uniform_grid", "center_band"):
+            rospy.logwarn(
+                "Unsupported WeDetect small-object tile layout %r; using uniform_grid.",
+                tile_layout,
+            )
+            tile_layout = "uniform_grid"
+        self.small_object_tile_layout = tile_layout
+        self.small_object_tile_overlap = min(0.45, max(
+            0.0, float(rospy.get_param("~wedetect_small_object_tile_overlap", 0.20))
+        ))
+        self.small_object_center_band_height_ratio = min(1.0, max(
+            0.10, float(rospy.get_param(
+                "~wedetect_small_object_center_band_height_ratio", 0.72
+            ))
+        ))
+        self.small_object_center_band_crops = max(
+            1, int(rospy.get_param("~wedetect_small_object_center_band_crops", 4))
+        )
+        self.small_object_tile_interval = max(
+            0.10, float(rospy.get_param("~wedetect_small_object_tile_interval", 2.0))
+        )
+        self._last_tile_search_monotonic = float("-inf")
+        self._last_inference_metadata = {}
         variant = rospy.get_param("~wedetect_variant", "base")
         rospy.loginfo("Loading WeDetect-%s model with cached text embeddings...", variant)
         try:
@@ -58,11 +92,87 @@ class WeDetectDetNode(DetectionNodeBase):
         except WeDetectUnavailable as exc:
             rospy.logfatal("WeDetect initialization failed: %s", exc)
             raise
-        rospy.loginfo("WeDetect-%s model loaded.", self.model.variant)
+        rospy.loginfo(
+            "WeDetect-%s model loaded; small-object tile search=%s layout=%s "
+            "grid=%dx%d center_band=%d@%.2f interval=%.2fs.",
+            self.model.variant,
+            self.small_object_tile_search_enabled,
+            self.small_object_tile_layout,
+            self.small_object_tile_grid,
+            self.small_object_tile_grid,
+            self.small_object_center_band_crops,
+            self.small_object_center_band_height_ratio,
+            self.small_object_tile_interval,
+        )
 
     def infer(self, image_bgr, prompt_a, prompt_b_terms):
+        inference_started = time.monotonic()
         image_source = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        boxes, scores, labels = self.model.detect(image_source, [prompt_a] + list(prompt_b_terms))
+        labels_for_model = [prompt_a] + list(prompt_b_terms)
+        boxes, scores, labels = self.model.detect(image_source, labels_for_model)
+        primary_target_count = sum(1 for label in labels if label == prompt_a)
+        metadata = {
+            "small_object_tile_search_enabled": self.small_object_tile_search_enabled,
+            "small_object_tile_search_ran": False,
+            "small_object_tile_search_layout": self.small_object_tile_layout,
+            "small_object_tile_search_grid": self.small_object_tile_grid,
+            "small_object_tile_search_center_band_height_ratio": (
+                self.small_object_center_band_height_ratio
+            ),
+            "small_object_tile_search_center_band_crops": (
+                self.small_object_center_band_crops
+            ),
+            "small_object_tile_search_primary_target_candidates": primary_target_count,
+            "small_object_tile_search_tiles": 0,
+            "small_object_tile_search_elapsed_seconds": 0.0,
+        }
+        # Keep the normal full-frame path at its established TensorRT rate. A
+        # crop pass is a search fallback only and maps every resulting box
+        # back to the original camera frame before common post-processing.
+        now = time.monotonic()
+        if (
+            self.small_object_tile_search_enabled
+            and primary_target_count == 0
+            and now - self._last_tile_search_monotonic
+            >= self.small_object_tile_interval
+        ):
+            tile_started = time.monotonic()
+            if self.small_object_tile_layout == "center_band":
+                tiled_boxes, tiled_scores, tiled_labels, tile_count = (
+                    self.model.detect_center_band(
+                        image_source,
+                        labels_for_model,
+                        crop_count=self.small_object_center_band_crops,
+                        band_height_ratio=self.small_object_center_band_height_ratio,
+                    )
+                )
+            else:
+                tiled_boxes, tiled_scores, tiled_labels, tile_count = self.model.detect_tiles(
+                    image_source,
+                    labels_for_model,
+                    grid=self.small_object_tile_grid,
+                    overlap=self.small_object_tile_overlap,
+                )
+            boxes, scores, labels = self.model.merge_normalized_detections(
+                list(boxes) + tiled_boxes,
+                list(scores) + tiled_scores,
+                list(labels) + tiled_labels,
+            )
+            self._last_tile_search_monotonic = now
+            metadata.update({
+                "small_object_tile_search_ran": True,
+                "small_object_tile_search_tiles": tile_count,
+                "small_object_tile_search_elapsed_seconds": round(
+                    time.monotonic() - tile_started, 4
+                ),
+                "small_object_tile_search_target_candidates": sum(
+                    1 for label in tiled_labels if label == prompt_a
+                ),
+            })
+        metadata["inference_elapsed_seconds"] = round(
+            time.monotonic() - inference_started, 4
+        )
+        self._last_inference_metadata = metadata
         target_boxes, target_scores, target_labels = [], [], []
         env_boxes, env_scores, env_labels = [], [], []
         env_set = set(prompt_b_terms)
@@ -84,6 +194,9 @@ class WeDetectDetNode(DetectionNodeBase):
             torch.tensor(env_scores, dtype=torch.float32),
             env_labels,
         )
+
+    def inference_metadata(self):
+        return dict(self._last_inference_metadata)
 
 
 if __name__ == "__main__":
