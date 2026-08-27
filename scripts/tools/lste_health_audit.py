@@ -149,6 +149,7 @@ class HealthAudit:
         self.publisher_topics = _string_list_param(
             "~publisher_topics", DEFAULT_PUBLISHER_TOPICS
         )
+        self._apply_pipeline_profile()
         self.fresh_topics = _fresh_topic_param()
 
         self.last_messages: Dict[str, float] = {}
@@ -184,6 +185,36 @@ class HealthAudit:
             % (self.startup_grace, self.check_interval, self.status_file),
             flush=True,
         )
+
+    def _apply_pipeline_profile(self) -> None:
+        """Remove inactive controller/legacy expectations from the audit.
+
+        The health sidecar is shared by TEB, teleop, and SA-PPO launches. A
+        static list that always requires the SA-PPO and legacy GP nodes makes a
+        healthy TEB benchmark report ``starting`` forever, even when every
+        node that the selected architecture needs is alive.
+        """
+        mode = str(rospy.get_param("~controller_mode", "")).strip().lower()
+        legacy_gp = str(rospy.get_param("~legacy_gp_frontier_enabled", "true")).strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        detector_node = str(rospy.get_param("~detector_node", "")).strip()
+        if mode in ("teb", "teleop"):
+            self.expected_nodes = [node for node in self.expected_nodes if node != "/StageEnv_0"]
+        if not legacy_gp:
+            self.expected_nodes = [node for node in self.expected_nodes if node != "/gp_subgoal"]
+        if detector_node:
+            self.expected_nodes = [node for node in self.expected_nodes if node != "/lste_det_node"]
+            if detector_node not in self.expected_nodes:
+                self.expected_nodes.append(detector_node)
+        if mode in ("teb", "teleop", "sappo"):
+            active_topic = "/lste/cmd_vel/%s" % mode
+            self.publisher_topics = [
+                topic
+                for topic in self.publisher_topics
+                if topic not in ("/lste/cmd_vel/teb", "/lste/cmd_vel/sappo", "/lste/cmd_vel/teleop")
+            ]
+            self.publisher_topics.append(active_topic)
 
     def _message_callback(self, _message: rospy.AnyMsg, topic: str) -> None:
         self.last_messages[topic] = time.monotonic()

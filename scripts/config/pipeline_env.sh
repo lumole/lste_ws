@@ -21,6 +21,12 @@ fi
 export LSTE_PRE_WS
 export LSTE_WS="$WS"
 
+# Catkin's generated Python relays use the base interpreter's shebang, while
+# the LSTE helper modules live in src/lste_core/scripts/utils.  Export the
+# source script directory explicitly so every ROS Python node can resolve the
+# shared ``utils`` package regardless of which conda interpreter launches it.
+export PYTHONPATH="$WS/src/lste_core/scripts:$WS/devel/lib/python3/dist-packages${PYTHONPATH:+:$PYTHONPATH}"
+
 # Keep startup deterministic: every model used by the simulation is expected to
 # be installed locally. Gazebo Classic otherwise blocks on its retired public
 # model database before the world can begin publishing /clock.

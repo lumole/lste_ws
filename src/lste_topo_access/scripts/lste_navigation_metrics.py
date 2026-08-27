@@ -67,7 +67,17 @@ class NavigationMetrics:
         self.retention_days = max(
             1, int(rospy.get_param("~retention_days", 15))
         )
-        self.run_timestamp, self.log_dir = self._create_run_dir()
+        # Benchmark launchers may allocate the timestamp directory before the
+        # node starts so every process in one invocation shares one parent.
+        # Normal production runs keep the historical auto-created directory.
+        requested_run_dir = str(rospy.get_param("~run_directory", "")).strip()
+        requested_timestamp = str(rospy.get_param("~run_timestamp", "")).strip()
+        if requested_run_dir:
+            self.log_dir = self._resolve_path(requested_run_dir)
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self.run_timestamp = requested_timestamp or self.log_dir.name
+        else:
+            self.run_timestamp, self.log_dir = self._create_run_dir()
         self.log_path = self.log_dir / (self.run_timestamp + "_navigation_metrics.log")
         self.stream = self.log_path.open("w", encoding="utf-8", buffering=1)
 

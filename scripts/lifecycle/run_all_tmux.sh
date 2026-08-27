@@ -44,6 +44,33 @@ nodes_session_ready() {
   done
 }
 
+all_nodes_ready() {
+  local node
+  for node in \
+    /lste_task_node /lste_prompt_node /lste_det_node \
+    /lste_score_node /lste_state_node /lste_det_vis_node /oc_srfc_proj \
+    /lste_global_frontier /lste_teb_goal_bridge /lste_teb_turn_supervisor \
+    /lste_controller_switch /lste_cmd_vel_mux /lste_health_audit \
+    /lste_navigation_metrics /move_base /teleop_twist_keyboard_reset; do
+    rosnode list 2>/dev/null | grep -qx "$node" || return 1
+  done
+}
+
+wait_for_all_nodes() {
+  local attempt
+  for attempt in $(seq 1 300); do
+    if all_nodes_ready; then
+      echo "[all] All benchmark nodes are registered."
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[error] Required LSTE nodes did not become ready within 300 seconds." >&2
+  echo "[error] Registered nodes:" >&2
+  rosnode list 2>/dev/null >&2 || true
+  return 1
+}
+
 if ! tmux has-session -t "=lste" 2>/dev/null; then
   source "$WS/scripts/config/pipeline_env.sh"
   echo "[all] Waiting for Gazebo services..."
@@ -58,6 +85,7 @@ if ! tmux has-session -t "=lste" 2>/dev/null; then
     exit 1
   fi
   "$WS/scripts/lifecycle/run_nodes_tmux.sh"
+  wait_for_all_nodes
 elif nodes_session_ready; then
   echo "[all] Reusing the existing 'lste' session."
   source "$WS/scripts/config/pipeline_env.sh"
@@ -68,11 +96,13 @@ elif nodes_session_ready; then
   else
     "$WS/scripts/lifecycle/switch_controller.sh" teb
   fi
+  wait_for_all_nodes
 else
   echo "[all] Existing 'lste' session is incomplete; rebuilding the node session."
   tmux kill-session -t "=lste"
   source "$WS/scripts/config/pipeline_env.sh"
   "$WS/scripts/lifecycle/run_nodes_tmux.sh"
+  wait_for_all_nodes
 fi
 
 for session in lste-env lste lste-teleop; do

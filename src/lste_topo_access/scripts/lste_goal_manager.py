@@ -923,6 +923,48 @@ class GoalManager:
             1, self.target_candidate_hits
         )
 
+        # A first valid target frame needs a short observation transaction.
+        # Without this hold, a frontier action can reach its terminal between
+        # two detector frames and immediately publish the next map waypoint.
+        # That changes the camera view before the candidate can satisfy the
+        # multi-frame confirmation contract.  The hold is bounded by the
+        # existing candidate timeout and is released automatically when no
+        # fresh evidence arrives; confirmed targets do not use it.
+        if (
+            not self.target_follow_confirmed
+            and self.target_candidate_hits == 1
+            and now >= self.target_observation_hold_until
+        ):
+            self.target_observation_hold_until = (
+                now + self.target_follow_candidate_timeout
+            )
+            self.publish_goal_arbitration(
+                "target_candidate_observation_hold",
+                target_track_id=self.target_track_id,
+                hits=int(self.target_candidate_hits),
+                hold_seconds=round(float(self.target_follow_candidate_timeout), 3),
+                hold_until=round(float(self.target_observation_hold_until), 3),
+                score=round(float(score), 4),
+                box=[round(float(det.w), 4), round(float(det.h), 4)],
+            )
+            # The observation hold is an execution barrier, not just a
+            # bookkeeping timer.  A weak first frame is usually visible for
+            # only one detector cycle while the robot is moving past a door.
+            # Freeze the current command so the next independent frame is
+            # captured from the same physical viewpoint.  Terminal
+            # re-observation has its own hold transaction and must not be
+            # overwritten here.
+            if not self.target_terminal_reobserve_pending:
+                self.set_navigation_hold(True, "target_candidate_observation")
+            rospy.loginfo(
+                "GoalManager: hold frontier for target candidate observation "
+                "for %.2fs (score=%.3f box=%.3fx%.3f)",
+                self.target_follow_candidate_timeout,
+                score,
+                float(det.w),
+                float(det.h),
+            )
+
         # Smooth the normalized image centre and then transform that single
         # filtered ray into odom.  Limit the per-frame heading change as a
         # second guard against a one-frame false association while allowing a
@@ -1017,6 +1059,15 @@ class GoalManager:
                 )
             self.target_follow_confirmed = True
             self.target_last_seen = now
+            if (
+                self.navigation_hold_active
+                and not self.target_terminal_reobserve_pending
+            ):
+                # Confirmation is now an explicit visual-track transaction;
+                # let the next timer tick validate and commit its Navfn/TEB
+                # approach segment instead of waiting for the full candidate
+                # timeout.
+                self.set_navigation_hold(False, "target_follow_confirmed")
         else:
             rospy.loginfo_throttle(
                 2.0,
@@ -2612,6 +2663,39 @@ class GoalManager:
                     # which keeps moving toward a doorway without pretending
                     # that the visual ray itself crosses the wall.
                     if self.target_route_validation_last_result == "blocked":
+                        # Once a validated visual segment has brought the
+                        # robot into the close-target window, an unavailable
+                        # *next* ray must not clear the track and discard the
+                        # close-vote history.  The target may be on a desk or
+                        # just beyond an inflated obstacle, so Navfn can quite
+                        # correctly reject another forward point even though
+                        # the current camera view already satisfies the task
+                        # completion contract.  Hold the base in place while
+                        # maybe_publish_task_done() consumes fresh close
+                        # frames; only a sustained evidence timeout will fall
+                        # through to semantic frontier recovery.
+                        close_evidence_active = (
+                            self.target_completed_segments >= 1
+                            and self.target_close_since is not None
+                            and self.target_close_last_seen is not None
+                            and now - self.target_close_last_seen
+                            <= max(self.target_done_max_detection_age, 2.0)
+                        )
+                        if close_evidence_active:
+                            self.target_execution_state = "TARGET_CLOSE_REOBSERVING"
+                            self.goal_source = "target_reobserving"
+                            self.set_navigation_hold(True, "await_close_confirmation")
+                            self.publish_goal_arbitration(
+                                "target_close_route_blocked_hold",
+                                target_track_id=self.target_track_id,
+                                completed_segments=int(self.target_completed_segments),
+                                close_hits=int(self.target_close_hits),
+                                remaining_seconds=round(
+                                    max(0.0, self.target_terminal_reobserve_until - now),
+                                    3,
+                                ),
+                            )
+                            return None
                         semantic_hint = self.target_semantic_hint_map()
                         if semantic_hint is not None:
                             self.target_terminal_reobserve_pending = False

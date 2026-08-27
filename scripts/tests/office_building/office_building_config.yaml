@@ -1,0 +1,52 @@
+# Benchmark-only pipeline overrides. Production defaults remain unchanged.
+WORLD: worlds/benchmark/office_building_v1_level_2_no_pro3.world
+TASK_JSON: model/Data_exchange/vlm_prompt/lab/yellow_cup.json
+TASK_ID: yellow_cup
+
+# The launcher replaces these four values from the selected robot profile.
+PRO3_SPAWN_X: 2.8
+PRO3_SPAWN_Y: 11.0
+PRO3_SPAWN_Z: 0.1
+PRO3_SPAWN_YAW: 0.0
+
+GLOBAL_GOAL_SOURCE: brain
+ONLINE_SLAM_ENABLED: true
+GLOBAL_FRONTIER_ENABLED: true
+LEGACY_GP_FRONTIER_ENABLED: false
+LSTE_CONTROLLER: teb
+CONTROLLER_MODE: teb
+DETECTOR: wedetect-large
+
+# Keep the navigation architecture used by the existing benchmark baseline.
+PERSISTENT_EXECUTION: true
+TEB_CONTROLLER_FREQUENCY: 20.0
+TEB_MAX_LINEAR_SPEED: 0.5
+TEB_MAX_VEL_THETA: 0.65
+TEB_MIN_OBSTACLE_DIST: 0.22
+TEB_INFLATION_DIST: 0.55
+TARGET_APPROACH_STRATEGY: reachable_viewpoint_ladder
+TARGET_ROUTE_CONTINUITY_ENABLED: true
+TARGET_ROUTE_CONTINUITY_DEFER_SHARP_TAKEOVER: true
+TARGET_REACQUIRE_DURATION: 12.0
+
+# Simulator-only target truth evaluation. It never publishes a command.
+TARGET_EVAL_ENABLED: true
+TARGET_EVAL_GAZEBO_TARGET_MODEL: cup_yellow
+TARGET_EVAL_GAZEBO_ROBOT_MODEL: pro3
+TARGET_EVAL_WORLD_FRAME: world
+TARGET_EVAL_ODOM_FRAME: odom
+TARGET_EVAL_CAMERA_FRAME: kinect_rgb_optical_frame
+TARGET_EVAL_CAMERA_INFO_TOPIC: /kinect/hd/camera_info
+TARGET_EVAL_TARGET_LABELS: "yellow cup,yellow mug"
+# The benchmark include scales the source cup by 1.8. Its measured visual
+# bounds are approximately 0.147 x 0.147 x 0.138 m, with the origin at the
+# base. These values are observer-only truth for projected-box diagnostics.
+TARGET_EVAL_TARGET_CENTER_M: "0,0,0.069"
+TARGET_EVAL_TARGET_SIZE_M: "0.147,0.147,0.138"
+# The Pro3 Kinect description in this workspace publishes RGB and CameraInfo,
+# but does not instantiate a depth sensor. Keep this optional truth check off
+# instead of treating a non-existent compressedDepth topic as a detector
+# failure. Target completion still uses detector evidence and approach state.
+TARGET_EVAL_DEPTH_ENABLED: false
+
+LOG_RETENTION_DAYS: 15

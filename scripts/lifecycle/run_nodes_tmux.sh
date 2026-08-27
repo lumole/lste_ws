@@ -71,7 +71,13 @@ _resolve() {
 # Resolve experiment provenance before individual tmux panes begin. The
 # metrics observer writes it once in ``run_start`` so two navigation runs can
 # be compared without guessing which scene or working tree produced a result.
-WORLD=$(_resolve "${CFG_WORLD:-worlds/place1.world}")
+# A caller may explicitly select a world for an isolated benchmark run.  Keep
+# that selection ahead of the YAML fallback so `start level_n` loads its own
+# immutable level artifact instead of silently falling back to level_2.
+WORLD=$(_resolve "${WORLD:-${CFG_WORLD:-worlds/place1.world}}")
+NAVIGATION_LOG_DIR=${NAVIGATION_LOG_DIR:-${CFG_NAVIGATION_LOG_DIR:-$WS/runtime/navigation/logs}}
+NAVIGATION_RUN_DIRECTORY=${NAVIGATION_RUN_DIRECTORY:-${CFG_NAVIGATION_RUN_DIRECTORY:-}}
+NAVIGATION_RUN_TIMESTAMP=${NAVIGATION_RUN_TIMESTAMP:-${CFG_NAVIGATION_RUN_TIMESTAMP:-}}
 GIT_REVISION=$(git -C "$WS" rev-parse HEAD 2>/dev/null || echo unknown)
 if git -C "$WS" diff --quiet && git -C "$WS" diff --cached --quiet; then
   GIT_DIRTY=false
@@ -322,6 +328,9 @@ if [[ "$DETECTOR_BACKEND" == "wedetect" ]]; then
   DETECTOR_INTERVAL_LOCKED=$WDETECT_INTERVAL_LOCKED
   DETECTOR_INTERVAL_EXHAUSTED=$WDETECT_INTERVAL_EXHAUSTED
   DETECTOR_NODE=lste_wedetect_det_node.py
+  # The executable is selected by filename, while both detector backends
+  # register the shared ROS node name from detection_node_common.py.
+  DETECTOR_ROS_NODE=/lste_det_node
   DETECTOR_MODEL_ARGS="_wedetect_source_dir:=$WDETECT_SOURCE_DIR \
 _wedetect_variant:=$WDETECT_VARIANT \
 _wedetect_checkpoint:=$WDETECT_CHECKPOINT \
@@ -349,6 +358,7 @@ else
   DETECTOR_INTERVAL_LOCKED=$DINO_INTERVAL_LOCKED
   DETECTOR_INTERVAL_EXHAUSTED=$DINO_INTERVAL_EXHAUSTED
   DETECTOR_NODE=lste_det_node.py
+  DETECTOR_ROS_NODE=/lste_det_node
   DETECTOR_MODEL_ARGS=""
 fi
 FRONTIER_LOG=${FRONTIER_LOG:-${CFG_FRONTIER_LOG:-true}}
@@ -715,10 +725,13 @@ tmux_new_window 4 "$WS" "prompt" \
      _vllm_start_timeout:=$VLLM_START_TIMEOUT"
 
 # 5: 独立检测节点：GroundingDINO 或 WeDetect，绝不在同一进程内混用。
+# rosrun's generated relay has the base conda shebang. Invoke the source
+# script through the activated dino interpreter so torch/TensorRT are loaded
+# from the detector environment rather than miniconda base.
 tmux_new_window 5 "$WS" "detector" \
   "$WAIT_ROSCORE; conda activate dino; export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7; \
    export LD_LIBRARY_PATH=\"\$CONDA_PREFIX/lib/python3.9/site-packages/tensorrt_libs:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cudnn/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cublas/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cufft/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/curand/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cusolver/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cusparse/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cuda_runtime/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cuda_nvrtc/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/nvjitlink/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/torch/lib:\${LD_LIBRARY_PATH:-}\"; \
-    rosrun lste_core $DETECTOR_NODE \
+    python "$WS/src/lste_core/scripts/$DETECTOR_NODE" \
       _min_inference_interval:=$DETECTOR_MIN_INTERVAL \
       _max_source_image_age:=$DETECTION_MAX_SOURCE_IMAGE_AGE \
      _interval_pass:=$DETECTOR_INTERVAL_PASS \
@@ -896,7 +909,10 @@ tmux_new_window 15 "$WS" "cmd_vel_mux" \
 
 # 16: 持续健康检查（在控制器前启动，以便捕获控制器启动失败）
 tmux_new_window 16 "$WS" "health" \
-  "$WAIT_ROSCORE; python3 $WS/scripts/tools/lste_health_audit.py"
+  "$WAIT_ROSCORE; python3 $WS/scripts/tools/lste_health_audit.py \
+    _controller_mode:=$LSTE_CONTROLLER \
+    _legacy_gp_frontier_enabled:=$LEGACY_GP_FRONTIER_ENABLED \
+    _detector_node:=$DETECTOR_ROS_NODE"
 
 # 17: Structured navigation telemetry. This observer never publishes control,
 # but writes one timestamped metrics log for this live run so goal changes,
@@ -905,7 +921,8 @@ tmux_new_window 16 "$WS" "health" \
 mkdir -p "$WS/runtime/navigation"
 tmux_new_window 17 "$WS/runtime/navigation" "metrics" \
   "$WAIT_ROSCORE; rosrun lste_topo_access lste_navigation_metrics.py \
-    _log_dir:=$WS/runtime/navigation/logs _retention_days:=15 \
+    _log_dir:=$NAVIGATION_LOG_DIR _run_directory:=$NAVIGATION_RUN_DIRECTORY \
+    _retention_days:=15 \
     _execution_architecture:=$TEB_EXECUTION_ARCHITECTURE \
     _teb_strong_angular_threshold:=$TEB_ANGULAR_SIGN_SWITCH_THRESHOLD \
     _task_json:=$TASK_JSON _task_id:=$TASK_ID \

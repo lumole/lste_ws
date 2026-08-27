@@ -1,0 +1,229 @@
+# Deterministic contract for office_building_v1.
+# Coordinates are Gazebo world metres; yaw is radians counter-clockwise.
+schema_version: 1
+scenario_id: office_building_v1
+display_name: Complex single-floor office building
+world: worlds/benchmark/office_building_v1_level_2_no_pro3.world
+world_name: office_building_v1
+world_sha256: generated_at_build_time
+seed: 20260827
+
+building:
+  bounds_m: [0.0, 0.0, 25.0, 22.0]
+  floor_z_m: 0.0
+  wall_height_m: 2.8
+  wall_thickness_m: 0.18
+  corridor_width_m: 3.4
+  intended_robot_clearance_m: 0.45
+  notes: >-
+    One connected office building with a central corridor, multiple semantic
+    rooms, a storage dead end, an alternate open-office circulation route, and
+    a target room whose target is hidden from the corridor by furniture. The
+    south entrance remains visible but is closed in the benchmark because the
+    robot starts indoors and the Gazebo ground plane outside is unbounded.
+
+rooms:
+  - id: lobby
+    semantic: entrance lobby and reception
+    bounds_m: [0.2, 0.2, 4.9, 9.1]
+    entry_doors: [south_entrance, lobby_corridor]
+    models: [lobby_sofa, lobby_table, lobby_notice_shelf]
+  - id: open_office
+    semantic: open-plan workstation area
+    bounds_m: [5.1, 0.2, 12.9, 9.1]
+    entry_doors: [open_office_corridor, open_office_internal]
+    models: [open_desk_0, open_desk_1, open_desk_2, open_desk_3, open_file_cabinet]
+  - id: printer
+    semantic: printing and document area
+    bounds_m: [13.1, 0.2, 16.9, 9.1]
+    entry_doors: [printer_corridor, printer_internal]
+    models: [printer_body, printer_paper_stack, printer_file_cabinet]
+  - id: storage
+    semantic: storage room and intentional dead end
+    bounds_m: [17.1, 0.2, 21.9, 9.1]
+    entry_doors: [storage_corridor]
+    models: [storage_shelf_block, storage_shelf_0, storage_shelf_1, storage_box]
+    dead_end: true
+  - id: lounge
+    semantic: informal seating area
+    bounds_m: [22.1, 0.2, 24.8, 9.1]
+    entry_doors: [lounge_corridor]
+    models: [lounge_sofa, lounge_table]
+  - id: conference
+    semantic: meeting room
+    bounds_m: [0.2, 12.9, 6.9, 21.8]
+    entry_doors: [conference_corridor]
+    models: [conference_table, conference_chair_0, conference_chair_1, conference_chair_2, conference_chair_3, conference_wall_screen]
+  - id: manager
+    semantic: private manager office
+    bounds_m: [7.1, 12.9, 12.9, 21.8]
+    entry_doors: [manager_corridor]
+    models: [manager_desk, manager_monitor, manager_chair, manager_bookshelf]
+  - id: kitchen
+    semantic: tea kitchen and break room
+    bounds_m: [13.1, 12.9, 18.9, 21.8]
+    entry_doors: [kitchen_corridor]
+    models: [kitchen_counter, kitchen_table, kitchen_chair_0, kitchen_chair_1, kitchen_blue_cup, kitchen_green_cup]
+  - id: target_room
+    semantic: target office with occluded workstation
+    bounds_m: [19.1, 12.9, 24.8, 21.8]
+    entry_doors: [target_room_corridor]
+    models: [target_room_occluder, target_desk, target_monitor_left, target_monitor_right, target_chair, target_room_shelf]
+
+doors:
+  - id: south_entrance
+    center_m: [3.4, 0.0]
+    width_m: 3.2
+    connects: [outside, lobby]
+    benchmark_closed: true
+  - id: lobby_corridor
+    center_m: [4.9, 9.3]
+    width_m: 1.1
+    connects: [lobby, main_corridor]
+  - id: open_office_corridor
+    center_m: [6.65, 9.3]
+    width_m: 1.1
+    connects: [open_office, main_corridor]
+  - id: printer_corridor
+    center_m: [13.45, 9.3]
+    width_m: 1.1
+    connects: [printer, main_corridor]
+  - id: storage_corridor
+    center_m: [17.4, 9.3]
+    width_m: 1.0
+    connects: [storage, main_corridor]
+  - id: lounge_corridor
+    center_m: [22.4, 9.3]
+    width_m: 1.0
+    connects: [lounge, main_corridor]
+  - id: conference_corridor
+    center_m: [3.0, 12.7]
+    width_m: 1.6
+    connects: [main_corridor, conference]
+  - id: manager_corridor
+    center_m: [7.7, 12.7]
+    width_m: 1.6
+    connects: [main_corridor, manager]
+  - id: kitchen_corridor
+    center_m: [15.15, 12.7]
+    width_m: 1.5
+    connects: [main_corridor, kitchen]
+  - id: target_room_corridor
+    center_m: [19.7, 12.7]
+    width_m: 1.6
+    connects: [main_corridor, target_room]
+  - id: open_office_internal
+    center_m: [13.0, 4.5]
+    width_m: 3.0
+    connects: [open_office, printer]
+  - id: printer_internal
+    center_m: [13.0, 4.5]
+    width_m: 3.0
+    connects: [printer, open_office]
+
+main_corridor:
+  bounds_m: [2.0, 9.4, 24.8, 12.6]
+  loop_description: >-
+    The open-office internal doorway provides an alternate connection between
+    the office and printer side of the building; the central furniture island
+    forces the local planner to choose a side instead of following a straight
+    empty corridor.
+  branch_points_m:
+    - [6.65, 11.0]
+    - [13.45, 11.0]
+    - [17.4, 11.0]
+    - [19.7, 11.0]
+
+robot_profiles:
+  primary:
+    pose: [2.8, 11.0, 0.0]
+    semantic: lobby-facing corridor start
+    use_for: [level_1, level_2, level_3, level_4]
+  office_entry:
+    pose: [6.4, 9.8, 1.57079632679]
+    semantic: open-office local navigation start
+    use_for: [perception_isolation]
+  target_entry:
+    pose: [19.8, 13.8, 1.57079632679]
+    semantic: target-room approach start
+    use_for: [target_approach_isolation]
+
+targets:
+  primary:
+    model: cup_yellow
+    label: yellow cup
+    task_id: yellow_cup
+    pose_xy: [21.6, 17.6]
+    benchmark_scale: 1.8
+    measured_size_m: [0.147, 0.147, 0.138]
+    room: target_room
+    semantic_context: [target_desk, target_monitor_left, target_monitor_right]
+    distractors: [cup_blue_target_distractor, cup_blue_target_distractor_2, kitchen_blue_cup, kitchen_green_cup]
+    occluder: target_room_occluder
+
+task_routes:
+  direct_corridor:
+    description: Lobby -> main corridor -> target room -> yellow cup
+    start_profile: primary
+    expected_rooms: [lobby, main_corridor, target_room]
+    expected_properties: [long_corridor, doorway_entry, target_occlusion]
+  office_context:
+    description: Lobby -> open office -> printer branch -> main corridor -> target room
+    start_profile: primary
+    expected_rooms: [lobby, open_office, printer, main_corridor, target_room]
+    expected_properties: [dense_furniture, semantic_context, alternate_route]
+  dead_end_recovery:
+    description: Lobby -> storage dead end -> recover -> main corridor -> target room
+    start_profile: primary
+    expected_rooms: [lobby, main_corridor, storage, main_corridor, target_room]
+    expected_properties: [dead_end, frontier_recovery, route_reselection]
+
+levels:
+  level_1:
+    world: worlds/benchmark/office_building_v1_level_1_no_pro3.world
+    enabled_rooms: [lobby, main_corridor, target_room]
+    enabled_features: [building_shell, doorways, target_desk]
+    dynamic_obstacles: false
+  level_2:
+    world: worlds/benchmark/office_building_v1_level_2_no_pro3.world
+    enabled_rooms: [lobby, open_office, printer, conference, manager, kitchen, lounge, target_room]
+    enabled_features: [semantic_furniture, distractor_cups, target_occluder]
+    dynamic_obstacles: false
+  level_3:
+    world: worlds/benchmark/office_building_v1_level_3_no_pro3.world
+    enabled_rooms: [lobby, open_office, printer, storage, conference, manager, kitchen, lounge, target_room]
+    enabled_features: [dead_end, alternate_route, target_occluder, narrow_door_approach]
+    dynamic_obstacles: false
+  level_4:
+    world: worlds/benchmark/office_building_v1_level_4_no_pro3.world
+    enabled_rooms: [lobby, open_office, printer, storage, conference, manager, kitchen, lounge, target_room]
+    enabled_features: [dead_end, alternate_route, target_occluder, semantic_distractors, one_dynamic_obstacle]
+    dynamic_obstacles: true
+    dynamic_obstacle_seed: 20260827
+
+required_models:
+  - desk_brown
+  - office_chair
+  - monitor_1
+  - monitor_2
+  - monitor_3
+  - table_conference_2
+  - cafe_table
+  - sofa_set_1
+  - sofa_set_2
+  - bookshelf
+  - file_cabinet_large
+  - cardboard_box
+  - kitchen_chair
+  - cup_yellow
+  - cup_blue
+  - cup_green
+
+acceptance:
+  no_robot_in_world: true
+  require_target_model: cup_yellow
+  require_topics: [/pro3/wheel_odom, /pro3/rlscan, /map]
+  require_navfn_route_to_room_entry: true
+  require_world_parse: true
+  max_unexplained_move_base_aborts: 0
+  runtime_log_retention_days: 15
