@@ -42,3 +42,9 @@
 | [teacher_progress_report_08052026.md](reporting/teacher_progress_report_08052026.md) | 面向老师的阶段性进展汇报：接手边界、完成工作、真实实验结果与后续计划 |
 | [project_delivery_report_08052026.md](reporting/project_delivery_report_08052026.md) | 阶段性交差报告：架构、控制器对比、真实截图与视频证据 |
 | [fixed_goal_video_evidence_07252026.md](reporting/fixed_goal_video_evidence_07252026.md) | 固定目标控制器录像与日志索引 |
+
+## testing
+
+| 文档 | 内容 |
+| --- | --- |
+| [office_building_benchmark_plan_08272026.md](testing/office_building_benchmark_plan_08272026.md) | 复杂办公楼 Gazebo 场景、任务路线、难度分层与评测计划 |
