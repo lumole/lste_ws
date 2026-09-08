@@ -2,18 +2,28 @@
 """Machine-readable status publishing for the TEB goal bridge."""
 
 import json
-import time
 
 import rospy
 from std_msgs.msg import String
+
+from clock_provider import now_for
 
 
 class TebGoalBridgeStatusMixin:
     """Build status snapshots without mixing diagnostics into action control."""
 
     def publish_bridge_status(self, event, **fields):
+        now = now_for(self)
         payload = {
             "event": str(event),
+            "lifecycle_transaction_id": int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
+            ),
             "mode": self.mode,
             "persistent_execution": bool(self.persistent_execution),
             "active": bool(self.action_active),
@@ -78,18 +88,19 @@ class TebGoalBridgeStatusMixin:
             "navfn_path_remaining": _rounded_or_none(self.active_navfn_remaining, 4),
             "navfn_path_endpoint": self.active_navfn_plan_endpoint,
             "navfn_path_progress_age": _elapsed_or_none(
-                self.active_navfn_progress_monotonic, 4
+                self.active_navfn_progress_monotonic, 4, now
             ),
             "physical_motion_progress_age": _elapsed_or_none(
-                self.active_motion_progress_monotonic, 4
+                self.active_motion_progress_monotonic, 4, now
             ),
             "teb_selected_velocity": _velocity_snapshot(
                 self.latest_teb_selected_linear,
                 self.latest_teb_selected_angular,
                 self.latest_teb_feedback_monotonic,
+                now=now,
             ),
-            "teb_planner_command": _planner_command_snapshot(self),
-            "teb_reorientation": _reorientation_snapshot(self),
+            "teb_planner_command": _planner_command_snapshot(self, now=now),
+            "teb_reorientation": _reorientation_snapshot(self, now=now),
             "priority_handoffs": int(self.priority_handoff_count),
             "target_segment_handoffs": int(self.target_segment_handoff_count),
             "frontier_segment_handoffs": int(self.frontier_segment_handoff_count),
@@ -183,43 +194,52 @@ def _rounded_or_none(value, digits):
     return None if value is None else round(float(value), digits)
 
 
-def _elapsed_or_none(start, digits):
+def _elapsed_or_none(start, digits, now=None):
     if start <= 0.0:
         return None
-    return round(max(0.0, time.monotonic() - start), digits)
+    if now is None:
+        now = start
+    return round(max(0.0, now - start), digits)
 
 
-def _velocity_snapshot(linear, angular, timestamp):
+def _velocity_snapshot(linear, angular, timestamp, now=None):
     if linear is None:
         return None
+    if now is None:
+        now = timestamp
     return {
         "linear_x": round(float(linear), 4),
         "angular_z": round(float(angular), 4),
-        "age": round(max(0.0, time.monotonic() - timestamp), 3),
+        "age": round(max(0.0, now - timestamp), 3),
     }
 
 
-def _planner_command_snapshot(bridge):
+def _planner_command_snapshot(bridge, now=None):
+    if now is None:
+        now = now_for(bridge)
     snapshot = _velocity_snapshot(
         bridge.latest_teb_planner_linear,
         bridge.latest_teb_planner_angular,
         bridge.latest_teb_planner_command_monotonic,
+        now=now,
     )
     if snapshot is None:
         return None
     snapshot["stationary_for"] = (
-        round(max(0.0, time.monotonic() - bridge.teb_planner_stationary_since), 3)
+        round(max(0.0, now - bridge.teb_planner_stationary_since), 3)
         if bridge.teb_planner_stationary_since > 0.0
         else 0.0
     )
     return snapshot
 
 
-def _reorientation_snapshot(bridge):
+def _reorientation_snapshot(bridge, now=None):
     started = bridge.teb_reorientation_started_monotonic
+    if now is None:
+        now = now_for(bridge)
     return {
         "active": bool(started > 0.0),
-        "duration": 0.0 if started <= 0.0 else round(max(0.0, time.monotonic() - started), 3),
+        "duration": 0.0 if started <= 0.0 else round(max(0.0, now - started), 3),
         "yaw_progress": round(float(bridge.teb_reorientation_total_yaw), 4),
         "deferrals": int(bridge.teb_reorientation_deferrals),
     }

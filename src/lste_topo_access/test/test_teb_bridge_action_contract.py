@@ -73,6 +73,7 @@ ACTION_CLIENT_MIXIN = load_class(
     {
         "copy": copy,
         "time": SimpleNamespace(monotonic=lambda: 100.0),
+        "now_for": lambda _owner: 100.0,
         "MappingProxyType": MappingProxyType,
         "rospy": SimpleNamespace(
             Duration=lambda seconds: seconds,
@@ -88,6 +89,7 @@ ACTION_TERMINAL_MIXIN = load_class(
     {
         "copy": copy,
         "time": SimpleNamespace(monotonic=lambda: 100.0),
+        "now_for": lambda _owner: 100.0,
         "rospy": SimpleNamespace(
             Time=SimpleNamespace(now=lambda: 123.0),
             loginfo=lambda *_args, **_kwargs: None,

@@ -1,15 +1,16 @@
 """Stall ownership policy for an active TEB move_base action."""
 
 import math
-import time
 
 import rospy
+
+from clock_provider import now_for
 
 
 class TebGoalBridgeHandoffStallMixin:
     def maybe_handoff_locked(self):
         """Handle a real no-progress failure without stealing healthy routes."""
-        now = time.monotonic()
+        now = now_for(self)
         if not self._handoff_is_eligible_locked(now):
             return
         pending_delta = self._pending_goal_delta_locked()

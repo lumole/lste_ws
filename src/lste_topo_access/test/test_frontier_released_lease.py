@@ -27,6 +27,7 @@ def _load_callback():
     namespace = {
         "json": json,
         "time": __import__("time"),
+        "now_for": lambda _owner: 100.0,
         "rospy": SimpleNamespace(
             logwarn=lambda *_args, **_kwargs: None,
         ),

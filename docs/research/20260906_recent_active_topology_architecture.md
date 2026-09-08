@@ -52,7 +52,7 @@ DiT/VLN 控制架构。它们共同支持“慢语义/结构记忆与快执行�
 1. `Active Semantic Perception` 有公开 ROS1 代码，但依赖先验地图和 RGB-D，不能被误写成当前未知办公楼的直接替代方案；
 2. `OVIP-SG` 公开了针对小物体和实例保持的实现，但 license 和部署负担需要单独审查；
 3. `Concept-Guided Exploration` 给出了“异步 room/door 概念代理”的近期架构依据，支持把 Place 和 Portal 的证据职责分开；
-4. 现有 `event_driven_evidence_graph_09062026.md` 的 STEGNav 链接已经修正为 `2608.28279`；之前的 `2608.28027` 实际不是 STEGNav。
+4. 现有 `20260906_event_driven_evidence_graph.md` 的 STEGNav 链接已经修正为 `2608.28279`；之前的 `2608.28027` 实际不是 STEGNav。
 
 还要如实记录一个实现缺口：当前 `EvidenceEventGraph.consume_wake()` 已经存在，但没有被规划 runtime 真正消费；它目前主要作为 status 的可回放投影。因此文档中“fast/slow”是已实现的状态边界和调度接口，不应宣传成已经完成的纯事件驱动运行时。
 

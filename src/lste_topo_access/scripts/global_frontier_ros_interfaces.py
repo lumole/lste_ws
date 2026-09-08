@@ -79,7 +79,12 @@ class GlobalFrontierRosInterfacesMixin:
             self.on_execution_terminal,
             queue_size=10,
         )
-        rospy.Timer(rospy.Duration(1.0), self.on_timer)
+        rospy.Timer(
+            rospy.Duration(
+                float(getattr(self, "lifecycle_tick_period", 1.0))
+            ),
+            self.on_timer,
+        )
         rospy.loginfo(
             "Global frontier explorer started: map=%s costmap=%s scan=%s task=%s detections=%s arbitration=%s recovery=%s bridge=%s goal=%s "
             "route_tangent_weight=%.2f heading_hard_limit=%.1fdeg "

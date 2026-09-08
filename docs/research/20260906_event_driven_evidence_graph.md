@@ -285,4 +285,4 @@ python3 -m pytest -q \
 Unit tests establish identity and transition invariants only. They do not show
 that the robot completes Level 4. The required next evidence is a clean run on
 the same seeded world, followed by paired baseline/ablation trials and the
-metrics in `office_building_benchmark_plan_08272026.md`.
+metrics in `20260827_office_building_benchmark_plan.md`.

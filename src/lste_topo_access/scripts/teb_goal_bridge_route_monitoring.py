@@ -1,7 +1,8 @@
 """Navfn and rolling-costmap observations for the TEB goal bridge."""
 
 import math
-import time
+
+from clock_provider import now_for
 
 
 class TebGoalBridgeRouteMonitoringMixin:
@@ -77,13 +78,13 @@ class TebGoalBridgeRouteMonitoringMixin:
             self.active_navfn_remaining = None
             self.active_navfn_best_remaining = None
             self.active_navfn_progress_monotonic = 0.0
-            self._update_navfn_path_progress_locked(time.monotonic())
+            self._update_navfn_path_progress_locked(now_for(self))
 
     def on_local_costmap(self, message):
         """Keep the latest rolling lidar map for route admission."""
         with self.lock:
             self.local_costmap = message
-            self.local_costmap_received_monotonic = time.monotonic()
+            self.local_costmap_received_monotonic = now_for(self)
 
     @staticmethod
     def _local_costmap_cell(message, x, y):

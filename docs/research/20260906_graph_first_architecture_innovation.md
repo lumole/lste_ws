@@ -237,7 +237,7 @@ The runtime now projects lifecycle status into a bounded
 high-rate, while the slow graph receives one wake event for each new durable
 route, Place, Portal, WorkItem, or target fact. It is replayable from the
 existing JSON status stream and does not introduce a second motion policy. See
-`event_driven_evidence_graph_09062026.md` for the contract and tests.
+`20260906_event_driven_evidence_graph.md` for the contract and tests.
 
 ## 20260906 GraphRoutePlanner Increment
 

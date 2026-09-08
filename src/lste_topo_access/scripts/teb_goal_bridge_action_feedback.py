@@ -2,7 +2,8 @@
 
 import copy
 import math
-import time
+
+from clock_provider import now_for
 
 
 class TebGoalBridgeActionFeedbackMixin:
@@ -11,7 +12,7 @@ class TebGoalBridgeActionFeedbackMixin:
         with self.lock:
             if generation != self.action_generation or not self.action_active:
                 return
-            now = time.monotonic()
+            now = now_for(self)
             self.last_feedback_monotonic = now
             if self.active_goal_global is None:
                 return

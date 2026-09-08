@@ -15,7 +15,10 @@ def connect_bridge_ros(bridge):
     # A hot restart must not leave a speculative target request latched.
     bridge._clear_persistent_target_request_locked("bridge_startup", force=True)
     _create_subscribers(bridge)
-    rospy.Timer(rospy.Duration(0.2), bridge.on_timer)
+    rospy.Timer(
+        rospy.Duration(float(getattr(bridge, "lifecycle_tick_period", 0.2))),
+        bridge.on_timer,
+    )
 
 
 def _create_publishers(bridge):

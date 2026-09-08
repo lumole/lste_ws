@@ -5,11 +5,11 @@ record a completed endpoint.  Physical departure is deliberately elsewhere.
 """
 
 import math
-import time
 
 import numpy as np
 import rospy
 
+from clock_provider import now_for
 from global_frontier_models import ObservationDepartureSource
 from global_frontier_topology import grid_visible_free_footprint
 
@@ -241,7 +241,7 @@ class GlobalFrontierObservationCoverageMixin:
     ):
         """Record a reached viewpoint and freeze ordinary place coverage."""
         if now is None:
-            now = time.monotonic()
+            now = now_for(self)
         if physical_xy is None and getattr(self, "pose_odom", None) is not None:
             physical_xy = (
                 float(self.pose_odom.x),

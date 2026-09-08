@@ -6,11 +6,12 @@ publish route ownership or manipulate the MoveBase action.
 """
 
 import math
-import time
 
 import rospy
 import tf
 from nav_msgs.srv import GetPlan, GetPlanRequest
+
+from clock_provider import now_for
 
 
 class TebGoalBridgePrefetchAdmissionMixin:
@@ -25,7 +26,7 @@ class TebGoalBridgePrefetchAdmissionMixin:
         optimization problem rather than a duplicated obstacle policy here.
         """
         message = self.local_costmap
-        now = time.monotonic()
+        now = now_for(self)
         if message is None:
             return False, {"reason": "local_costmap_unavailable"}
         age = now - self.local_costmap_received_monotonic
@@ -127,7 +128,7 @@ class TebGoalBridgePrefetchAdmissionMixin:
             return False, {"reason": "feedback_or_prefetch_unavailable"}
         route_pair = (int(self.active_route_id), int(self.prefetched_frontier_route_id))
         feedback_xy = (float(self.active_feedback_pose[0]), float(self.active_feedback_pose[1]))
-        now = time.monotonic()
+        now = now_for(self)
         cached = self.persistent_prefetch_admission_cache
         if (
             cached is not None
@@ -267,4 +268,3 @@ class TebGoalBridgePrefetchAdmissionMixin:
             "details": dict(details),
         }
         return bool(accepted), details
-

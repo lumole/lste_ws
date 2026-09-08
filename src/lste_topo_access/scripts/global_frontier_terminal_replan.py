@@ -1,13 +1,13 @@
-"""Immediate successor scheduling after a verified route terminal.
+"""Successor scheduling after a verified route terminal.
 
-The terminal topic is an execution-critical ingress.  Its ROS callback must not
-wait for the frontier planner's potentially long snapshot/BFS cycle, otherwise
-TEB can sit at a zero command until move_base starts recovery.  Messages are
-therefore queued first and consumed under the normal planning lock by a short
-one-shot drain timer.
+The live node gathers the terminal into ``LifecycleManager`` and consumes it
+from the fixed tick.  The lock/timer path remains only for older compositions
+and focused compatibility fixtures.
 """
 
 import rospy
+
+from lifecycle_manager import EventType
 
 
 class GlobalFrontierTerminalReplanMixin:
@@ -31,9 +31,17 @@ class GlobalFrontierTerminalReplanMixin:
                 ]
             ),
         )
-        # Bypass only the compute-throttle, never route validation. A one-shot
-        # timer keeps work outside the action callback.
+        # Bypass only the compute-throttle, never route validation. The next
+        # fixed lifecycle tick consumes this fact; no callback-owned timer is
+        # needed for the successor boundary.
         self.last_planning_wall = 0.0
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        if lifecycle is not None:
+            lifecycle.enqueue_type(
+                EventType.REPLAN_REQUESTED,
+                {"event": "terminal_replan"},
+            )
+            return
         if self.immediate_plan_timer is None and not rospy.is_shutdown():
             self.immediate_plan_timer = rospy.Timer(
                 rospy.Duration(0.01), self.on_immediate_plan, oneshot=True
@@ -48,6 +56,8 @@ class GlobalFrontierTerminalReplanMixin:
 
     def _arm_terminal_drain_timer(self):
         """Schedule a fast, non-blocking retry for queued terminal facts."""
+        if getattr(self, "lifecycle_manager", None) is not None:
+            return
         with self.terminal_ingress_lock:
             if (
                 not self.pending_execution_terminals
@@ -67,6 +77,11 @@ class GlobalFrontierTerminalReplanMixin:
         # that load the callback without executing module-level imports.
         from copy import deepcopy
 
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        if lifecycle is not None:
+            return lifecycle.enqueue_type(
+                EventType.EXECUTION_TERMINAL, deepcopy(message)
+            )
         # Compatibility doubles and old external compositions may not have
         # the runtime ingress state yet. Preserve their synchronous contract;
         # the production node initializes the queue before subscriptions.
@@ -110,6 +125,8 @@ class GlobalFrontierTerminalReplanMixin:
 
     def _drain_execution_terminals_locked(self):
         """Drain a stable batch while the planning lock is already held."""
+        if getattr(self, "lifecycle_manager", None) is not None:
+            return
         with self.terminal_ingress_lock:
             pending = list(self.pending_execution_terminals)
             self.pending_execution_terminals.clear()
@@ -120,6 +137,8 @@ class GlobalFrontierTerminalReplanMixin:
 
     def on_terminal_drain_timer(self, _event):
         """Try the planning lock without turning terminal ingress into a wait."""
+        if getattr(self, "lifecycle_manager", None) is not None:
+            return
         # A one-shot timer is no longer a pending wake once its callback starts.
         # Clear the handle before trying the planning lock; otherwise a busy
         # planning cycle makes ``_arm_terminal_drain_timer`` see the expired

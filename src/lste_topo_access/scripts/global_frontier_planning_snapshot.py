@@ -1,11 +1,11 @@
 """Creation of internally consistent map, route, and pose planning snapshots."""
 
 import math
-import time
 
 import numpy as np
 import rospy
 
+from clock_provider import now_for
 from global_frontier_models import (
     FrontierMapContext,
     FrontierPlanningSnapshot,
@@ -549,7 +549,7 @@ class GlobalFrontierPlanningSnapshotMixin:
         )
         if robot_map is None or message.info.resolution <= 0.0:
             return None
-        now = time.monotonic()
+        now = now_for(self)
         if not self.navigation_stack_is_ready(robot_map, map_frame, now):
             return None
         robot_yaw_map = self.transform_yaw(

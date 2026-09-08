@@ -92,17 +92,17 @@ GroundingDINO 在当前端到端 Gazebo/RViz 负载上的最高持续结果率�
 
 ### 3.1 三路真实录像对照
 
-![SA-PPO、DWA、TEB 同步对比截图](assets/fixed_goal_comparison_20260725.png)
+![SA-PPO、DWA、TEB 同步对比截图](assets/20260725_fixed_goal_comparison.png)
 
 上图来自三个真实 RViz 录像的第 35 秒同步画面，左至右分别为：原始 SA-PPO `policy_only`、DWA、TEB。
 
 <video controls preload="metadata" width="100%">
-  <source src="assets/fixed_goal_rl_dwa_teb_comparison_20260725.mp4" type="video/mp4">
+  <source src="assets/20260725_fixed_goal_rl_dwa_teb_comparison.mp4" type="video/mp4">
   当前 Markdown 查看器不支持内嵌视频。请打开
-  <a href="assets/fixed_goal_rl_dwa_teb_comparison_20260725.mp4">45 秒三路对比视频</a>。
+  <a href="assets/20260725_fixed_goal_rl_dwa_teb_comparison.mp4">45 秒三路对比视频</a>。
 </video>
 
-视频链接：[打开 45 秒三路对比视频](assets/fixed_goal_rl_dwa_teb_comparison_20260725.mp4)。三段均从原始录像起点同步开始，未加速、未删除失败片段。
+视频链接：[打开 45 秒三路对比视频](assets/20260725_fixed_goal_rl_dwa_teb_comparison.mp4)。三段均从原始录像起点同步开始，未加速、未删除失败片段。
 
 | 控制方案 | 实际输入与能力 | 75 秒内观测结果 | 结论 |
 | --- | --- | --- | --- |
@@ -112,13 +112,13 @@ GroundingDINO 在当前端到端 Gazebo/RViz 负载上的最高持续结果率�
 
 ### 3.2 原始 SA-PPO 停滞证据
 
-![原始 SA-PPO 的 odom 与 2D lidar 视图](assets/sappo_policy_only_20260725.png)
+![原始 SA-PPO 的 odom 与 2D lidar 视图](assets/20260725_sappo_policy_only.png)
 
 原始 SA-PPO 的 RViz 视图只显示真实 `odom`、机器人、单线 lidar 和最终目标，**没有叠加 SLAM 地图或虚构路线**。日志显示最小激光距离降到约 `0.20 m` 后，policy 的前进动作被裁剪为零并持续停滞。这说明仅凭当前局部观测，policy 无法确认墙后存在绕行出口。
 
 ### 3.3 DWA 墙角停滞证据
 
-![DWA 在局部势场与墙角附近停滞](assets/dwa_stall_20260725.png)
+![DWA 在局部势场与墙角附近停滞](assets/20260725_dwa_stall.png)
 
 DWA 已经拥有 SLAM 地图和 Navfn 规划方向，但在墙角处正确动作需要“先转向、短期看似远离目标、再前进”。短时采样的局部代价容易把这种动作排除，最终速度接近零。这是替换为 TEB 的直接工程依据，而不是主观选择。
 
@@ -169,12 +169,12 @@ flowchart LR
 | 原始 SA-PPO 录像 | `runtime/rl_fixed_goal_test/videos/20260725_190115/20260725_190115_rl_policy_only_rviz.mp4` |
 | DWA 原始录像 | `runtime/rl_fixed_goal_test/videos/20260725_185731/20260725_185731_dwa_rviz.mp4` |
 | TEB 原始录像 | `runtime/rl_fixed_goal_test/videos/20260725_185540/20260725_185540_teb_rviz.mp4` |
-| 三路合成视频 | `docs/reporting/assets/fixed_goal_rl_dwa_teb_comparison_20260725.mp4` |
+| 三路合成视频 | `docs/reporting/assets/20260725_fixed_goal_rl_dwa_teb_comparison.mp4` |
 | 实验日志 | `runtime/rl_fixed_goal_test/logs/<YYYYMMDD_HHMMSS>/` |
-| 固定目标测试说明 | [fixed_goal_navigation_debugging_07232026.md](../navigation/fixed_goal_navigation_debugging_07232026.md) |
-| 录像说明 | [fixed_goal_video_evidence_07252026.md](fixed_goal_video_evidence_07252026.md) |
-| 感知与性能说明 | [visual_pipeline_07232026.md](../perception/visual_pipeline_07232026.md) |
-| WeDetect / TensorRT 说明 | [wedetect_tensorrt_integration_07232026.md](../perception/wedetect_tensorrt_integration_07232026.md) |
+| 固定目标测试说明 | [20260723_fixed_goal_navigation_debugging.md](../navigation/20260723_fixed_goal_navigation_debugging.md) |
+| 录像说明 | [20260725_fixed_goal_video_evidence.md](20260725_fixed_goal_video_evidence.md) |
+| 感知与性能说明 | [20260723_visual_pipeline.md](../perception/20260723_visual_pipeline.md) |
+| WeDetect / TensorRT 说明 | [20260723_wedetect_tensorrt_integration.md](../perception/20260723_wedetect_tensorrt_integration.md) |
 
 重新录制固定目标对照时，使用：
 

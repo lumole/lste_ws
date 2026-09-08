@@ -11,10 +11,17 @@ from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 
 from goal_manager_modes import CATCH_TARGET_MODE, EXPLORE_SUS_C_MODE
+from lifecycle_manager import EventType
 
 
 class GoalManagerTebCallbacksMixin:
     """Callbacks that commit or recover a single TEB navigation action."""
+
+    def gather_teb_goal_terminal(self, msg: PoseStamped):
+        enqueue = getattr(self, "_enqueue_lifecycle_event", None)
+        if callable(enqueue):
+            return enqueue(EventType.TEB_GOAL_TERMINAL, msg)
+        return GoalManagerTebCallbacksMixin.apply_teb_goal_terminal(self, msg)
 
     def on_teb_goal_terminal(self, msg: PoseStamped):
         """Release exactly one committed segment after a TEB terminal result.
@@ -283,6 +290,14 @@ class GoalManagerTebCallbacksMixin:
             "next frontier update may replace it",
             msg.pose.position.x,
             msg.pose.position.y,
+        )
+
+    def gather_teb_goal_failure(self, message: String):
+        enqueue = getattr(self, "_enqueue_lifecycle_event", None)
+        if callable(enqueue):
+            return enqueue(EventType.TEB_GOAL_FAILURE, message)
+        return GoalManagerTebCallbacksMixin.apply_teb_goal_failure(
+            self, message
         )
 
     def on_teb_goal_failure(self, message: String):
@@ -586,4 +601,12 @@ class GoalManagerTebCallbacksMixin:
         rospy.logwarn(
             "GoalManager: target route failed; wait for a frontier branch "
             "recomputed from the current pose"
+        )
+
+    def apply_teb_goal_terminal(self, msg):
+        return GoalManagerTebCallbacksMixin.on_teb_goal_terminal(self, msg)
+
+    def apply_teb_goal_failure(self, message):
+        return GoalManagerTebCallbacksMixin.on_teb_goal_failure(
+            self, message
         )

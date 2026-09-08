@@ -4,7 +4,7 @@
 
 import json
 import math
-import time
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import rospy
@@ -14,9 +14,23 @@ from global_frontier_semantic_belief import (
     semantic_place_action,
     task_intent_from_message,
 )
+from lifecycle_manager import EventType
+from clock_provider import now_for
 
 
 class GlobalFrontierEventCallbacksMixin:
+    @staticmethod
+    def _enqueue_or_apply(owner, event_type, message, apply):
+        enqueue = getattr(owner, "_enqueue_lifecycle_event", None)
+        if callable(enqueue):
+            return enqueue(event_type, message)
+        return apply(message)
+
+    def gather_task(self, message):
+        return GlobalFrontierEventCallbacksMixin._enqueue_or_apply(
+            self, EventType.TASK_UPDATED, message, self.apply_task
+        )
+
     def on_task(self, message):
         """Install a new semantic mission without touching route ownership."""
         task_id = str(getattr(message, "task_id", "") or "").strip()
@@ -210,6 +224,11 @@ class GlobalFrontierEventCallbacksMixin:
                     self.current_task_version, place_id, track_id,
                 )
 
+    def gather_detections(self, message):
+        return GlobalFrontierEventCallbacksMixin._enqueue_or_apply(
+            self, EventType.DETECTIONS_UPDATED, message, self.apply_detections
+        )
+
     def on_detections(self, message):
         """Associate semantic detections with the current physical Place."""
         task_id = str(getattr(message, "task_id", "") or "").strip()
@@ -234,6 +253,11 @@ class GlobalFrontierEventCallbacksMixin:
         )
         self._record_semantic_observation(
             int(place_id), labels, target_labels, stamp,
+        )
+
+    def gather_goal_arbitration(self, message):
+        return GlobalFrontierEventCallbacksMixin._enqueue_or_apply(
+            self, EventType.GOAL_UPDATED, message, self.apply_goal_arbitration
         )
 
     def on_goal_arbitration(self, message):
@@ -351,6 +375,11 @@ class GlobalFrontierEventCallbacksMixin:
             local_work_pending,
         )
 
+    def gather_task_done(self, message):
+        return GlobalFrontierEventCallbacksMixin._enqueue_or_apply(
+            self, EventType.TASK_COMPLETED, message, self.apply_task_done
+        )
+
     def on_task_done(self, message):
         done = bool(message.data)
         if done == self.task_done:
@@ -444,6 +473,14 @@ class GlobalFrontierEventCallbacksMixin:
             self.frontier_exhausted = False
             rospy.loginfo("Global frontier resumed: task_done=false")
 
+    def gather_move_base_recovery(self, message):
+        return GlobalFrontierEventCallbacksMixin._enqueue_or_apply(
+            self,
+            EventType.RECOVERY_OBSERVED,
+            message,
+            self.apply_move_base_recovery,
+        )
+
     def on_move_base_recovery(self, message):
         """Record a local recovery without preempting the global action.
 
@@ -460,7 +497,7 @@ class GlobalFrontierEventCallbacksMixin:
         behavior = str(message.recovery_behavior_name or "unknown")
         route_id = int(self.active_route_id)
         forward_clearance = self.scan_forward_minimum
-        self.active_progress_time = time.monotonic()
+        self.active_progress_time = now_for(self)
         self.active_last_progress_signal = "local_recovery:%s" % behavior
         self.publish_status(
             "planner_recovery_observed",
@@ -483,21 +520,26 @@ class GlobalFrontierEventCallbacksMixin:
             int(message.total_number_of_recoveries),
         )
 
+    def gather_bridge_status(self, message):
+        return GlobalFrontierEventCallbacksMixin._enqueue_or_apply(
+            self, EventType.NAV_FAILED, message, self.apply_bridge_status
+        )
+
     def on_bridge_status(self, message):
         """Promote only a matching failed frontier action to a route change."""
         try:
             payload = json.loads(message.data)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return
+            return False
         if not isinstance(payload, dict) or payload.get("event") != "terminal":
-            return
+            return False
         if self.task_done:
-            return
+            return False
         route_id = max(0, int(payload.get("active_route_id", 0) or 0))
         if route_id <= 0 or route_id != self.active_route_id:
-            return
+            return False
         if str(payload.get("active_intent_source", "")) != "global_slam_frontier":
-            return
+            return False
         route_kind = str(payload.get("active_route_kind", ""))
         mission_route_kind = str(payload.get("active_mission_route_kind", ""))
         if route_kind not in ("frontier_endpoint", "portal_transition") and mission_route_kind not in (
@@ -505,7 +547,7 @@ class GlobalFrontierEventCallbacksMixin:
             "portal_transition",
             "portal_probe",
         ):
-            return
+            return False
         active_frontier_live = self.active_frontier is not None
         released_kind = str(
             getattr(self, "last_released_route_kind", "") or ""
@@ -526,17 +568,17 @@ class GlobalFrontierEventCallbacksMixin:
             # prove that a controller still owns the route. A delayed action
             # callback is admissible only through the explicit release
             # tombstone recorded by ``release_active_frontier``.
-            return
+            return False
         status = int(payload.get("status", -1) or -1)
         # PREEMPTED is an intentional lifecycle handoff/cancel and therefore
         # cannot be used as evidence that the frontier is unreachable.
         if status not in (4, 5, 8, 9):  # ABORTED, REJECTED, RECALLED, LOST
-            return
+            return False
         status_name = str(payload.get("status_text", "FAILED")).upper()
         self.recovery_pending_route_id = route_id
         self.recovery_pending_behavior = "move_base_terminal"
         self.recovery_pending_reason = "move_base_%s" % status_name.lower()
-        self.recovery_pending_wall = time.monotonic()
+        self.recovery_pending_wall = now_for(self)
         released_after_logical_terminal = bool(
             released_route_matches
             and getattr(self, "last_released_route_terminal_received", False)
@@ -611,6 +653,12 @@ class GlobalFrontierEventCallbacksMixin:
             route_id,
             status_name,
         )
+        return True
+
+    def gather_scan(self, message):
+        return GlobalFrontierEventCallbacksMixin._enqueue_or_apply(
+            self, EventType.SCAN_UPDATED, message, self.apply_scan
+        )
 
     def on_scan(self, message):
         """Retain recovery clearance and the current physical observation horizon."""
@@ -637,6 +685,11 @@ class GlobalFrontierEventCallbacksMixin:
             observed_ranges.sort()
             index = int(round(0.75 * (len(observed_ranges) - 1)))
             self.scan_observation_horizon = observed_ranges[index]
+
+    def gather_replan_request(self, message):
+        return GlobalFrontierEventCallbacksMixin._enqueue_or_apply(
+            self, EventType.REPLAN_REQUESTED, message, self.apply_replan_request
+        )
 
     def on_replan_request(self, message):
         """Discard cached route ownership and rebuild from the current pose."""
@@ -893,8 +946,13 @@ class GlobalFrontierEventCallbacksMixin:
             "replan_replayed_after_portal_transaction",
             request_id=int(payload.get("request_id", 0) or 0),
         )
-        self.on_replan_request(SimpleNamespace(data=json.dumps(payload)))
+        self.apply_replan_request(SimpleNamespace(data=json.dumps(payload)))
         return True
+
+    def gather_turn_status(self, message):
+        return GlobalFrontierEventCallbacksMixin._enqueue_or_apply(
+            self, EventType.TURN_STATUS, message, self.apply_turn_status
+        )
 
     def on_turn_status(self, message):
         """Receive the execution adapter's atomic-turn state."""
@@ -904,7 +962,11 @@ class GlobalFrontierEventCallbacksMixin:
             return
         if not isinstance(payload, dict):
             return
-        with self.planning_lock:
+        with (
+            getattr(self, "planning_lock", None)
+            if getattr(self, "planning_lock", None) is not None
+            else nullcontext()
+        ):
             self.turn_supervisor_state = (
                 str(payload.get("state", "UNKNOWN")).strip().upper() or "UNKNOWN"
             )
@@ -955,7 +1017,7 @@ class GlobalFrontierEventCallbacksMixin:
                     return
                 self.active_turn_completed_route_id = int(self.active_route_id)
                 self.active_turn_completed_goal = (endpoint_x, endpoint_y)
-                self.active_turn_completed_wall = time.monotonic()
+                self.active_turn_completed_wall = now_for(self)
                 self.active_turn_completed_odom_xy = (
                     None if self.pose_odom is None else (
                         float(self.pose_odom.x), float(self.pose_odom.y)
@@ -984,9 +1046,40 @@ class GlobalFrontierEventCallbacksMixin:
                 )
 
     def on_immediate_plan(self, event):
-        # ``on_timer`` owns the non-blocking cycle lease.  Keeping a second
-        # wrapper lock here used to make an immediate successor wait behind a
-        # full frontier-selection pass and obscured which callback owned the
-        # planning transaction.
-        self.immediate_plan_timer = None
-        self.on_timer(event)
+        del event
+        return self._enqueue_lifecycle_event(
+            EventType.REPLAN_REQUESTED, {"event": "immediate_plan"}
+        )
+
+    def apply_task(self, message):
+        return GlobalFrontierEventCallbacksMixin.on_task(self, message)
+
+    def apply_detections(self, message):
+        return GlobalFrontierEventCallbacksMixin.on_detections(self, message)
+
+    def apply_goal_arbitration(self, message):
+        return GlobalFrontierEventCallbacksMixin.on_goal_arbitration(
+            self, message
+        )
+
+    def apply_task_done(self, message):
+        return GlobalFrontierEventCallbacksMixin.on_task_done(self, message)
+
+    def apply_move_base_recovery(self, message):
+        return GlobalFrontierEventCallbacksMixin.on_move_base_recovery(
+            self, message
+        )
+
+    def apply_bridge_status(self, message):
+        return GlobalFrontierEventCallbacksMixin.on_bridge_status(self, message)
+
+    def apply_scan(self, message):
+        return GlobalFrontierEventCallbacksMixin.on_scan(self, message)
+
+    def apply_replan_request(self, message):
+        return GlobalFrontierEventCallbacksMixin.on_replan_request(
+            self, message
+        )
+
+    def apply_turn_status(self, message):
+        return GlobalFrontierEventCallbacksMixin.on_turn_status(self, message)

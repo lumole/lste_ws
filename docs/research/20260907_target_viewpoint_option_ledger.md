@@ -123,9 +123,9 @@ candidate_0 active
 地点和局部观测任务作为长期状态。仓库已有的研究记录整理了 Clio、OneMap、OSG
 Navigator、VLFM、SG-Nav、UniGoal、RayFronts 和 R2F 的相关联系：
 
-- [place_portal_workitem_study_09052026.md](place_portal_workitem_study_09052026.md)
-- [recent_active_topology_architecture_09062026.md](recent_active_topology_architecture_09062026.md)
-- [portal_evidence_graph_architecture_09062026.md](portal_evidence_graph_architecture_09062026.md)
+- [20260905_place_portal_workitem_study.md](20260905_place_portal_workitem_study.md)
+- [20260906_recent_active_topology_architecture.md](20260906_recent_active_topology_architecture.md)
+- [20260906_portal_evidence_graph_architecture.md](20260906_portal_evidence_graph_architecture.md)
 
 本模块的研究假设不是“某个阈值更好”，而是：
 

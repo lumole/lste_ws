@@ -5,7 +5,7 @@ LSTE Gazebo environment. It runs the validated policy directly and does not
 start training.
 
 For the Chinese operational startup guide, see
-[`startup_guide_07232026.md`](../operations/startup_guide_07232026.md).
+[`20260723_startup_guide.md`](../operations/20260723_startup_guide.md).
 
 ## Integrated Start
 

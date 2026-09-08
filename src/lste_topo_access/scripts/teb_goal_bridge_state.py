@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Runtime state construction for the TEB goal bridge."""
 
-import threading
+from contextlib import nullcontext
 
 import actionlib
 import tf
@@ -12,7 +12,10 @@ from goal_context import default_goal_context
 
 def initialize_bridge_state(bridge):
     """Create state in small, named groups before any ROS callback can run."""
-    bridge.lock = threading.RLock()
+    # LifecycleManager.tick is the live serialization boundary. Keep a
+    # no-op context for legacy helpers that still spell their critical
+    # sections as ``with self.lock``.
+    bridge.lock = nullcontext()
     _initialize_action_state(bridge)
     _initialize_frontier_state(bridge)
     _initialize_mission_state(bridge)

@@ -7,9 +7,10 @@ the point action is complete only after TEB has safely slowed at the endpoint.
 
 import copy
 import math
-import time
 
 import rospy
+
+from clock_provider import now_for
 
 
 class TebGoalBridgePersistentExecutionMixin:
@@ -113,7 +114,7 @@ class TebGoalBridgePersistentExecutionMixin:
         control cycles. Prefer the latter when it is fresh; retain the
         feedback fallback for launch configurations without the raw topic.
         """
-        now = time.monotonic()
+        now = now_for(self)
         raw_fresh = (
             self.latest_teb_planner_linear is not None
             and now - self.latest_teb_planner_command_monotonic

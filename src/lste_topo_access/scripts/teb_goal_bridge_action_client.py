@@ -6,11 +6,12 @@ sending or cancelling an action.  Dispatch policy lives in sibling modules.
 """
 
 import copy
-import time
 from types import MappingProxyType
 
 import rospy
 from move_base_msgs.msg import MoveBaseGoal
+
+from clock_provider import now_for
 
 
 class TebGoalBridgeActionClientMixin:
@@ -89,7 +90,7 @@ class TebGoalBridgeActionClientMixin:
             else None
         )
         self.last_terminal_goal = None
-        self.last_dispatch_monotonic = time.monotonic()
+        self.last_dispatch_monotonic = now_for(self)
         self.last_result_status = None
         self.action_active = True
         self.active_intent_source = self.latest_intent_source
@@ -121,9 +122,9 @@ class TebGoalBridgeActionClientMixin:
         self.last_feedback_pose_global = None
         self.feedback_transform_failures = 0
         self.active_best_distance = None
-        self.active_progress_monotonic = time.monotonic()
+        self.active_progress_monotonic = now_for(self)
         self.active_motion_reference = None
-        self.active_motion_progress_monotonic = time.monotonic()
+        self.active_motion_progress_monotonic = now_for(self)
         self.active_navfn_plan_points = []
         self.active_navfn_plan_endpoint = None
         self.active_navfn_remaining = None

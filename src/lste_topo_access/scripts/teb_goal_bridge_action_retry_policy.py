@@ -6,10 +6,10 @@ publishes a new route ID.  The bridge may still dispatch a higher-priority
 target or an explicit forced controller transition.
 """
 
-import time
-
 import rospy
 from actionlib_msgs.msg import GoalStatus
+
+from clock_provider import now_for
 
 
 class TebGoalBridgeActionRetryPolicyMixin:
@@ -198,7 +198,7 @@ class TebGoalBridgeActionRetryPolicyMixin:
                 self._hold_failed_frontier_route_locked(reason)
                 return
             if (
-                time.monotonic() - self.last_result_monotonic
+                now_for(self) - self.last_result_monotonic
                 < self.goal_retry_interval
             ):
                 return
@@ -207,7 +207,7 @@ class TebGoalBridgeActionRetryPolicyMixin:
         if (
             not force
             and self.last_dispatched_goal is not None
-            and time.monotonic() - self.last_dispatch_monotonic
+            and now_for(self) - self.last_dispatch_monotonic
             < self.min_update_interval
         ):
             return

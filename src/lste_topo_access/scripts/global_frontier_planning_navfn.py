@@ -3,11 +3,12 @@
 import math
 import queue
 import threading
-import time
 
 import numpy as np
 import rospy
 from nav_msgs.srv import GetPlanRequest
+from lifecycle_manager import EventType
+from clock_provider import now_for
 
 
 class GlobalFrontierPlanningNavfnMixin:
@@ -21,6 +22,8 @@ class GlobalFrontierPlanningNavfnMixin:
 
     def _request_navfn_validation_wake(self, reason="navfn_validation_retry"):
         """Wake event-driven deliberation after a consumed result."""
+        if getattr(self, "lifecycle_manager", None) is not None:
+            return
         scheduler = getattr(self, "decision_wake_scheduler", None)
         request = getattr(scheduler, "request", None)
         if callable(request):
@@ -76,7 +79,15 @@ class GlobalFrontierPlanningNavfnMixin:
                 str(frame_id or "map").strip().lstrip("/") or "map"
             ),
             "resolution": float(resolution),
-            "submitted_wall": time.monotonic(),
+            "submitted_wall": now_for(self),
+            "transaction_id": int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
+            ),
         }
 
     def _navfn_validation_result_ready(self):
@@ -110,21 +121,39 @@ class GlobalFrontierPlanningNavfnMixin:
                         "kind": "error",
                         "state": "service_error",
                         "error": str(exc),
-                        "completed_wall": time.monotonic(),
+                        "completed_wall": now_for(self),
                     }
-                with self._navfn_validation_lock:
-                    self._navfn_validation_pending.discard(key)
-                    if len(self._navfn_validation_results) >= (
-                        self._NAVFN_RESULT_LIMIT
-                    ):
-                        # Completed results are facts waiting for the planning
-                        # boundary. Evict only the oldest unconsumed identity
-                        # when the bounded result ledger is full.
-                        oldest = next(iter(self._navfn_validation_results), None)
-                        if oldest is not None:
-                            self._navfn_validation_results.pop(oldest, None)
-                    self._navfn_validation_results[key] = (
-                        time.monotonic(), result,
+                completed_wall = now_for(self)
+                lifecycle = getattr(self, "lifecycle_manager", None)
+                if lifecycle is not None:
+                    accepted = lifecycle.enqueue_type(
+                        EventType.NAVFN_RESULT,
+                        {
+                            "key": key,
+                            "payload": payload,
+                            "result": result,
+                            "completed_wall": completed_wall,
+                        },
+                        transaction_id=payload.get("transaction_id"),
+                    )
+                    if not accepted:
+                        # A bounded lifecycle inbox may be full of causal
+                        # events. Preserve the worker fact in the bounded
+                        # result ledger and release the identity so the next
+                        # Compute phase can consume or retry it.
+                        self._store_navfn_validation_result(
+                            key, payload, result, completed_wall
+                        )
+                        rospy.logwarn_throttle(
+                            5.0,
+                            "Global frontier retained Navfn result after "
+                            "lifecycle queue backpressure goal=(%.2f,%.2f)",
+                            payload["goal_xy"][0],
+                            payload["goal_xy"][1],
+                        )
+                else:
+                    self._store_navfn_validation_result(
+                        key, payload, result, completed_wall
                     )
                 rospy.loginfo(
                     "Global frontier Navfn async validation completed "
@@ -132,7 +161,7 @@ class GlobalFrontierPlanningNavfnMixin:
                     payload["goal_xy"][0],
                     payload["goal_xy"][1],
                     result.get("state", "reachable" if result.get("reachable") else "empty"),
-                    time.monotonic() - payload["submitted_wall"],
+                    now_for(self) - payload["submitted_wall"],
                 )
                 # The result is now available, but the planning timer may be
                 # event-driven and have already returned after observing the
@@ -157,7 +186,7 @@ class GlobalFrontierPlanningNavfnMixin:
                 "kind": "error",
                 "state": "unavailable",
                 "error": str(exc),
-                "completed_wall": time.monotonic(),
+                "completed_wall": now_for(self),
             }
 
         request = GetPlanRequest()
@@ -181,7 +210,7 @@ class GlobalFrontierPlanningNavfnMixin:
                 "kind": "error",
                 "state": "service_error",
                 "error": str(exc),
-                "completed_wall": time.monotonic(),
+                "completed_wall": now_for(self),
             }
         reachable = bool(response.plan.poses)
         endpoint = None
@@ -193,8 +222,24 @@ class GlobalFrontierPlanningNavfnMixin:
             "reachable": reachable,
             "endpoint": endpoint,
             "resolution": payload["resolution"],
-            "completed_wall": time.monotonic(),
+                "completed_wall": now_for(self),
         }
+
+    def _store_navfn_validation_result(
+        self, key, payload, result, completed_wall=None,
+    ):
+        """Commit one worker fact at the lifecycle tick boundary."""
+        del payload
+        with self._navfn_validation_lock:
+            self._navfn_validation_pending.discard(key)
+            if len(self._navfn_validation_results) >= self._NAVFN_RESULT_LIMIT:
+                oldest = next(iter(self._navfn_validation_results), None)
+                if oldest is not None:
+                    self._navfn_validation_results.pop(oldest, None)
+            self._navfn_validation_results[key] = (
+                now_for(self) if completed_wall is None else float(completed_wall),
+                result,
+            )
 
     def _consume_navfn_validation_result(self, key, payload):
         """Apply one worker result without performing another RPC."""
@@ -219,7 +264,7 @@ class GlobalFrontierPlanningNavfnMixin:
             )
             return None, True
 
-        now_wall = float(result.get("completed_wall", time.monotonic()))
+        now_wall = float(result.get("completed_wall", now_for(self)))
         if self.navfn_first_response_wall is None:
             self.navfn_first_response_wall = now_wall
         reachable = bool(result.get("reachable", False))
@@ -430,7 +475,7 @@ class GlobalFrontierPlanningNavfnMixin:
         payload = self._navfn_validation_request_payload(
             robot_map, goal_xy, frame, resolution,
         )
-        now = time.monotonic()
+        now = now_for(self)
         with self._navfn_validation_lock:
             cached = self._navfn_validation_results.get(key)
             pending = key in self._navfn_validation_pending

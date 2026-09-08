@@ -11,10 +11,18 @@ from lste_msgs.msg import LsteDetections, LsteFrontiers, LsteScores, LsteState, 
 from goal_context import task_version_from_task
 from goal_manager_detection import handle_detections, record_detector_frame
 from goal_manager_modes import CATCH_CTX_MODE, CATCH_TARGET_MODE, STATE_LOCKED
+from lifecycle_manager import EventType
 
 
 class GoalManagerInputCallbacksMixin:
     """Callbacks for state, perception, task, and operator input topics."""
+
+    @staticmethod
+    def _enqueue_or_apply(owner, event_type, message, apply):
+        enqueue = getattr(owner, "_enqueue_lifecycle_event", None)
+        if callable(enqueue):
+            return enqueue(event_type, message)
+        return apply(message)
 
     def set_navigation_hold(self, active: bool, reason: str):
         """Publish mission-level observation hold only on state changes."""
@@ -31,6 +39,9 @@ class GoalManagerInputCallbacksMixin:
         )
 
     def on_state(self, msg: LsteState):
+        return self._enqueue_or_apply(self, EventType.STATE_UPDATED, msg, self.apply_state)
+
+    def apply_state(self, msg: LsteState):
         prev_state = self.current_state
         prev_subtype = self.current_subtype
         self.latest_state_msg = msg
@@ -90,14 +101,23 @@ class GoalManagerInputCallbacksMixin:
         self.last_state = msg.state
 
     def on_dets(self, msg: LsteDetections):
+        return self._enqueue_or_apply(self, EventType.DETECTIONS_UPDATED, msg, self.apply_dets)
+
+    def apply_dets(self, msg: LsteDetections):
         """Forward one detector frame to the detection evidence state machine."""
         record_detector_frame(self, msg)
         handle_detections(self, msg)
 
     def on_scores(self, msg: LsteScores):
+        return self._enqueue_or_apply(self, EventType.SCORES_UPDATED, msg, self.apply_scores)
+
+    def apply_scores(self, msg: LsteScores):
         self.latest_scores = msg
 
     def on_task(self, msg: LsteTask):
+        return self._enqueue_or_apply(self, EventType.TASK_UPDATED, msg, self.apply_task)
+
+    def apply_task(self, msg: LsteTask):
         task_id = (msg.task_id or "").strip()
         task_version = task_version_from_task(msg)
         mission_id = task_id
@@ -140,6 +160,9 @@ class GoalManagerInputCallbacksMixin:
         self.latest_task = msg
 
     def on_pose(self, msg: Pose2D):
+        return self._enqueue_or_apply(self, EventType.POSE_UPDATED, msg, self.apply_pose)
+
+    def apply_pose(self, msg: Pose2D):
         self.latest_pose = msg
         if self.start_pose is None:
             self.start_pose = msg
@@ -148,6 +171,9 @@ class GoalManagerInputCallbacksMixin:
             self.init_headings(msg)
 
     def on_cam_info(self, msg: CameraInfo):
+        return self._enqueue_or_apply(self, EventType.CAMERA_INFO_UPDATED, msg, self.apply_cam_info)
+
+    def apply_cam_info(self, msg: CameraInfo):
         try:
             self.camera_model.fromCameraInfo(msg)
             self.camera_info = msg
@@ -156,16 +182,28 @@ class GoalManagerInputCallbacksMixin:
             rospy.logwarn_throttle(5.0, "Failed to load camera info: %s", exc)
 
     def on_depth(self, msg: Image):
+        return self._enqueue_or_apply(self, EventType.DEPTH_UPDATED, msg, self.apply_depth)
+
+    def apply_depth(self, msg: Image):
         self.depth_image = msg
         self.depth_stamp = msg.header.stamp
 
     def on_frontier(self, msg: Vector3Stamped):
+        return self._enqueue_or_apply(self, EventType.FRONTIER_UPDATED, msg, self.apply_frontier)
+
+    def apply_frontier(self, msg: Vector3Stamped):
         self.latest_frontier = msg
 
     def on_frontiers(self, msg: LsteFrontiers):
+        return self._enqueue_or_apply(self, EventType.FRONTIERS_UPDATED, msg, self.apply_frontiers)
+
+    def apply_frontiers(self, msg: LsteFrontiers):
         self.latest_frontiers = msg
 
     def on_controller_mode(self, msg: String):
+        return self._enqueue_or_apply(self, EventType.CONTROLLER_MODE_UPDATED, msg, self.apply_controller_mode)
+
+    def apply_controller_mode(self, msg: String):
         mode = (msg.data or "").strip().lower()
         if mode in ("sappo", "teleop", "teb"):
             if mode != self.controller_mode:
@@ -177,21 +215,36 @@ class GoalManagerInputCallbacksMixin:
             self.controller_mode = mode
 
     def on_scan(self, msg: LaserScan):
+        return self._enqueue_or_apply(self, EventType.SCAN_UPDATED, msg, self.apply_scan)
+
+    def apply_scan(self, msg: LaserScan):
         self.latest_scan = msg
 
     def on_cmd_vel(self, msg: Twist):
+        return self._enqueue_or_apply(self, EventType.CMD_VEL_UPDATED, msg, self.apply_cmd_vel)
+
+    def apply_cmd_vel(self, msg: Twist):
         self.latest_cmd_vel = msg
 
     def on_access_mode(self, msg: UInt8):
+        return self._enqueue_or_apply(self, EventType.ACCESS_MODE_UPDATED, msg, self.apply_access_mode)
+
+    def apply_access_mode(self, msg: UInt8):
         try:
             self.access_mode = int(msg.data)
         except Exception:
             self.access_mode = 0
 
     def on_access_goal(self, msg: PoseStamped):
+        return self._enqueue_or_apply(self, EventType.ACCESS_GOAL_UPDATED, msg, self.apply_access_goal)
+
+    def apply_access_goal(self, msg: PoseStamped):
         self.access_backtrack_goal = msg
 
     def on_fixed_goal_click(self, msg: PoseStamped):
+        return self._enqueue_or_apply(self, EventType.FIXED_GOAL_UPDATED, msg, self.apply_fixed_goal_click)
+
+    def apply_fixed_goal_click(self, msg: PoseStamped):
         """Replace the fixed target from the Gazebo Shift-click UI."""
         previous = self.fixed_goal
         yaw = self.yaw_from_pose(msg)

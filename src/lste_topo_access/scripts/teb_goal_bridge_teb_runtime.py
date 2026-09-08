@@ -1,9 +1,10 @@
 """Live TEB execution observations used by the action-health policy."""
 
 import json
-import time
 
 import rospy
+
+from clock_provider import now_for
 
 
 class TebGoalBridgeTebRuntimeMixin:
@@ -27,7 +28,7 @@ class TebGoalBridgeTebRuntimeMixin:
             ):
                 # XY feedback is stationary during a mandated yaw connector.
                 # Completing it is still action-health progress.
-                self.active_progress_monotonic = time.monotonic()
+                self.active_progress_monotonic = now_for(self)
                 if self.active_feedback_distance is not None:
                     self.active_best_distance = self.active_feedback_distance
             if (
@@ -80,7 +81,7 @@ class TebGoalBridgeTebRuntimeMixin:
             if selected is not None and selected.trajectory
             else None
         )
-        now = time.monotonic()
+        now = now_for(self)
         with self.lock:
             if first is None:
                 self.latest_teb_selected_linear = None
@@ -105,7 +106,7 @@ class TebGoalBridgeTebRuntimeMixin:
 
     def on_teb_planner_command(self, message):
         """Track raw TEB output used for endpoint lifecycle release."""
-        now = time.monotonic()
+        now = now_for(self)
         linear = float(message.linear.x)
         angular = float(message.angular.z)
         with self.lock:
@@ -120,7 +121,7 @@ class TebGoalBridgeTebRuntimeMixin:
 
     def on_pose(self, message):
         """Measure real turn progress in odometry, independent of SLAM drift."""
-        now = time.monotonic()
+        now = now_for(self)
         yaw = float(message.theta)
         with self.lock:
             self.odom_yaw = yaw

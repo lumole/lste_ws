@@ -1,6 +1,6 @@
 """Runtime state initialization for the TEB turn supervisor."""
 
-import threading
+from contextlib import nullcontext
 
 import tf
 from geometry_msgs.msg import Twist
@@ -10,7 +10,7 @@ from teb_turn_supervisor_contract import STATE_PASS_THROUGH
 
 def initialize_turn_supervisor_state(supervisor):
     """Create all mutable state before ROS callbacks can observe it."""
-    supervisor.lock = threading.RLock()
+    supervisor.lock = nullcontext()
     supervisor.state = STATE_PASS_THROUGH
     supervisor.task_done = False
     supervisor.navigation_hold = False

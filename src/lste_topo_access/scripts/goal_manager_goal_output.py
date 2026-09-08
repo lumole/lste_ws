@@ -14,6 +14,7 @@ from std_msgs.msg import String
 from tf.transformations import quaternion_from_euler, quaternion_matrix
 
 from goal_context import default_goal_context
+from lifecycle_manager import State
 
 class GoalManagerGoalOutputMixin:
     # -------------------- Helpers --------------------
@@ -61,6 +62,9 @@ class GoalManagerGoalOutputMixin:
         """Transfer action ownership to post-terminal target observation."""
         if getattr(self, "target_terminal_observation_intent_sent", False):
             return False
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        if lifecycle is not None:
+            lifecycle.begin_transaction(State.DISPATCHED)
         self.goal_command_id += 1
         mission_context = default_goal_context(
             getattr(self, "exploration_method", "legacy"),
@@ -86,6 +90,14 @@ class GoalManagerGoalOutputMixin:
                 getattr(self, "target_viewpoint_attempt_id", "") or ""
             ),
             "goal_context": mission_context,
+            "lifecycle_transaction_id": int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
+            ),
             "reason": str(reason or "target_terminal_observation"),
         }
         self.pub_goal_command.publish(
@@ -265,6 +277,16 @@ class GoalManagerGoalOutputMixin:
             self.target_execution_state = "TARGET_EXECUTING"
         if self.goal_source == "global_slam_frontier":
             self.frontier_goal_sent_at = rospy.Time.now().to_sec()
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        preserve_external_route = bool(
+            lifecycle is not None
+            and getattr(self, "_lifecycle_event_transaction_id", None)
+            and self.goal_source == "global_slam_frontier"
+            and getattr(self, "_lifecycle_event_transaction_id", None)
+            == lifecycle.current_transaction_id
+        )
+        if lifecycle is not None and not preserve_external_route:
+            lifecycle.begin_transaction(State.DISPATCHED)
         # Publish the mission decision before the pose.  The bridge can then
         # classify the following PoseStamped before it considers dispatching an
         # action, avoiding a race between a target takeover and a frontier
@@ -281,6 +303,14 @@ class GoalManagerGoalOutputMixin:
         intent = {
             "source": self.goal_source,
             "priority": self.goal_intent_priority(self.goal_source),
+            "lifecycle_transaction_id": int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
+            ),
             # These fields identify the long-lived semantic mission.  The
             # PoseStamped below remains only the short-lived executable point.
             "task_id": str(getattr(self, "current_task_id", "")),
@@ -342,6 +372,14 @@ class GoalManagerGoalOutputMixin:
                 1.0 - 2.0 * (q.y * q.y + q.z * q.z),
             ), 4),
             "stamp": rospy.Time.now().to_sec(),
+            "lifecycle_transaction_id": int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
+            ),
         })
         self.pub_goal_command.publish(String(data=json.dumps(command, sort_keys=True)))
         self.pub_goal_intent.publish(String(data=json.dumps(intent, sort_keys=True)))

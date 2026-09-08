@@ -23,7 +23,7 @@
 | `global_frontier_models.py` | 规划快照、候选和 watchdog 等数据契约 | 不执行副作用操作 |
 | `global_frontier_planning_contract.py` | 慢规划提案的 generation、路线 lease 校验和原子提交边界 | 不选择目标、不发布速度或修改控制器 |
 
-Goal Manager 采用同样的“主节点编排、策略模块负责单一职责”布局，具体拆分见 [`goal_manager_code_layout_09052026.md`](goal_manager_code_layout_09052026.md)。
+Goal Manager 采用同样的“主节点编排、策略模块负责单一职责”布局，具体拆分见 [`20260905_goal_manager_code_layout.md`](20260905_goal_manager_code_layout.md)。
 
 ## 运行调用链
 

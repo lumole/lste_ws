@@ -491,6 +491,14 @@ class GlobalFrontierReportingMixin:
                 self, "turn_supervisor_target_yaw", None
             ),
             "route_id": int(self.active_route_id),
+            "lifecycle_transaction_id": int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
+            ),
             "active_region_id": active_region_id,
             "active_region_state": active_region_state,
             "released_controller_route": {
@@ -597,6 +605,14 @@ class GlobalFrontierReportingMixin:
             "goal": [round(float(x), 4), round(float(y), 4)],
             "yaw": None if yaw is None else round(float(yaw), 4),
             "route_id": int(self.active_route_id),
+            "lifecycle_transaction_id": int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
+            ),
             "route_kind": str(route_kind or "frontier_endpoint"),
             "mission_route_kind": str(
                 mission_route_kind

@@ -20,6 +20,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from goal_manager_config import GoalManagerConfigMixin
+from goal_manager_lifecycle import GoalManagerLifecycleMixin
 from goal_manager_goal_arbitration import GoalManagerGoalArbitrationMixin
 from goal_manager_goal_output import GoalManagerGoalOutputMixin
 from goal_manager_legacy_goals import GoalManagerLegacyGoalsMixin
@@ -47,6 +48,7 @@ from goal_manager_target_utils import GoalManagerTargetUtilsMixin, wrap_angle
 
 
 class GoalManager(
+    GoalManagerLifecycleMixin,
     GoalManagerRosCallbacksMixin,
     GoalManagerSchedulingMixin,
     GoalManagerTargetSegmentsMixin,
@@ -70,6 +72,7 @@ class GoalManager(
         gp = rospy.get_param
         self._load_parameters(gp)
         self._initialize_runtime_state(gp)
+        self._initialize_lifecycle_manager()
         self._setup_ros_interfaces()
         rospy.loginfo(
             "Goal Manager started: source=%s publishes /lste/final_goal "

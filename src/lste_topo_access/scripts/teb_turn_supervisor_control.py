@@ -2,10 +2,11 @@
 
 import copy
 import math
-import time
 
 import rospy
 from geometry_msgs.msg import Twist
+
+from clock_provider import now_for
 
 from teb_turn_supervisor_contract import (
     STATE_PASS_THROUGH,
@@ -217,6 +218,7 @@ class TebTurnSupervisorControlMixin:
         return command
 
     def on_timer(self, _event):
+        now = now_for(self)
         with self.lock:
             if (
                 self.mode == self.active_mode
@@ -225,7 +227,7 @@ class TebTurnSupervisorControlMixin:
                 and self.state == STATE_TURNING
             ):
                 clearance_reason = self._turn_clearance_reason_locked(
-                    time.monotonic()
+                    now
                 )
                 if clearance_reason:
                     self._release_turn_locked(
@@ -244,20 +246,20 @@ class TebTurnSupervisorControlMixin:
                 and not self.navigation_hold
             ):
                 planner_command_stale = (
-                    time.monotonic() - self.latest_planner_command_wall
+                    now - self.latest_planner_command_wall
                     > self.planner_command_timeout
                 )
                 if not planner_command_stale:
                     command = copy.deepcopy(self.latest_planner_command)
                     continuity = self._trajectory_continuity_command_locked(
-                        time.monotonic()
+                        now
                     )
                     if continuity is not None:
                         command = continuity
                 else:
                     command = Twist()
                     continuity = self._trajectory_continuity_command_locked(
-                        time.monotonic(), planner_command_stale=True
+                        now, planner_command_stale=True
                     )
                     if continuity is not None:
                         command = continuity
@@ -266,7 +268,7 @@ class TebTurnSupervisorControlMixin:
                     and self.pose is not None
                     and self.turn_settle_yaw is not None
                 ):
-                    if time.monotonic() < self.turn_settle_until_wall:
+                    if now < self.turn_settle_until_wall:
                         yaw_err = normalize_angle(
                             self.turn_settle_yaw - self.pose.theta
                         )
@@ -288,7 +290,6 @@ class TebTurnSupervisorControlMixin:
             ):
                 self._activate_turn_locked()
         self.output_pub.publish(command)
-        now = time.monotonic()
         with self.lock:
             if now - self.last_status_wall >= 1.0:
                 self.last_status_wall = now

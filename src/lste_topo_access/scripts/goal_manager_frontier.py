@@ -17,12 +17,20 @@ from goal_context import (
     goal_context_identity,
     normalize_goal_context,
 )
+from lifecycle_manager import EventType, State
 
 
 class GoalManagerFrontierMixin:
     """Receive, invalidate, and explicitly replan map-connected routes."""
 
     _GOAL_CONTEXT_ROLES = GOAL_CONTEXT_ROLES
+
+    @staticmethod
+    def _enqueue_or_apply(owner, event_type, message, apply):
+        enqueue = getattr(owner, "_enqueue_lifecycle_event", None)
+        if callable(enqueue):
+            return enqueue(event_type, message)
+        return apply(message)
 
     @staticmethod
     def _goal_context_id(value):
@@ -54,6 +62,12 @@ class GoalManagerFrontierMixin:
         return goal_context_identity(self.frontier_mission_goal_context()) != (
             goal_context_identity(getattr(self, "last_frontier_goal_context", None))
         )
+
+    def gather_global_frontier(self, msg: PoseStamped):
+        enqueue = getattr(self, "_enqueue_lifecycle_event", None)
+        if callable(enqueue):
+            return enqueue(EventType.GLOBAL_FRONTIER_UPDATED, msg)
+        return GoalManagerFrontierMixin.apply_global_frontier(self, msg)
 
     def on_global_frontier(self, msg: PoseStamped):
         # The normal online planner publishes a complete route-command
@@ -88,6 +102,14 @@ class GoalManagerFrontierMixin:
         # A terminal means the next fresh frontier message is actionable now.
         if self.teb_terminal_goal is not None:
             self.next_update_time = 0.0
+
+    def gather_global_frontier_command(self, message: String):
+        enqueue = getattr(self, "_enqueue_lifecycle_event", None)
+        if callable(enqueue):
+            return enqueue(EventType.GLOBAL_FRONTIER_COMMAND, message)
+        return GoalManagerFrontierMixin.apply_global_frontier_command(
+            self, message
+        )
 
     def on_global_frontier_command(self, message: String):
         """Consume one atomic online-frontier route transaction."""
@@ -220,6 +242,14 @@ class GoalManagerFrontierMixin:
         else:
             self.next_update_time = 0.0
 
+    def gather_global_frontier_status(self, message: String):
+        enqueue = getattr(self, "_enqueue_lifecycle_event", None)
+        if callable(enqueue):
+            return enqueue(EventType.GLOBAL_FRONTIER_STATUS, message)
+        return GoalManagerFrontierMixin.apply_global_frontier_status(
+            self, message
+        )
+
     def on_global_frontier_status(self, message: String):
         """Synchronize mission ownership when the explorer abandons a route."""
         try:
@@ -329,6 +359,9 @@ class GoalManagerFrontierMixin:
             and not target_room_claim_release
         ):
             return self.frontier_replan_pending_id
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        if lifecycle is not None:
+            lifecycle.begin_transaction(State.IDLE)
         self.frontier_replan_request_id += 1
         request_id = self.frontier_replan_request_id
         self.frontier_replan_pending_id = request_id
@@ -341,6 +374,14 @@ class GoalManagerFrontierMixin:
             "event": "replan_request",
             "request_id": request_id,
             "reason": str(reason),
+            "lifecycle_transaction_id": int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
+            ),
         }
         payload.update(fields)
         self.pub_global_frontier_replan.publish(
@@ -373,4 +414,17 @@ class GoalManagerFrontierMixin:
             target_room_claim=False,
             target_room_claim_release_reason=str(reason),
             target_track_id=str(target_track_id or ""),
+        )
+
+    def apply_global_frontier(self, msg):
+        return GoalManagerFrontierMixin.on_global_frontier(self, msg)
+
+    def apply_global_frontier_command(self, message):
+        return GoalManagerFrontierMixin.on_global_frontier_command(
+            self, message
+        )
+
+    def apply_global_frontier_status(self, message):
+        return GoalManagerFrontierMixin.on_global_frontier_status(
+            self, message
         )

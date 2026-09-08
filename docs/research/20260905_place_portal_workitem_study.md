@@ -122,7 +122,7 @@ WorkItem 的语义状态只有 `unresolved` 与 `resolved`。一次 Navfn/TEB �
 
 ## 4. Benchmark 与可复现协议
 
-场景为 `office_building_v1` 的四个静态 level，详细几何和任务契约在 [office_building_benchmark_plan_08272026.md](../testing/office_building_benchmark_plan_08272026.md)。主比较使用 Level 2（语义办公家具）和 Level 3（死路、窄门、替代路线），固定 `primary` 起点和 `yellow_cup` 任务。
+场景为 `office_building_v1` 的四个静态 level，详细几何和任务契约在 [20260827_office_building_benchmark_plan.md](../testing/20260827_office_building_benchmark_plan.md)。主比较使用 Level 2（语义办公家具）和 Level 3（死路、窄门、替代路线），固定 `primary` 起点和 `yellow_cup` 任务。
 
 研究矩阵在 `scripts/tests/office_building/experiment_matrix.yaml`：
 

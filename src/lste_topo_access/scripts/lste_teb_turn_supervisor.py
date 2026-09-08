@@ -43,6 +43,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from teb_turn_supervisor_callbacks import TebTurnSupervisorCallbacksMixin
 from teb_turn_supervisor_control import TebTurnSupervisorControlMixin
+from teb_turn_supervisor_lifecycle import TebTurnSupervisorLifecycleMixin
 from teb_turn_supervisor_parameters import configure_turn_supervisor_parameters
 from teb_turn_supervisor_routes import TebTurnSupervisorRoutesMixin
 from teb_turn_supervisor_ros import connect_turn_supervisor_ros
@@ -51,6 +52,7 @@ from teb_turn_supervisor_turn_lifecycle import TebTurnSupervisorTurnLifecycleMix
 
 
 class TebTurnSupervisor(
+    TebTurnSupervisorLifecycleMixin,
     TebTurnSupervisorControlMixin,
     TebTurnSupervisorTurnLifecycleMixin,
     TebTurnSupervisorRoutesMixin,
@@ -62,6 +64,7 @@ class TebTurnSupervisor(
         rospy.init_node("lste_teb_turn_supervisor")
         configure_turn_supervisor_parameters(self)
         initialize_turn_supervisor_state(self)
+        self._initialize_lifecycle_manager()
         connect_turn_supervisor_ros(self)
         self.publish_status_locked("startup")
         rospy.loginfo(

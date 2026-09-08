@@ -2,6 +2,7 @@
 
 import time
 import traceback
+from contextlib import nullcontext
 
 import rospy
 
@@ -9,6 +10,11 @@ from global_frontier_planning_contract import PlanningProposal
 
 
 class GlobalFrontierPlanningRuntimeMixin:
+
+    def _planning_context(self):
+        """Use the lifecycle tick as the production serialization boundary."""
+        lock = getattr(self, "planning_lock", None)
+        return nullcontext() if lock is None else lock
 
     def planning_should_preempt(self):
         """Return whether the current snapshot has lost execution ownership."""
@@ -43,7 +49,7 @@ class GlobalFrontierPlanningRuntimeMixin:
     def _finish_planning_cycle(self, token):
         """Drain queued execution facts after the slow pass releases state."""
         gate = getattr(self, "planning_proposal_gate", None)
-        with self.planning_lock:
+        with self._planning_context():
             if gate is not None:
                 gate.finish(token)
             drain_terminals = getattr(
@@ -56,7 +62,7 @@ class GlobalFrontierPlanningRuntimeMixin:
 
     def _prepare_planning_cycle(self):
         """Perform only short ingress work before the expensive selector."""
-        with self.planning_lock:
+        with self._planning_context():
             drain_terminals = getattr(
                 self, "_drain_execution_terminals_locked", None
             )
@@ -68,7 +74,11 @@ class GlobalFrontierPlanningRuntimeMixin:
             event_driven = bool(
                 getattr(self, "event_driven_deliberation_enabled", False)
             )
-            if event_driven and self.active_frontier is None:
+            if (
+                event_driven
+                and self.active_frontier is None
+                and getattr(self, "lifecycle_manager", None) is None
+            ):
                 decision_wake = (
                     None
                     if decision_scheduler is None
@@ -311,10 +321,10 @@ class GlobalFrontierPlanningRuntimeMixin:
 
             gate = getattr(self, "planning_proposal_gate", None)
             if gate is None:
-                with self.planning_lock:
+                with self._planning_context():
                     commit_selected_route()
             else:
-                with self.planning_lock:
+                with self._planning_context():
                     decision = gate.commit_if_current(
                         proposal.token,
                         getattr(self, "active_route_id", 0),
@@ -348,10 +358,10 @@ class GlobalFrontierPlanningRuntimeMixin:
             return True
 
         if gate is None:
-            with self.planning_lock:
+            with self._planning_context():
                 commit()
         else:
-            with self.planning_lock:
+            with self._planning_context():
                 decision = gate.commit_if_current(
                     proposal.token,
                     getattr(self, "active_route_id", 0),

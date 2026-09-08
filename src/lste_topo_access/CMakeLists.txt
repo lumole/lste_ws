@@ -190,6 +190,12 @@ catkin_install_python(PROGRAMS
 # beside the executables so an install-space launch has the same module layout
 # as a devel-space launch.
 install(FILES
+  scripts/clock_provider.py
+  scripts/lifecycle_manager.py
+  scripts/global_frontier_lifecycle.py
+  scripts/goal_manager_lifecycle.py
+  scripts/teb_goal_bridge_lifecycle.py
+  scripts/teb_turn_supervisor_lifecycle.py
   scripts/gp_frontier_bootstrap.py
   scripts/gp_frontier_common.py
   scripts/gp_frontier_callbacks_config.py

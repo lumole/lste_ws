@@ -20,6 +20,14 @@
   node is split, and install every sibling Python module needed by an
   install-space or devel-space launch.
 
+## Documentation Naming
+
+- Except for the fixed index `docs/introduction.md`, files under `docs/` use
+  the `YYYYMMDD_topic.extension` format; Markdown documents use
+  `YYYYMMDD_topic.md`.
+- The date prefix is written as year, month, and day in that order. Keep the
+  fixed index path unchanged when updating its links.
+
 ## Fixed-Goal Test Logs
 
 - Every `rltest` invocation must create one timestamped parent directory under

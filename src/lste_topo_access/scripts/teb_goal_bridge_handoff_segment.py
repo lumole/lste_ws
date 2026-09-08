@@ -1,9 +1,10 @@
 """In-place segment replacement policy for the TEB action bridge."""
 
 import math
-import time
 
 import rospy
+
+from clock_provider import now_for
 
 
 class TebGoalBridgeHandoffSegmentMixin:
@@ -36,7 +37,7 @@ class TebGoalBridgeHandoffSegmentMixin:
         ):
             # A turn is a semantic action: the supervisor owns angle closure.
             return None
-        if time.monotonic() - self.last_dispatch_monotonic < self.min_update_interval:
+        if now_for(self) - self.last_dispatch_monotonic < self.min_update_interval:
             return None
         pending_delta = self._pending_goal_delta_locked()
         frontier_branch = bool(

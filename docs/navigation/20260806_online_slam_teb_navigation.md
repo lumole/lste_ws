@@ -87,7 +87,7 @@ DETECTOR: wedetect-large
 # target ray must be connected by the live Navfn planner before it can own TEB
 TARGET_ROUTE_VALIDATION: true
 TEB_GOAL_FAILURE_TOPIC: /lste/teb_goal_failure
-# 连续前沿交接与平顺度参数（详见 navigation_smoothness_optimization_08072026.md）
+# 连续前沿交接与平顺度参数（详见 20260807_navigation_smoothness_optimization.md）
 GLOBAL_FRONTIER_APPROACH_DISTANCE: 1.5
 GLOBAL_FRONTIER_EARLY_HANDOFF_RADIUS: 2.00
 # launch 层：allow_in_place_replacement=false,
@@ -130,7 +130,7 @@ action 终态，因此不会把不同任务混成一个轨迹。bridge 会读取
 `force_reinit_new_goal_dist`（5.0 m）和
 `xy_goal_tolerance`，拒绝会重建 timed elastic band 或已经落入终态容差的跳转；这些是
 TEB 的结构性边界，不是额外 PID 参数。见
-[导航平顺度优化报告](navigation_smoothness_optimization_08072026.md)。
+[导航平顺度优化报告](20260807_navigation_smoothness_optimization.md)。
 
 这条事件驱动规划边界和 action bridge 是同一个架构契约：地图观测的变化不会自动
 升级成执行事务。只有 frontier 节点确认当前路线失效并发布 `route_invalidated`，或

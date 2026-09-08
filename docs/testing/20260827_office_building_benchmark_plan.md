@@ -450,7 +450,7 @@ scripts/tests/office_building/
   summarize_run.py
 
 docs/testing/
-  office_building_benchmark_plan_08272026.md
+  20260827_office_building_benchmark_plan.md
 ```
 
 四份 `office_building_v1_level_*_no_pro3.world` 只保存建筑和环境模型。Pro3 由现有启动流程根据配置生成，避免 world 内置机器人和脚本生成机器人发生重复。

@@ -1,9 +1,11 @@
 """Timer-driven persistent-mission progression for the TEB bridge."""
 
 import copy
-import time
 
 import rospy
+
+from clock_provider import now_for
+from lifecycle_manager import EventType
 
 
 class TebGoalBridgeMissionRuntimeMixin:
@@ -55,9 +57,9 @@ class TebGoalBridgeMissionRuntimeMixin:
         )
         self.active_goal_context = dict(self.latest_goal_context)
         self.active_best_distance = None
-        self.active_progress_monotonic = time.monotonic()
+        self.active_progress_monotonic = now_for(self)
         self.active_motion_reference = None
-        self.active_motion_progress_monotonic = time.monotonic()
+        self.active_motion_progress_monotonic = now_for(self)
         self.active_navfn_plan_points = []
         self.active_navfn_plan_endpoint = None
         self.active_navfn_remaining = None
@@ -108,7 +110,7 @@ class TebGoalBridgeMissionRuntimeMixin:
         if self.persistent_frontier_lookahead_handoff_enabled:
             admitted, admission = self._admit_persistent_frontier_prefetch_locked()
             if not admitted:
-                now = time.monotonic()
+                now = now_for(self)
                 if now - self.persistent_prefetch_admission_last_report_monotonic >= 1.0:
                     self.persistent_prefetch_admission_last_report_monotonic = now
                     self.publish_bridge_status(
@@ -178,6 +180,11 @@ class TebGoalBridgeMissionRuntimeMixin:
                 self.dispatch_locked(force=False, reason="terminal_followup")
 
     def schedule_terminal_dispatch_locked(self):
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        if lifecycle is not None:
+            self.terminal_dispatch_timer = None
+            lifecycle.enqueue_type(EventType.BRIDGE_WAKE, None)
+            return
         if self.terminal_dispatch_timer is None and not rospy.is_shutdown():
             self.terminal_dispatch_timer = rospy.Timer(
                 # This is a lifecycle synchronization barrier, not a planning

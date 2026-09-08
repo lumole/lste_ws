@@ -11,6 +11,7 @@
   <arg name="costmap_topic" default="/move_base/global_costmap/costmap"/>
   <arg name="costmap_updates_topic" default="/move_base/global_costmap/costmap_updates"/>
   <arg name="costmap_max_age" default="3.0"/>
+  <arg name="costmap_stationary_pose_epsilon" default="0.01"/>
   <!-- Connectivity validation is throttled because the rolling local
        costmap/TEB checks every command at a higher rate. -->
   <arg name="costmap_validation_period" default="2.0"/>
@@ -176,6 +177,7 @@
     <param name="costmap_topic" value="$(arg costmap_topic)"/>
     <param name="costmap_updates_topic" value="$(arg costmap_updates_topic)"/>
     <param name="costmap_max_age" value="$(arg costmap_max_age)"/>
+    <param name="costmap_stationary_pose_epsilon" value="$(arg costmap_stationary_pose_epsilon)"/>
     <param name="costmap_validation_period" value="$(arg costmap_validation_period)"/>
     <param name="navfn_plan_validation" value="$(arg navfn_plan_validation)"/>
     <param name="navfn_make_plan_service" value="$(arg navfn_make_plan_service)"/>

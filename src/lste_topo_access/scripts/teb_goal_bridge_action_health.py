@@ -9,11 +9,12 @@ The host provides publishers, action state, and status helpers.
 import copy
 import json
 import math
-import time
 
 import rospy
 from actionlib_msgs.msg import GoalStatus
 from std_msgs.msg import String
+
+from clock_provider import now_for
 
 
 class TebGoalBridgeActionHealthMixin:
@@ -114,7 +115,7 @@ class TebGoalBridgeActionHealthMixin:
                 transport_cancelled = True
             self.action_active = False
             self.last_result_status = GoalStatus.PREEMPTED
-            self.last_result_monotonic = time.monotonic()
+            self.last_result_monotonic = now_for(self)
         if self.persistent_execution:
             clear_request = getattr(
                 self, "_clear_persistent_target_request_locked", None
@@ -199,7 +200,7 @@ class TebGoalBridgeActionHealthMixin:
         self._clear_action_health_locked()
         self._clear_failed_route_lease_locked()
         self.last_result_status = GoalStatus.PREEMPTED
-        self.last_result_monotonic = time.monotonic()
+        self.last_result_monotonic = now_for(self)
         self.publish_bridge_status(
             "controller_lease_released",
             route_id=route_id,
@@ -232,7 +233,7 @@ class TebGoalBridgeActionHealthMixin:
         self._clear_action_health_locked()
         self._clear_failed_route_lease_locked()
         self.last_result_status = GoalStatus.PREEMPTED
-        self.last_result_monotonic = time.monotonic()
+        self.last_result_monotonic = now_for(self)
         self.publish_bridge_status("cancel", reason=reason)
         rospy.loginfo("TEB goal bridge cancelled move_base action: reason=%s", reason)
 
@@ -521,7 +522,7 @@ class TebGoalBridgeActionHealthMixin:
                 getattr(self, "active_target_viewpoint_attempt_id", "") or ""
             )
         )
-        now = time.monotonic()
+        now = now_for(self)
         progress_basis, target_progress_age = self._target_progress_state_locked(now)
         self.target_failure_latched = True
         self.target_failure_goal = source_goal

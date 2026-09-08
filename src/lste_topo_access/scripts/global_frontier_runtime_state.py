@@ -3,7 +3,6 @@
 """Mutable runtime state for the online frontier explorer."""
 
 import collections
-import threading
 
 import rospy
 from nav_msgs.srv import GetPlan
@@ -26,7 +25,6 @@ from global_frontier_event_graph import EvidenceEventGraph
 from global_frontier_decision_wake import DecisionWakeScheduler
 from global_frontier_graph_route_planner import GraphRoutePlanner
 from global_frontier_directional_branch_coverage import DirectionalBranchCoverage
-from global_frontier_planning_contract import PlanningProposalGate
 
 
 class GlobalFrontierRuntimeStateMixin:
@@ -37,6 +35,12 @@ class GlobalFrontierRuntimeStateMixin:
         self.costmap_msg = None
         self.costmap_message_count = 0
         self.costmap_last_receive_wall = 0.0
+        self.costmap_stationary_pose_epsilon = max(
+            0.0, float(gp("~costmap_stationary_pose_epsilon", 0.01))
+        )
+        self.costmap_stationary = False
+        self.costmap_stationary_since = None
+        self._costmap_explicitly_invalid = False
         # A full costmap BFS is useful for candidate validation, but it is not
         # a control-cycle operation.  Reuse the last connected mask briefly;
         # the local costmap/TEB remains responsible for immediate obstacles.
@@ -425,27 +429,28 @@ class GlobalFrontierRuntimeStateMixin:
         # materializer. The graph adapter consumes it to release the stale
         # action lease and replan; it is cleared after that handoff.
         self.last_durable_portal_crossing_unavailable = None
-        # Deliberation is an optimistic slow layer.  The cycle lock only
-        # serializes timer callbacks; it is intentionally not held while the
-        # frontier selector scans a large snapshot.  A proposal gate protects
-        # the final activation boundary from a terminal that arrives during
-        # that scan.
-        self.planning_cycle_lock = threading.Lock()
+        # The lifecycle tick owns all route-state computation.  Slow planning
+        # compatibility fields remain observable for old diagnostics/tests,
+        # but the live node does not use a second lock or proposal state
+        # machine to coordinate callbacks.
+        # The lifecycle manager's tick is the only production compute owner.
+        # These legacy locks/gates remain optional compatibility hooks for
+        # isolated tests and older compositions, but are absent in the live
+        # node so they cannot become a second state machine.
+        self.planning_cycle_lock = None
         self.planning_cycle_active = False
         self.planning_cycle_started_wall = 0.0
         self.planning_cycle_skipped = 0
-        self.planning_proposal_gate = PlanningProposalGate()
+        self.planning_proposal_gate = None
         self.planning_cycle_token = None
         self.planning_cycle_proposal = None
-        self.planning_lock = threading.RLock()
-        self.immediate_plan_timer = None
-        # The terminal ROS callback must never wait behind the slow planning
-        # cycle.  It enqueues the immutable message here; a short one-shot
-        # timer drains it after the planning lock becomes available.
-        self.terminal_ingress_lock = threading.Lock()
-        self.pending_execution_terminals = collections.deque(maxlen=16)
+        self.planning_lock = None
+        # Terminal ingress is owned by LifecycleManager in the live node.
+        # The following fields are optional compatibility state for older
+        # compositions and are intentionally not initialized here.
+        self.terminal_ingress_lock = None
+        self.pending_execution_terminals = None
         self.terminal_ingress_dropped = 0
-        self.terminal_drain_timer = None
         # A terminal invalidates any snapshot-local candidate computation that
         # is still running. The callback only flips this atomic fact; the
         # planner consumes it at safe enumeration boundaries.

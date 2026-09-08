@@ -9,6 +9,7 @@ import math
 
 import rospy
 
+from lifecycle_manager import State
 from global_frontier_models import SelectedFrontier
 from global_frontier_topology import copy_component_evidence
 from global_frontier_portal_crossing import portal_signed_distance
@@ -107,6 +108,9 @@ class GlobalFrontierActivationMixin:
         self, selection, region, now, robot_map, probe_record=None,
     ):
         """Install the selected candidate as a new route lifecycle lease."""
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        if lifecycle is not None:
+            lifecycle.begin_transaction(State.DISPATCHED, now=now)
         self.frontier_exhausted = False
         self.active_frontier = (
             selection.row,

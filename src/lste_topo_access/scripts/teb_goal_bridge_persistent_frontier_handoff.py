@@ -8,9 +8,10 @@ over safely.
 
 import copy
 import math
-import time
 
 import rospy
+
+from clock_provider import now_for
 
 
 class TebGoalBridgePersistentFrontierHandoffMixin:
@@ -87,7 +88,7 @@ class TebGoalBridgePersistentFrontierHandoffMixin:
             "pending_delta": float(pending_delta),
             "heading_delta": float(prefetch_heading_delta),
             "heading_basis": prefetch_heading_basis,
-            "started_monotonic": time.monotonic(),
+            "started_monotonic": now_for(self),
         }
         self.frontier_continuous_prefetch_handoff_pending = pending
         # This is a logical terminal only. The old action deliberately keeps

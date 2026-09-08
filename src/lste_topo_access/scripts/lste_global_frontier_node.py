@@ -25,6 +25,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from global_frontier_execution import GlobalFrontierExecutionMixin
 from global_frontier_event_callbacks import GlobalFrontierEventCallbacksMixin
+from global_frontier_lifecycle import GlobalFrontierLifecycleMixin
 from global_frontier_durable_lease_lifecycle import (
     GlobalFrontierDurableLeaseLifecycleMixin,
 )
@@ -61,6 +62,7 @@ from global_frontier_terminal_observation import GlobalFrontierTerminalObservati
 
 
 class GlobalFrontierExplorer(
+    GlobalFrontierLifecycleMixin,
     GlobalFrontierTerminalLifecycleMixin,
     GlobalFrontierTerminalObservationMixin,
     GlobalFrontierPortalProbeLifecycleMixin,
@@ -86,6 +88,7 @@ class GlobalFrontierExplorer(
         rospy.init_node("lste_global_frontier")
         self._load_parameters(rospy.get_param)
         self._initialize_runtime_state()
+        self._initialize_lifecycle_manager()
         self._setup_ros_interfaces()
 
     @staticmethod

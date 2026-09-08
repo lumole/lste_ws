@@ -7,10 +7,11 @@ decides a velocity itself; route and execution modules own those decisions.
 import copy
 import json
 import math
-import time
 
 import rospy
 from geometry_msgs.msg import PoseStamped, Twist
+
+from clock_provider import now_for
 
 from teb_turn_supervisor_contract import (
     FRONTIER_ENDPOINT_KIND,
@@ -209,12 +210,12 @@ class TebTurnSupervisorCallbacksMixin:
                 minimum = min(minimum, float(value))
         with self.lock:
             self.scan_minimum = minimum
-            self.scan_monotonic = time.monotonic()
+            self.scan_monotonic = now_for(self)
 
     def on_planner_command(self, message):
         with self.lock:
             self.latest_planner_command = copy.deepcopy(message)
-            self.latest_planner_command_wall = time.monotonic()
+            self.latest_planner_command_wall = now_for(self)
 
     def on_teb_feedback(self, message):
         """Cache the selected TEB velocity for a bounded raw-command gap."""
@@ -230,7 +231,7 @@ class TebTurnSupervisorCallbacksMixin:
         command.linear.x = float(velocity.linear.x)
         command.angular.z = float(velocity.angular.z)
         with self.lock:
-            now = time.monotonic()
+            now = now_for(self)
             if self.latest_trajectory_command_wall > 0.0:
                 period = now - self.latest_trajectory_command_wall
                 if 0.005 <= period <= self.trajectory_feedback_timeout_cap:

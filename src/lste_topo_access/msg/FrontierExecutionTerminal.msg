@@ -5,6 +5,8 @@
 # route ID is the authoritative identity at the bridge/frontier boundary.
 
 uint32 route_id
+# LifecycleManager uses a full UUID1 integer; keep it lossless across ROS.
+string lifecycle_transaction_id
 uint32 action_generation
 string route_kind
 geometry_msgs/PoseStamped goal

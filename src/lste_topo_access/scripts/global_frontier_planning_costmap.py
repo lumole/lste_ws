@@ -1,10 +1,11 @@
 """Costmap freshness and connected-grid validation for frontier planning."""
 
 import math
-import time
 
 import numpy as np
 import rospy
+
+from clock_provider import now_for
 
 
 class GlobalFrontierPlanningCostmapMixin:
@@ -68,14 +69,27 @@ class GlobalFrontierPlanningCostmapMixin:
         if message is None or message.info.resolution <= 0.0:
             return None
         # Full grids are normally latched and remain unchanged while
-        # costmap_2d publishes only incremental updates. Use wall-clock age of
-        # the full-grid/update stream rather than the static map stamp.
+        # costmap_2d publishes only incremental updates. Use the shared
+        # lifecycle-clock age of the full-grid/update stream rather than the
+        # static map stamp.
         age = (
             float("inf")
             if self.costmap_last_receive_wall <= 0.0
-            else time.monotonic() - self.costmap_last_receive_wall
+            else now_for(self) - self.costmap_last_receive_wall
         )
         if age > self.costmap_max_age:
+            if (
+                getattr(self, "costmap_stationary", False)
+                and not getattr(self, "_costmap_explicitly_invalid", False)
+            ):
+                rospy.logwarn_throttle(
+                    5.0,
+                    "Global frontier retaining stationary costmap cache "
+                    "age=%.2fs limit=%.2fs",
+                    age,
+                    self.costmap_max_age,
+                )
+                return message
             rospy.logwarn_throttle(
                 5.0,
                 "Global frontier costmap stale age=%.2fs limit=%.2fs",

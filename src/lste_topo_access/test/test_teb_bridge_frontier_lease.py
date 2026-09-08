@@ -42,6 +42,7 @@ HEALTH_MIXIN = load_class(
     "TebGoalBridgeActionHealthMixin",
     {
         "time": SimpleNamespace(monotonic=lambda: 100.0),
+        "now_for": lambda _owner: 100.0,
         "GoalStatus": GoalStatusStub,
         "rospy": SimpleNamespace(logwarn=lambda *_args, **_kwargs: None),
     },

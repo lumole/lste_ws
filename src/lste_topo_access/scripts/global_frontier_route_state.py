@@ -4,24 +4,32 @@
 
 import copy
 import math
-import time
 
 import rospy
 
+from clock_provider import now_for
 from global_frontier_topology import grid_frontier_observed_from_viewpoint
+from lifecycle_manager import EventType
 
 
 class GlobalFrontierRouteStateMixin:
     def on_map(self, message):
+        return self._enqueue_lifecycle_event(EventType.MAP_UPDATED, message)
+
+    def apply_map(self, message):
         self.map_msg = message
         scheduler = getattr(self, "decision_wake_scheduler", None)
         if scheduler is not None:
             scheduler.observe_map(message)
 
     def on_costmap(self, message):
+        return self._enqueue_lifecycle_event(EventType.COSTMAP_UPDATED, ("full", message))
+
+    def apply_costmap(self, message):
         self.costmap_msg = message
         self.costmap_message_count += 1
-        self.costmap_last_receive_wall = time.monotonic()
+        self.costmap_last_receive_wall = now_for(self)
+        self._costmap_explicitly_invalid = False
         scheduler = getattr(self, "decision_wake_scheduler", None)
         if scheduler is not None:
             # Full costmap publications are the dependency boundary. The
@@ -41,6 +49,9 @@ class GlobalFrontierRouteStateMixin:
         )
 
     def on_costmap_update(self, update):
+        return self._enqueue_lifecycle_event(EventType.COSTMAP_UPDATED, ("delta", update))
+
+    def apply_costmap_update(self, update):
         """Apply costmap_2d's incremental update to the cached full grid."""
         base = self.costmap_msg
         if base is None:
@@ -69,7 +80,8 @@ class GlobalFrontierRouteStateMixin:
             updated.data = list(update.data)
             self.costmap_msg = updated
             self.costmap_message_count += 1
-            self.costmap_last_receive_wall = time.monotonic()
+            self.costmap_last_receive_wall = now_for(self)
+            self._costmap_explicitly_invalid = False
             self.cached_costmap_validation = None
             self.cached_costmap_validation_wall = 0.0
             rospy.loginfo(
@@ -110,11 +122,58 @@ class GlobalFrontierRouteStateMixin:
             data[start:end] = update.data[source_start:source_start + update_width]
         updated.data = data
         self.costmap_msg = updated
-        self.costmap_last_receive_wall = time.monotonic()
+        self.costmap_last_receive_wall = now_for(self)
+        self._costmap_explicitly_invalid = False
         self.cached_costmap_validation = None
         self.cached_costmap_validation_wall = 0.0
 
+    def invalidate_costmap(self):
+        """Drop a partial delta reconstruction until a full grid arrives."""
+        self.costmap_msg = None
+        self.costmap_last_receive_wall = 0.0
+        self._costmap_explicitly_invalid = True
+        self.cached_costmap_validation = None
+        self.cached_costmap_validation_wall = 0.0
+        rospy.logwarn_throttle(
+            5.0,
+            "Global frontier dropped costmap cache after coalesced delta loss; "
+            "waiting for a full costmap publication",
+        )
+
     def on_pose(self, message):
+        return self._enqueue_lifecycle_event(EventType.POSE_UPDATED, message)
+
+    def apply_pose(self, message):
+        previous = getattr(self, "pose_odom", None)
+        epsilon = max(
+            0.0,
+            float(getattr(self, "costmap_stationary_pose_epsilon", 0.01)),
+        )
+        moved = False
+        if previous is not None:
+            translation = math.hypot(
+                float(message.x) - float(previous.x),
+                float(message.y) - float(previous.y),
+            )
+            yaw_delta = abs(
+                (float(message.theta) - float(previous.theta) + math.pi)
+                % (2.0 * math.pi)
+                - math.pi
+            )
+            moved = max(translation, yaw_delta) > epsilon
+        now = now_for(self)
+        if previous is None:
+            self.costmap_stationary_since = now
+            self.costmap_stationary = True
+        elif moved:
+            self.costmap_stationary_since = None
+            self.costmap_stationary = False
+            if getattr(self, "costmap_msg", None) is not None:
+                self._costmap_explicitly_invalid = True
+        else:
+            if not getattr(self, "costmap_stationary", False):
+                self.costmap_stationary_since = now
+            self.costmap_stationary = True
         self.pose_odom = message
         scheduler = getattr(self, "decision_wake_scheduler", None)
         if scheduler is not None:

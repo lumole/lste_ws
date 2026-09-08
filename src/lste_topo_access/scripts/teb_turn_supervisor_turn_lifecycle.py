@@ -2,10 +2,11 @@
 
 import json
 import math
-import time
 
 import rospy
 from std_msgs.msg import String
+
+from clock_provider import now_for
 
 from teb_turn_supervisor_contract import (
     STATE_PASS_THROUGH,
@@ -25,6 +26,14 @@ class TebTurnSupervisorTurnLifecycleMixin:
             error = normalize_angle(self.turn_target_yaw - pose.theta)
         payload = {
             "event": str(event),
+            "lifecycle_transaction_id": int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
+            ),
             "state": self.state,
             "mode": self.mode,
             "route_kind": self.latest_route_kind,
@@ -76,7 +85,7 @@ class TebTurnSupervisorTurnLifecycleMixin:
             self.completed_turn_key = previous_key
             self.turn_completed_count += 1
             self.turn_settle_until_wall = (
-                time.monotonic() + self.turn_settle_duration
+                now_for(self) + self.turn_settle_duration
                 if self.turn_settle_duration > 0.0 else 0.0
             )
             self.turn_settle_yaw = (
@@ -135,7 +144,7 @@ class TebTurnSupervisorTurnLifecycleMixin:
         goal_distance = self._goal_distance_in_pose_frame_locked(
             self.active_action_goal
         )
-        feedback_age = max(0.0, time.monotonic() - self.latest_trajectory_command_wall)
+        feedback_age = max(0.0, now_for(self) - self.latest_trajectory_command_wall)
         feedback_timeout = self._trajectory_feedback_timeout_locked()
         linear = float(self.latest_trajectory_command.linear.x)
         angular = float(self.latest_trajectory_command.angular.z)
@@ -186,7 +195,7 @@ class TebTurnSupervisorTurnLifecycleMixin:
             self.stalled_route_candidate_since_wall = 0.0
             self.stalled_route_ready_identity = None
             return None
-        now = time.monotonic()
+        now = now_for(self)
         if self.stalled_route_candidate_identity != action_identity:
             self.stalled_route_candidate_identity = action_identity
             self.stalled_route_candidate_since_wall = now
@@ -304,7 +313,7 @@ class TebTurnSupervisorTurnLifecycleMixin:
             ):
                 return True
             return False
-        now = time.monotonic()
+        now = now_for(self)
         if self.turn_pending_identity != key:
             self.turn_pending_identity = key
             self.turn_pending_since_wall = now

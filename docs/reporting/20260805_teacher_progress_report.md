@@ -59,16 +59,16 @@ flowchart LR
 
 ## 三、关键实验结果
 
-![三种控制器真实 RViz 同步对比](assets/fixed_goal_comparison_20260725.png)
+![三种控制器真实 RViz 同步对比](assets/20260725_fixed_goal_comparison.png)
 
 上图和下方视频均来自真实 Gazebo/RViz 运行，不是示意图。左至右为原始 SA-PPO、DWA、TEB。
 
 <video controls preload="metadata" width="100%">
-  <source src="assets/fixed_goal_rl_dwa_teb_comparison_20260725.mp4" type="video/mp4">
-  请打开 <a href="assets/fixed_goal_rl_dwa_teb_comparison_20260725.mp4">控制器对比视频</a>。
+  <source src="assets/20260725_fixed_goal_rl_dwa_teb_comparison.mp4" type="video/mp4">
+  请打开 <a href="assets/20260725_fixed_goal_rl_dwa_teb_comparison.mp4">控制器对比视频</a>。
 </video>
 
-视频链接：[打开 45 秒控制器对比视频](assets/fixed_goal_rl_dwa_teb_comparison_20260725.mp4)。
+视频链接：[打开 45 秒控制器对比视频](assets/20260725_fixed_goal_rl_dwa_teb_comparison.mp4)。
 
 | 方法 | 实验现象 | 当前结论 |
 | --- | --- | --- |
@@ -76,9 +76,9 @@ flowchart LR
 | DWA | 已有在线地图和全局方向，但在墙角附近停在距目标约 `3.30 m` 处。 | 有全局路径不代表局部控制器一定能执行绕墙动作。 |
 | TEB | 使用 SLAM + Navfn + TEB，日志记录 `move_base reports the fixed final goal reached`。 | 当前场景中存在可通路径，且传统导航基线能够实际完成。 |
 
-![DWA 在墙角附近停滞](assets/dwa_stall_20260725.png)
+![DWA 在墙角附近停滞](assets/20260725_dwa_stall.png)
 
-![原始 SA-PPO 只有局部 lidar 的运行视图](assets/sappo_policy_only_20260725.png)
+![原始 SA-PPO 只有局部 lidar 的运行视图](assets/20260725_sappo_policy_only.png)
 
 这个实验得到的最重要结论是：**原始 SA-PPO 尚未在该绕墙任务上跑通；当前跑通的是 SLAM + Navfn + TEB 的控制基线。** 这一结论为后续工作提供了清晰参照，避免把“路线本来不可走”和“RL 不会走”混为一谈。
 

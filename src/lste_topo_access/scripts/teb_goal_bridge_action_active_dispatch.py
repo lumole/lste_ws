@@ -1,8 +1,8 @@
 """Dispatch policy while a MoveBase action is already active."""
 
-import time
-
 import rospy
+
+from clock_provider import now_for
 
 from goal_context import goal_context_identity
 
@@ -34,7 +34,7 @@ class TebGoalBridgeActionActiveDispatchMixin:
                     float(continuous_handoff["pending_delta"]), 3
                 ),
                 "handoff_wait_seconds": round(
-                    time.monotonic()
+                    now_for(self)
                     - float(continuous_handoff["started_monotonic"]),
                     4,
                 ),
@@ -159,7 +159,7 @@ class TebGoalBridgeActionActiveDispatchMixin:
             return
         self.deferred_signature = pending_signature
         self.deferred_goal_updates += 1
-        now = time.monotonic()
+        now = now_for(self)
         if now - self.deferred_goal_log_wall < 2.0:
             return
         self.deferred_goal_log_wall = now

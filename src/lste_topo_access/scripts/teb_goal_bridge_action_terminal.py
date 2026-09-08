@@ -5,11 +5,12 @@ That ownership belongs to Global Frontier and the dispatch policy respectively.
 """
 
 import copy
-import time
 
 import rospy
 from actionlib_msgs.msg import GoalStatus
 from lste_topo_access.msg import FrontierExecutionTerminal
+
+from clock_provider import now_for
 
 
 TURN_ROUTE_KIND = "frontier_turn_connector"
@@ -89,6 +90,14 @@ class TebGoalBridgeActionTerminalMixin:
             and route_id > 0
         )
         terminal.route_id = route_id if is_frontier else 0
+        terminal.lifecycle_transaction_id = str(
+            getattr(
+                getattr(self, "lifecycle_manager", None),
+                "current_transaction_id",
+                0,
+            )
+            or 0
+        )
         terminal.action_generation = action_generation
         terminal.route_kind = (
             route_kind or "frontier_endpoint"
@@ -111,7 +120,7 @@ class TebGoalBridgeActionTerminalMixin:
         self.frontier_observation_completion_pending = None
         self.action_active = False
         self.last_result_status = int(status)
-        self.last_result_monotonic = time.monotonic()
+        self.last_result_monotonic = now_for(self)
         self.frontier_observation_completion_count += 1
         self.terminal_count += 1
         self.publish_bridge_status(
@@ -156,7 +165,7 @@ class TebGoalBridgeActionTerminalMixin:
         ):
             return False
         self.last_result_status = int(status)
-        self.last_result_monotonic = time.monotonic()
+        self.last_result_monotonic = now_for(self)
         self.move_base_terminal_pending = True
         self.publish_bridge_status(
             "turn_execution_terminal",
@@ -291,7 +300,7 @@ class TebGoalBridgeActionTerminalMixin:
 
             self.action_active = False
             self.last_result_status = int(status)
-            self.last_result_monotonic = time.monotonic()
+            self.last_result_monotonic = now_for(self)
             if self._close_persistent_task_terminal_locked(
                 status, action_contract
             ):

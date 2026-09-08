@@ -41,6 +41,7 @@ def load_method(source_path, class_name, method_name):
         "json": json,
         "math": math,
         "time": time,
+        "now_for": lambda _owner: 42.0,
         "String": StringStub,
         "GoalStatus": GoalStatusStub,
         "normalize_goal_context": lambda value: value or {},

@@ -1,7 +1,8 @@
 """Advance a segmented frontier route without completing its mission lease."""
 
 import math
-import time
+
+from clock_provider import now_for
 
 
 class GlobalFrontierTerminalConnectorMixin:
@@ -40,7 +41,7 @@ class GlobalFrontierTerminalConnectorMixin:
         self.active_last_waypoint_map = None
         self.active_last_waypoint_yaw = None
         self.active_terminal_received = False
-        self.active_progress_time = time.monotonic()
+        self.active_progress_time = now_for(self)
         self.active_last_progress_signal = "connector_terminal"
         # Force the next timer to rebuild a route from the newly observed
         # local map before it emits the next segment of this same mission.

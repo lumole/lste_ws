@@ -26,6 +26,7 @@ from teb_goal_bridge_frontier_status import TebGoalBridgeFrontierStatusMixin
 from teb_goal_bridge_geometry import TebGoalBridgeGeometryMixin
 from teb_goal_bridge_handoff import TebGoalBridgeHandoffMixin
 from teb_goal_bridge_intent import TebGoalBridgeIntentMixin
+from teb_goal_bridge_lifecycle import TebGoalBridgeLifecycleMixin
 from teb_goal_bridge_mission_lifecycle import TebGoalBridgeMissionLifecycleMixin
 from teb_goal_bridge_parameters import configure_bridge_parameters
 from teb_goal_bridge_persistent_frontier_endpoint import (
@@ -48,6 +49,7 @@ from teb_goal_bridge_teb_runtime import TebGoalBridgeTebRuntimeMixin
 
 
 class TebGoalBridge(
+    TebGoalBridgeLifecycleMixin,
     TebGoalBridgeTebRuntimeMixin,
     TebGoalBridgeFrontierStatusMixin,
     TebGoalBridgeIntentMixin,
@@ -70,6 +72,7 @@ class TebGoalBridge(
         rospy.init_node("lste_teb_goal_bridge")
         configure_bridge_parameters(self)
         initialize_bridge_state(self)
+        self._initialize_lifecycle_manager()
         connect_bridge_ros(self)
         rospy.loginfo(
             "TEB goal bridge ready: action=move_base mode=%s active_mode=%s "

@@ -158,6 +158,20 @@ class NavfnAsyncValidationTest(unittest.TestCase):
 
         self.assertIn("navfn_validation_completed", requested)
 
+    def test_rejected_lifecycle_result_does_not_strand_pending_identity(self):
+        """A full lifecycle inbox must allow a Navfn identity to retry."""
+        explorer = _SlowNavfnExplorer()
+        explorer.lifecycle_manager = SimpleNamespace(
+            current_transaction_id=1,
+            enqueue_type=lambda *_args, **_kwargs: False,
+        )
+
+        explorer.navfn_goal_reachable((0.0, 0.0), (2.0, 0.0), "map")
+        self.assertTrue(explorer.call_finished.wait(1.0))
+
+        key = explorer._navfn_validation_key((0.0, 0.0), (2.0, 0.0), "map")
+        self.assertNotIn(key, explorer._navfn_validation_pending)
+
     def test_persistent_stream_uses_costmap_readiness_until_first_mission(self):
         explorer = _ReadinessExplorer(persistent_execution=True)
 

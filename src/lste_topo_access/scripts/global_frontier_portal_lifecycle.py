@@ -1,6 +1,6 @@
 """Portal-arrival lifecycle composition for global-frontier exploration."""
 
-import time
+from clock_provider import now_for
 from global_frontier_models import PendingPortalArrival
 from global_frontier_portal_arrival_commit import (
     GlobalFrontierPortalArrivalCommitMixin,
@@ -39,7 +39,7 @@ class GlobalFrontierPortalLifecycleMixin(
         ):
             return None
         if now is None:
-            now = time.monotonic()
+            now = now_for(self)
         crossing = self.confirm_active_portal_crossing()
         if not crossing.verified:
             if retry_on_unconfirmed:

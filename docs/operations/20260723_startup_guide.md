@@ -161,7 +161,7 @@ prompt，只要类别数不超过该值就复用同一份 engine；只有提高�
 更换 GPU 或删除缓存时才需要重新编译。
 
 完整的架构、环境版本、缓存策略与实测结果见
-[`wedetect_tensorrt_integration_07232026.md`](../perception/wedetect_tensorrt_integration_07232026.md)。
+[`20260723_wedetect_tensorrt_integration.md`](../perception/20260723_wedetect_tensorrt_integration.md)。
 
 WeDetect 的中文类别映射、阈值、NMS 和 FP16 设置也位于同一配置文件。当前映射覆盖
 `blue mug`、`yellow mug`、桌椅、显示器、文件夹、门、消防栓和灭火器；新类别可通过
@@ -169,7 +169,7 @@ WeDetect 的中文类别映射、阈值、NMS 和 FP16 设置也位于同一配�
 
 `lste_goal_manager.py` 是 `/lste/final_goal` 的唯一发布者。该消息类型为 `geometry_msgs/PoseStamped`，坐标系为 `odom`。SA-PPO 使用同一 `odom` 坐标系下的 `/pro3/wheel_odom` 计算车体局部目标，并输出 `/cmd_vel`。
 
-如需绕过大脑、检测与 GP 来验证控制器，可在 `scripts/config/pipeline_defaults.yaml` 将 `GLOBAL_GOAL_SOURCE` 改为 `fixed`，并设置 `FIXED_GLOBAL_GOAL_X/Y/YAW`。固定模式仍由同一个 Goal Manager 发布 `/lste/final_goal`；详细配置、Gazebo 点击更新和已验证路径见 [固定 Global Goal 接入说明](../navigation/fixed_global_goal_integration_08052026.md)。
+如需绕过大脑、检测与 GP 来验证控制器，可在 `scripts/config/pipeline_defaults.yaml` 将 `GLOBAL_GOAL_SOURCE` 改为 `fixed`，并设置 `FIXED_GLOBAL_GOAL_X/Y/YAW`。固定模式仍由同一个 Goal Manager 发布 `/lste/final_goal`；详细配置、Gazebo 点击更新和已验证路径见 [固定 Global Goal 接入说明](../navigation/20260805_fixed_global_goal_integration.md)。
 
 SA-PPO 在收到第一条 `/lste/final_goal` 之前只发布零速度。到达目标后，Goal Manager 对同一目标的周期性重发不会重新启动车辆；大脑发布位置发生变化的新目标时，控制器会重新开始运动。
 

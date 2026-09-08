@@ -40,6 +40,7 @@ def load_retry_policy():
         "GoalStatus": GoalStatusStub,
         "rospy": SimpleNamespace(logwarn_throttle=lambda *_args: None),
         "time": SimpleNamespace(monotonic=lambda: 100.0),
+        "now_for": lambda _owner: 100.0,
     }
     exec(
         compile(

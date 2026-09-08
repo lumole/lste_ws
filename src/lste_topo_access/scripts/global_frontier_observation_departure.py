@@ -5,9 +5,10 @@ are kept together so the state transition is auditable and easy to change.
 """
 
 import math
-import time
 
 import numpy as np
+
+from clock_provider import now_for
 
 
 class GlobalFrontierObservationDepartureMixin:
@@ -183,7 +184,7 @@ class GlobalFrontierObservationDepartureMixin:
                 portal_probe_ledger=getattr(self, "portal_probe_ledger", None),
             )
         closed, anchor, place_hops = self.place_departure.commit(
-            self.region_memory, time.monotonic()
+            self.region_memory, now_for(self)
         )
         if closed is not None and closed.get("state") == "dormant":
             if self.place_departure.last_committed_basis == "covered_transit":
