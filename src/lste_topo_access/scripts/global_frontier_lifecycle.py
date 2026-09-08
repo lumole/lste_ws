@@ -282,7 +282,9 @@ class GlobalFrontierLifecycleMixin:
                 previous_state=previous.value,
                 current_state=current.value,
                 transaction_id=int(self.lifecycle_transaction_id()),
-                event=(None if event is None else event.type.value),
+                transition_event=(
+                    None if event is None else event.type.value
+                ),
             )
         if current == State.FAILED:
             active_frontier = getattr(self, "active_frontier", None)

@@ -239,6 +239,19 @@ class NavigationMetricsExecutionEventsMixin:
                 self.bridge_target_retries += 1
             elif event == "target_route_failed":
                 self.target_route_failures += 1
+            elif (
+                event == "cancel"
+                and str(payload.get("reason", ""))
+                == "target_terminal_observation"
+                and bool(payload.get("was_active", True))
+            ):
+                # The terminal-observation intent deliberately cancels the
+                # current target action before the fresh observation phase.
+                # actionlib reports that cancellation as PREEMPTED; correlate
+                # it explicitly so the observer does not open a failure
+                # episode for a normal ownership boundary.
+                if self.pending_target_terminal_observation_preemptions <= 0:
+                    self.pending_target_terminal_observation_preemptions = 1
             elif event == "target_segment_handoff_requested":
                 self.bridge_target_segment_handoffs += 1
             elif event == "cancel" and str(payload.get("reason", "")) == "task_done":

@@ -132,10 +132,18 @@ class TargetObservationBridgeTest(unittest.TestCase):
             bridge.clear_calls,
             [("target_terminal_observation", True)],
         )
+        self.assertIsNone(bridge.latest_goal)
         self.assertFalse(bridge.action_active)
+        status_events = [event for event, _fields in bridge.statuses]
+        self.assertIn("target_terminal_observation_started", status_events)
         self.assertEqual(
             bridge.statuses[-1][0],
-            "target_terminal_observation_started",
+            "target_terminal_observation_released",
+        )
+        self.assertEqual(bridge.statuses[-1][1]["transaction_id"], 5)
+        self.assertEqual(
+            bridge.statuses[-1][1]["controller_lease"],
+            "released",
         )
 
     def test_frontier_cannot_overwrite_active_target_transaction(self):

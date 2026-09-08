@@ -113,7 +113,29 @@ class NavigationMetricsGoalEventsMixin:
             payload = json.loads(message.data)
         except (TypeError, ValueError, json.JSONDecodeError):
             return
-        if not isinstance(payload, dict) or payload.get("event") != "mission_goal":
+        if not isinstance(payload, dict):
+            return
+        if payload.get("event") == "target_terminal_observation":
+            with self.lock:
+                self._failure_record_context_locked(
+                    "goal", "target_terminal_observation", payload
+                )
+                # The intent is published before bridge cancellation. Arm
+                # the expected PREEMPTED correlation at the semantic boundary
+                # so callback ordering cannot turn this normal handoff into a
+                # failure episode.
+                if self.pending_target_terminal_observation_preemptions <= 0:
+                    self.pending_target_terminal_observation_preemptions = 1
+                self._write(
+                    "INFO",
+                    "target_terminal_observation_intent",
+                    transaction_id=int(payload.get("transaction_id", 0) or 0),
+                    target_epoch=int(payload.get("target_epoch", 0) or 0),
+                    target_track_id=str(payload.get("target_track_id", "") or ""),
+                    reason=str(payload.get("reason", "") or ""),
+                )
+            return
+        if payload.get("event") != "mission_goal":
             return
         with self.lock:
             self._failure_record_context_locked("goal", "mission_goal", payload)

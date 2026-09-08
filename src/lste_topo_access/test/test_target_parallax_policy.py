@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sys
+import math
 from types import SimpleNamespace
 import unittest
 
@@ -24,13 +25,17 @@ class ParallaxFixture(GoalManagerTargetFollowMixin):
         self.latest_pose = SimpleNamespace(x=0.0, y=0.0)
         self.target_last_heading = 1.0
         self.target_parallax_goal = None
+        self.target_parallax_completed = False
+        self.target_parallax_active_side = ""
         self.target_parallax_attempts = 0
         self.target_parallax_failed_sides = []
+        self.target_goal_reached_radius = 0.5
         self.target_track_id = "task:cup:1"
         self.target_execution_state = "TARGET_CANDIDATE"
         self.target_route_validation_last_endpoint = None
         self.events = []
         self.validation_calls = []
+        self.observation_handoffs = []
 
     def target_minimum_viewpoint_distance(self):
         return 0.9
@@ -54,8 +59,18 @@ class ParallaxFixture(GoalManagerTargetFollowMixin):
         self.target_route_validation_last_endpoint = goal
         return True
 
+    def goal_robot_distance(self, goal):
+        return math.hypot(
+            float(goal.pose.position.x) - float(self.latest_pose.x),
+            float(goal.pose.position.y) - float(self.latest_pose.y),
+        )
+
     def publish_goal_arbitration(self, event, **fields):
         self.events.append((event, fields))
+
+    def publish_target_terminal_observation_intent(self, reason):
+        self.observation_handoffs.append(str(reason))
+        return True
 
 
 class TargetParallaxPolicyTest(unittest.TestCase):
@@ -74,6 +89,25 @@ class TargetParallaxPolicyTest(unittest.TestCase):
             source,
         )
 
+    def test_physical_parallax_boundary_requires_viewpoint_diversity(self):
+        fixture = ParallaxFixture()
+        fixture.target_parallax_goal = fixture.make_goal_pose((0.4, 0.0), 0.0)
+
+        self.assertFalse(fixture._complete_reached_target_parallax(1.0))
+        fixture.target_candidate_viewpoint_diverse = True
+
+        self.assertTrue(fixture._complete_reached_target_parallax(1.0))
+        self.assertIsNone(fixture.target_parallax_goal)
+        self.assertTrue(fixture.target_parallax_completed)
+        self.assertEqual(
+            fixture.observation_handoffs,
+            ["target_parallax_viewpoint_reached_physical"],
+        )
+        self.assertEqual(
+            fixture.events[-1][0],
+            "target_parallax_viewpoint_reached_physical",
+        )
+
     def test_one_strong_detection_can_start_bounded_parallax(self):
         fixture = ParallaxFixture()
         fixture.target_candidate_hits = 1
@@ -85,6 +119,14 @@ class TargetParallaxPolicyTest(unittest.TestCase):
 
         self.assertIsNotNone(goal)
         self.assertEqual(fixture.events[-1][0], "target_parallax_viewpoint_selected")
+        self.assertAlmostEqual(
+            math.hypot(
+                goal.pose.position.x - fixture.latest_pose.x,
+                goal.pose.position.y - fixture.latest_pose.y,
+            ),
+            0.90,
+            places=6,
+        )
 
     def test_rejected_side_is_consumed_and_other_side_is_selected(self):
         fixture = ParallaxFixture()

@@ -23,6 +23,49 @@ class GoalManagerTebCallbacksMixin:
             return enqueue(EventType.TEB_GOAL_TERMINAL, msg)
         return GoalManagerTebCallbacksMixin.apply_teb_goal_terminal(self, msg)
 
+    def gather_teb_bridge_status(self, message: String):
+        enqueue = getattr(self, "_enqueue_lifecycle_event", None)
+        if callable(enqueue):
+            return enqueue(EventType.TEB_BRIDGE_STATUS, message)
+        return GoalManagerTebCallbacksMixin.apply_teb_bridge_status(self, message)
+
+    def apply_teb_bridge_status(self, message: String):
+        """Consume only the bridge ACK for this manager's pending boundary."""
+        try:
+            payload = json.loads(message.data)
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("event", "")).strip() != (
+            "target_terminal_observation_released"
+        ):
+            return
+        try:
+            transaction_id = int(payload.get("transaction_id", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        pending = int(
+            getattr(self, "target_terminal_observation_pending_transaction", 0)
+            or 0
+        )
+        if transaction_id <= 0 or pending <= 0 or transaction_id != pending:
+            return
+        self.target_terminal_observation_ack_transaction = transaction_id
+        self.next_update_time = 0.0
+        self.publish_goal_arbitration(
+            "target_terminal_observation_bridge_released",
+            transaction_id=transaction_id,
+            target_epoch=int(payload.get("target_epoch", 0) or 0),
+            target_track_id=str(payload.get("target_track_id", "") or ""),
+            controller_lease=str(payload.get("controller_lease", "") or ""),
+        )
+        rospy.loginfo(
+            "GoalManager: bridge released target terminal transaction=%d; "
+            "successor planning is enabled",
+            transaction_id,
+        )
+
     def on_teb_goal_terminal(self, msg: PoseStamped):
         """Release exactly one committed segment after a TEB terminal result.
 

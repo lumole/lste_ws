@@ -14,6 +14,10 @@ def initialize_turn_supervisor_state(supervisor):
     supervisor.state = STATE_PASS_THROUGH
     supervisor.task_done = False
     supervisor.navigation_hold = False
+    # Latest ROS hold sample is ingress state, not mission ownership. The
+    # timer consumes it after lifecycle events so an old transaction event
+    # cannot overwrite a newer release.
+    supervisor.latest_navigation_hold_sample = None
     supervisor.pose = None
     supervisor.scan_minimum = float("inf")
     supervisor.scan_monotonic = 0.0

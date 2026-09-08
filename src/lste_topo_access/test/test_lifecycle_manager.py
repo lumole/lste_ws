@@ -73,6 +73,30 @@ class LifecycleManagerTest(unittest.TestCase):
         self.assertEqual(result.discarded_stale, 1)
         self.assertEqual(manager.current_state, State.IDLE)
 
+    def test_navigation_hold_state_survives_a_transaction_boundary(self):
+        observed = []
+        manager = LifecycleManager(
+            event_handler=lambda event: observed.append(event.payload),
+        )
+        old_transaction = manager.begin_transaction()
+        manager.enqueue_type(
+            EventType.BRIDGE_NAVIGATION_HOLD,
+            True,
+            transaction_id=old_transaction,
+        )
+        manager.begin_transaction()
+        manager.enqueue_type(
+            EventType.BRIDGE_NAVIGATION_HOLD,
+            False,
+            transaction_id=old_transaction,
+        )
+
+        result = manager.tick(now=2.5)
+
+        self.assertEqual(result.processed, 1)
+        self.assertEqual(result.discarded_stale, 0)
+        self.assertEqual(observed, [False])
+
     def test_events_are_serialized_even_when_producers_race(self):
         manager = LifecycleManager()
         transaction_id = manager.begin_transaction()

@@ -112,8 +112,18 @@ class TebGoalBridgeLifecycleMixin:
         return self._enqueue_bridge_event(EventType.BRIDGE_TASK_DONE, message)
 
     def on_persistent_target_plan_result(self, message):
+        # ``transaction_id`` in the C++ result is the semantic target command
+        # identity, not this bridge's distributed lifecycle transaction. Keep
+        # the local lifecycle identity on the ingress event so a valid target
+        # installation cannot be discarded as stale after a newer mission
+        # command adopted a UUID-based lifecycle transaction.
         return self._enqueue_bridge_event(
-            EventType.BRIDGE_TARGET_RESULT, message
+            EventType.BRIDGE_TARGET_RESULT,
+            message,
+            transaction_id=int(
+                getattr(self.lifecycle_manager, "current_transaction_id", 0)
+                or 0
+            ),
         )
 
     def on_persistent_frontier_endpoint_reached(self, message):
@@ -228,7 +238,9 @@ class TebGoalBridgeLifecycleMixin:
                 lifecycle_transaction_id=int(
                     self.lifecycle_manager.current_transaction_id
                 ),
-                event=(None if event is None else event.type.value),
+                transition_event=(
+                    None if event is None else event.type.value
+                ),
             )
         if current == State.FAILED:
             cancel = getattr(self, "cancel_locked", None)

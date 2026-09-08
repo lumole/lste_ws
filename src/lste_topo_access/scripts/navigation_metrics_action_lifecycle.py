@@ -122,6 +122,9 @@ class NavigationMetricsActionLifecycleMixin:
                     if self.pending_task_done_preemptions > 0:
                         self.pending_task_done_preemptions -= 1
                         self.task_done_preemptions += 1
+                    elif self.pending_target_terminal_observation_preemptions > 0:
+                        self.pending_target_terminal_observation_preemptions -= 1
+                        self.target_terminal_observation_preemptions += 1
                     elif self.pending_priority_preemptions > 0:
                         self.pending_priority_preemptions -= 1
                         self.priority_preemptions += 1
@@ -189,6 +192,9 @@ class NavigationMetricsActionLifecycleMixin:
                         self.frontier_continuous_prefetch_preemptions
                     ),
                     frontier_segment_preemptions=self.frontier_segment_preemptions,
+                    target_terminal_observation_preemptions=(
+                        self.target_terminal_observation_preemptions
+                    ),
                     priority_preemptions=self.priority_preemptions,
                     task_done_preemptions=self.task_done_preemptions,
                     unexpected_preemptions=self.unexpected_preemptions,

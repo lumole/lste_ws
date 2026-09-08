@@ -172,11 +172,34 @@ class GoalManagerSchedulingMixin:
                 return self.sus_b_period
         return self.pass_period
 
+    def _target_terminal_observation_bridge_pending(self) -> bool:
+        """Keep successor planning behind the bridge's release ACK."""
+        ready = getattr(self, "target_terminal_observation_bridge_ready", None)
+        if callable(ready):
+            return not bool(ready())
+        pending = int(
+            getattr(self, "target_terminal_observation_pending_transaction", 0)
+            or 0
+        )
+        acknowledged = int(
+            getattr(self, "target_terminal_observation_ack_transaction", 0)
+            or 0
+        )
+        return pending > 0 and acknowledged < pending
+
     def compute_goal(self) -> Optional[PoseStamped]:
         # A global SLAM frontier is a map-connected exploration waypoint. It
         # dominates the old local GP/access recovery until a visual target ray
         # is available; visual target following remains higher priority.
         now = rospy.Time.now().to_sec()
+        if self._target_terminal_observation_bridge_pending():
+            self.goal_source = "target_terminal_observation_waiting_bridge"
+            rospy.loginfo_throttle(
+                3.0,
+                "GoalManager: waiting for bridge release ACK before successor "
+                "target transaction",
+            )
+            return None
         # A visual terminal is not a frontier terminal.  During this bounded
         # re-observation hold, the next detector frames must decide whether to
         # continue, confirm close range, or release the target. Once that
@@ -254,8 +277,14 @@ class GoalManagerSchedulingMixin:
                 getattr(self, "target_parallax_goal", None) is not None
                 and not getattr(self, "target_parallax_completed", False)
             ):
-                self.goal_source = "target_parallax"
-                return self.target_parallax_goal
+                complete_parallax = getattr(
+                    self, "_complete_reached_target_parallax", None
+                )
+                if not callable(complete_parallax) or not complete_parallax(now):
+                    self.goal_source = "target_parallax"
+                    return self.target_parallax_goal
+                self.goal_source = "target_terminal_observation_waiting_bridge"
+                return None
             # Never let legacy access-topology recovery preempt a current (or
             # just-lost) visual target ray.  goal_from_target_follow preserves
             # the last short visual-servo goal through a brief detector gap.

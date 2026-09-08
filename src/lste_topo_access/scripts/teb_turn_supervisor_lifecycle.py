@@ -91,13 +91,27 @@ class TebTurnSupervisorLifecycleMixin:
         return self._enqueue_turn_event(EventType.BRIDGE_TASK_DONE, message)
 
     def on_navigation_hold(self, message):
-        return self._enqueue_turn_event(EventType.BRIDGE_WAKE, message)
+        # Keep the latest actuator gate outside mission transaction ordering.
+        # The queued event remains useful for serialized lifecycle replay, but
+        # the timer applies this latest sample last so a stale queued value
+        # cannot re-arm a hold after a release.
+        self.latest_navigation_hold_sample = bool(message.data)
+        return self._enqueue_turn_event(
+            EventType.BRIDGE_NAVIGATION_HOLD, message
+        )
 
     def on_timer(self, event):
+        def compute(now):
+            pending_hold = self.latest_navigation_hold_sample
+            self.latest_navigation_hold_sample = None
+            if pending_hold is not None:
+                TebTurnSupervisorControlMixin.apply_navigation_hold_sample(
+                    self, pending_hold
+                )
+            return TebTurnSupervisorControlMixin.on_timer(self, event)
+
         return self.lifecycle_manager.tick(
-            compute_handler=lambda _now: TebTurnSupervisorControlMixin.on_timer(
-                self, event
-            )
+            compute_handler=compute
         )
 
     def _handle_lifecycle_event(self, event):
@@ -117,7 +131,7 @@ class TebTurnSupervisorLifecycleMixin:
             EventType.BRIDGE_TEB_FEEDBACK: TebTurnSupervisorCallbacksMixin.on_teb_feedback,
             EventType.BRIDGE_MODE: TebTurnSupervisorControlMixin.on_mode,
             EventType.BRIDGE_TASK_DONE: TebTurnSupervisorControlMixin.on_task_done,
-            EventType.BRIDGE_WAKE: TebTurnSupervisorControlMixin.on_navigation_hold,
+            EventType.BRIDGE_NAVIGATION_HOLD: TebTurnSupervisorControlMixin.on_navigation_hold,
         }
         handler = handlers.get(event.type)
         if handler is None:
@@ -144,7 +158,9 @@ class TebTurnSupervisorLifecycleMixin:
                 lifecycle_transaction_id=int(
                     self.lifecycle_manager.current_transaction_id
                 ),
-                event=(None if event is None else event.type.value),
+                transition_event=(
+                    None if event is None else event.type.value
+                ),
             )
         if current == State.FAILED:
             release = getattr(self, "_release_turn_locked", None)

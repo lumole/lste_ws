@@ -60,6 +60,9 @@ class GoalManagerNavigationConfigMixin:
         self.teb_goal_failure_topic = gp(
             "~teb_goal_failure_topic", "/lste/teb_goal_failure"
         )
+        self.teb_goal_bridge_status_topic = gp(
+            "~teb_goal_bridge_status_topic", "/lste/teb_goal_bridge/status"
+        )
         self.global_frontier_max_age = max(
             0.0, float(gp("~global_frontier_max_age", 3.0))
         )

@@ -50,7 +50,15 @@ class TebTurnSupervisorControlMixin:
             self._sharp_navfn_entry_heading_error_locked()
             if transient_gap else None
         )
-        if sharp_entry_error is not None:
+        # A confirmed target segment remains owned by TEB's local trajectory;
+        # a sharp Navfn entry must not turn a transient planner publish gap
+        # into a zero command while the selected target trajectory is valid.
+        # Graph-owned frontier/portal routes retain the conservative suppression
+        # because their entry tangent is an explicit topology contract.
+        if (
+            sharp_entry_error is not None
+            and not self._is_same_target_segment_continuation_locked()
+        ):
             action_identity = self.active_action_identity
             if action_identity != self.trajectory_continuity_sharp_entry_identity:
                 self.trajectory_continuity_sharp_entry_identity = action_identity
@@ -161,13 +169,22 @@ class TebTurnSupervisorControlMixin:
                 self.completed_turn_key = None
                 self._activate_turn_locked()
 
+    def _set_navigation_hold_locked(self, active):
+        active = bool(active)
+        self.navigation_hold = active
+        if active:
+            self._release_turn_locked("navigation_hold", completed=False)
+        else:
+            self._activate_turn_locked()
+
+    def apply_navigation_hold_sample(self, active):
+        """Apply the latest non-transactional actuator gate on the timer tick."""
+        with self.lock:
+            self._set_navigation_hold_locked(active)
+
     def on_navigation_hold(self, message):
         with self.lock:
-            self.navigation_hold = bool(message.data)
-            if self.navigation_hold:
-                self._release_turn_locked("navigation_hold", completed=False)
-            else:
-                self._activate_turn_locked()
+            self._set_navigation_hold_locked(message.data)
 
     def _turn_command_locked(self, dt):
         """Return one acceleration-limited turn command."""

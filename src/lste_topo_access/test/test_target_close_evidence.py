@@ -63,6 +63,9 @@ METHODS = {
     "target_close_confirmation_active": (
         GoalManagerTargetCompletionMixin.target_close_confirmation_active
     ),
+    "target_terminal_observation_eligible": (
+        GoalManagerTargetCompletionMixin.target_terminal_observation_eligible
+    ),
     "target_evidence_timeout": GoalManagerTargetUtilsMixin.target_evidence_timeout,
     "target_candidate_information_active": (
         GoalManagerTargetUtilsMixin.target_candidate_information_active
@@ -90,6 +93,9 @@ class TargetCloseEvidenceTest(unittest.TestCase):
         target_close_confirmation_active = METHODS[
             "target_close_confirmation_active"
         ]
+        target_terminal_observation_eligible = METHODS[
+            "target_terminal_observation_eligible"
+        ]
         target_evidence_timeout = METHODS["target_evidence_timeout"]
         target_pursuit_hint_distance = METHODS["target_pursuit_hint_distance"]
         clear_target_memory = METHODS["clear_target_memory"]
@@ -109,6 +115,7 @@ class TargetCloseEvidenceTest(unittest.TestCase):
             self.target_done_min_box_height = 0.05
             self.target_done_require_approach_terminal = False
             self.target_follow_min_score = 0.20
+            self.target_follow_min_box_size = 0.01
             self.target_follow_confirmed = True
             self.target_completed_segments = 1
             self.target_track_id = "yellow_cup:yellow cup:1"
@@ -132,6 +139,9 @@ class TargetCloseEvidenceTest(unittest.TestCase):
             self.target_goal_reached_radius = 0.75
             self.controller_mode = "keyboard"
             self.target_segment_terminal_ready = False
+            self.target_terminal_close_candidate_seen = False
+            self.target_observation_epoch = 3
+            self.target_terminal_reobserve_min_epoch = 2
             self.target_terminal_reobserve_pending = False
             self.target_last_heading = None
             self.target_terminal_blind_advances = 0
@@ -215,6 +225,15 @@ class TargetCloseEvidenceTest(unittest.TestCase):
         manager = self.GoalManagerStub()
         manager.target_done_require_approach_terminal = True
         self.assertTrue(manager.target_close_completion_eligible())
+
+    def test_terminal_track_continuity_can_start_at_validated_endpoint(self):
+        manager = self.GoalManagerStub()
+        manager.target_segment_terminal_ready = True
+        detection = SimpleNamespace(score=0.50, w=0.032, h=0.049)
+
+        self.assertTrue(
+            manager.target_terminal_observation_eligible(detection)
+        )
 
     def test_uncalibrated_ray_point_cannot_complete_a_small_target(self):
         """Low-residual diagnostic geometry must not create a false task_done."""

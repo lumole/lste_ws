@@ -161,6 +161,9 @@ class NavigationMetricsSnapshotMixin:
             ),
             "move_base_frontier_segment_preemptions": self.frontier_segment_preemptions,
             "move_base_target_segment_preemptions": self.target_segment_preemptions,
+            "move_base_target_terminal_observation_preemptions": (
+                self.target_terminal_observation_preemptions
+            ),
             "move_base_priority_preemptions": self.priority_preemptions,
             "move_base_task_done_preemptions": self.task_done_preemptions,
             "move_base_route_recovery_preemptions": self.route_recovery_preemptions,

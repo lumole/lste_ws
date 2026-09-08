@@ -155,6 +155,15 @@ class GoalManagerLifecycleMixin:
             EventType.TEB_GOAL_FAILURE, message
         )
 
+    def on_teb_goal_bridge_status(self, message):
+        # Bridge status carries the bridge's own lifecycle identity.  It is an
+        # acknowledgement for this node, not a remote transaction boundary, so
+        # keep the GoalManager transaction identity local while still routing
+        # the callback through the single timer-owned event queue.
+        return self.lifecycle_manager.enqueue_type(
+            EventType.TEB_BRIDGE_STATUS, deepcopy(message)
+        )
+
     def on_task_done(self, message):
         return self._enqueue_lifecycle_event(
             EventType.TASK_COMPLETED, message
@@ -212,6 +221,7 @@ class GoalManagerLifecycleMixin:
             EventType.GLOBAL_FRONTIER_STATUS: GoalManagerFrontierMixin.apply_global_frontier_status,
             EventType.TEB_GOAL_TERMINAL: GoalManagerTebCallbacksMixin.apply_teb_goal_terminal,
             EventType.TEB_GOAL_FAILURE: GoalManagerTebCallbacksMixin.apply_teb_goal_failure,
+            EventType.TEB_BRIDGE_STATUS: GoalManagerTebCallbacksMixin.apply_teb_bridge_status,
         }
         if event.type == EventType.TASK_UPDATED:
             previous = (
@@ -246,7 +256,9 @@ class GoalManagerLifecycleMixin:
                 previous_state=previous.value,
                 current_state=current.value,
                 transaction_id=int(self.lifecycle_transaction_id()),
-                event=(None if event is None else event.type.value),
+                transition_event=(
+                    None if event is None else event.type.value
+                ),
             )
 
     def _on_lifecycle_timeout(self, event):

@@ -20,6 +20,7 @@ class TebTurnSupervisorTurnLifecycleMixin:
     """Own the explicit in-place turn transaction, from admission to release."""
 
     def publish_status_locked(self, event, **fields):
+        now = now_for(self)
         pose = self.pose
         error = None
         if pose is not None and self.turn_target_yaw is not None:
@@ -38,6 +39,7 @@ class TebTurnSupervisorTurnLifecycleMixin:
             "mode": self.mode,
             "route_kind": self.latest_route_kind,
             "active_action": bool(self.active_action),
+            "navigation_hold": bool(self.navigation_hold),
             "active_route_kind": self.active_action_route_kind,
             "intent_source": self.latest_intent_source,
             "intent_priority": int(self.latest_intent_priority),
@@ -61,6 +63,17 @@ class TebTurnSupervisorTurnLifecycleMixin:
                 else round(float(self.scan_minimum), 4)
             ),
             "turn_min_clearance": round(float(self.turn_min_clearance), 4),
+            "planner_command": [
+                round(float(self.latest_planner_command.linear.x), 4),
+                round(float(self.latest_planner_command.angular.z), 4),
+            ],
+            "planner_command_age_seconds": (
+                None
+                if self.latest_planner_command_wall <= 0.0
+                else round(
+                    max(0.0, now - self.latest_planner_command_wall), 4
+                )
+            ),
             "turns": int(self.turn_count),
             "completed_turns": int(self.turn_completed_count),
             "released_turns": int(self.turn_released_count),

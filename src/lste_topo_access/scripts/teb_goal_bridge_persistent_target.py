@@ -47,10 +47,15 @@ class TebGoalBridgePersistentTargetMixin:
         self.persistent_installed_target_transaction = int(transaction_id)
         self.persistent_target_pending_transaction = 0
         self.persistent_target_pending_goal = None
-        # Publish the approved mission before clearing the speculative request,
-        # so the persistent C++ planner can atomically promote the same route.
+        # The target request has been consumed by the approved mission
+        # transaction. Do not publish the generic CLEAR here: that command is
+        # also consumed by PersistentTebLocalPlanner and would erase the
+        # installed target identity before its approach terminal. A real
+        # terminal, target failure, or non-target successor owns that release.
+        self.persistent_target_request_transaction = 0
+        # Publish the approved mission so the persistent C++ planner can
+        # atomically promote the same validated route.
         self._publish_persistent_mission_goal_locked("target_plan_installed")
-        self._clear_persistent_target_request_locked("target_plan_installed")
         if self.action_active:
             self._adopt_persistent_mission_goal_locked()
         self.publish_bridge_status(

@@ -221,6 +221,7 @@ class NavigationMetricsObserverStateMixin:
         self.frontier_continuous_prefetch_preemptions = 0
         self.frontier_segment_preemptions = 0
         self.target_segment_preemptions = 0
+        self.target_terminal_observation_preemptions = 0
         self.priority_preemptions = 0
         self.task_done_preemptions = 0
         self.unexpected_preemptions = 0
@@ -229,6 +230,7 @@ class NavigationMetricsObserverStateMixin:
         self.pending_frontier_continuous_prefetch_preemptions = 0
         self.pending_frontier_segment_preemptions = 0
         self.pending_target_segment_preemptions = 0
+        self.pending_target_terminal_observation_preemptions = 0
         self.pending_priority_preemptions = 0
         self.pending_task_done_preemptions = 0
         # A frontier route can be intentionally cancelled after the graph

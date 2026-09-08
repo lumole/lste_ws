@@ -15,11 +15,34 @@ if DEVEL_PYTHON.is_dir() and str(DEVEL_PYTHON) not in sys.path:
     sys.path.insert(0, str(DEVEL_PYTHON))
 
 from lifecycle_manager import State
+from goal_manager_lifecycle import GoalManagerLifecycleMixin
+from global_frontier_lifecycle import GlobalFrontierLifecycleMixin
 from teb_goal_bridge_lifecycle import TebGoalBridgeLifecycleMixin
 from teb_turn_supervisor_lifecycle import TebTurnSupervisorLifecycleMixin
 
 
 class LifecycleFailureCleanupTest(unittest.TestCase):
+    def test_lifecycle_transition_event_does_not_collide_with_publish_event(self):
+        probes = [
+            (GoalManagerLifecycleMixin(), "publish_goal_arbitration"),
+            (GlobalFrontierLifecycleMixin(), "publish_status"),
+            (TebGoalBridgeLifecycleMixin(), "publish_bridge_status"),
+            (TebTurnSupervisorLifecycleMixin(), "publish_status_locked"),
+        ]
+        for owner, publisher_name in probes:
+            owner.lifecycle_manager = SimpleNamespace(current_transaction_id=9)
+            owner.lifecycle_transaction_id = lambda: 9
+            captured = []
+
+            def publisher(event, **fields):
+                captured.append((event, fields))
+
+            setattr(owner, publisher_name, publisher)
+            owner._on_lifecycle_transition(State.IDLE, State.DISPATCHED, None)
+
+            self.assertEqual(captured[-1][0], "lifecycle_transition")
+            self.assertIsNone(captured[-1][1]["transition_event"])
+
     def test_bridge_failure_cancels_active_action(self):
         bridge = TebGoalBridgeLifecycleMixin()
         bridge.lifecycle_manager = SimpleNamespace(current_transaction_id=7)

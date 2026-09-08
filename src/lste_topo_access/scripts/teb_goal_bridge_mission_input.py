@@ -133,6 +133,11 @@ class TebGoalBridgeMissionInputMixin:
                     self._clear_persistent_target_request_locked(
                         "target_terminal_observation", force=True
                     )
+                    # The terminal-observation intent is an ownership
+                    # boundary, not a goal-less retry of the previous target.
+                    # Clear the latched pose before the timer can coalesce and
+                    # redispatch the action that was just cancelled.
+                    self.latest_goal = None
                     self.intent_seen = True
                     self.latest_intent_source = "target_terminal_observation"
                     self.latest_intent_priority = 2
@@ -159,6 +164,22 @@ class TebGoalBridgeMissionInputMixin:
                         transaction_id=transaction_id,
                         target_epoch=target_epoch,
                         target_track_id=self.latest_target_track_id,
+                        reason=str(
+                            payload.get(
+                                "reason", "target_terminal_observation"
+                            )
+                        ),
+                    )
+                    # This is the ownership acknowledgement.  The bridge has
+                    # already invalidated the old action generation and
+                    # cleared its persistent target request above, so the
+                    # mission layer may now publish a successor transaction.
+                    self.publish_bridge_status(
+                        "target_terminal_observation_released",
+                        transaction_id=transaction_id,
+                        target_epoch=target_epoch,
+                        target_track_id=self.latest_target_track_id,
+                        controller_lease="released",
                         reason=str(
                             payload.get(
                                 "reason", "target_terminal_observation"

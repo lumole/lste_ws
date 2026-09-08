@@ -146,6 +146,10 @@ class GoalManagerRuntimeStateMixin:
         # One explicit ownership handoff cancels the old TEB terminal action
         # while post-arrival target evidence is being collected.
         self.target_terminal_observation_intent_sent = False
+        # The successor target transaction is held until the TEB bridge
+        # confirms that the previous controller lease was released.
+        self.target_terminal_observation_pending_transaction = 0
+        self.target_terminal_observation_ack_transaction = 0
         self.target_track_label = ""
         # A detector epoch changes for every inference frame. This id remains
         # stable for one continuous visual target track.

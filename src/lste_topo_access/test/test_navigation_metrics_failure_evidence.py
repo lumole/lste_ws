@@ -26,6 +26,12 @@ from navigation_metrics_execution_events import (  # noqa: E402
     route_invalidation_failure_trigger,
     route_recovery_preemption_reason,
 )
+from navigation_metrics_action_lifecycle import (  # noqa: E402
+    NavigationMetricsActionLifecycleMixin,
+)
+from navigation_metrics_goal_events import (  # noqa: E402
+    NavigationMetricsGoalEventsMixin,
+)
 
 
 def sample(**overrides):
@@ -45,6 +51,148 @@ def sample(**overrides):
     }
     value.update(overrides)
     return value
+
+
+class TargetTerminalPreemptionHarness(
+    NavigationMetricsGoalEventsMixin,
+    NavigationMetricsExecutionEventsMixin,
+    NavigationMetricsActionLifecycleMixin,
+):
+    """Minimal observer fixture for the explicit terminal handoff contract."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.lifecycle_event_wall = {}
+        self.status_seen = set()
+        self.move_base_goal_ids = set()
+        self.status_counts = {}
+        self.last_move_base_status = "UNKNOWN"
+        self.preemptions = 0
+        self.frontier_observation_preemptions = 0
+        self.frontier_terminal_settle_preemptions = 0
+        self.frontier_continuous_prefetch_preemptions = 0
+        self.frontier_segment_preemptions = 0
+        self.target_segment_preemptions = 0
+        self.target_terminal_observation_preemptions = 0
+        self.priority_preemptions = 0
+        self.task_done_preemptions = 0
+        self.unexpected_preemptions = 0
+        self.pending_frontier_observation_preemptions = 0
+        self.pending_frontier_terminal_settle_preemptions = 0
+        self.pending_frontier_continuous_prefetch_preemptions = 0
+        self.pending_frontier_segment_preemptions = 0
+        self.pending_target_segment_preemptions = 0
+        self.pending_target_terminal_observation_preemptions = 0
+        self.pending_priority_preemptions = 0
+        self.pending_task_done_preemptions = 0
+        self.pending_route_recovery_preemptions = 0
+        self.route_recovery_preemption_reasons = {}
+        self.aborts = 0
+        self.successes = 0
+        self.bridge_events = 0
+        self.bridge_last_event = ""
+        self.bridge_active = False
+        self.bridge_active_intent_source = "unknown"
+        self.bridge_latest_intent_source = "unknown"
+        self.bridge_deferred_goal_updates = 0
+        self.bridge_dispatches = 0
+        self.persistent_execution = True
+        self.execution_architecture = "persistent_stream"
+        self.goal_source = "unknown"
+        self.goal_transaction_id = 0
+        self.goal_transition_kind = "unknown"
+        self.goal_predecessor_route_id = 0
+        self.goal_transition_distance = None
+        self.mission_goal_messages = 0
+        self.failure_calls = 0
+        self.writes = []
+
+    @staticmethod
+    def _as_bool(value):
+        return bool(value)
+
+    def _failure_record_context_locked(self, *_args, **_kwargs):
+        return None
+
+    def _begin_failure_episode_locked(self, *_args, **_kwargs):
+        self.failure_calls += 1
+
+    def _write(self, level, event, **fields):
+        self.writes.append((level, event, fields))
+
+
+class TargetTerminalPreemptionTest(unittest.TestCase):
+    def test_expected_terminal_observation_cancel_is_not_a_failure(self):
+        metrics = TargetTerminalPreemptionHarness()
+        metrics.on_bridge_status(
+            SimpleNamespace(
+                data=json.dumps(
+                    {
+                        "event": "cancel",
+                        "reason": "target_terminal_observation",
+                        "was_active": True,
+                        "persistent_execution": True,
+                    }
+                )
+            )
+        )
+
+        self.assertEqual(
+            metrics.pending_target_terminal_observation_preemptions,
+            1,
+        )
+        metrics.on_status(
+            SimpleNamespace(
+                status_list=[
+                    SimpleNamespace(
+                        goal_id=SimpleNamespace(id="target-goal-1"),
+                        status=2,
+                        text="-",
+                    )
+                ]
+            )
+        )
+
+        self.assertEqual(metrics.target_terminal_observation_preemptions, 1)
+        self.assertEqual(metrics.pending_target_terminal_observation_preemptions, 0)
+        self.assertEqual(metrics.unexpected_preemptions, 0)
+        self.assertEqual(metrics.failure_calls, 0)
+        status = next(
+            fields for _level, event, fields in metrics.writes
+            if event == "move_base_status"
+        )
+        self.assertEqual(status["target_terminal_observation_preemptions"], 1)
+
+    def test_terminal_observation_intent_arms_before_cancel_callback(self):
+        metrics = TargetTerminalPreemptionHarness()
+        metrics.on_mission_goal(
+            SimpleNamespace(
+                data=json.dumps(
+                    {
+                        "event": "target_terminal_observation",
+                        "transaction_id": 7,
+                        "target_epoch": 12,
+                        "target_track_id": "yellow_cup:yellow cup:1",
+                        "reason": "target_terminal_reobserve_expired",
+                    }
+                )
+            )
+        )
+        metrics.on_status(
+            SimpleNamespace(
+                status_list=[
+                    SimpleNamespace(
+                        goal_id=SimpleNamespace(id="target-goal-2"),
+                        status=2,
+                        text="-",
+                    )
+                ]
+            )
+        )
+
+        self.assertEqual(metrics.target_terminal_observation_preemptions, 1)
+        self.assertEqual(metrics.unexpected_preemptions, 0)
+        self.assertEqual(metrics.failure_calls, 0)
 
 
 class FailureClassificationTest(unittest.TestCase):

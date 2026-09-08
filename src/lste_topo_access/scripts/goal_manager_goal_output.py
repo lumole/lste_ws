@@ -58,9 +58,45 @@ class GoalManagerGoalOutputMixin:
             float(goal.pose.position.y) - robot[1],
         )
 
+    def target_terminal_observation_bridge_ready(self) -> bool:
+        """Return whether the bridge released the previous target lease."""
+        pending = int(
+            getattr(self, "target_terminal_observation_pending_transaction", 0)
+            or 0
+        )
+        if pending <= 0:
+            return True
+        acknowledged = int(
+            getattr(self, "target_terminal_observation_ack_transaction", 0)
+            or 0
+        )
+        return acknowledged >= pending
+
+    def _consume_target_terminal_observation_handoff(self) -> bool:
+        """Close the acknowledged boundary when a successor is published."""
+        pending = int(
+            getattr(self, "target_terminal_observation_pending_transaction", 0)
+            or 0
+        )
+        if pending <= 0 or not self.target_terminal_observation_bridge_ready():
+            return False
+        self.target_terminal_observation_pending_transaction = 0
+        self.target_terminal_observation_ack_transaction = 0
+        self.target_terminal_observation_intent_sent = False
+        return True
+
     def publish_target_terminal_observation_intent(self, reason: str) -> bool:
         """Transfer action ownership to post-terminal target observation."""
-        if getattr(self, "target_terminal_observation_intent_sent", False):
+        if (
+            getattr(self, "target_terminal_observation_intent_sent", False)
+            or int(
+                getattr(
+                    self, "target_terminal_observation_pending_transaction", 0
+                )
+                or 0
+            )
+            > 0
+        ):
             return False
         lifecycle = getattr(self, "lifecycle_manager", None)
         if lifecycle is not None:
@@ -105,6 +141,10 @@ class GoalManagerGoalOutputMixin:
         )
         self.pub_goal_intent.publish(String(data=json.dumps(intent, sort_keys=True)))
         self.target_terminal_observation_intent_sent = True
+        self.target_terminal_observation_pending_transaction = int(
+            self.goal_command_id
+        )
+        self.target_terminal_observation_ack_transaction = 0
         self.publish_goal_arbitration(
             "target_terminal_observation_intent_published",
             reason=str(reason or "target_terminal_observation"),
@@ -267,6 +307,7 @@ class GoalManagerGoalOutputMixin:
             return False
         self.last_goal = goal
         self.last_goal_source = self.goal_source
+        self._consume_target_terminal_observation_handoff()
         if self.goal_source == "global_slam_frontier":
             self.last_frontier_goal_context = frontier_context
             self.teb_frontier_goal_history.append(copy.deepcopy(goal))

@@ -80,6 +80,8 @@ class EventType(Enum):
     BRIDGE_TASK_DONE = "BRIDGE_TASK_DONE"
     BRIDGE_TARGET_RESULT = "BRIDGE_TARGET_RESULT"
     BRIDGE_FRONTIER_ENDPOINT = "BRIDGE_FRONTIER_ENDPOINT"
+    TEB_BRIDGE_STATUS = "TEB_BRIDGE_STATUS"
+    BRIDGE_NAVIGATION_HOLD = "BRIDGE_NAVIGATION_HOLD"
     ACTION_FEEDBACK = "ACTION_FEEDBACK"
     ACTION_DONE = "ACTION_DONE"
     BRIDGE_WAKE = "BRIDGE_WAKE"
@@ -161,6 +163,12 @@ class LifecycleManager:
         EventType.BRIDGE_COSTMAP,
         EventType.BRIDGE_POSE,
         EventType.TURN_STATUS,
+    })
+    # Navigation hold is a sampled actuator gate, not ownership of a mission
+    # transaction. It must survive a bridge transaction boundary so a queued
+    # release cannot be discarded as stale after a successor goal is adopted.
+    _TRANSACTION_INDEPENDENT_EVENT_TYPES = frozenset({
+        EventType.BRIDGE_NAVIGATION_HOLD,
     })
     _TRANSACTION_UNIQUE_BITS = 64
     _TRANSACTION_ID_LOCK = threading.Lock()
@@ -415,7 +423,11 @@ class LifecycleManager:
             and event.payload[0] == "__coalesced__"
         ):
             stream = event.payload[1] if len(event.payload) > 1 else None
+            if event.type in cls._TRANSACTION_INDEPENDENT_EVENT_TYPES:
+                return event.type, 0, stream
             return event.type, int(event.transaction_id), stream
+        if event.type in cls._TRANSACTION_INDEPENDENT_EVENT_TYPES:
+            return event.type, 0, "state"
         if event.type not in cls._COALESCED_EVENT_TYPES:
             if event.type != EventType.ACTION_FEEDBACK:
                 return None
@@ -569,6 +581,15 @@ class LifecycleManager:
                     except queue.Empty:
                         break
                     event = self._materialize_event(marker)
+                if event.type in self._TRANSACTION_INDEPENDENT_EVENT_TYPES:
+                    # Apply the latest sampled state to whichever mission
+                    # transaction is current when the timer owns the tick.
+                    event = Event(
+                        event.type,
+                        self.current_transaction_id,
+                        event.payload,
+                        event.created_at,
+                    )
                 with self._inbox_state_lock:
                     highest_queued_transaction = (
                         self._highest_accepted_transaction_id

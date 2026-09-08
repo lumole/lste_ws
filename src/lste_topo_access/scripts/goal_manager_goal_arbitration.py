@@ -122,7 +122,9 @@ class GoalManagerGoalArbitrationMixin:
     ) -> Optional[bool]:
         """Delegate Navfn validation to the focused route-validation module."""
         return validate_target_route_request(self, goal, now, force=force)
-    def target_reacquisition_goal(self, now: float) -> Optional[PoseStamped]:
+    def target_reacquisition_goal(
+        self, now: float, force: bool = False
+    ) -> Optional[PoseStamped]:
         """Make one bounded forward continuation after a target is lost.
 
         The camera saw the target along ``target_last_heading``.  Continuing
@@ -131,6 +133,17 @@ class GoalManagerGoalArbitrationMixin:
         pointed the vehicle away from the detected object and made the normal
         pipeline abandon valid sightings near desks.
         """
+        if (
+            self.target_reacquire_goal is not None
+            and self.target_reacquire_started is not None
+        ):
+            if now - self.target_reacquire_started < self.target_reacquire_duration:
+                self.goal_source = "target_reacquisition_sweep"
+                return self.target_reacquire_goal
+            rospy.loginfo("GoalManager: target reacquisition sweep expired; resume global exploration")
+            self.target_reacquire_goal = None
+            self.target_reacquire_started = None
+            return None
         if (
             self.target_blocked
             # An active target segment already owns the same visual evidence.
@@ -145,7 +158,7 @@ class GoalManagerGoalArbitrationMixin:
         ):
             return None
         evidence_timeout = self.target_evidence_timeout()
-        if now - self.target_last_seen < evidence_timeout:
+        if not force and now - self.target_last_seen < evidence_timeout:
             return None
         if self.target_reacquire_started is None:
             heading = self.target_last_heading
@@ -219,12 +232,9 @@ class GoalManagerGoalArbitrationMixin:
                 self.target_reacquire_attempts,
                 self.target_reacquire_max_attempts,
             )
-        if now - self.target_reacquire_started < self.target_reacquire_duration:
+        if self.target_reacquire_goal is not None:
             self.goal_source = "target_reacquisition_sweep"
             return self.target_reacquire_goal
-        rospy.loginfo("GoalManager: target reacquisition sweep expired; resume global exploration")
-        self.target_reacquire_goal = None
-        self.target_reacquire_started = None
         return None
 
     def fresh_global_frontier_goal(self, now: float) -> Optional[PoseStamped]:

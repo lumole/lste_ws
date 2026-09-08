@@ -16,6 +16,9 @@ class GoalManagerTargetCompletionMixin:
     def reset_target_terminal_observation(self):
         """Start a fresh post-terminal completion evidence transaction."""
         self.target_terminal_close_candidate_seen = False
+        self.target_terminal_observation_intent_sent = False
+        self.target_terminal_observation_pending_transaction = 0
+        self.target_terminal_observation_ack_transaction = 0
 
     def target_terminal_observation_eligible(self, det) -> bool:
         """Bridge a close-box dip with continuity of the same target track.
@@ -29,10 +32,11 @@ class GoalManagerTargetCompletionMixin:
         fallback accepts only the existing track evidence, after a terminal,
         and within the same observation epoch.
         """
-        if det is None or not bool(
-            getattr(self, "target_terminal_close_candidate_seen", False)
-        ):
+        if det is None:
             return False
+        candidate_seen = bool(
+            getattr(self, "target_terminal_close_candidate_seen", False)
+        )
         if not (
             bool(getattr(self, "target_follow_confirmed", False))
             and int(getattr(self, "target_completed_segments", 0) or 0) >= 1
@@ -41,6 +45,23 @@ class GoalManagerTargetCompletionMixin:
             == str(getattr(self, "target_approach_track_id", "") or "")
         ):
             return False
+        if not candidate_seen:
+            # A validated terminal is already an approved camera viewpoint.
+            # When the same confirmed track remains visible there, a detector
+            # box just below the pixel close rule must enter the existing
+            # terminal-continuity vote instead of reopening the same terminal
+            # observation transaction forever. The physical endpoint envelope
+            # and fresh-frame vote below remain mandatory.
+            distance_fn = getattr(self, "goal_robot_distance", None)
+            goal = getattr(self, "target_last_goal", None)
+            radius = getattr(self, "target_goal_reached_radius", None)
+            if not callable(distance_fn) or goal is None or radius is None:
+                return False
+            try:
+                if float(distance_fn(goal)) > float(radius):
+                    return False
+            except (TypeError, ValueError):
+                return False
         gate = getattr(self, "target_observation_gate", None)
         if gate is not None and gate.loss_certified(
             getattr(self, "target_track_id", "")
@@ -348,6 +369,8 @@ class GoalManagerTargetCompletionMixin:
         self.target_terminal_reobserve_min_epoch = 0
         self.target_terminal_reobserve_until = 0.0
         self.target_terminal_observation_intent_sent = False
+        self.target_terminal_observation_pending_transaction = 0
+        self.target_terminal_observation_ack_transaction = 0
         self.target_track_label = saved["track_label"] if preserve_obligation else ""
         self.target_track_id = saved["track_id"] if preserve_obligation else ""
         self.target_terminal_blind_advances = 0

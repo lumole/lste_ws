@@ -85,6 +85,12 @@ class GoalManagerRosInterfacesMixin:
             self.on_teb_goal_failure,
             queue_size=10,
         )
+        self.sub_teb_goal_bridge_status = rospy.Subscriber(
+            self.teb_goal_bridge_status_topic,
+            String,
+            self.on_teb_goal_bridge_status,
+            queue_size=10,
+        )
         self.sub_controller_mode = rospy.Subscriber(
             self.controller_mode_topic, String, self.on_controller_mode,
             queue_size=1,
@@ -99,5 +105,4 @@ class GoalManagerRosInterfacesMixin:
             )
 
         self.timer = rospy.Timer(rospy.Duration(0.2), self.on_timer)  # 5Hz
-
 

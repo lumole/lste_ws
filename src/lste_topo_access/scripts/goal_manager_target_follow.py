@@ -155,6 +155,55 @@ class GoalManagerTargetFollowMixin:
             return self._start_confirmed_target_segment(now)
         return self._follow_active_target_segment(now)
 
+    def _complete_reached_target_parallax(self, now: float) -> bool:
+        """Close a physical parallax boundary when the action terminal lags."""
+        goal = getattr(self, "target_parallax_goal", None)
+        if goal is None or getattr(self, "target_parallax_completed", False):
+            return False
+        if not getattr(self, "target_candidate_viewpoint_diverse", False):
+            return False
+        try:
+            distance = self.goal_robot_distance(goal)
+        except (AttributeError, TypeError, ValueError):
+            distance = None
+        if distance is None:
+            return False
+        try:
+            boundary = max(
+                0.30,
+                min(0.55, float(getattr(self, "target_goal_reached_radius", 0.5))),
+            )
+        except (TypeError, ValueError):
+            boundary = 0.50
+        if float(distance) > boundary:
+            return False
+        self.target_parallax_goal = None
+        self.target_parallax_active_side = ""
+        self.target_parallax_completed = True
+        self.target_execution_state = "TARGET_PARALLAX_REOBSERVE"
+        self.next_update_time = 0.0
+        # This local boundary must also become a bridge ownership boundary.
+        # Otherwise the persistent controller keeps executing the old
+        # parallax action while the semantic layer waits for new evidence.
+        handoff = getattr(self, "publish_target_terminal_observation_intent", None)
+        if callable(handoff):
+            handoff("target_parallax_viewpoint_reached_physical")
+        self.publish_goal_arbitration(
+            "target_parallax_viewpoint_reached_physical",
+            target_track_id=getattr(self, "target_track_id", ""),
+            distance=round(float(distance), 3),
+            boundary=round(float(boundary), 3),
+            evidence="viewpoint_diversity",
+            ros_time=round(float(now), 3),
+        )
+        rospy.loginfo(
+            "GoalManager: closed target parallax at physical boundary "
+            "distance=%.3fm boundary=%.3fm",
+            float(distance),
+            float(boundary),
+        )
+        return True
+
     def _resolve_target_follow_preconditions(
         self, now: float
     ) -> Tuple[bool, Optional[PoseStamped]]:
@@ -201,6 +250,16 @@ class GoalManagerTargetFollowMixin:
         if parallax is not None:
             self.goal_source = "target_parallax"
             return True, parallax
+        # A completed information action with an unconfirmed candidate is a
+        # reinspection boundary. The ordinary reacquisition helper waits for
+        # evidence expiry, but waiting here would strand the target owner while
+        # the detector is still seeing the same object. Reuse its bounded,
+        # Navfn-validated continuation exactly once.
+        if getattr(self, "target_parallax_completed", False):
+            reacquire = self.target_reacquisition_goal(now, force=True)
+            if reacquire is not None:
+                self.goal_source = "target_reacquisition_sweep"
+                return True, reacquire
         if getattr(self, "target_candidate_room_claim_requested", False):
             frontier = self.fresh_global_frontier_goal(now)
             if frontier is not None:
@@ -269,12 +328,14 @@ class GoalManagerTargetFollowMixin:
         if heading is None:
             return None
         try:
-            step = min(
-                0.60,
-                max(0.35, 0.65 * float(self.target_minimum_viewpoint_distance())),
-            )
+            # The viewpoint compiler already defines the smallest endpoint
+            # outside the target action's arrival radius.  Reusing that
+            # contract keeps this information action executable by TEB; a
+            # shorter local shortcut can be accepted without producing a new
+            # camera viewpoint at all.
+            step = float(self.target_minimum_viewpoint_distance())
         except (AttributeError, TypeError, ValueError):
-            step = 0.60
+            return None
         failed_sides = set(
             str(side)
             for side in getattr(self, "target_parallax_failed_sides", [])
@@ -287,7 +348,12 @@ class GoalManagerTargetFollowMixin:
             side_name = "left" if side > 0.0 else "right"
             if side_name in failed_sides:
                 continue
-            lateral_heading = float(heading) + side * math.pi * 0.5
+            # A purely perpendicular side-step makes a forward-only base turn
+            # in place before it can create any parallax.  Use a diagonal
+            # information step instead: it still changes the camera viewpoint
+            # on either side of the target ray, while retaining a forward
+            # component that TEB can execute through a narrow doorway.
+            lateral_heading = float(heading) + side * math.pi * 0.25
             requested_odom = self.make_goal_pose(
                 (
                     float(self.latest_pose.x) + step * math.cos(lateral_heading),

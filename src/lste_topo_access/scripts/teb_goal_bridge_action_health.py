@@ -222,7 +222,8 @@ class TebGoalBridgeActionHealthMixin:
 
     def cancel_locked(self, reason):
         self.action_generation += 1
-        if self.action_active:
+        was_active = bool(self.action_active)
+        if was_active:
             self.action_client.cancel_goal()
         self.action_active = False
         self.handoff_requested = False
@@ -234,7 +235,11 @@ class TebGoalBridgeActionHealthMixin:
         self._clear_failed_route_lease_locked()
         self.last_result_status = GoalStatus.PREEMPTED
         self.last_result_monotonic = now_for(self)
-        self.publish_bridge_status("cancel", reason=reason)
+        self.publish_bridge_status(
+            "cancel",
+            reason=reason,
+            was_active=was_active,
+        )
         rospy.loginfo("TEB goal bridge cancelled move_base action: reason=%s", reason)
 
     def _clear_action_health_locked(self):
