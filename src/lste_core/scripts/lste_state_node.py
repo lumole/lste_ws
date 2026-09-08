@@ -328,9 +328,19 @@ class StateNode:
         if not left_term or left_term == "none" or not right_term or right_term == "none":
             return False
         all_dets = list(self.latest_dets.env_dets) + list(self.latest_dets.target_dets)
-        has_left = any(left_term in (d.label or "").lower() for d in all_dets)
-        has_right = any(right_term in (d.label or "").lower() for d in all_dets)
-        return has_left and has_right
+        left_hits = [
+            det for det in all_dets
+            if left_term in (det.label or "").lower()
+        ]
+        right_hits = [
+            det for det in all_dets
+            if right_term in (det.label or "").lower()
+        ]
+        # ``yellow_cup.json`` uses ``monitor`` for both sides.  A single
+        # monitor bounding box must not satisfy both semantic slots: it is one
+        # observation, not an inferred pair.  The Goal Manager applies the
+        # same distinct-detection rule when it calculates a context midpoint.
+        return any(left is not right for left in left_hits for right in right_hits)
 
     def should_exhaust(self, now: float) -> bool:
         if self.total_scores_count < self.exh_min_scores:

@@ -95,6 +95,8 @@ VIDEO_FILTER="drawbox=x=12:y=12:w=iw-24:h=52:color=black@0.65:t=fill,drawtext=fo
 
 CAPTURE_TARGET="desktop"
 CAPTURE_BACKEND="ffmpeg"
+CAPTURE_X=0
+CAPTURE_Y=0
 if [[ -n "$WINDOW_NAME" && "$WINDOW_NAME" != "desktop" ]]; then
   if [[ "$WINDOW_NAME" == "RViz" ]]; then
     # Do not exit awk early: with pipefail that would leave xwininfo writing
@@ -106,46 +108,62 @@ if [[ -n "$WINDOW_NAME" && "$WINDOW_NAME" != "desktop" ]]; then
   WINDOW_INFO="$(xwininfo -id "$WINDOW_ID" -display "$DISPLAY_NAME")"
   WIDTH="$(awk '/Width:/ { print $2; exit }' <<<"$WINDOW_INFO")"
   HEIGHT="$(awk '/Height:/ { print $2; exit }' <<<"$WINDOW_INFO")"
-  if ! [[ "$WINDOW_ID" =~ ^0x[0-9a-fA-F]+$ && "$WIDTH" =~ ^[1-9][0-9]*$ && "$HEIGHT" =~ ^[1-9][0-9]*$ ]]; then
+  CAPTURE_X="$(awk '/Absolute upper-left X:/ { print $4; exit }' <<<"$WINDOW_INFO")"
+  CAPTURE_Y="$(awk '/Absolute upper-left Y:/ { print $4; exit }' <<<"$WINDOW_INFO")"
+  if ! [[ "$WINDOW_ID" =~ ^0x[0-9a-fA-F]+$ && "$WIDTH" =~ ^[1-9][0-9]*$ && "$HEIGHT" =~ ^[1-9][0-9]*$ && "$CAPTURE_X" =~ ^-?[0-9]+$ && "$CAPTURE_Y" =~ ^-?[0-9]+$ ]]; then
     echo "[error] Unable to resolve visible X11 window: $WINDOW_NAME" >&2
     exit 1
   fi
-  WINDOW_ID_DECIMAL="$((WINDOW_ID))"
   CAPTURE_TARGET="window:${WINDOW_NAME}:${WINDOW_ID}"
-  CAPTURE_BACKEND="gstreamer"
 fi
 
 printf '%s [INFO] [screen_record] event=record_start output=%s backend=%s display=%s target=%s geometry=%sx%s fps=%s duration_seconds=%s label=%s\n' \
   "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$OUTPUT" "$CAPTURE_BACKEND" "$DISPLAY_NAME" "$CAPTURE_TARGET" "$WIDTH" "$HEIGHT" "$FPS" "$DURATION" "$SAFE_LABEL"
 
-if [[ "$CAPTURE_BACKEND" == "gstreamer" ]]; then
-  FRAME_COUNT="$((DURATION * FPS))"
-  RECORD_COMMAND=(
-    gst-launch-1.0 -e
-    ximagesrc "display-name=$DISPLAY_NAME" "xid=$WINDOW_ID_DECIMAL" num-buffers="$FRAME_COUNT" use-damage=false show-pointer=false
-    ! "video/x-raw,framerate=${FPS}/1"
-    ! videoconvert
-    ! textoverlay "text=$SAFE_LABEL" font-desc="Sans 12" valignment=top halignment=left shaded-background=true
-    ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=2500 key-int-max="$FPS"
-    ! h264parse
-    ! mp4mux faststart=true
-    ! filesink "location=$PARTIAL_OUTPUT"
-  )
-else
-  RECORD_COMMAND=(
-    ffmpeg -hide_banner -nostdin -y
-    -f x11grab -draw_mouse 0 -framerate "$FPS" -video_size "${WIDTH}x${HEIGHT}"
-    -i "${DISPLAY_NAME}+0,0" -t "$DURATION"
-    -vf "$VIDEO_FILTER" -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p
-    -movflags +faststart "$PARTIAL_OUTPUT"
-  )
-fi
+RECORD_COMMAND=(
+  ffmpeg -hide_banner -nostdin -y
+  -f x11grab -draw_mouse 0 -framerate "$FPS" -video_size "${WIDTH}x${HEIGHT}"
+  -i "${DISPLAY_NAME}+${CAPTURE_X},${CAPTURE_Y}" -t "$DURATION"
+  -vf "$VIDEO_FILTER" -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p
+  -movflags +faststart "$PARTIAL_OUTPUT"
+)
 
-if "${RECORD_COMMAND[@]}"; then
+RECORD_PID=""
+finish_interrupted_recording() {
+  if [[ -n "$RECORD_PID" ]] && kill -0 "$RECORD_PID" 2>/dev/null; then
+    kill -INT "$RECORD_PID" 2>/dev/null || true
+    wait "$RECORD_PID" 2>/dev/null || true
+  fi
+  if [[ -s "$PARTIAL_OUTPUT" ]]; then
+    mv -f "$PARTIAL_OUTPUT" "$OUTPUT"
+    printf '%s [INFO] [screen_record] event=record_interrupted output=%s bytes=%s\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$OUTPUT" "$(stat -c '%s' "$OUTPUT")"
+  else
+    printf '%s [ERROR] [screen_record] event=record_interrupted_without_output output=%s\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$OUTPUT" >&2
+  fi
+  exit 0
+}
+trap finish_interrupted_recording INT TERM
+
+"${RECORD_COMMAND[@]}" &
+RECORD_PID="$!"
+if wait "$RECORD_PID"; then
   mv -f "$PARTIAL_OUTPUT" "$OUTPUT"
   printf '%s [INFO] [screen_record] event=record_complete output=%s bytes=%s\n' \
     "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$OUTPUT" "$(stat -c '%s' "$OUTPUT")"
 else
+  # A recorder launched in its own process group can receive SIGINT directly
+  # while its shell is waiting. ffmpeg then writes a valid MP4 trailer but
+  # exits non-zero before this script can enter the signal trap. Preserve that
+  # verified partial recording; malformed partial files remain failures.
+  if [[ -s "$PARTIAL_OUTPUT" ]] && command -v ffprobe >/dev/null 2>&1 \
+      && ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 "$PARTIAL_OUTPUT" >/dev/null 2>&1; then
+    mv -f "$PARTIAL_OUTPUT" "$OUTPUT"
+    printf '%s [INFO] [screen_record] event=record_interrupted output=%s bytes=%s\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$OUTPUT" "$(stat -c '%s' "$OUTPUT")"
+    exit 0
+  fi
   rm -f "$PARTIAL_OUTPUT"
   printf '%s [ERROR] [screen_record] event=record_failed output=%s\n' \
     "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$OUTPUT" >&2

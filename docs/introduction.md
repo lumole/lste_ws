@@ -34,6 +34,31 @@
 | --- | --- |
 | [open_vocabulary_detector_research_07232026.md](research/open_vocabulary_detector_research_07232026.md) | 开放词汇检测器的调研和选型 |
 | [semantic_navigation_architecture_survey_08232026.md](research/semantic_navigation_architecture_survey_08232026.md) | 保留 LSTE global goal 的语义导航架构调研与实施建议 |
+| [place_portal_workitem_study_09052026.md](research/place_portal_workitem_study_09052026.md) | Place-Portal-WorkItem 方法边界、基线、指标、复现实验和论文证据规则 |
+| [task_conditioned_place_portal_belief_09062026.md](research/task_conditioned_place_portal_belief_09062026.md) | 任务条件语义信念、方向 WorkItem、主动门洞探测、持久 Portal 和目标射线验证架构 |
+| [graph_first_architecture_innovation_09062026.md](research/graph_first_architecture_innovation_09062026.md) | 基于近期研究的图优先动作架构、实现边界与验证计划 |
+| [portal_probe_value_pareto_09062026.md](research/portal_probe_value_pareto_09062026.md) | Portal probe 的硬约束、动作类别和 Pareto 选择层 |
+| [place_phase_branch_transaction_09062026.md](research/place_phase_branch_transaction_09062026.md) | Place phase、Portal transaction、失败缓存失效和近期拓扑探索架构落地 |
+| [branch_first_evidence_gated_exploration_09062026.md](research/branch_first_evidence_gated_exploration_09062026.md) | Branch-first 证据门控策略、事务身份校验、可证伪假设与消融指标 |
+| [portal_decision_architecture_09062026.md](research/portal_decision_architecture_09062026.md) | 任务条件 Portal 决策层、无权重 Pareto 选择和外部架构依据 |
+| [frontier_action_evidence_policy_09062026.md](research/frontier_action_evidence_policy_09062026.md) | Place 内 ObservationWorkItem 的事件类别、证据向量、Pareto 选择和实验边界 |
+| [event_driven_evidence_graph_09062026.md](research/event_driven_evidence_graph_09062026.md) | Fast-Slow 事件图、可回放证据投影和目标/Portal 身份边界 |
+| [graph_route_planner_09062026.md](research/graph_route_planner_09062026.md) | 持久 Place/Portal/WorkItem 图级路线规划器、第一条边物化和回归验证 |
+| [controller_owned_route_lease_09062026.md](research/controller_owned_route_lease_09062026.md) | 持久执行中的控制器失败终端所有权与路线 lease 架构 |
+| [recent_active_topology_architecture_09062026.md](research/recent_active_topology_architecture_09062026.md) | 2025-2026 未知环境语义拓扑探索调研、代码可用性和 ECAG 架构建议 |
+| [durable_portal_action_compiler_09062026.md](research/durable_portal_action_compiler_09062026.md) | 持久 Portal 证据到 crossing route 的无 frontier 物化、preobserved crossing 和验证边界 |
+| [target_viewpoint_option_ledger_09072026.md](research/target_viewpoint_option_ledger_09072026.md) | 目标拥有的视点选项账本：将局部 Navfn/TEB 失败与语义目标身份解耦 |
+| [optimistic_slow_planning_09072026.md](research/optimistic_slow_planning_09072026.md) | 慢速图规划与快速执行的提案提交协议，避免长规划锁住终端事件 |
+
+## development
+
+| 文档 | 内容 |
+| --- | --- |
+| [global_frontier_code_layout_09052026.md](development/global_frontier_code_layout_09052026.md) | Global frontier 主节点与策略模块的职责划分 |
+| [goal_manager_code_layout_09052026.md](development/goal_manager_code_layout_09052026.md) | Goal Manager 的检测、投影、路由和跟随模块划分 |
+| [telemetry_code_layout_09052026.md](development/telemetry_code_layout_09052026.md) | 导航遥测与 TEB bridge 的模块边界和验证方式 |
+| [targeted_navigation_experiments_09072026.md](development/targeted_navigation_experiments_09072026.md) | 从秒级最小故障回放逐步扩展到 Level 4 的实验阶梯 |
+| [navigation_failure_evidence_09082026.md](development/navigation_failure_evidence_09082026.md) | 失败 episode、route stall 归因、目标 lease 释放和标准摘要 |
 
 ## reporting
 

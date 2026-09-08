@@ -203,6 +203,13 @@ def _crop_box(image_source: np.ndarray, box: torch.Tensor) -> np.ndarray:
 
 
 def validate_color_by_phrase(image_source, boxes, logits, phrases, ratio_threshold=0.02, blur_ksize=3, dilate_iter=1):
+    """Keep detections whose named colour is visible in their BGR crop.
+
+    ``DetectionNodeBase`` obtains ROS camera frames with ``bgr8``.  Converting
+    these pixels with ``COLOR_RGB2HSV`` swaps red and blue, which made a real
+    yellow cup look blue to this final validation stage and caused the model
+    result to disappear before the Goal Manager could observe it.
+    """
     if boxes is None or phrases is None:
         return boxes, logits, phrases
     boxes_list = boxes.cpu().tolist() if isinstance(boxes, torch.Tensor) else boxes
@@ -219,7 +226,7 @@ def validate_color_by_phrase(image_source, boxes, logits, phrases, ratio_thresho
         crop = _crop_box(image_source, box_t)
         if crop is None or crop.size == 0:
             continue
-        hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         if blur_ksize and blur_ksize > 1:
             hsv = cv2.GaussianBlur(hsv, (blur_ksize, blur_ksize), 0)
         matched = False
@@ -243,6 +250,12 @@ def validate_color_by_phrase(image_source, boxes, logits, phrases, ratio_thresho
 
 
 def filter_boxes_by_color(image_source, boxes, logits, phrases, color_terms, ratio_threshold=0.01, min_keep=1):
+    """Prefer BGR boxes with the requested colour without changing fallback.
+
+    The caller deliberately retains the original detector result when every
+    candidate fails this optional preference.  Its colour conversion must use
+    the same BGR convention as ``validate_color_by_phrase`` above.
+    """
     if not color_terms or boxes is None:
         return boxes, logits, phrases, False, []
     boxes_list = boxes.cpu().tolist() if isinstance(boxes, torch.Tensor) else boxes
@@ -256,7 +269,7 @@ def filter_boxes_by_color(image_source, boxes, logits, phrases, color_terms, rat
         if crop is None or crop.size == 0:
             removed.append(phrases_list[idx] if idx < len(phrases_list) else "")
             continue
-        hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         matched = False
         for color in color_terms:
             ranges = COLOR_HSV_RANGES.get(color)
@@ -280,6 +293,41 @@ def filter_boxes_by_color(image_source, boxes, logits, phrases, color_terms, rat
     filtered_logits = [logits_list[i] for i in kept] if logits_list else []
     filtered_phrases = [phrases_list[i] for i in kept] if phrases_list else []
     return torch.tensor(filtered_boxes), torch.tensor(filtered_logits), filtered_phrases, True, removed
+
+
+def postprocess_target_candidates(
+    image_source,
+    boxes,
+    logits,
+    phrases,
+    color_terms,
+    ratio_threshold=0.02,
+):
+    """Apply optional visual corroboration without erasing model evidence.
+
+    The detector model supplies semantic evidence (for example ``yellow cup``)
+    and the pixel-color test is only a corroborating observation.  A small,
+    blurred, occluded, or badly exposed object can legitimately fail that
+    second observation even when the model candidate is useful.  The color
+    filter already has the right evidence-layer contract: it narrows the
+    candidates when at least one box has positive color evidence and returns
+    the original candidates when none can be verified.  Keep that fallback
+    instead of applying a second destructive validator to it.
+    """
+    if not color_terms or boxes is None or len(boxes) == 0:
+        return boxes, logits, phrases
+    filtered_boxes, filtered_logits, filtered_phrases, _verified, _removed = (
+        filter_boxes_by_color(
+            image_source,
+            boxes,
+            logits,
+            phrases,
+            color_terms,
+            ratio_threshold=ratio_threshold,
+            min_keep=1,
+        )
+    )
+    return filtered_boxes, filtered_logits, filtered_phrases
 
 
 def run_grounding_dino_with_caption(

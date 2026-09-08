@@ -3,6 +3,10 @@
   <arg name="scan_topic" default="/pro3/rlscan"/>
   <arg name="odom_topic" default="/pro3/wheel_odom"/>
   <arg name="pose_topic" default="/rbt_pose"/>
+  <!-- Task/detection streams feed the task-conditioned Place belief. They
+       never publish goals or alter controller parameters. -->
+  <arg name="task_topic" default="/lste/task"/>
+  <arg name="detections_topic" default="/lste/detections"/>
   <!-- Candidate validation follows the same inflated grid used by Navfn. -->
   <arg name="costmap_topic" default="/move_base/global_costmap/costmap"/>
   <arg name="costmap_updates_topic" default="/move_base/global_costmap/costmap_updates"/>
@@ -37,6 +41,7 @@
   <arg name="replan_request_topic" default="/lste/global_frontier/replan_request"/>
   <arg name="turn_status_topic" default="/lste/teb_turn_supervisor/status"/>
   <arg name="terminal_topic" default="/lste/teb_goal_terminal"/>
+  <arg name="terminal_contract_topic" default="/lste/teb_goal_terminal_contract"/>
   <!-- Promote a TEB/move_base recovery to a map-level frontier replan. -->
   <arg name="recovery_topic" default="/move_base/recovery_status"/>
   <arg name="task_done_topic" default="/lste/task_done"/>
@@ -44,6 +49,11 @@
        obstacle distance. Frontier cells themselves may be closer; the node
        publishes a safe approach point instead of the boundary cell. -->
   <arg name="clearance" default="0.52"/>
+  <!-- Must match TebLocalPlannerROS/xy_goal_tolerance. Portal endpoints are
+       positioned beyond this success circle, so a TEB SUCCEEDED terminal is
+       still provably on the destination side of the door. Keeping the value
+       in this launch contract avoids depending on process start order. -->
+  <arg name="teb_xy_goal_tolerance" default="0.50"/>
   <!-- Strict clearance is the normal complete route topology. Recovery may
        use loose topology only between strict-clearance endpoints; the live
        costmap and exact Navfn plan remain hard executability gates. -->
@@ -85,6 +95,24 @@
   <arg name="unreachable_grace" default="20.0"/>
   <arg name="rejected_timeout" default="180.0"/>
   <arg name="completed_radius" default="1.25"/>
+  <!-- Research method boundary. All values keep the same SLAM, Navfn, TEB,
+       perception and task pipeline; they only change persistent exploration
+       memory: frontier, frontier_distance_dedup, place_portal, or
+       place_portal_workitem. The full method also consumes /lste/task and
+       /lste/detections to choose task-conditioned topological expansion. -->
+  <arg name="exploration_method" default="place_portal_workitem"/>
+  <!-- Region memory sits above point-level frontier completion. The primary
+       identity is a doorway-separated, high-clearance known-free component:
+       it groups far endpoints in one room while a narrow door cuts the room
+       from its corridor neighbor. Unseen regions are selected before revisits.
+       A dormant region stays excluded for this SLAM invocation: boundary
+       jitter alone is not valid evidence that a room became unexplored again. -->
+  <arg name="region_memory_radius" default="2.5"/>
+  <arg name="region_information_delta" default="8"/>
+  <!-- This is a no-information dwell bound, not a route timeout. The normal
+       active/stall watchdog still owns blocked or non-executable paths. -->
+  <arg name="region_stagnation_timeout" default="12.0"/>
+  <arg name="region_failure_limit" default="2"/>
   <arg name="structure_radius_cells" default="10"/>
   <arg name="structure_weight" default="0.16"/>
   <arg name="min_structure_cells" default="3"/>
@@ -121,6 +149,9 @@
        route is far from its frontier. Near-endpoint and stall checks wake it
        immediately. -->
   <arg name="planning_period" default="1.5"/>
+  <!-- Keep SLAM available for controller-only diagnostics while allowing the
+       expensive frontier executive to be omitted from the fast inner loop. -->
+  <arg name="start_frontier" default="true"/>
 
   <node pkg="gmapping" type="slam_gmapping" name="lste_online_slam" output="screen">
     <remap from="scan" to="$(arg scan_topic)"/>
@@ -140,7 +171,7 @@
     <param name="ymax" value="9.0"/>
   </node>
 
-  <node pkg="lste_topo_access" type="lste_global_frontier_node.py" name="lste_global_frontier" output="screen">
+  <node if="$(arg start_frontier)" pkg="lste_topo_access" type="lste_global_frontier_node.py" name="lste_global_frontier" output="screen">
     <param name="map_topic" value="/map"/>
     <param name="costmap_topic" value="$(arg costmap_topic)"/>
     <param name="costmap_updates_topic" value="$(arg costmap_updates_topic)"/>
@@ -154,15 +185,19 @@
     <param name="navfn_startup_probe_distance" value="$(arg navfn_startup_probe_distance)"/>
     <param name="pose_topic" value="$(arg pose_topic)"/>
     <param name="scan_topic" value="$(arg scan_topic)"/>
+    <param name="task_topic" value="$(arg task_topic)"/>
+    <param name="detections_topic" value="$(arg detections_topic)"/>
     <param name="goal_topic" value="$(arg goal_topic)"/>
     <param name="command_topic" value="$(arg command_topic)"/>
     <param name="status_topic" value="$(arg status_topic)"/>
     <param name="replan_request_topic" value="$(arg replan_request_topic)"/>
     <param name="turn_status_topic" value="$(arg turn_status_topic)"/>
     <param name="terminal_topic" value="$(arg terminal_topic)"/>
+    <param name="terminal_contract_topic" value="$(arg terminal_contract_topic)"/>
     <param name="recovery_topic" value="$(arg recovery_topic)"/>
     <param name="task_done_topic" value="$(arg task_done_topic)"/>
     <param name="clearance" value="$(arg clearance)"/>
+    <param name="teb_xy_goal_tolerance" value="$(arg teb_xy_goal_tolerance)"/>
     <param name="navfn_observation_recovery_enabled" value="$(arg navfn_observation_recovery_enabled)"/>
     <param name="fallback_clearance" value="$(arg fallback_clearance)"/>
     <param name="frontier_approach_distance" value="$(arg frontier_approach_distance)"/>
@@ -180,6 +215,11 @@
     <param name="unreachable_grace" value="$(arg unreachable_grace)"/>
     <param name="rejected_timeout" value="$(arg rejected_timeout)"/>
     <param name="completed_radius" value="$(arg completed_radius)"/>
+    <param name="exploration_method" value="$(arg exploration_method)"/>
+    <param name="region_memory_radius" value="$(arg region_memory_radius)"/>
+    <param name="region_information_delta" value="$(arg region_information_delta)"/>
+    <param name="region_stagnation_timeout" value="$(arg region_stagnation_timeout)"/>
+    <param name="region_failure_limit" value="$(arg region_failure_limit)"/>
     <param name="structure_radius_cells" value="$(arg structure_radius_cells)"/>
     <param name="structure_weight" value="$(arg structure_weight)"/>
     <param name="min_structure_cells" value="$(arg min_structure_cells)"/>

@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GROUNDINGDINO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # 激活环境
-source ~/anaconda3/etc/profile.d/conda.sh
+source ~/miniconda3/etc/profile.d/conda.sh
 conda activate dino
 export CUDA_HOME=/usr
 

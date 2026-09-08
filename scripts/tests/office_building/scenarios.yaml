@@ -10,9 +10,8 @@ levels:
     description: Full semantic office furniture and target distractors
     dynamic_obstacles: false
   level_3:
-    description: Dead end, alternate route, occluded target, and narrow entries
+    description: Dead end, alternate route, occluded target, and narrow target doorway
     dynamic_obstacles: false
   level_4:
-    description: Level 3 plus one deterministic moving obstacle
-    dynamic_obstacles: true
-    seed: 20260827
+    description: Level 3 plus a parked corridor trolley and semantic distractors
+    dynamic_obstacles: false

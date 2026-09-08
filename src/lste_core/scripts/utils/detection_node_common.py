@@ -14,6 +14,7 @@ from std_msgs.msg import Header, String
 
 from lste_msgs.msg import LsteDetection, LsteDetections, LstePrompts, LsteState, LsteTask
 from utils import detector as det_utils
+from utils.target_evidence import preserve_raw_target_evidence
 
 
 STATE_PASS = 0
@@ -244,18 +245,24 @@ class DetectionNodeBase:
             (self.task_parsed.get("target") or {}).get("attributes", [])
         )
         if required_colors and target_boxes is not None and len(target_boxes) > 0:
-            target_boxes, target_scores, target_labels, _, _ = det_utils.filter_boxes_by_color(
-                image_source, target_boxes, target_scores, target_labels, required_colors, ratio_threshold=0.02
+            target_boxes, target_scores, target_labels = det_utils.postprocess_target_candidates(
+                image_source,
+                target_boxes,
+                target_scores,
+                target_labels,
+                required_colors,
+                ratio_threshold=0.02,
             )
         if target_boxes is not None and len(target_boxes) > 1:
             target_boxes, target_scores, target_labels = det_utils.nms_iou(
                 target_boxes, target_scores, target_labels, threshold=0.9
             )
         if target_boxes is not None and len(target_boxes) > 0:
-            target_boxes, target_scores, target_labels = det_utils.validate_color_by_phrase(
-                image_source, target_boxes, target_scores, target_labels, ratio_threshold=0.02,
-                blur_ksize=3, dilate_iter=1,
-            )
+            # Color is an optional corroborating observation, not a second
+            # semantic detector. ``postprocess_target_candidates`` preserves
+            # model candidates when the tiny/occluded crop has no reliable
+            # color pixels; applying ``validate_color_by_phrase`` here would
+            # turn valid WeDetect candidates into empty target messages.
             target_boxes, target_scores, target_labels = det_utils.keep_top_confidence_detection(
                 target_boxes, target_scores, target_labels
             )
@@ -300,6 +307,28 @@ class DetectionNodeBase:
                 raw_target_boxes, raw_target_scores, raw_target_labels = raw_result[1:4]
                 raw_env_boxes, raw_env_scores, raw_env_labels = raw_result[4:7]
                 result = self._postprocess(*raw_result)
+                (
+                    target_boxes,
+                    target_scores,
+                    target_labels,
+                    target_evidence_fallback,
+                    target_evidence_fallback_reason,
+                ) = preserve_raw_target_evidence(
+                    raw_target_boxes,
+                    raw_target_scores,
+                    raw_target_labels,
+                    result[0],
+                    result[1],
+                    result[2],
+                )
+                result = (
+                    target_boxes,
+                    target_scores,
+                    target_labels,
+                    result[3],
+                    result[4],
+                    result[5],
+                )
             except Exception as exc:
                 rospy.logerr_throttle(1.0, "%s exception: %s", self.detector_name, exc)
                 self.publish_perception_decision(
@@ -343,6 +372,8 @@ class DetectionNodeBase:
             outcome = (
                 "model_no_target_candidate"
                 if raw_target_count == 0
+                else "target_published_from_raw_evidence"
+                if target_evidence_fallback
                 else "target_removed_by_postprocess"
                 if target_count == 0
                 else "target_published"
@@ -360,6 +391,8 @@ class DetectionNodeBase:
                 published_env_candidates=len(env_boxes),
                 published_target_top=self._candidate_summary(target_scores, target_labels),
                 published_env_top=self._candidate_summary(env_scores, env_labels),
+                target_evidence_fallback=bool(target_evidence_fallback),
+                target_evidence_fallback_reason=target_evidence_fallback_reason,
                 force=bool(inference_metadata.get("small_object_tile_search_ran")),
                 **inference_metadata,
             )

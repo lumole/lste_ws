@@ -88,6 +88,97 @@ def add_floor_zone(
     )
 
 
+def add_wall_with_openings(
+    structure: ET.Element,
+    name: str,
+    orientation: str,
+    fixed: float,
+    start: float,
+    end: float,
+    doorways: Sequence[tuple[str, float, float]],
+    *,
+    rgba: Sequence[float],
+) -> None:
+    """Build one continuous wall, interrupted only by named doorways.
+
+    ``orientation`` is ``horizontal`` for an x-aligned wall and ``vertical``
+    for a y-aligned wall.  Keeping every wall in this one helper prevents a
+    forgotten gap from becoming an accidental room-to-room passage.
+    """
+    cursor = start
+    for index, (_door_id, center, width) in enumerate(sorted(doorways, key=lambda item: item[1])):
+        opening_start = max(start, center - width / 2.0)
+        opening_end = min(end, center + width / 2.0)
+        if opening_start > cursor:
+            midpoint = (cursor + opening_start) / 2.0
+            length = opening_start - cursor
+            if orientation == "horizontal":
+                add_box_link(
+                    structure,
+                    f"{name}_segment_{index}",
+                    midpoint,
+                    fixed,
+                    (length, WALL_THICKNESS, WALL_HEIGHT),
+                    rgba=rgba,
+                )
+            else:
+                add_box_link(
+                    structure,
+                    f"{name}_segment_{index}",
+                    fixed,
+                    midpoint,
+                    (WALL_THICKNESS, length, WALL_HEIGHT),
+                    rgba=rgba,
+                )
+        cursor = max(cursor, opening_end)
+    if cursor < end:
+        midpoint = (cursor + end) / 2.0
+        length = end - cursor
+        if orientation == "horizontal":
+            add_box_link(
+                structure,
+                f"{name}_segment_final",
+                midpoint,
+                fixed,
+                (length, WALL_THICKNESS, WALL_HEIGHT),
+                rgba=rgba,
+            )
+        else:
+            add_box_link(
+                structure,
+                f"{name}_segment_final",
+                fixed,
+                midpoint,
+                (WALL_THICKNESS, length, WALL_HEIGHT),
+                rgba=rgba,
+            )
+
+
+def add_door_lintel(
+    structure: ET.Element,
+    name: str,
+    orientation: str,
+    fixed: float,
+    center: float,
+    width: float,
+    *,
+    rgba: Sequence[float],
+) -> None:
+    """Add a visual lintel to make a named opening read as a doorway."""
+    size = (width, WALL_THICKNESS, 0.12) if orientation == "horizontal" else (WALL_THICKNESS, width, 0.12)
+    x, y = (center, fixed) if orientation == "horizontal" else (fixed, center)
+    add_box_link(
+        structure,
+        f"{name}_lintel",
+        x,
+        y,
+        size,
+        z=2.45,
+        rgba=rgba,
+        collision=False,
+    )
+
+
 def add_include(
     world: ET.Element,
     uri: str,
@@ -193,60 +284,66 @@ def build_structure(world: ET.Element, level: str) -> None:
         rgba=(0.30, 0.38, 0.45, 1),
     )
 
-    # Main corridor boundaries. Gaps are doorways, not random holes.
-    for index, (x0, x1) in enumerate(
-        [(5.0, 6.1), (7.2, 13.0), (14.0, 16.9), (17.9, 21.9), (22.9, 25.0)]
-    ):
-        add_box_link(
-            structure,
-            f"lower_partition_{index}",
-            (x0 + x1) / 2.0,
-            9.3,
-            (x1 - x0, wall, h),
-            rgba=dark,
+    # Every room is enclosed.  The only passages through the corridor walls
+    # are the named doors below, so the topology matches a normal office plan
+    # rather than an accidental collection of wall fragments.
+    lower_corridor_doors = (
+        ("lobby_corridor", 2.8, 1.10),
+        ("open_office_corridor", 8.0, 1.20),
+        ("printer_corridor", 15.0, 1.10),
+        ("storage_corridor", 19.5, 1.00),
+        ("lounge_corridor", 23.5, 1.00),
+    )
+    upper_corridor_doors = (
+        ("conference_corridor", 3.0, 1.20),
+        ("manager_corridor", 10.0, 1.10),
+        ("kitchen_corridor", 16.0, 1.10),
+        ("target_room_corridor", 22.0, 1.20),
+    )
+    if level == "level_3":
+        # Keep the target doorway usable for Pro3, but make the approach
+        # narrower than the baseline so Level 3 exercises recovery.
+        upper_corridor_doors = tuple(
+            (
+                door_id,
+                center,
+                0.95 if door_id == "target_room_corridor" else width,
+            )
+            for door_id, center, width in upper_corridor_doors
         )
-    for index, (x0, x1) in enumerate(
-        [(0.0, 2.2), (3.8, 6.9), (8.5, 12.8), (14.4, 15.9), (17.5, 18.9), (20.5, 25.0)]
-    ):
-        add_box_link(
-            structure,
-            f"upper_partition_{index}",
-            (x0 + x1) / 2.0,
-            12.7,
-            (x1 - x0, wall, h),
-            rgba=dark,
-        )
+    staff_door = (("office_printer_staff_door", 4.5, 1.10),)
+    add_wall_with_openings(
+        structure, "lower_corridor_wall", "horizontal", 9.3, 0.0, 25.0,
+        lower_corridor_doors, rgba=dark,
+    )
+    add_wall_with_openings(
+        structure, "upper_corridor_wall", "horizontal", 12.7, 0.0, 25.0,
+        upper_corridor_doors, rgba=dark,
+    )
 
-    # Room separators. Each opening is wide enough for Pro3 but forces a
-    # deliberate heading change, making it useful for TEB continuity tests.
-    add_box_link(structure, "lobby_office_separator", 5.0, 4.3, (wall, 7.4, h), rgba=dark)
-    add_box_link(structure, "office_printer_separator_a", 13.0, 1.5, (wall, 3.0, h), rgba=dark)
-    add_box_link(structure, "office_printer_separator_b", 13.0, 7.2, (wall, 2.0, h), rgba=dark)
-    add_box_link(structure, "printer_storage_separator_a", 17.0, 1.4, (wall, 2.8, h), rgba=dark)
-    add_box_link(structure, "printer_storage_separator_b", 17.0, 7.5, (wall, 2.4, h), rgba=dark)
-    # Storage has a single corridor door and is intentionally a dead end.
-    add_box_link(structure, "storage_lounge_separator", 22.0, 4.65, (wall, 9.3, h), rgba=dark)
+    # Bottom rooms: only the open-office/printer staff door is an intentional
+    # room-to-room connection. Storage remains a true one-door dead end.
+    add_wall_with_openings(structure, "lobby_office_wall", "vertical", 5.0, 0.0, 9.3, (), rgba=dark)
+    add_wall_with_openings(structure, "office_printer_wall", "vertical", 13.0, 0.0, 9.3, staff_door, rgba=dark)
+    add_wall_with_openings(structure, "printer_storage_wall", "vertical", 17.0, 0.0, 9.3, (), rgba=dark)
+    add_wall_with_openings(structure, "storage_lounge_wall", "vertical", 22.0, 0.0, 9.3, (), rgba=dark)
 
-    add_box_link(structure, "conference_manager_separator_a", 7.0, 13.9, (wall, 2.4, h), rgba=dark)
-    add_box_link(structure, "conference_manager_separator_b", 7.0, 20.6, (wall, 2.0, h), rgba=dark)
-    add_box_link(structure, "manager_kitchen_separator_a", 13.0, 13.9, (wall, 4.0, h), rgba=dark)
-    add_box_link(structure, "manager_kitchen_separator_b", 13.0, 20.9, (wall, 1.4, h), rgba=dark)
-    add_box_link(structure, "kitchen_target_separator_a", 19.0, 13.9, (wall, 2.4, h), rgba=dark)
-    add_box_link(structure, "kitchen_target_separator_b", 19.0, 20.7, (wall, 2.2, h), rgba=dark)
+    # North-side rooms are independent offices and connect only through their
+    # own corridor doors; there are no unexplained conference/manager/kitchen
+    # cut-throughs.
+    add_wall_with_openings(structure, "conference_manager_wall", "vertical", 7.0, 12.7, 22.0, (), rgba=dark)
+    add_wall_with_openings(structure, "manager_kitchen_wall", "vertical", 13.0, 12.7, 22.0, (), rgba=dark)
+    add_wall_with_openings(structure, "kitchen_target_wall", "vertical", 19.0, 12.7, 22.0, (), rgba=dark)
 
-    # A short inner circulation loop connects the open office to the lobby and
-    # the corridor through two separate openings. It is a real alternate route,
-    # not merely a visual marking.
-    add_box_link(structure, "office_loop_block_north", 8.8, 7.9, (6.0, wall, h), rgba=dark)
-    add_box_link(structure, "office_loop_block_south", 8.8, 1.1, (6.0, wall, h), rgba=dark)
-    add_box_link(structure, "office_loop_block_west", 6.0, 4.5, (wall, 6.8, h), rgba=dark)
-
-    # Door lintels and frames are visual only; the actual doorway remains open.
+    # The lintels make every opening visually legible as a doorway while the
+    # neighboring full-height wall segments form the jambs.
     door_color = (0.30, 0.38, 0.45, 1)
-    for index, x in enumerate((5.55, 14.45, 18.45, 23.45)):
-        add_box_link(structure, f"lower_door_lintel_{index}", x, 9.3, (1.05, wall, 0.10), z=2.45, rgba=door_color, collision=False)
-    for index, x in enumerate((3.0, 8.0, 15.15, 19.7)):
-        add_box_link(structure, f"upper_door_lintel_{index}", x, 12.7, (1.05, wall, 0.10), z=2.45, rgba=door_color, collision=False)
+    for door_id, center, width in lower_corridor_doors:
+        add_door_lintel(structure, door_id, "horizontal", 9.3, center, width, rgba=door_color)
+    for door_id, center, width in upper_corridor_doors:
+        add_door_lintel(structure, door_id, "horizontal", 12.7, center, width, rgba=door_color)
+    for door_id, center, width in staff_door:
+        add_door_lintel(structure, door_id, "vertical", 13.0, center, width, rgba=door_color)
 
     # Furniture collision blockers are enabled by difficulty. Level 1 keeps
     # the building shell and target desk; higher levels add semantic room
@@ -255,9 +352,22 @@ def build_structure(world: ET.Element, level: str) -> None:
         add_box_link(structure, "printer_body", 15.0, 4.8, (1.0, 0.85, 1.05), z=0.525, rgba=(0.25, 0.27, 0.30, 1))
         add_box_link(structure, "printer_paper_stack", 15.8, 6.2, (0.55, 0.45, 0.9), z=0.45, rgba=(0.88, 0.88, 0.82, 1))
         add_box_link(structure, "kitchen_counter", 16.2, 18.8, (3.6, 0.65, 0.95), z=0.475, rgba=(0.55, 0.42, 0.28, 1))
+        # The two blue target-room cups sit on this low refreshment counter.
+        # Keeping the supporting surface in the structure also gives it a
+        # collision shape, rather than making it a purely visual prop.
+        add_box_link(structure, "target_room_refreshment_counter", 23.5, 19.35, (2.55, 0.65, 0.95), z=0.475, rgba=(0.55, 0.42, 0.28, 1))
         add_box_link(structure, "target_room_occluder", 23.0, 15.0, (1.35, 0.75, 1.65), z=0.825, rgba=(0.45, 0.28, 0.18, 1))
     if level in ("level_3", "level_4"):
         add_box_link(structure, "storage_shelf_block", 19.0, 4.0, (1.5, 0.65, 2.0), z=1.0, rgba=(0.48, 0.32, 0.20, 1))
+    if level == "level_4":
+        # A parked office trolley narrows, but does not close, the main
+        # corridor. It creates a meaningful detour without changing the
+        # room/portal graph or inventing a random obstacle.
+        add_include(world, "utility_cart", "level4_corridor_cart", 12.5, 10.15)
+        # Floor-supported semantic context makes this level visibly distinct
+        # while leaving the target-room task unchanged.
+        add_include(world, "plant_1_single", "level4_lobby_plant", 1.25, 8.25)
+        add_include(world, "cabinet", "level4_conference_cabinet", 5.8, 20.4)
 
 
 def add_furniture(world: ET.Element, level: str) -> None:
@@ -284,7 +394,11 @@ def add_furniture(world: ET.Element, level: str) -> None:
         add_include(world, "table_conference_2", "conference_table", 4.5, 17.2, 0.0, 0.0)
         for index, (x, y, yaw) in enumerate(((2.8, 15.2, 0.0), (6.2, 15.2, math.pi), (2.8, 19.1, 0.0), (6.2, 19.1, math.pi))):
             add_include(world, "office_chair", f"conference_chair_{index}", x, y, 0.0, yaw)
-        add_include(world, "monitor_3", "conference_wall_screen", 3.0, 21.2, 0.75, 0.0)
+        # monitor_3 is a desktop model with a visible stand, so it must not
+        # be used as a wall display.  The presentation workstation gives the
+        # screen an explicit supporting desk rather than making it float.
+        add_include(world, "desk_brown", "conference_presentation_desk", 3.0, 20.5)
+        add_include(world, "monitor_3", "conference_presentation_monitor", 3.0, 20.5, 0.72)
 
     # Manager office.
     if include_full_semantics:
@@ -301,6 +415,11 @@ def add_furniture(world: ET.Element, level: str) -> None:
         add_include(world, "kitchen_chair", "kitchen_chair_1", 16.9, 16.0, 0.0, -math.pi / 2)
         add_include(world, "cup_blue", "kitchen_blue_cup", 15.8, 18.55, 1.02)
         add_include(world, "cup_green", "kitchen_green_cup", 17.0, 18.55, 1.02)
+        if level == "level_4":
+            # Similar cups share the existing counter surface; they are
+            # semantic distractors, not free-floating visual markers.
+            add_include(world, "cup_paper", "kitchen_paper_cup", 16.55, 18.55, 0.951)
+            add_include(world, "plastic_cup", "kitchen_plastic_cup", 17.35, 18.55, 0.951)
 
     # Printer area and storage dead end.
     if include_full_semantics:
@@ -341,23 +460,12 @@ def add_furniture(world: ET.Element, level: str) -> None:
         scale=(1.8, 1.8, 1.8),
     )
     if include_full_semantics:
-        add_include(world, "cup_blue", "cup_blue_target_distractor", 22.9, 19.35, 1.02)
-        add_include(world, "cup_blue", "cup_blue_target_distractor_2", 24.2, 19.35, 1.02)
+        # These blue mugs rest on target_room_refreshment_counter, whose top
+        # surface is z=0.95 m.  Their mesh origin is at the base; keep only a
+        # one-millimetre rendering clearance so they visibly rest on it.
+        add_include(world, "cup_blue", "cup_blue_target_distractor", 22.9, 19.35, 0.951)
+        add_include(world, "cup_blue", "cup_blue_target_distractor_2", 24.2, 19.35, 0.951)
         add_include(world, "bookshelf", "target_room_shelf", 24.2, 20.5, 0.0, math.pi / 2)
-
-
-def add_dynamic_obstacle(world: ET.Element) -> None:
-    """Add a static-in-physics box that the Level 4 node moves explicitly."""
-    obstacle = element(world, "model", name="benchmark_dynamic_obstacle")
-    element(obstacle, "static", "true")
-    element(obstacle, "pose", pose_text(10.0, 11.0, 0.6))
-    link = element(obstacle, "link", name="link")
-    element(link, "pose", pose_text(0.0, 0.0, 0.0))
-    collision = element(link, "collision", name="collision")
-    box_geometry(collision, (0.65, 0.65, 1.2))
-    visual = element(link, "visual", name="visual")
-    box_geometry(visual, (0.65, 0.65, 1.2))
-    material(visual, (0.88, 0.37, 0.12, 1.0))
 
 
 def add_gui(world: ET.Element) -> None:
@@ -375,8 +483,6 @@ def build_world(level: str) -> ET.ElementTree:
     add_world_header(world)
     build_structure(world, level)
     add_furniture(world, level)
-    if level == "level_4":
-        add_dynamic_obstacle(world)
     add_gui(world)
     return ET.ElementTree(sdf)
 
@@ -413,7 +519,7 @@ def main() -> int:
         "--level",
         choices=("level_1", "level_2", "level_3", "level_4"),
         default="level_2",
-        help="Difficulty profile used to include furniture and dynamic obstacles",
+        help="Difficulty profile used to include building geometry and furniture",
     )
     args = parser.parse_args()
     write_world(args.output, args.level)

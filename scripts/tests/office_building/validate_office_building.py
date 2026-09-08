@@ -65,6 +65,15 @@ def model_exists(model_name: str) -> bool:
     return any((base / model_name / "model.sdf").is_file() for base in available_model_dirs())
 
 
+def pose_components(node: ET.Element) -> list[float] | None:
+    """Return the six SDF pose components, or None for a malformed pose."""
+    try:
+        values = [float(value) for value in (node.findtext("pose") or "").split()]
+    except ValueError:
+        return None
+    return values if len(values) == 6 else None
+
+
 def parse_required_level(manifest: dict, level: str, result: Validation) -> None:
     levels = manifest.get("levels", {}) or {}
     if level not in levels:
@@ -128,8 +137,33 @@ def validate(manifest_path: Path, level: str, runtime: bool) -> tuple[Validation
     if "office_building_structure" not in names:
         result.error("world has no office_building_structure model")
 
+    structure = next(
+        (node for node in model_nodes if node.get("name") == "office_building_structure"),
+        None,
+    )
+    structure_links = {
+        str(link.get("name", "")).strip()
+        for link in (structure.findall("link") if structure is not None else [])
+    }
+
+    # Level-specific entities make the four deterministic difficulty
+    # profiles auditable. A required entity may be either an included model
+    # or a named structural link (for example, a narrow doorway lintel).
+    level_profile = (manifest.get("levels", {}) or {}).get(level, {}) or {}
+    world_entities = set(names) | structure_links
+    for entity in level_profile.get("required_entities", []) or []:
+        entity = str(entity).strip()
+        if entity and entity not in world_entities:
+            result.error(
+                "level %s is missing required entity: %s" % (level, entity)
+            )
+
     include_uris = []
+    includes_by_name = {}
     for include in include_nodes:
+        include_name = str(include.findtext("name") or "").strip()
+        if include_name:
+            includes_by_name[include_name] = include
         uri = (include.findtext("uri") or "").strip()
         if not uri.startswith("model://"):
             result.error("include %r does not use model:// URI" % (include.findtext("name")))
@@ -149,6 +183,9 @@ def validate(manifest_path: Path, level: str, runtime: bool) -> tuple[Validation
 
     building = manifest.get("building", {}) or {}
     bounds = building.get("bounds_m", [])
+    target_xy = (
+        (manifest.get("targets", {}) or {}).get("primary", {}) or {}
+    ).get("pose_xy", [])
     if len(bounds) != 4:
         result.error("building.bounds_m must be [min_x, min_y, max_x, max_y]")
     else:
@@ -172,18 +209,140 @@ def validate(manifest_path: Path, level: str, runtime: bool) -> tuple[Validation
     if target_room not in room_ids:
         result.error("primary target room %r is not declared in rooms" % target_room)
 
-    for profile_name, profile in (manifest.get("robot_profiles", {}) or {}).items():
+    robot_profiles = manifest.get("robot_profiles", {}) or {}
+    for profile_name, profile in robot_profiles.items():
+        if not isinstance(profile, dict):
+            result.error("robot profile %s must be a mapping" % profile_name)
+            continue
         pose = profile.get("pose", [])
         if len(pose) != 3:
             result.error("robot profile %s pose must be [x, y, yaw]" % profile_name)
+            continue
+        try:
+            profile_xy = [float(pose[0]), float(pose[1])]
+            float(pose[2])
+        except (TypeError, ValueError):
+            result.error("robot profile %s pose must contain numeric values" % profile_name)
+            continue
+        if len(bounds) == 4:
+            if not (
+                float(bounds[0]) <= profile_xy[0] <= float(bounds[2])
+                and float(bounds[1]) <= profile_xy[1] <= float(bounds[3])
+            ):
+                result.error(
+                    "robot profile %s lies outside building bounds: %s"
+                    % (profile_name, pose)
+                )
+
+    target_entry = robot_profiles.get("target_entry")
+    if target_entry is None:
+        result.error("manifest must declare robot profile target_entry")
+    elif isinstance(target_entry, dict):
+        if target_entry.get("diagnostic_only") is not True:
+            result.error("robot profile target_entry must be diagnostic_only")
+        if target_entry.get("bypasses_exploration") is not True:
+            result.error("robot profile target_entry must declare bypasses_exploration")
+        if target_entry.get("benchmark_evidence") is not False:
+            result.error("robot profile target_entry must not produce benchmark evidence")
+        if "target_approach_isolation" not in (target_entry.get("use_for") or []):
+            result.error(
+                "robot profile target_entry must be marked for target_approach_isolation"
+            )
+        if len(target_xy) == 2:
+            try:
+                entry_xy = [float(target_entry["pose"][0]), float(target_entry["pose"][1])]
+                target_xy_float = [float(target_xy[0]), float(target_xy[1])]
+            except (KeyError, TypeError, ValueError, IndexError):
+                entry_xy = None
+                target_xy_float = None
+            if entry_xy is not None and target_xy_float is not None:
+                if all(abs(a - b) <= 1e-6 for a, b in zip(entry_xy, target_xy_float)):
+                    result.error("robot profile target_entry must not equal primary target truth")
+    else:
+        result.error("robot profile target_entry must be a mapping")
     door_ids = {str(door.get("id", "")).strip() for door in manifest.get("doors", []) or []}
     for room in manifest.get("rooms", []) or []:
         for door_id in room.get("entry_doors", []) or []:
             if door_id not in door_ids:
                 result.error("room %s references unknown door %s" % (room.get("id"), door_id))
+    for door in manifest.get("doors", []) or []:
+        door_id = str(door.get("id", "")).strip()
+        if not door_id:
+            result.error("door has no id")
+            continue
+        if door.get("benchmark_closed"):
+            required_link = "south_entry_closed_door"
+        else:
+            required_link = door_id + "_lintel"
+        if required_link not in structure_links:
+            result.error(
+                "door %s is missing its world marker link %s"
+                % (door_id, required_link)
+            )
+
+    # Keep furniture semantically grounded.  The supplied monitor model has a
+    # visible stand, therefore the conference presentation screen must share
+    # a pose with an explicit desk at normal desktop height.
+    presentation_desk = includes_by_name.get("conference_presentation_desk")
+    presentation_monitor = includes_by_name.get("conference_presentation_monitor")
+    if (presentation_desk is None) != (presentation_monitor is None):
+        result.error("conference presentation desk and monitor must be included together")
+    elif presentation_desk is not None and presentation_monitor is not None:
+        desk_pose = pose_components(presentation_desk)
+        monitor_pose = pose_components(presentation_monitor)
+        if desk_pose is None or monitor_pose is None:
+            result.error("conference presentation desk or monitor has an invalid pose")
+        elif (
+            abs(desk_pose[0] - monitor_pose[0]) > 0.03
+            or abs(desk_pose[1] - monitor_pose[1]) > 0.03
+            or not (0.70 <= monitor_pose[2] <= 0.75)
+        ):
+            result.error("conference presentation monitor must rest on its desk at desktop height")
+
+    cup_names = ("cup_blue_target_distractor", "cup_blue_target_distractor_2")
+    target_cups = [includes_by_name[name] for name in cup_names if name in includes_by_name]
+    if target_cups:
+        counter = next(
+            (
+                link
+                for link in (structure.findall("link") if structure is not None else [])
+                if link.get("name") == "target_room_refreshment_counter"
+            ),
+            None,
+        )
+        if counter is None:
+            result.error("target-room cups require target_room_refreshment_counter")
+        else:
+            counter_pose = pose_components(counter)
+            size_text = counter.findtext("visual/geometry/box/size")
+            try:
+                counter_size = [float(value) for value in (size_text or "").split()]
+            except ValueError:
+                counter_size = []
+            if counter_pose is None or len(counter_size) != 3:
+                result.error("target_room_refreshment_counter has invalid geometry or pose")
+            else:
+                top_z = counter_pose[2] + counter_size[2] / 2.0
+                for cup in target_cups:
+                    cup_name = str(cup.findtext("name") or "cup")
+                    cup_pose = pose_components(cup)
+                    if cup_pose is None:
+                        result.error("%s has an invalid pose" % cup_name)
+                        continue
+                    within_counter = (
+                        abs(cup_pose[0] - counter_pose[0]) <= counter_size[0] / 2.0
+                        and abs(cup_pose[1] - counter_pose[1]) <= counter_size[1] / 2.0
+                    )
+                    if not within_counter or not (top_z <= cup_pose[2] <= top_z + 0.005):
+                        result.error("%s must rest on target_room_refreshment_counter" % cup_name)
 
     actual_hash = sha256(world_path)
-    declared_hash = str(manifest.get("world_sha256", "")).strip()
+    # Prefer the level-local hash.  A single top-level hash cannot describe
+    # four independent deterministic world artifacts and would let a modified
+    # Level 4 file pass validation when Level 2 happened to be the default.
+    declared_hash = str(
+        level_profile.get("world_sha256") or manifest.get("world_sha256", "")
+    ).strip()
     if declared_hash and declared_hash != "generated_at_build_time" and declared_hash != actual_hash:
         result.error("world_sha256 mismatch: manifest=%s actual=%s" % (declared_hash, actual_hash))
 

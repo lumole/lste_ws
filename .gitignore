@@ -1,6 +1,7 @@
 # Catkin build artifacts
 build/
 devel/
+install/
 
 # Python
 __pycache__/
@@ -11,6 +12,10 @@ __pycache__/
 ros_logs/
 log/
 runtime/
+
+# Native crash dumps
+core
+core.*
 
 # ROS tf2_tools view_frames output
 frames.gv

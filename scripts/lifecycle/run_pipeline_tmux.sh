@@ -31,23 +31,7 @@ tmux() { command tmux "$@" 9>&-; }
 # 可选 YAML 配置：通过 PIPELINE_CONFIG 指定；存在时为未显式设置的变量提供默认值
 PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}
 if [[ -f "$PIPELINE_CONFIG" ]]; then
-  eval "$(
-    python - "$PIPELINE_CONFIG" <<'PY' || true
-import sys, json, shlex
-path = sys.argv[1]
-try:
-    import yaml
-except ImportError:
-    sys.exit(0)
-with open(path, 'r', encoding='utf-8') as f:
-    data = yaml.safe_load(f) or {}
-for k, v in data.items():
-    if isinstance(v, (str, int, float)):
-        # The values are consumed through bash eval; quote every scalar so a
-        # label or path containing whitespace remains a single assignment.
-        print(f'CFG_{k}={shlex.quote(str(v))}')
-PY
-  )"
+  eval "$("$WS/scripts/config/load_pipeline_config.sh" "$PIPELINE_CONFIG")"
 fi
 SESSION=${SESSION:-${CFG_SESSION:-lste}}
 
@@ -198,6 +182,7 @@ TARGET_REACQUIRE_DISTANCE=${TARGET_REACQUIRE_DISTANCE:-${CFG_TARGET_REACQUIRE_DI
 TARGET_REACQUIRE_MAX_ATTEMPTS=${TARGET_REACQUIRE_MAX_ATTEMPTS:-${CFG_TARGET_REACQUIRE_MAX_ATTEMPTS:-1}}
 FOLLOW_CONTEXT_STEP_DISTANCE=${FOLLOW_CONTEXT_STEP_DISTANCE:-${CFG_FOLLOW_CONTEXT_STEP_DISTANCE:-1.5}}
 GLOBAL_FRONTIER_ENABLED=${GLOBAL_FRONTIER_ENABLED:-${CFG_GLOBAL_FRONTIER_ENABLED:-true}}
+GLOBAL_FRONTIER_METHOD=${GLOBAL_FRONTIER_METHOD:-${CFG_GLOBAL_FRONTIER_METHOD:-place_portal_workitem}}
 GLOBAL_FRONTIER_TOPIC=${GLOBAL_FRONTIER_TOPIC:-${CFG_GLOBAL_FRONTIER_TOPIC:-/lste/global_frontier_goal}}
 TEB_GOAL_TERMINAL_TOPIC=${TEB_GOAL_TERMINAL_TOPIC:-${CFG_TEB_GOAL_TERMINAL_TOPIC:-/lste/teb_goal_terminal}}
 TEB_GOAL_FAILURE_TOPIC=${TEB_GOAL_FAILURE_TOPIC:-${CFG_TEB_GOAL_FAILURE_TOPIC:-/lste/teb_goal_failure}}
@@ -217,6 +202,10 @@ GLOBAL_FRONTIER_WAYPOINT_RELEASE_RADIUS=${GLOBAL_FRONTIER_WAYPOINT_RELEASE_RADIU
 GLOBAL_FRONTIER_ACTIVE_TIMEOUT=${GLOBAL_FRONTIER_ACTIVE_TIMEOUT:-${CFG_GLOBAL_FRONTIER_ACTIVE_TIMEOUT:-45.0}}
 GLOBAL_FRONTIER_STALL_TIMEOUT=${GLOBAL_FRONTIER_STALL_TIMEOUT:-${CFG_GLOBAL_FRONTIER_STALL_TIMEOUT:-12.0}}
 GLOBAL_FRONTIER_COMPLETED_RADIUS=${GLOBAL_FRONTIER_COMPLETED_RADIUS:-${CFG_GLOBAL_FRONTIER_COMPLETED_RADIUS:-1.25}}
+GLOBAL_FRONTIER_REGION_MEMORY_RADIUS=${GLOBAL_FRONTIER_REGION_MEMORY_RADIUS:-${CFG_GLOBAL_FRONTIER_REGION_MEMORY_RADIUS:-3.0}}
+GLOBAL_FRONTIER_REGION_INFORMATION_DELTA=${GLOBAL_FRONTIER_REGION_INFORMATION_DELTA:-${CFG_GLOBAL_FRONTIER_REGION_INFORMATION_DELTA:-8}}
+GLOBAL_FRONTIER_REGION_STAGNATION_TIMEOUT=${GLOBAL_FRONTIER_REGION_STAGNATION_TIMEOUT:-${CFG_GLOBAL_FRONTIER_REGION_STAGNATION_TIMEOUT:-20.0}}
+GLOBAL_FRONTIER_REGION_FAILURE_LIMIT=${GLOBAL_FRONTIER_REGION_FAILURE_LIMIT:-${CFG_GLOBAL_FRONTIER_REGION_FAILURE_LIMIT:-2}}
 GLOBAL_FRONTIER_STRUCTURE_RADIUS_CELLS=${GLOBAL_FRONTIER_STRUCTURE_RADIUS_CELLS:-${CFG_GLOBAL_FRONTIER_STRUCTURE_RADIUS_CELLS:-10}}
 GLOBAL_FRONTIER_STRUCTURE_WEIGHT=${GLOBAL_FRONTIER_STRUCTURE_WEIGHT:-${CFG_GLOBAL_FRONTIER_STRUCTURE_WEIGHT:-0.16}}
 GLOBAL_FRONTIER_MIN_STRUCTURE_CELLS=${GLOBAL_FRONTIER_MIN_STRUCTURE_CELLS:-${CFG_GLOBAL_FRONTIER_MIN_STRUCTURE_CELLS:-3}}
@@ -247,7 +236,7 @@ fi
 export PYTHONDONTWRITEBYTECODE=1
 if command -v conda >/dev/null 2>&1; then
   echo "[preflight] 清理 vsgp 环境下的 TensorFlow 缓存并做自检..."
-  CONDA_PREFIX="$(conda info --base 2>/dev/null || echo "$HOME/anaconda3")"
+  CONDA_PREFIX="$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")"
   conda run -n vsgp bash -lc "find \"$CONDA_PREFIX/envs/vsgp/lib/python3.7/site-packages/tensorflow\" -name '*.pyc' -delete 2>/dev/null; find \"$CONDA_PREFIX/envs/vsgp/lib/python3.7/site-packages/tensorflow\" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null" || true
   conda run -n vsgp python - <<'PY' || true
 import sys, tensorflow as tf
@@ -294,7 +283,7 @@ WAIT_ROSCORE='until rostopic list >/dev/null 2>&1; do echo \"waiting for roscore
 
 # 1: 仿真 + 机器人（等待 master 就绪）
 tmux_new_window 1 "$WS" "world" \
-  "$WAIT_ROSCORE; roslaunch lste_core lab_with_pro3.launch world_name:=$WORLD spawn_pro3:=$SPAWN_PRO3 gui:=$GUI \
+  "$WAIT_ROSCORE; export LIBGL_ALWAYS_SOFTWARE=1; lste_gazebo_exec roslaunch lste_core lab_with_pro3.launch world_name:=$WORLD spawn_pro3:=$SPAWN_PRO3 gui:=$GUI \
     x:=$PRO3_SPAWN_X y:=$PRO3_SPAWN_Y z:=$PRO3_SPAWN_Z yaw:=$PRO3_SPAWN_YAW"
 
 # 2: 发布任务（latched，可随时替换 json/task_id）
@@ -421,6 +410,7 @@ if [[ "${GLOBAL_FRONTIER_ENABLED,,}" == "true" || "$GLOBAL_FRONTIER_ENABLED" == 
   tmux_new_window 12 "$WS" "global_frontier" \
     "$WAIT_ROSCORE; roslaunch lste_topo_access online_slam_frontier.launch \
       goal_topic:=$GLOBAL_FRONTIER_TOPIC \
+      command_topic:=/lste/global_frontier/route_command \
       clearance:=$GLOBAL_FRONTIER_CLEARANCE \
       fallback_clearance:=$GLOBAL_FRONTIER_FALLBACK_CLEARANCE \
       navfn_observation_recovery_enabled:=$GLOBAL_FRONTIER_NAVFN_OBSERVATION_RECOVERY_ENABLED \
@@ -432,11 +422,16 @@ if [[ "${GLOBAL_FRONTIER_ENABLED,,}" == "true" || "$GLOBAL_FRONTIER_ENABLED" == 
       active_timeout:=$GLOBAL_FRONTIER_ACTIVE_TIMEOUT \
       stall_timeout:=$GLOBAL_FRONTIER_STALL_TIMEOUT \
       completed_radius:=$GLOBAL_FRONTIER_COMPLETED_RADIUS \
+      region_memory_radius:=$GLOBAL_FRONTIER_REGION_MEMORY_RADIUS \
+      region_information_delta:=$GLOBAL_FRONTIER_REGION_INFORMATION_DELTA \
+      region_stagnation_timeout:=$GLOBAL_FRONTIER_REGION_STAGNATION_TIMEOUT \
+      region_failure_limit:=$GLOBAL_FRONTIER_REGION_FAILURE_LIMIT \
       structure_radius_cells:=$GLOBAL_FRONTIER_STRUCTURE_RADIUS_CELLS \
       structure_weight:=$GLOBAL_FRONTIER_STRUCTURE_WEIGHT \
       min_structure_cells:=$GLOBAL_FRONTIER_MIN_STRUCTURE_CELLS \
       heading_weight:=$GLOBAL_FRONTIER_HEADING_WEIGHT \
       heading_hard_limit_deg:=$GLOBAL_FRONTIER_HEADING_HARD_LIMIT_DEG \
+      exploration_method:=$GLOBAL_FRONTIER_METHOD \
       planning_period:=$GLOBAL_FRONTIER_PLANNING_PERIOD"
 fi
 

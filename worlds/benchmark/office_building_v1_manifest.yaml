@@ -5,6 +5,8 @@ scenario_id: office_building_v1
 display_name: Complex single-floor office building
 world: worlds/benchmark/office_building_v1_level_2_no_pro3.world
 world_name: office_building_v1
+# Kept for compatibility with older tooling. Each level below pins its own
+# artifact; validators prefer the level-local value.
 world_sha256: generated_at_build_time
 seed: 20260827
 
@@ -16,11 +18,18 @@ building:
   corridor_width_m: 3.4
   intended_robot_clearance_m: 0.45
   notes: >-
-    One connected office building with a central corridor, multiple semantic
-    rooms, a storage dead end, an alternate open-office circulation route, and
-    a target room whose target is hidden from the corridor by furniture. The
-    south entrance remains visible but is closed in the benchmark because the
-    robot starts indoors and the Gazebo ground plane outside is unbounded.
+    One connected office building with a central corridor and independently
+    enclosed semantic rooms. Each room has a named corridor doorway; the only
+    room-to-room connection is a standard staff door between the open office
+    and printer area. Storage is a one-door dead end. The south entrance stays
+    visible but closed because the robot starts indoors and the Gazebo ground
+    plane outside is unbounded.
+
+# Coverage uses a fixed physical denominator, not the changing extents of
+# gmapping's /map. Enabled rooms and the corridor are inset before sampling.
+coverage_truth:
+  sample_resolution_m: 0.25
+  boundary_clearance_m: 0.30
 
 rooms:
   - id: lobby
@@ -31,12 +40,12 @@ rooms:
   - id: open_office
     semantic: open-plan workstation area
     bounds_m: [5.1, 0.2, 12.9, 9.1]
-    entry_doors: [open_office_corridor, open_office_internal]
+    entry_doors: [open_office_corridor, office_printer_staff_door]
     models: [open_desk_0, open_desk_1, open_desk_2, open_desk_3, open_file_cabinet]
   - id: printer
     semantic: printing and document area
     bounds_m: [13.1, 0.2, 16.9, 9.1]
-    entry_doors: [printer_corridor, printer_internal]
+    entry_doors: [printer_corridor, office_printer_staff_door]
     models: [printer_body, printer_paper_stack, printer_file_cabinet]
   - id: storage
     semantic: storage room and intentional dead end
@@ -53,7 +62,7 @@ rooms:
     semantic: meeting room
     bounds_m: [0.2, 12.9, 6.9, 21.8]
     entry_doors: [conference_corridor]
-    models: [conference_table, conference_chair_0, conference_chair_1, conference_chair_2, conference_chair_3, conference_wall_screen]
+    models: [conference_table, conference_chair_0, conference_chair_1, conference_chair_2, conference_chair_3, conference_presentation_desk, conference_presentation_monitor]
   - id: manager
     semantic: private manager office
     bounds_m: [7.1, 12.9, 12.9, 21.8]
@@ -63,12 +72,12 @@ rooms:
     semantic: tea kitchen and break room
     bounds_m: [13.1, 12.9, 18.9, 21.8]
     entry_doors: [kitchen_corridor]
-    models: [kitchen_counter, kitchen_table, kitchen_chair_0, kitchen_chair_1, kitchen_blue_cup, kitchen_green_cup]
+    models: [kitchen_counter, kitchen_table, kitchen_chair_0, kitchen_chair_1, kitchen_blue_cup, kitchen_green_cup, kitchen_paper_cup, kitchen_plastic_cup]
   - id: target_room
     semantic: target office with occluded workstation
     bounds_m: [19.1, 12.9, 24.8, 21.8]
     entry_doors: [target_room_corridor]
-    models: [target_room_occluder, target_desk, target_monitor_left, target_monitor_right, target_chair, target_room_shelf]
+    models: [target_room_occluder, target_desk, target_monitor_left, target_monitor_right, target_chair, target_room_refreshment_counter, target_room_shelf]
 
 doors:
   - id: south_entrance
@@ -77,62 +86,59 @@ doors:
     connects: [outside, lobby]
     benchmark_closed: true
   - id: lobby_corridor
-    center_m: [4.9, 9.3]
+    center_m: [2.8, 9.3]
     width_m: 1.1
     connects: [lobby, main_corridor]
   - id: open_office_corridor
-    center_m: [6.65, 9.3]
-    width_m: 1.1
+    center_m: [8.0, 9.3]
+    width_m: 1.2
     connects: [open_office, main_corridor]
   - id: printer_corridor
-    center_m: [13.45, 9.3]
+    center_m: [15.0, 9.3]
     width_m: 1.1
     connects: [printer, main_corridor]
   - id: storage_corridor
-    center_m: [17.4, 9.3]
+    center_m: [19.5, 9.3]
     width_m: 1.0
     connects: [storage, main_corridor]
   - id: lounge_corridor
-    center_m: [22.4, 9.3]
+    center_m: [23.5, 9.3]
     width_m: 1.0
     connects: [lounge, main_corridor]
   - id: conference_corridor
     center_m: [3.0, 12.7]
-    width_m: 1.6
+    width_m: 1.2
     connects: [main_corridor, conference]
   - id: manager_corridor
-    center_m: [7.7, 12.7]
-    width_m: 1.6
+    center_m: [10.0, 12.7]
+    width_m: 1.1
     connects: [main_corridor, manager]
   - id: kitchen_corridor
-    center_m: [15.15, 12.7]
-    width_m: 1.5
+    center_m: [16.0, 12.7]
+    width_m: 1.1
     connects: [main_corridor, kitchen]
   - id: target_room_corridor
-    center_m: [19.7, 12.7]
-    width_m: 1.6
+    center_m: [22.0, 12.7]
+    width_m: 1.2
     connects: [main_corridor, target_room]
-  - id: open_office_internal
+  - id: office_printer_staff_door
     center_m: [13.0, 4.5]
-    width_m: 3.0
+    width_m: 1.1
     connects: [open_office, printer]
-  - id: printer_internal
-    center_m: [13.0, 4.5]
-    width_m: 3.0
-    connects: [printer, open_office]
 
 main_corridor:
   bounds_m: [2.0, 9.4, 24.8, 12.6]
   loop_description: >-
-    The open-office internal doorway provides an alternate connection between
-    the office and printer side of the building; the central furniture island
-    forces the local planner to choose a side instead of following a straight
-    empty corridor.
+    Each enclosed room has an independent doorway to the main corridor. The
+    only room-to-room passage is a standard-width staff door between the open
+    office and printer area; it is an intentional service connection, not an
+    unbounded opening between rooms.
   branch_points_m:
-    - [6.65, 11.0]
-    - [13.45, 11.0]
-    - [17.4, 11.0]
-    - [19.7, 11.0]
+    - [2.8, 11.0]
+    - [8.0, 11.0]
+    - [15.0, 11.0]
+    - [19.5, 11.0]
+    - [22.0, 11.0]
 
 robot_profiles:
   primary:
@@ -145,8 +151,11 @@ robot_profiles:
     use_for: [perception_isolation]
   target_entry:
     pose: [19.8, 13.8, 1.57079632679]
-    semantic: target-room approach start
+    semantic: target-room corridor-adjacent diagnostic isolation start
     use_for: [target_approach_isolation]
+    diagnostic_only: true
+    bypasses_exploration: true
+    benchmark_evidence: false
 
 targets:
   primary:
@@ -181,25 +190,30 @@ task_routes:
 levels:
   level_1:
     world: worlds/benchmark/office_building_v1_level_1_no_pro3.world
+    world_sha256: 5c55979e53b2d029939f90d3e1c1fd3324cc02aca6c354e0f5b36d6e2b56da1b
     enabled_rooms: [lobby, main_corridor, target_room]
     enabled_features: [building_shell, doorways, target_desk]
     dynamic_obstacles: false
   level_2:
     world: worlds/benchmark/office_building_v1_level_2_no_pro3.world
+    world_sha256: 6b9e2d314bf21ba568012142590a76252768a6af3d3dcbe0089cdc4dc4089d41
     enabled_rooms: [lobby, open_office, printer, conference, manager, kitchen, lounge, target_room]
     enabled_features: [semantic_furniture, distractor_cups, target_occluder]
     dynamic_obstacles: false
   level_3:
     world: worlds/benchmark/office_building_v1_level_3_no_pro3.world
+    world_sha256: 74b43250220fdc8107c52d646abfa608fe2c8b24b9c2834b21bf93967e886ce2
     enabled_rooms: [lobby, open_office, printer, storage, conference, manager, kitchen, lounge, target_room]
-    enabled_features: [dead_end, alternate_route, target_occluder, narrow_door_approach]
+    enabled_features: [dead_end, alternate_route, target_occluder, narrow_target_door]
     dynamic_obstacles: false
+    required_entities: [storage_shelf_block, target_room_corridor_lintel]
   level_4:
     world: worlds/benchmark/office_building_v1_level_4_no_pro3.world
+    world_sha256: 8b022c48d01a20a9e1551079a145e8395673b41fe15927cbadc7e1e8917c1c07
     enabled_rooms: [lobby, open_office, printer, storage, conference, manager, kitchen, lounge, target_room]
-    enabled_features: [dead_end, alternate_route, target_occluder, semantic_distractors, one_dynamic_obstacle]
-    dynamic_obstacles: true
-    dynamic_obstacle_seed: 20260827
+    enabled_features: [dead_end, alternate_route, target_occluder, corridor_trolley, semantic_distractors, floor_semantic_props]
+    dynamic_obstacles: false
+    required_entities: [level4_corridor_cart, level4_lobby_plant, level4_conference_cabinet, kitchen_paper_cup, kitchen_plastic_cup]
 
 required_models:
   - desk_brown

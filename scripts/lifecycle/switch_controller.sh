@@ -11,56 +11,11 @@ MODE="${1:-}"
 source "$WS/scripts/config/pipeline_env.sh"
 PIPELINE_CONFIG="${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}"
 if [[ -f "$PIPELINE_CONFIG" ]]; then
-  eval "$(python - "$PIPELINE_CONFIG" <<'PY' || true
-import sys
-import shlex
-try:
-    import yaml
-except ImportError:
-    sys.exit(0)
-with open(sys.argv[1], 'r', encoding='utf-8') as stream:
-    for key, value in (yaml.safe_load(stream) or {}).items():
-        if isinstance(value, (str, int, float)):
-            # These assignments are evaluated by the parent shell. Quote every
-            # scalar so labels such as "yellow cup,yellow mug" remain one
-            # configuration value during a hot controller switch.
-            print(f'CFG_{key}={shlex.quote(str(value))}')
-PY
-  )"
+  eval "$("$WS/scripts/config/load_pipeline_config.sh" "$PIPELINE_CONFIG")"
 fi
-SAPPO_SPEED="${SAPPO_SPEED:-0.50}"
-SAPPO_PYTHON="${SAPPO_PYTHON:-$HOME/miniconda3/envs/rlenvs/bin/python}"
-SAPPO_CONTROLLER_MODE="${SAPPO_CONTROLLER_MODE:-rl_grid_guard}"
-SAPPO_GOAL_TOLERANCE="${SAPPO_GOAL_TOLERANCE:-0.30}"
-SAPPO_MAX_LINEAR_ACTION_STEP="${SAPPO_MAX_LINEAR_ACTION_STEP:-0.12}"
-SAPPO_MAX_LINEAR_ACTION_DECEL="${SAPPO_MAX_LINEAR_ACTION_DECEL:-0.06}"
-SAPPO_MAX_ANGULAR_ACTION_STEP="${SAPPO_MAX_ANGULAR_ACTION_STEP:-0.16}"
-SAPPO_IN_PLACE_TURN_ANGULAR_THRESHOLD="${SAPPO_IN_PLACE_TURN_ANGULAR_THRESHOLD:-0.12}"
-SAPPO_BOUNDARY_TURN_LOCK_TIME="${SAPPO_BOUNDARY_TURN_LOCK_TIME:-3.0}"
-SAPPO_BOUNDARY_TURN_MAX_DURATION="${SAPPO_BOUNDARY_TURN_MAX_DURATION:-2.8}"
-SAPPO_BOUNDARY_TURN_MAX_ANGLE_DEG="${SAPPO_BOUNDARY_TURN_MAX_ANGLE_DEG:-112.0}"
-SAPPO_BOUNDARY_TURN_MAX_ATTEMPTS="${SAPPO_BOUNDARY_TURN_MAX_ATTEMPTS:-2}"
-SAPPO_BOUNDARY_REENTRY_COOLDOWN="${SAPPO_BOUNDARY_REENTRY_COOLDOWN:-1.5}"
-SAPPO_BOUNDARY_PROGRESS_TIMEOUT="${SAPPO_BOUNDARY_PROGRESS_TIMEOUT:-10.0}"
-SAPPO_BOUNDARY_PROGRESS_MARGIN="${SAPPO_BOUNDARY_PROGRESS_MARGIN:-0.45}"
-SAPPO_BOUNDARY_WALL_DISTANCE="${SAPPO_BOUNDARY_WALL_DISTANCE:-0.72}"
-SAPPO_BOUNDARY_WALL_KP="${SAPPO_BOUNDARY_WALL_KP:-0.45}"
-SAPPO_BOUNDARY_WALL_HEADING_KP="${SAPPO_BOUNDARY_WALL_HEADING_KP:-0.35}"
-SAPPO_BOUNDARY_WALL_MAX_LINEAR="${SAPPO_BOUNDARY_WALL_MAX_LINEAR:-0.28}"
-SAPPO_BOUNDARY_WALL_MAX_RANGE="${SAPPO_BOUNDARY_WALL_MAX_RANGE:-1.80}"
-SAPPO_BOUNDARY_WALL_FILTER_ALPHA="${SAPPO_BOUNDARY_WALL_FILTER_ALPHA:-0.28}"
-SAPPO_BOUNDARY_WALL_ANGULAR_STEP="${SAPPO_BOUNDARY_WALL_ANGULAR_STEP:-0.08}"
-SAPPO_BOUNDARY_WALL_ANGULAR_DEADBAND="${SAPPO_BOUNDARY_WALL_ANGULAR_DEADBAND:-0.035}"
-SAPPO_BOUNDARY_GOAL_CANCEL_ANGLE_DEG="${SAPPO_BOUNDARY_GOAL_CANCEL_ANGLE_DEG:-165.0}"
-SAPPO_BOUNDARY_GOAL_CANCEL_DISTANCE="${SAPPO_BOUNDARY_GOAL_CANCEL_DISTANCE:-0.75}"
-SAPPO_WAYPOINT_HOLD_RADIUS="${SAPPO_WAYPOINT_HOLD_RADIUS:-0.40}"
-SAPPO_WAYPOINT_SWITCH_DISTANCE="${SAPPO_WAYPOINT_SWITCH_DISTANCE:-0.75}"
-SAPPO_GRID_OBSTACLE_RADIUS="${SAPPO_GRID_OBSTACLE_RADIUS:-0.48}"
-SAPPO_GRID_EDGE_CLEARANCE="${SAPPO_GRID_EDGE_CLEARANCE:-0.42}"
-SAPPO_REORIENT_OBSTACLE_CLEARANCE="${SAPPO_REORIENT_OBSTACLE_CLEARANCE:-0.72}"
-SAPPO_INTERMEDIATE_GOAL_TOLERANCE="${SAPPO_INTERMEDIATE_GOAL_TOLERANCE:-0.45}"
-SAPPO_ANGULAR_SIGN_SWITCH_THRESHOLD="${SAPPO_ANGULAR_SIGN_SWITCH_THRESHOLD:-${CFG_SAPPO_ANGULAR_SIGN_SWITCH_THRESHOLD:-0.18}}"
-SAPPO_BACKGROUND_ENABLED="${SAPPO_BACKGROUND_ENABLED:-${CFG_SAPPO_BACKGROUND_ENABLED:-false}}"
+# Keep one canonical source of controller defaults. Environment variables set
+# by a hot switch still take precedence over YAML-derived CFG_* values.
+source "$WS/scripts/lifecycle/nodes/config/controllers.sh"
 RL_DIR="$WS/rl_navigation"
 RUNTIME_DIR="$WS/runtime/sappo"
 POLICY_DIR="$RL_DIR/policy"
@@ -142,44 +97,52 @@ start_sappo() {
     echo "[error] SA-PPO runtime is incomplete." >&2
     exit 1
   fi
-  local python_site sappo_entry sappo_mode_args
+  local python_site sappo_entry sappo_command
+  local -a sappo_arguments=(
+    "_linear_speed_scale:=$SAPPO_SPEED"
+    "_goal_size:=$SAPPO_GOAL_TOLERANCE"
+    "_goal_topic:=/lste/final_goal"
+    "_cmd_vel_topic:=/lste/cmd_vel/sappo"
+    "_wait_for_goal:=true"
+    "_allow_intermediate_goals:=true"
+  )
   case "$SAPPO_CONTROLLER_MODE" in
     policy_only)
       sappo_entry="$RL_DIR/sappo_pure.py"
-      sappo_mode_args=""
       ;;
     stabilized_recovery|rl_dwa_guard|rl_mppi_guard|rl_grid_guard)
       sappo_entry="$WS/scripts/tests/rl_fixed_goal/sappo_test.py"
-      sappo_mode_args="_controller_mode:=$SAPPO_CONTROLLER_MODE \
-        _in_place_turn_angular_threshold:=$SAPPO_IN_PLACE_TURN_ANGULAR_THRESHOLD \
-        _boundary_turn_lock_time:=$SAPPO_BOUNDARY_TURN_LOCK_TIME \
-        _boundary_turn_max_duration:=$SAPPO_BOUNDARY_TURN_MAX_DURATION \
-        _boundary_turn_max_angle_deg:=$SAPPO_BOUNDARY_TURN_MAX_ANGLE_DEG \
-        _boundary_turn_max_attempts:=$SAPPO_BOUNDARY_TURN_MAX_ATTEMPTS \
-        _boundary_reentry_cooldown:=$SAPPO_BOUNDARY_REENTRY_COOLDOWN \
-        _boundary_progress_timeout:=$SAPPO_BOUNDARY_PROGRESS_TIMEOUT \
-        _boundary_progress_margin:=$SAPPO_BOUNDARY_PROGRESS_MARGIN \
-        _boundary_wall_distance:=$SAPPO_BOUNDARY_WALL_DISTANCE \
-        _boundary_wall_kp:=$SAPPO_BOUNDARY_WALL_KP \
-        _boundary_wall_heading_kp:=$SAPPO_BOUNDARY_WALL_HEADING_KP \
-        _boundary_wall_max_linear:=$SAPPO_BOUNDARY_WALL_MAX_LINEAR \
-        _boundary_wall_max_range:=$SAPPO_BOUNDARY_WALL_MAX_RANGE \
-        _boundary_wall_filter_alpha:=$SAPPO_BOUNDARY_WALL_FILTER_ALPHA \
-        _boundary_wall_angular_step:=$SAPPO_BOUNDARY_WALL_ANGULAR_STEP \
-        _boundary_wall_angular_deadband:=$SAPPO_BOUNDARY_WALL_ANGULAR_DEADBAND \
-        _boundary_goal_cancel_angle_deg:=$SAPPO_BOUNDARY_GOAL_CANCEL_ANGLE_DEG \
-        _boundary_goal_cancel_distance:=$SAPPO_BOUNDARY_GOAL_CANCEL_DISTANCE \
-        _waypoint_hold_radius:=$SAPPO_WAYPOINT_HOLD_RADIUS \
-        _waypoint_switch_distance:=$SAPPO_WAYPOINT_SWITCH_DISTANCE \
-        _grid_obstacle_radius:=$SAPPO_GRID_OBSTACLE_RADIUS \
-        _grid_edge_clearance:=$SAPPO_GRID_EDGE_CLEARANCE \
-        _reorient_obstacle_clearance:=$SAPPO_REORIENT_OBSTACLE_CLEARANCE \
-        _max_linear_action_step:=$SAPPO_MAX_LINEAR_ACTION_STEP \
-        _max_linear_action_decel:=$SAPPO_MAX_LINEAR_ACTION_DECEL \
-        _max_angular_action_step:=$SAPPO_MAX_ANGULAR_ACTION_STEP \
-        _angular_sign_switch_threshold:=$SAPPO_ANGULAR_SIGN_SWITCH_THRESHOLD \
-        _intermediate_goal_size:=$SAPPO_INTERMEDIATE_GOAL_TOLERANCE \
-        _allow_intermediate_goals:=true"
+      sappo_arguments+=(
+        "_controller_mode:=$SAPPO_CONTROLLER_MODE"
+        "_in_place_turn_angular_threshold:=$SAPPO_IN_PLACE_TURN_ANGULAR_THRESHOLD"
+        "_boundary_turn_lock_time:=$SAPPO_BOUNDARY_TURN_LOCK_TIME"
+        "_boundary_turn_max_duration:=$SAPPO_BOUNDARY_TURN_MAX_DURATION"
+        "_boundary_turn_max_angle_deg:=$SAPPO_BOUNDARY_TURN_MAX_ANGLE_DEG"
+        "_boundary_turn_max_attempts:=$SAPPO_BOUNDARY_TURN_MAX_ATTEMPTS"
+        "_boundary_reentry_cooldown:=$SAPPO_BOUNDARY_REENTRY_COOLDOWN"
+        "_boundary_progress_timeout:=$SAPPO_BOUNDARY_PROGRESS_TIMEOUT"
+        "_boundary_progress_margin:=$SAPPO_BOUNDARY_PROGRESS_MARGIN"
+        "_boundary_wall_distance:=$SAPPO_BOUNDARY_WALL_DISTANCE"
+        "_boundary_wall_kp:=$SAPPO_BOUNDARY_WALL_KP"
+        "_boundary_wall_heading_kp:=$SAPPO_BOUNDARY_WALL_HEADING_KP"
+        "_boundary_wall_max_linear:=$SAPPO_BOUNDARY_WALL_MAX_LINEAR"
+        "_boundary_wall_max_range:=$SAPPO_BOUNDARY_WALL_MAX_RANGE"
+        "_boundary_wall_filter_alpha:=$SAPPO_BOUNDARY_WALL_FILTER_ALPHA"
+        "_boundary_wall_angular_step:=$SAPPO_BOUNDARY_WALL_ANGULAR_STEP"
+        "_boundary_wall_angular_deadband:=$SAPPO_BOUNDARY_WALL_ANGULAR_DEADBAND"
+        "_boundary_goal_cancel_angle_deg:=$SAPPO_BOUNDARY_GOAL_CANCEL_ANGLE_DEG"
+        "_boundary_goal_cancel_distance:=$SAPPO_BOUNDARY_GOAL_CANCEL_DISTANCE"
+        "_waypoint_hold_radius:=$SAPPO_WAYPOINT_HOLD_RADIUS"
+        "_waypoint_switch_distance:=$SAPPO_WAYPOINT_SWITCH_DISTANCE"
+        "_grid_obstacle_radius:=$SAPPO_GRID_OBSTACLE_RADIUS"
+        "_grid_edge_clearance:=$SAPPO_GRID_EDGE_CLEARANCE"
+        "_reorient_obstacle_clearance:=$SAPPO_REORIENT_OBSTACLE_CLEARANCE"
+        "_max_linear_action_step:=$SAPPO_MAX_LINEAR_ACTION_STEP"
+        "_max_linear_action_decel:=$SAPPO_MAX_LINEAR_ACTION_DECEL"
+        "_max_angular_action_step:=$SAPPO_MAX_ANGULAR_ACTION_STEP"
+        "_angular_sign_switch_threshold:=$SAPPO_ANGULAR_SIGN_SWITCH_THRESHOLD"
+        "_intermediate_goal_size:=$SAPPO_INTERMEDIATE_GOAL_TOLERANCE"
+      )
       ;;
     *)
       echo "[error] invalid SAPPO_CONTROLLER_MODE: '$SAPPO_CONTROLLER_MODE'" >&2
@@ -193,18 +156,13 @@ start_sappo() {
   python_site="$($SAPPO_PYTHON -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
   mkdir -p "$RUNTIME_DIR"
   ln -sfn "$POLICY_DIR" "$RUNTIME_DIR/policy"
+  printf -v sappo_command '%q ' "$SAPPO_PYTHON" "$sappo_entry" "${sappo_arguments[@]}"
   tmux kill-window -t "=$SESSION:sappo" 2>/dev/null || true
   tmux new-window -t "=$SESSION:" -n sappo -c "$RUNTIME_DIR" \
     "bash -lc 'source \"$WS/scripts/config/pipeline_env.sh\"; \
 until rostopic list | grep -qx /pro3/wheel_odom && rostopic list | grep -qx /pro3/rlscan; do sleep 1; done; \
 PYTHONPATH=\"$python_site:$WS/devel/lib/python3/dist-packages:/opt/ros/noetic/lib/python3/dist-packages:/usr/lib/python3/dist-packages\" \
-\"$SAPPO_PYTHON\" \"$sappo_entry\" \
-  _linear_speed_scale:=$SAPPO_SPEED \
-  _goal_size:=$SAPPO_GOAL_TOLERANCE \
-  _goal_topic:=/lste/final_goal \
-  _cmd_vel_topic:=/lste/cmd_vel/sappo \
-  _wait_for_goal:=true \
-  _allow_intermediate_goals:=true $sappo_mode_args; exec bash'"
+$sappo_command; exec bash'"
   # Point-cloud conversion and the policy process can take tens of seconds to
   # register after Gazebo has spawned the robot. Keep startup bounded, but do
   # not mistake normal initialization for a controller crash.

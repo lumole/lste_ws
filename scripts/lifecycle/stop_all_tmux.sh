@@ -22,6 +22,28 @@ tmux() { command tmux "$@" 9>&-; }
 
 SESSIONS=(lste-teleop sappo-lste lste lste-env)
 
+graceful_shutdown_metrics() {
+  # The metrics node owns the failure ring and its on_shutdown hook writes the
+  # final sample/run_stop record.  Killing the tmux session first can send a
+  # SIGHUP before rospy gets that callback, leaving an active failure episode
+  # open and making a manually stopped run impossible to audit.
+  if ! command -v rosnode >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! rosnode list 2>/dev/null | grep -qx /lste_navigation_metrics; then
+    return 0
+  fi
+  echo "[stop] Requesting a graceful shutdown of /lste_navigation_metrics"
+  timeout -k 1 3 rosnode kill /lste_navigation_metrics >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do
+    if ! rosnode list 2>/dev/null | grep -qx /lste_navigation_metrics; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "[stop] Warning: metrics node did not unregister within the bounded grace period" >&2
+}
+
 collect_residual_pids() {
   {
     pgrep -x gzclient || true
@@ -38,6 +60,9 @@ collect_residual_pids() {
     pgrep -f "$WS/scripts/lifecycle/switch_controller.sh" || true
   } | sort -nu
 }
+
+# Flush correlated failure evidence before killing the business-node session.
+graceful_shutdown_metrics
 
 for session in "${SESSIONS[@]}"; do
   if tmux has-session -t "=$session" 2>/dev/null; then

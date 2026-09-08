@@ -7,6 +7,12 @@
 
 > **文档定位**：本文件是办公楼 benchmark 的唯一计划和验收依据。第 1 至 14 节定义目标与设计，第 15 至 27 节记录当前实现和事实，第 28 节以后给出可直接执行的验收计划。静态文件“已存在”不等于端到端任务“已通过”。
 
+> **当前配置快照（2026-09-06）**：仓库当前的四个 level 都是静态场景；
+> `scripts/tests/office_building/scenarios.yaml` 和
+> `worlds/benchmark/office_building_v1_manifest.yaml` 是 level/实体的运行时权威来源。
+> 本文中关于 `dynamic_obstacle.py`、动态服务和旧 hash 的段落属于历史运行记录，
+> 不代表当前 Level 4 配置；新的实验必须以当前 manifest、现场 SHA-256 和日志为准。
+
 ## 0. 一页式总览
 
 这份文档同时承担三项职责：
@@ -153,17 +159,18 @@ worlds/benchmark/office_building_v1_level_4_no_pro3.world
 
 ### 3.2 房间连接关系
 
-建筑至少包含三类连接：
+建筑采用“主走廊 + 独立房间”的办公楼拓扑：
 
-1. 主走廊连接大厅、会议室、茶水间和打印区；
-2. 开放办公区通过较宽入口连接大厅，并有桌列形成内部通道；
-3. 储物间和目标房间位于较深分支，需要经过门洞或绕过遮挡才能进入。
+1. 大厅、开放办公区、打印区、储物间、休息区、会议室、经理办公室、茶水间和目标房间都各自拥有通向主走廊的命名门洞；
+2. 墙体在门洞以外必须连续，房间不能因为两段墙之间的空隙而直接相通；
+3. 只有开放办公区与打印区保留一扇标准宽度的员工内门，它是明确建模的服务连接，不是大面积开口；
+4. 储物间和目标房间位于较深分支，需要经过自己的门洞或绕过遮挡才能进入。
 
 应避免所有房间都只有一条直线连接。至少保留：
 
 - 一个 T 字分叉；
 - 一个 L 型转弯；
-- 一个可绕行的环路；
+- 一个由走廊和“开放办公区 - 打印区”员工内门形成的小型可绕行环路；
 - 一个看起来可走但实际是死路的分支；
 - 一个必须从门洞进入的房间；
 - 一个目标在墙后、但地图上存在绕行路线的区域。
@@ -178,7 +185,7 @@ worlds/benchmark/office_building_v1_level_4_no_pro3.world
 - 走廊中段设置一个轻微转折，而不是无限长直线；
 - 两侧有不同房间入口，入口宽度和深度略有差异；
 - 其中一个入口通往死路或储物间，避免 frontier 只根据最近距离选择错误分支；
-- 走廊末端连接另一个空间，形成可验证的环路。
+- 开放办公区与打印区的员工内门和两侧走廊门形成可验证的小型服务环路。
 
 测试重点：地图扩展、路线连续性、走廊中心行驶、目标锁定后的路径接管。
 
@@ -191,6 +198,7 @@ worlds/benchmark/office_building_v1_level_4_no_pro3.world
 - 被家具部分遮挡的门洞：需要先接近并观察，不能从远处直接把目标点当作可达点。
 
 门洞不能用不可见碰撞体制造。视觉模型和激光雷达看到的几何必须一致，否则无法判断失败来自算法还是仿真模型。
+除 manifest 中明确列出的 `office_printer_staff_door` 外，房间之间没有直接通路；每个门洞均由连续墙体两侧的门框和上方 lintel 表达。
 
 南侧 `south_entrance` 是一个例外且已明确记录：它保留门框和入口语义，但在 benchmark
 中使用可见的关闭门。机器人标准起点位于建筑内部，Gazebo 建筑外是无限地面；如果入口
@@ -768,7 +776,8 @@ dynamic_obstacle_seed: 20260827 or null
 | Navfn | move_base status/path | 房间入口路径成功，墙后不可达时有记录 | navigation log |
 | TEB | `/cmd_vel`、metrics | 连续速度、无长期摆动和非必要原地旋转 | metrics + trajectory |
 | 视觉目标 | detections/final goal | 多帧确认后锁定，干扰杯不抢占 | detector/goal log |
-| Level 4 动态 | dynamic obstacle log + model states | 模型按固定轨迹运动，服务调用成功 | dynamic log |
+| 方法契约 | `global_frontier_event` + `summary` | 至少观测到一个且只能观测到请求的方法；缺失或不一致的 trial 不进入方法均值 | summary + aggregation record |
+| Level 4 静态扩展 | global frontier log + model states | 手推车、绿植、柜子和相似杯子实体存在且有碰撞模型 | frontier/world log |
 | 任务结果 | `summary` | 指标完整，成功/失败原因可解释 | JSON 汇总 |
 
 推荐保存的证据文件名：
@@ -940,10 +949,10 @@ OFFICE_BUILDING_LEVEL=level_1 \
 
 | level | world SHA-256 |
 | --- | --- |
-| `level_1` | `d1c9d42715334e70db8e4f60ad86764e9207eca10a9f782001465b95b9f8aa74` |
-| `level_2` | `12c161a61920cdb89b39e999c6d6e9b1ffcac6409b81ad0c9ba6a02766c3212b` |
-| `level_3` | `f41f3cee4441294a9e10d2a5b8da982f526bb179d158b1e512426ad0e3d0d4d2` |
-| `level_4` | `9b63bba1d89987eeb7aff2fcf080948f049295abc97edc5ff9825560563fcc50` |
+| `level_1` | `5c55979e53b2d029939f90d3e1c1fd3324cc02aca6c354e0f5b36d6e2b56da1b` |
+| `level_2` | `6b9e2d314bf21ba568012142590a76252768a6af3d3dcbe0089cdc4dc4089d41` |
+| `level_3` | `74b43250220fdc8107c52d646abfa608fe2c8b24b9c2834b21bf93967e886ce2` |
+| `level_4` | `8b022c48d01a20a9e1551079a145e8395673b41fe15927cbadc7e1e8917c1c07` |
 
 hash 是生成器、模型引用和文件内容的联合指纹。只要修改生成器、manifest、模型坐标、材质或 XML 排序，就必须重新生成并更新本表；实验日志始终以现场计算值为准。
 
@@ -1018,6 +1027,11 @@ runtime/office_building_benchmark/logs/20260827_212613/
 
 结果是 `diagnostic_only`，不计入 Level 1 的三次重复验收，但它证明了目标模型和
 近距离接近链路本身可工作：
+
+`target_entry` 是目标房间走廊侧的隔离起点（`[19.8, 13.8, 1.57079632679]`），
+不是 manifest 中的目标真值坐标 `[21.6, 17.6]`。选择该 profile 会绕过正常的
+frontier exploration；因此这类运行只能用于快速定位感知/接近链路，结果属于
+diagnostic-only，不能作为最终 Level 4 benchmark evidence 或进入正式聚合。
 
 - 第一帧候选分数 `0.619`、框大小 `0.037 x 0.044`；下一帧分数 `0.707`，
   中心偏移 `0.024`，达到 `target_follow_confirmed`；

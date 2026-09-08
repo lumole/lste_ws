@@ -126,7 +126,7 @@ class CmdVelMuxNode:
         self.teb_turn_hint_wall = 0.0
         self.teb_last_filter_reason = "reset"
 
-    def filter_teb_angular(self, command):
+    def filter_teb_angular(self, command, allow_turn_entry_reversal=False):
         """Drop only quantization-scale opposite steering corrections.
 
         TEB remains responsible for the trajectory and obstacle response. The
@@ -149,6 +149,7 @@ class CmdVelMuxNode:
             and self.teb_last_angular_sign
             and sign != self.teb_last_angular_sign
             and magnitude < self.teb_angular_sign_switch_threshold
+            and not allow_turn_entry_reversal
         ):
             self.teb_filter_events += 1
             if (
@@ -439,7 +440,18 @@ class CmdVelMuxNode:
                 self.teb_reverse_clamp_count,
                 message.linear.x,
             )
-        command = self.filter_teb_angular(command)
+        # A negative TEB linear sample is the planner's explicit turn-entry
+        # signal when forward-only execution is enabled.  The mux has already
+        # removed that reverse component; do not then suppress the accompanying
+        # small opposite angular command as if it were corridor quantization.
+        command = self.filter_teb_angular(
+            command,
+            allow_turn_entry_reversal=(
+                self.teb_forward_only
+                and float(message.linear.x) < 0.0
+                and abs(float(command.angular.z)) > self.teb_angular_deadband
+            ),
+        )
         if self.teb_last_filter_reason != "none":
             filter_reason = self.teb_last_filter_reason
         self.forward(

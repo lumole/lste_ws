@@ -8,8 +8,6 @@ ENV_NAME="${GROUNDINGDINO_ENV_NAME:-dino}"
 if ! command -v conda >/dev/null 2>&1; then
     if [[ -x "$HOME/miniconda3/bin/conda" ]]; then
         export PATH="$HOME/miniconda3/bin:$PATH"
-    elif [[ -x "$HOME/anaconda3/bin/conda" ]]; then
-        export PATH="$HOME/anaconda3/bin:$PATH"
     else
         echo "[error] conda was not found" >&2
         exit 1

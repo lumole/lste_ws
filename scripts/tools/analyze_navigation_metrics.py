@@ -11,6 +11,7 @@ import datetime
 import json
 import math
 from pathlib import Path
+import re
 
 
 def latest_log(root):
@@ -34,6 +35,228 @@ def load_records(path):
             record["_line"] = line.rstrip()
             records.append(record)
     return records
+
+
+def load_failure_snapshots(metrics_path):
+    """Load failure artifacts, with the append-only evidence log as fallback.
+
+    A closed episode is written to ``<run>_failure_NNNN.json`` before the
+    corresponding log event.  Reading those bounded files first avoids
+    scanning a large high-rate metrics stream and, importantly, preserves the
+    direct artifact path in reports.  Older runs may only have the evidence
+    log, so its ``failure_snapshot`` record remains a compatibility source.
+    """
+    metrics_path = Path(metrics_path)
+    snapshots = {}
+    artifact_pattern = metrics_path.parent.name + "_failure_*.json"
+    artifact_name = re.compile(
+        r"^%s_failure_[0-9]{4}\.json$" % re.escape(metrics_path.parent.name)
+    )
+    for path in sorted(metrics_path.parent.glob(artifact_pattern)):
+        # The report generator writes ``*_failure_report.json`` beside the
+        # episode snapshots.  Only numbered episode artifacts are valid input
+        # here; otherwise a regenerated report is scanned as a fake episode.
+        if artifact_name.fullmatch(path.name) is None:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        failure_id = str(payload.get("failure_id", "")).strip()
+        if failure_id:
+            snapshots[failure_id] = payload
+
+    evidence_path = metrics_path.parent / (
+        metrics_path.parent.name + "_failure_evidence.log"
+    )
+    if evidence_path.is_file():
+        try:
+            stream = evidence_path.open(
+                "r", encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            stream = None
+        if stream is not None:
+            with stream:
+                for line in stream:
+                    if (
+                        " event=failure_snapshot " not in line
+                        or " data=" not in line
+                    ):
+                        continue
+                    try:
+                        payload = json.loads(line.split(" data=", 1)[1])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    failure_id = str(payload.get("failure_id", "")).strip()
+                    # Keep the full artifact when available.  ``setdefault``
+                    # makes the log a fallback for pre-artifact runs only.
+                    if failure_id:
+                        snapshots.setdefault(failure_id, payload)
+    return snapshots
+
+
+def load_startup_failure(metrics_path):
+    """Load the sibling startup-gate artifact, if this run has one."""
+    metrics_path = Path(metrics_path)
+    path = metrics_path.parent / (metrics_path.parent.name + "_startup_failure.json")
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {
+            "failure_kind": "startup_failure",
+            "artifact_path": str(path),
+            "read_error": "invalid_json",
+        }
+    return payload if isinstance(payload, dict) else {
+        "failure_kind": "startup_failure",
+        "artifact_path": str(path),
+        "read_error": "invalid_payload",
+    }
+
+
+def _compact_failure_sample(sample):
+    """Return investigator-facing fields without duplicating the full ring."""
+    if not isinstance(sample, dict):
+        return None
+    route_context = sample.get("route_context")
+    if isinstance(route_context, dict):
+        route_context = route_context.get("route", route_context)
+    result = {
+        key: sample.get(key)
+        for key in (
+            "ros_time", "wall_elapsed_seconds", "pose", "pose_frame", "goal",
+            "goal_frame", "pose_goal_frame", "pose_transform_available",
+            "distance_to_goal", "goal_source",
+            "goal_transaction_id", "cmd_vel", "teb_cmd", "teb_planner_cmd",
+            "teb_status", "teb_feedback_age_seconds", "mux_status_age_seconds",
+            "move_base_status", "scan",
+            "obstacle_clearance_threshold", "navfn_plan",
+            "navfn_path_remaining_m", "navfn_path_endpoint", "teb_feedback",
+            "channel_health",
+            "teb_turn_supervisor", "teb_turn_supervisor_last_event",
+            "teb_turn_supervisor_events",
+            "global_costmap", "local_costmap", "global_costmap_window",
+            "local_costmap_window", "move_base_feedback", "recovery",
+            "route_identity",
+            "controller", "bridge_active", "navigation_hold", "state",
+            "frontier_route_unavailable_count",
+            "frontier_route_unavailable_identity",
+            "frontier_route_unavailable_latch",
+            "frontier_route_unavailable_duration_seconds",
+        )
+        if key in sample
+    }
+    if route_context:
+        result["route"] = route_context
+    return result
+
+
+def _compact_route_context(context):
+    if not isinstance(context, dict):
+        return context
+    route = context.get("route")
+    return route if isinstance(route, dict) else context
+
+
+def _failure_snapshot_evidence(snapshot):
+    if not isinstance(snapshot, dict):
+        return None
+    return {
+        "artifact_path": snapshot.get("artifact_path"),
+        "run_context": snapshot.get("run_context"),
+        "trigger": snapshot.get("trigger"),
+        "source": snapshot.get("source"),
+        "resolution": snapshot.get("resolution"),
+        "details": snapshot.get("details"),
+        "causal_route": snapshot.get("causal_route"),
+        "diagnosis": snapshot.get("diagnosis"),
+        "diagnosis_at_trigger": snapshot.get("diagnosis_at_trigger"),
+        "diagnosis_at_end": snapshot.get("diagnosis_at_end"),
+        "route_context_at_trigger": _compact_route_context(
+            snapshot.get("route_context_at_trigger")
+        ),
+        "route_context_at_end": _compact_route_context(
+            snapshot.get("route_context_at_end")
+        ),
+        "trigger_sample": _compact_failure_sample(snapshot.get("trigger_sample")),
+        "end_sample": _compact_failure_sample(snapshot.get("end_sample")),
+        "classification_initial": snapshot.get("classification_initial"),
+        "classification_at_end": snapshot.get("classification_at_end"),
+        "sample_count": snapshot.get("sample_count", 0),
+    }
+
+
+def _technical_diagnosis(snapshot):
+    """Expose the causal reducer separately from the stored class label.
+
+    Failure artifacts are immutable.  Their historical ``classification`` may
+    have been produced by an older reducer, while ``diagnosis`` is the direct
+    command/route evidence captured at the trigger boundary.  Keeping this
+    field beside the label makes that distinction explicit to scripts and
+    humans reading a summary.
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    value = snapshot.get("diagnosis") or snapshot.get("diagnosis_at_trigger")
+    if not isinstance(value, dict):
+        return None
+    # Older artifacts could sample after GlobalFrontier cleared its active
+    # lease, leaving diagnosis.route_id=0 even though the trigger classifier
+    # retained the causal route in classification.evidence.route. Normalize
+    # that compatibility shape for human and machine summaries.
+    normalized = dict(value)
+    causal_route = snapshot.get("causal_route")
+    if not isinstance(causal_route, dict):
+        classification = snapshot.get("classification")
+        classification = classification if isinstance(classification, dict) else {}
+        evidence = classification.get("evidence")
+        causal_route = evidence.get("route") if isinstance(evidence, dict) else None
+    if not isinstance(causal_route, dict):
+        causal_route = {}
+    route_id = normalized.get("route_id")
+    try:
+        route_id_missing = route_id is None or float(route_id) <= 0.0
+    except (TypeError, ValueError):
+        route_id_missing = route_id in (None, "")
+    if route_id_missing:
+        for key in ("route_id", "active_route_id", "released_route_id"):
+            if causal_route.get(key) not in (None, "", 0, "0"):
+                normalized["route_id"] = causal_route[key]
+                break
+    if not normalized.get("route_kind"):
+        normalized["route_kind"] = (
+            causal_route.get("route_kind")
+            or causal_route.get("active_route_kind")
+            or causal_route.get("released_route_kind")
+            or (normalized.get("execution_phase") or {}).get(
+                "turn_supervisor_route_kind"
+            )
+        )
+    if not normalized.get("graph_action"):
+        normalized["graph_action"] = (
+            causal_route.get("graph_action")
+            or causal_route.get("action")
+        )
+    if not normalized.get("graph_action"):
+        details = snapshot.get("details")
+        details = details if isinstance(details, dict) else {}
+        graph_plan = details.get("graph_route_plan")
+        graph_plan = graph_plan if isinstance(graph_plan, dict) else {}
+        transaction = details.get("graph_route_action_transaction")
+        transaction = transaction if isinstance(transaction, dict) else {}
+        transaction_plan = transaction.get("plan")
+        transaction_plan = (
+            transaction_plan if isinstance(transaction_plan, dict) else {}
+        )
+        normalized["graph_action"] = (
+            graph_plan.get("action") or transaction_plan.get("action")
+        )
+    return normalized
 
 
 def finite_min(values):
@@ -340,6 +563,126 @@ def target_mission_transaction_summary(records):
     }
 
 
+def failure_episode_summary(records, snapshots=None):
+    """Rebuild correlated failure episodes from the compact metrics stream.
+
+    ``failure_started`` and ``failure_snapshot_ready`` are intentionally
+    separate events: a process can be killed during the post-window, in which
+    case the open episode is still useful evidence and is reported as
+    ``open_at_log_end`` instead of disappearing from the analysis.
+    """
+    started = {}
+    completed = {}
+    related_counts = {}
+    for record in records:
+        event = record.get("_event", "")
+        failure_id = str(record.get("failure_id", "")).strip()
+        if not failure_id:
+            continue
+        if event == "failure_started":
+            started[failure_id] = dict(record)
+        elif event == "failure_related_event":
+            related_counts[failure_id] = related_counts.get(failure_id, 0) + 1
+        elif event == "failure_snapshot_ready":
+            completed[failure_id] = dict(record)
+
+    snapshots = snapshots if isinstance(snapshots, dict) else {}
+    episodes = []
+    for failure_id, begin in started.items():
+        end = completed.get(failure_id)
+        classification = (
+            (end or {}).get("classification")
+            or ((begin.get("classification") or {}).get("label"))
+            or "unknown"
+        )
+        episode = {
+            "failure_id": failure_id,
+            "trigger": begin.get("trigger"),
+            "source": begin.get("source"),
+            "artifact_path": (
+                (snapshots.get(failure_id) or {}).get("artifact_path")
+                or (end or {}).get("artifact_path")
+            ),
+            "classification": classification,
+            "confidence": (
+                (end or {}).get("confidence")
+                or ((begin.get("classification") or {}).get("confidence"))
+                or "low"
+            ),
+            "started_wall_elapsed_seconds": begin.get(
+                "started_wall_elapsed_seconds"
+            ),
+            "ended_wall_elapsed_seconds": (
+                None if end is None else end.get("ended_wall_elapsed_seconds")
+            ),
+            "duration_seconds": (
+                None if end is None else end.get("duration_seconds")
+            ),
+            "sample_count": 0 if end is None else end.get("sample_count", 0),
+            "related_event_count": related_counts.get(failure_id, 0),
+            "status": "open_at_log_end" if end is None else "closed",
+        }
+        evidence = _failure_snapshot_evidence(snapshots.get(failure_id))
+        if evidence is not None:
+            episode["evidence"] = evidence
+            diagnosis = _technical_diagnosis(snapshots.get(failure_id))
+            if diagnosis is not None:
+                episode["technical_diagnosis"] = diagnosis
+        elif isinstance((end or {}).get("diagnosis"), dict):
+            episode["technical_diagnosis"] = dict(end["diagnosis"])
+        episodes.append(episode)
+
+    # A snapshot can survive even if the compact start event was lost during
+    # startup ordering. Keep it visible rather than silently dropping it.
+    for failure_id, end in completed.items():
+        if failure_id in started:
+            continue
+        episode = {
+            "failure_id": failure_id,
+            "trigger": end.get("trigger"),
+            "source": end.get("source"),
+            "artifact_path": (
+                (snapshots.get(failure_id) or {}).get("artifact_path")
+                or end.get("artifact_path")
+            ),
+            "classification": end.get("classification", "unknown"),
+            "confidence": end.get("confidence", "low"),
+            "started_wall_elapsed_seconds": None,
+            "ended_wall_elapsed_seconds": end.get("ended_wall_elapsed_seconds"),
+            "duration_seconds": end.get("duration_seconds"),
+            "sample_count": end.get("sample_count", 0),
+            "related_event_count": related_counts.get(failure_id, 0),
+            "status": "closed_without_start_event",
+        }
+        evidence = _failure_snapshot_evidence(snapshots.get(failure_id))
+        if evidence is not None:
+            episode["evidence"] = evidence
+            diagnosis = _technical_diagnosis(snapshots.get(failure_id))
+            if diagnosis is not None:
+                episode["technical_diagnosis"] = diagnosis
+        elif isinstance(end.get("diagnosis"), dict):
+            episode["technical_diagnosis"] = dict(end["diagnosis"])
+        episodes.append(episode)
+
+    episodes.sort(
+        key=lambda item: (
+            item.get("started_wall_elapsed_seconds") is None,
+            item.get("started_wall_elapsed_seconds") or float("inf"),
+        )
+    )
+    by_classification = {}
+    for episode in episodes:
+        label = str(episode.get("classification", "unknown"))
+        by_classification[label] = by_classification.get(label, 0) + 1
+    return {
+        "episode_count": len(episodes),
+        "closed_count": sum(item["status"] == "closed" for item in episodes),
+        "open_count": sum(item["status"] == "open_at_log_end" for item in episodes),
+        "by_classification": dict(sorted(by_classification.items())),
+        "episodes": episodes,
+    }
+
+
 def summarize(path):
     raw_records = load_records(path)
     completion_record = next(
@@ -454,6 +797,10 @@ def summarize(path):
         source = str(record.get("goal_source", "unknown"))
         source_counts[source] = source_counts.get(source, 0) + 1
     target_mission_transactions = target_mission_transaction_summary(records)
+    failure_evidence = failure_episode_summary(
+        raw_records, load_failure_snapshots(path)
+    )
+    startup_failure = load_startup_failure(path)
 
     replacement_counts = {}
     for record in bridge_events:
@@ -558,6 +905,12 @@ def summarize(path):
         "goal_delta_mean_m": last.get("goal_delta_mean"),
         "goal_change_sources": source_counts,
         "target_mission_transactions": target_mission_transactions,
+        "failure_evidence": failure_evidence,
+        "startup_failure": startup_failure,
+        "failure_evidence_log": (
+            (last.get("failure_evidence") or {}).get("failure_log_path")
+            or run_start.get("failure_evidence_log")
+        ),
         "goal_transition_counts": last.get("goal_transition_counts", {}),
         "goal_transition_brake_events": last.get(
             "goal_transition_brake_events", {}
@@ -603,6 +956,12 @@ def summarize(path):
         ),
         "move_base_task_done_preemptions": last.get(
             "move_base_task_done_preemptions", 0
+        ),
+        "move_base_route_recovery_preemptions": last.get(
+            "move_base_route_recovery_preemptions", 0
+        ),
+        "move_base_route_recovery_preemption_reasons": last.get(
+            "move_base_route_recovery_preemption_reasons", {}
         ),
         "move_base_unexpected_preemptions": last.get(
             "move_base_unexpected_preemptions", 0
@@ -929,10 +1288,11 @@ def print_human(result):
     print("  persistent plans: %s" % json.dumps(
         result["persistent_plan"], sort_keys=True
     ))
-    print("  actions: observed=%s bridge_dispatches=%s success=%s raw_preempt=%s observation_preempt=%s settle_preempt=%s continuous_preempt=%s segment_preempt=%s priority_preempt=%s done_preempt=%s unexpected_preempt=%s abort=%s bridge_deferred=%s" % (
+    print("  actions: observed=%s bridge_dispatches=%s success=%s raw_preempt=%s route_recovery_preempt=%s observation_preempt=%s settle_preempt=%s continuous_preempt=%s segment_preempt=%s priority_preempt=%s done_preempt=%s unexpected_preempt=%s abort=%s bridge_deferred=%s" % (
         result["move_base_observed_actions"], result["move_base_bridge_dispatches"],
         result["move_base_successes"],
         result["move_base_preemptions"],
+        result["move_base_route_recovery_preemptions"],
         result["move_base_frontier_observation_preemptions"],
         result["move_base_frontier_terminal_settle_preemptions"],
         result["move_base_frontier_continuous_prefetch_preemptions"],
@@ -1032,6 +1392,71 @@ def print_human(result):
         result["controller_mode"], result["goal_source"], result["task_done"],
     ))
     print("  bridge events: %s" % json.dumps(result["bridge_event_counts"], sort_keys=True))
+    failure_evidence = result.get("failure_evidence") or {}
+    print("  failure evidence: episodes=%s closed=%s open=%s classes=%s" % (
+        failure_evidence.get("episode_count", 0),
+        failure_evidence.get("closed_count", 0),
+        failure_evidence.get("open_count", 0),
+        json.dumps(failure_evidence.get("by_classification", {}), sort_keys=True),
+    ))
+    for episode in failure_evidence.get("episodes", []):
+        print(
+            "    %s t=%s trigger=%s class=%s confidence=%s status=%s related=%s"
+            % (
+                episode.get("failure_id"),
+                episode.get("started_wall_elapsed_seconds"),
+                episode.get("trigger"),
+                episode.get("classification"),
+                episode.get("confidence"),
+                episode.get("status"),
+                episode.get("related_event_count", 0),
+            )
+        )
+        diagnosis = episode.get("technical_diagnosis") or {}
+        if diagnosis:
+            print(
+                "     technical_diagnosis: cause=%s layer=%s route=%s "
+                "action=%s confidence=%s"
+                % (
+                    diagnosis.get("primary_cause"),
+                    diagnosis.get("layer"),
+                    diagnosis.get("route_id"),
+                    diagnosis.get("graph_action"),
+                    diagnosis.get("confidence"),
+                )
+            )
+        evidence = episode.get("evidence") or {}
+        trigger = evidence.get("trigger_sample") or {}
+        if trigger:
+            print(
+                "     现场: pose=%s goal=%s dist=%s teb=%s navfn_remaining=%s "
+                "scan_forward=%s cmd=%s route=%s artifact=%s"
+                % (
+                    trigger.get("pose"),
+                    trigger.get("goal"),
+                    trigger.get("distance_to_goal"),
+                    trigger.get("teb_status"),
+                    trigger.get("navfn_path_remaining_m"),
+                    (trigger.get("scan") or {}).get("forward_min"),
+                    trigger.get("cmd_vel"),
+                    evidence.get("route_context_at_trigger"),
+                    evidence.get("artifact_path"),
+                )
+            )
+    startup_failure = result.get("startup_failure")
+    if startup_failure:
+        readiness = startup_failure.get("readiness") or {}
+        print(
+            "  startup failure: id=%s reason=%s readiness=%s elapsed=%s s "
+            "artifact=%s"
+            % (
+                startup_failure.get("failure_id"),
+                startup_failure.get("reason"),
+                readiness.get("readiness_last_state") or readiness.get("reason"),
+                readiness.get("elapsed_wall_seconds"),
+                startup_failure.get("artifact_path"),
+            )
+        )
 
 
 COMPARE_FIELDS = [
@@ -1041,6 +1466,7 @@ COMPARE_FIELDS = [
     ("observed actions", "move_base_observed_actions"),
     ("bridge dispatches", "move_base_bridge_dispatches"),
     ("preemptions", "move_base_preemptions"),
+    ("route recovery preemptions", "move_base_route_recovery_preemptions"),
     ("continuous handoffs", "bridge_frontier_continuous_prefetch_handoffs"),
     ("continuous fallbacks", "bridge_frontier_continuous_prefetch_fallbacks"),
     ("preemption ratio", "preemption_ratio"),
@@ -1209,6 +1635,11 @@ def main():
         help="print the raw goal/brake/flip/dispatch event trace for a log",
     )
     parser.add_argument(
+        "--failures",
+        action="store_true",
+        help="print correlated failure IDs plus trigger/end evidence",
+    )
+    parser.add_argument(
         "--compare",
         nargs=2,
         type=Path,
@@ -1233,6 +1664,13 @@ def main():
         diagnose(path)
         return
     result = summarize(path)
+    if args.failures:
+        evidence = result.get("failure_evidence") or {}
+        print(json.dumps({
+            "startup_failure": result.get("startup_failure"),
+            "episodes": evidence,
+        }, indent=2, sort_keys=True))
+        return
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:

@@ -6,6 +6,7 @@
   <!-- +pi/2: Pro3 forward axis points along the world +Y axis. -->
   <arg name="yaw" default="1.57079632679"/>
   <arg name="robot_description_path" default="$(find pja)/urdf/pro3.xacro"/>
+  <arg name="benchmark_contact_sensor" default="false"/>
   <!-- 控制是否真的向 Gazebo spawn 模型，false 时仍然加载 robot_description + rsp -->
   <arg name="spawn_model" default="true"/>
   <!-- robot_description, robot_state_publisher and the LiDAR-frame alias are
@@ -16,7 +17,7 @@
 
   <group ns="$(arg robot_name)" if="$(arg start_support_nodes)">
     <param name="robot_description"
-           command="$(find xacro)/xacro '$(arg robot_description_path)' ns:=$(arg robot_name)" />
+           command="$(find xacro)/xacro '$(arg robot_description_path)' ns:=$(arg robot_name) benchmark_contact_sensor:=$(arg benchmark_contact_sensor)" />
 
     <node pkg="robot_state_publisher"
           type="robot_state_publisher"

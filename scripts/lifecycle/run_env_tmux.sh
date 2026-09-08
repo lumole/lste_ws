@@ -33,22 +33,7 @@ fi
 tmux() { command tmux "$@" 9>&-; }
 PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}
 if [[ -f "$PIPELINE_CONFIG" ]]; then
-  eval "$(
-    python - "$PIPELINE_CONFIG" <<'PY' || true
-import sys
-import shlex
-path = sys.argv[1]
-try:
-    import yaml
-except ImportError:
-    sys.exit(0)
-with open(path, 'r', encoding='utf-8') as f:
-    data = yaml.safe_load(f) or {}
-for k, v in data.items():
-    if isinstance(v, (str, int, float)):
-        print(f'CFG_{k}={shlex.quote(str(v))}')
-PY
-  )"
+  eval "$("$WS/scripts/config/load_pipeline_config.sh" "$PIPELINE_CONFIG")"
 fi
 _resolve() {
   local val="$1"
@@ -60,6 +45,15 @@ _resolve() {
 }
 
 WORLD=${WORLD:-$(_resolve "${CFG_WORLD:-worlds/place1.world}")}
+GAZEBO_RANDOM_SEED=${GAZEBO_RANDOM_SEED:-${CFG_GAZEBO_RANDOM_SEED:-}}
+GAZEBO_EXTRA_ARGS=""
+if [[ -n "$GAZEBO_RANDOM_SEED" ]]; then
+  if [[ ! "$GAZEBO_RANDOM_SEED" =~ ^[0-9]+$ ]]; then
+    echo "[error] GAZEBO_RANDOM_SEED must be a non-negative integer." >&2
+    exit 1
+  fi
+  GAZEBO_EXTRA_ARGS="--seed $GAZEBO_RANDOM_SEED"
+fi
 GUI=true
 GUI_PLUGIN="$WS/devel/lib/libgazebo_click_point.so"
 
@@ -100,8 +94,9 @@ LSTE_WORLD=\"$WORLD\" exec rosrun gazebo_ros gzclient --gui-client-plugin \"$GUI
 # ---- Session 管理 ----
 if tmux has-session -t "=$SESSION" 2>/dev/null; then
   EXISTING_WORLD="$(tmux show-environment -t "=$SESSION" 2>/dev/null | awk -F= '/^LSTE_WORLD=/{print substr($0,length("LSTE_WORLD=")+1)}')"
-  if [[ -n "$EXISTING_WORLD" && "$EXISTING_WORLD" != "$WORLD" ]]; then
-    echo "[info] WORLD changed ($EXISTING_WORLD → $WORLD), restarting session."
+  EXISTING_SEED="$(tmux show-environment -t "=$SESSION" 2>/dev/null | awk -F= '/^LSTE_GAZEBO_SEED=/{print substr($0,length("LSTE_GAZEBO_SEED=")+1)}')"
+  if [[ -n "$EXISTING_WORLD" && ( "$EXISTING_WORLD" != "$WORLD" || "$EXISTING_SEED" != "$GAZEBO_RANDOM_SEED" ) ]]; then
+    echo "[info] WORLD or Gazebo seed changed, restarting session."
     tmux kill-session -t "=$SESSION"
   else
     if ! gazebo_gui_ready; then
@@ -121,18 +116,24 @@ fi
 tmux new-session -d -s "$SESSION" -c "$WS" -n "roscore" \
   "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/config/pipeline_env.sh\"; roscore'; echo; echo '[EXIT] roscore'; exec bash"
 tmux set-environment -t "=$SESSION" LSTE_WORLD "$WORLD"
+tmux set-environment -t "=$SESSION" LSTE_GAZEBO_SEED "$GAZEBO_RANDOM_SEED"
 tmux set-option -t "=$SESSION:" remain-on-exit on
 echo "[env] roscore started (window 0)"
 
 WAIT_ROSCORE='until rostopic list >/dev/null 2>&1; do echo \"waiting for roscore...\"; sleep 1; done'
 
 # Window 1: Gazebo 场景（不含 pro3，用 _no_pro3.world）
-tmux new-window -t "=$SESSION:1" -n "world" -c "$WS" \
-  "bash -lc 'WS=\"$WS\"; source \"$WS/scripts/config/pipeline_env.sh\"; \
-$WAIT_ROSCORE; \
-roslaunch lste_core lab_with_pro3.launch world_name:=$WORLD spawn_pro3:=false gui:=$GUI; \
-echo \"[world] roslaunch exited, sleeping to keep window alive...\"; sleep 86400'; \
-echo; echo '[EXIT] world'; exec bash"
+# Keep each launch argument as a single shell word.  In particular,
+# ``extra_gazebo_args`` may be "--seed N"; interpolating it into the tmux
+# command used to split it into two roslaunch arguments and leave runall
+# waiting forever for Gazebo's spawn service.
+printf -v WORLD_QUOTED '%q' "$WORLD"
+printf -v PIPELINE_ENV_QUOTED '%q' "$WS/scripts/config/pipeline_env.sh"
+printf -v GAZEBO_ARGS_QUOTED '%q' "$GAZEBO_EXTRA_ARGS"
+WORLD_COMMAND="WS=$(printf '%q' "$WS"); source $PIPELINE_ENV_QUOTED; $WAIT_ROSCORE; export LIBGL_ALWAYS_SOFTWARE=1; lste_gazebo_exec roslaunch lste_core lab_with_pro3.launch world_name:=$WORLD_QUOTED spawn_pro3:=false gui:=$GUI extra_gazebo_args:=$GAZEBO_ARGS_QUOTED"
+printf -v WORLD_COMMAND_QUOTED '%q' "$WORLD_COMMAND"
+tmux new-window -d -t "=$SESSION" -n "world" -c "$WS" \
+  "bash -lc $WORLD_COMMAND_QUOTED"
 echo "[env] Gazebo world started (window 1)"
 
 echo ""

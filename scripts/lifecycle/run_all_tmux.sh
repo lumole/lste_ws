@@ -3,6 +3,10 @@ set -euo pipefail
 
 WS="${LSTE_WS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 export LSTE_NO_ATTACH=1
+PIPELINE_CONFIG="${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}"
+if [[ -f "$PIPELINE_CONFIG" ]]; then
+  eval "$(LSTE_WS="$WS" "$WS/scripts/config/load_pipeline_config.sh" "$PIPELINE_CONFIG")"
+fi
 
 # A complete startup spans the environment and node sessions.  Serialize that
 # sequence so two quick `runall` invocations cannot both observe a missing
@@ -35,23 +39,38 @@ fi
 "$WS/scripts/lifecycle/run_env_tmux.sh"
 
 nodes_session_ready() {
-  local window node
+  local window node global_frontier_enabled
+  global_frontier_enabled="${GLOBAL_FRONTIER_ENABLED:-${CFG_GLOBAL_FRONTIER_ENABLED:-true}}"
   for window in goal teb_nav controller_switch cmd_vel_mux health; do
     tmux list-windows -t "=lste" -F '#{window_name}' 2>/dev/null | grep -qx "$window" || return 1
   done
   for node in /lste_goal_manager /lste_teb_goal_bridge /lste_controller_switch /lste_cmd_vel_mux /move_base; do
     rosnode list 2>/dev/null | grep -qx "$node" || return 1
   done
+  if [[ "${global_frontier_enabled,,}" == "true" \
+      || "$global_frontier_enabled" == "1" ]]; then
+    rosnode list 2>/dev/null | grep -qx /lste_global_frontier || return 1
+  fi
 }
 
 all_nodes_ready() {
-  local node
-  for node in \
+  local node global_frontier_enabled
+  global_frontier_enabled="${GLOBAL_FRONTIER_ENABLED:-${CFG_GLOBAL_FRONTIER_ENABLED:-true}}"
+  local required_nodes=(
     /lste_task_node /lste_prompt_node /lste_det_node \
     /lste_score_node /lste_state_node /lste_det_vis_node /oc_srfc_proj \
-    /lste_global_frontier /lste_teb_goal_bridge /lste_teb_turn_supervisor \
+    /lste_teb_goal_bridge /lste_teb_turn_supervisor \
     /lste_controller_switch /lste_cmd_vel_mux /lste_health_audit \
-    /lste_navigation_metrics /move_base /teleop_twist_keyboard_reset; do
+    /lste_navigation_metrics /move_base /teleop_twist_keyboard_reset
+  )
+  # Diagnostic target-entry runs keep SLAM and the controller but deliberately
+  # omit the exploration executive. Do not wait 300 s for a node that the
+  # selected profile explicitly disabled.
+  if [[ "${global_frontier_enabled,,}" == "true" \
+      || "$global_frontier_enabled" == "1" ]]; then
+    required_nodes+=(/lste_global_frontier)
+  fi
+  for node in "${required_nodes[@]}"; do
     rosnode list 2>/dev/null | grep -qx "$node" || return 1
   done
 }

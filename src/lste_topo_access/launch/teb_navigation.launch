@@ -18,6 +18,7 @@
        explicitly set it false. -->
   <arg name="require_intent" default="true"/>
   <arg name="terminal_topic" default="/lste/teb_goal_terminal"/>
+  <arg name="terminal_contract_topic" default="/lste/teb_goal_terminal_contract"/>
   <arg name="target_failure_topic" default="/lste/teb_goal_failure"/>
   <arg name="frontier_status_topic" default="/lste/global_frontier/status"/>
   <arg name="navfn_plan_topic" default="/move_base/NavfnROS/plan"/>
@@ -30,12 +31,12 @@
        stays on the validated single-band route until the recovery supervisor
        below can hand off a blocked route without a stop/restart race. -->
   <arg name="teb_homotopy_class_planning" default="false"/>
-  <!-- Convert dense local-costmap occupancy cells into clustered convex
-       obstacles before TEB optimizes. Set the value to ``disabled`` for the
-       raw local-costmap comparison, which deliberately omits this parameter.
-       The line-converter variant was rejected because it crashes the installed
-       Noetic move_base process in this setup. -->
-  <arg name="teb_costmap_converter_plugin" default="costmap_converter::CostmapToPolygonsDBSMCCH"/>
+  <!-- The raw rolling costmap is the production obstacle representation.
+       The DBSMCCH converter remains available for an explicit A/B, but its
+       polygons were observed to make TEB stall near a valid endpoint in the
+       compact T-junction world. The line-converter variant is not supported
+       by this Noetic installation because it crashes move_base. -->
+  <arg name="teb_costmap_converter_plugin" default="disabled"/>
   <!-- Keep the initial production experiment single-threaded while isolating
        converter behavior. Conversion at 5 Hz remains below the 20 Hz control
        loop. -->
@@ -43,6 +44,10 @@
   <!-- The local costmap updates at 10 Hz. Five Hz provides fresh wall
        geometry without making TEB chase every individual scan update. -->
   <arg name="teb_costmap_converter_rate" default="5"/>
+  <!-- The polygon converter and the raw costmap are alternative obstacle
+       representations for a focused A/B. Production uses the raw costmap;
+       polygon-only runs set this false explicitly. -->
+  <arg name="teb_include_costmap_obstacles" default="true"/>
   <!-- endpoint_action uses the established action-per-route lifecycle.
        persistent_stream is an opt-in plugin architecture that keeps one
        execution lease while Navfn/TEB receive fresh mission paths. -->
@@ -84,6 +89,10 @@
   <arg name="persistent_installed_target_command_topic" default="/lste/persistent_execution/installed_target_command"/>
   <arg name="base_global_planner" default="navfn/NavfnROS"/>
   <arg name="base_local_planner" default="teb_local_planner/TebLocalPlannerROS"/>
+  <!-- Production keeps the historical respawn behavior. Focused diagnostic
+       launchers can disable it so one startup dependency failure produces one
+       bounded artifact instead of a respawn storm. -->
+  <arg name="move_base_respawn" default="true"/>
   <arg name="planner_frequency" default="0.0"/>
   <arg name="persistent_plan_equivalence_distance" default="0.25"/>
   <!-- Goal Manager already filters ordinary frontier updates. This smaller
@@ -180,7 +189,7 @@
   <arg name="frontier_stale_recovery_grace" default="4.0"/>
   <arg name="frontier_stale_recovery_max_distance" default="1.50"/>
 
-  <node pkg="move_base" type="move_base" name="move_base" output="screen" respawn="true">
+  <node pkg="move_base" type="move_base" name="move_base" output="screen" respawn="$(arg move_base_respawn)">
     <!-- TEB is never a second /cmd_vel publisher. The LSTE mux selects this
          stream only when /lste/controller_mode is teb. -->
     <!-- Keep TEB's raw planner stream separate. The turn supervisor below
@@ -205,6 +214,7 @@
     <param name="persistent_frontier_admission_endpoint_epsilon" value="$(arg persistent_frontier_admission_endpoint_epsilon)"/>
     <param name="persistent_frontier_curve_handoff_max_heading_deg" value="$(arg persistent_frontier_curve_handoff_max_heading_deg)"/>
     <param name="persistent_task_done_topic" value="/lste/task_done"/>
+    <param name="persistent_mission_command_topic" value="$(arg persistent_mission_command_topic)"/>
     <param name="persistent_installed_target_goal_topic" value="/lste/persistent_execution/installed_target_goal"/>
     <param name="persistent_target_approach_topic" value="/lste/persistent_execution/target_approach"/>
     <param name="persistent_target_plan_result_topic" value="/lste/persistent_execution/target_plan_result"/>
@@ -380,7 +390,7 @@
     <param name="TebLocalPlannerROS/obstacle_proximity_ratio_max_vel" value="0.40"/>
     <param name="TebLocalPlannerROS/obstacle_proximity_lower_bound" value="0.35"/>
     <param name="TebLocalPlannerROS/obstacle_proximity_upper_bound" value="1.20"/>
-    <param name="TebLocalPlannerROS/include_costmap_obstacles" value="true"/>
+    <param name="TebLocalPlannerROS/include_costmap_obstacles" value="$(arg teb_include_costmap_obstacles)"/>
     <param name="TebLocalPlannerROS/include_dynamic_obstacles" value="false"/>
     <!-- Static indoor geometry is represented as clustered convex obstacles
          instead of a dense cloud of occupied cells. This changes only TEB's obstacle
@@ -427,6 +437,7 @@
     <param name="require_intent" value="$(arg require_intent)"/>
     <param name="bridge_status_topic" value="/lste/teb_goal_bridge/status"/>
     <param name="terminal_topic" value="$(arg terminal_topic)"/>
+    <param name="terminal_contract_topic" value="$(arg terminal_contract_topic)"/>
     <param name="target_failure_topic" value="$(arg target_failure_topic)"/>
     <param name="global_frame" value="$(arg global_frame)"/>
     <param name="initial_mode" value="$(arg controller_mode)"/>
@@ -515,7 +526,12 @@
          external stalled-route rotation is retained only for a controlled
          comparison: it can complete its yaw phase while TEB still rejects the
          subsequent band, so it must not become a second local controller. -->
-    <param name="stalled_route_reorientation_enabled" value="false"/>
+    <!-- When TEB has a valid global path but emits a persistent near-zero
+         command because its first tangent is behind the base, let the
+         execution adapter perform one bounded in-place turn. This keeps the
+         recovery in the controller layer and prevents move_base from spending
+         every recovery behavior inside the same room. -->
+    <param name="stalled_route_reorientation_enabled" value="true"/>
     <param name="stalled_route_reorientation_delay" value="0.80"/>
     <param name="stalled_route_reorientation_heading_deg" value="45.0"/>
     <param name="stalled_route_reorientation_linear" value="0.03"/>

@@ -18,6 +18,7 @@ PersistentTebLocalPlanner::PersistentTebLocalPlanner()
       has_installed_target_goal_(false),
       has_reported_target_goal_(false),
       has_reported_frontier_goal_(false),
+      terminal_hold_active_(false),
       reported_frontier_route_version_(0),
       target_goal_epsilon_(0.05),
       frontier_endpoint_equivalence_distance_(0.05),
@@ -28,7 +29,9 @@ PersistentTebLocalPlanner::PersistentTebLocalPlanner()
       plan_installed_count_(0),
       route_version_(0),
       route_geometry_hash_(0),
-      installed_target_transaction_(0) {}
+      installed_target_transaction_(0),
+      latest_mission_transaction_(0),
+      installed_mission_transaction_(0) {}
 
 void PersistentTebLocalPlanner::initialize(
     std::string name, tf2_ros::Buffer* tf,
@@ -102,6 +105,13 @@ void PersistentTebLocalPlanner::initialize(
   teb_.initialize("TebLocalPlannerROS", tf, costmap_ros);
   task_done_subscriber_ = private_nh.subscribe(
       task_done_topic, 1, &PersistentTebLocalPlanner::onTaskDone, this);
+  std::string mission_command_topic;
+  ros::param::param<std::string>(
+      "/move_base/persistent_mission_command_topic", mission_command_topic,
+      "/lste/persistent_execution/mission_command");
+  mission_command_subscriber_ = private_nh.subscribe(
+      mission_command_topic, 1, &PersistentTebLocalPlanner::onMissionCommand,
+      this);
   installed_target_command_subscriber_ = private_nh.subscribe(
       installed_target_command_topic, 1,
       &PersistentTebLocalPlanner::onInstalledTargetCommand, this);
@@ -133,7 +143,11 @@ bool PersistentTebLocalPlanner::setPlan(
     // geometrically covered by it; a changed endpoint or a real detour still
     // installs immediately. Local costmap collision checking remains in TEB's
     // 20 Hz compute cycle, independently of this global-path gate.
-    if (persistent_execution_ && planIsEquivalentLocked(plan)) {
+    const bool mission_transaction_pending = persistent_execution_ &&
+        latest_mission_transaction_.load(std::memory_order_acquire) >
+            installed_mission_transaction_.load(std::memory_order_acquire);
+    if (persistent_execution_ && !mission_transaction_pending &&
+        planIsEquivalentLocked(plan)) {
       plan_equivalent_count_.fetch_add(1, std::memory_order_relaxed);
       retained_equivalent = true;
       const ros::WallTime now = ros::WallTime::now();
@@ -174,6 +188,12 @@ bool PersistentTebLocalPlanner::setPlan(
     // holding the same mutex used by the reporter, so it cannot associate a
     // new goal with the preceding path version.
     route_version_.fetch_add(1, std::memory_order_relaxed);
+    installed_mission_transaction_.store(
+        latest_mission_transaction_.load(std::memory_order_acquire),
+        std::memory_order_release);
+    // A newly installed route owns the controller again. Equivalent Navfn
+    // refreshes deliberately retain the hold above and do not reset TEB.
+    terminal_hold_active_.store(false, std::memory_order_release);
   }
   plan_installed_count_.fetch_add(1, std::memory_order_relaxed);
   route_geometry_hash_.store(geometryHash(plan), std::memory_order_relaxed);
@@ -299,6 +319,29 @@ bool PersistentTebLocalPlanner::computeVelocityCommands(
   if (!persistent_execution_ || task_done_.load()) {
     return command_available;
   }
+  // Endpoint ownership has already been transferred to the graph. Keep the
+  // MoveBase action healthy while the graph commits a successor route. This
+  // prevents a transient TEB false result at the old endpoint from entering
+  // recovery; a real successor clears the hold in setPlan/onMissionCommand.
+  if (terminal_hold_active_.load(std::memory_order_acquire)) {
+    if (isInstalledTargetPlanLocked()) {
+      reportTargetApproachIfReady();
+    } else {
+      reportFrontierEndpointIfReady();
+    }
+    cmd_vel = geometry_msgs::Twist();
+    return true;
+  }
+  // A newer mission transaction has arrived, but move_base has not yet handed
+  // its corresponding Navfn path to this plugin. The previous path may already
+  // be inside its XY tolerance; do not report that stale endpoint as the new
+  // route's terminal. Keep the action healthy until setPlan installs the
+  // transaction-bound route.
+  if (persistent_execution_ &&
+      latest_mission_transaction_.load(std::memory_order_acquire) >
+          installed_mission_transaction_.load(std::memory_order_acquire)) {
+    return command_available;
+  }
   // TEB returns false at every XY terminal. In the persistent architecture an
   // action is a lease for the whole mission, so both a temporary frontier and
   // a target approach must keep move_base's control loop healthy while the
@@ -329,6 +372,15 @@ bool PersistentTebLocalPlanner::isGoalReached() {
   if (task_done_.load()) {
     return true;
   }
+  if (persistent_execution_ &&
+      latest_mission_transaction_.load(std::memory_order_acquire) >
+          installed_mission_transaction_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  if (terminal_hold_active_.load(std::memory_order_acquire)) {
+    // The action remains a mission lease until a successor route is installed.
+    return false;
+  }
   if (teb_.isGoalReached()) {
     if (isInstalledTargetPlanLocked()) {
       reportTargetApproachIfReady();
@@ -347,6 +399,10 @@ bool PersistentTebLocalPlanner::reportFrontierEndpointIfReady() {
   uint64_t route_version = 0;
   {
     std::lock_guard<std::mutex> lock(plan_mutex_);
+    if (latest_mission_transaction_.load(std::memory_order_acquire) >
+        installed_mission_transaction_.load(std::memory_order_acquire)) {
+      return false;
+    }
     if (current_plan_goal_.header.frame_id.empty()) {
       return false;
     }
@@ -361,6 +417,7 @@ bool PersistentTebLocalPlanner::reportFrontierEndpointIfReady() {
     has_reported_frontier_goal_ = true;
     endpoint = current_plan_goal_;
     endpoint.header.stamp = ros::Time::now();
+    terminal_hold_active_.store(true, std::memory_order_release);
   }
   frontier_endpoint_publisher_.publish(endpoint);
   ROS_INFO_STREAM(
@@ -406,6 +463,7 @@ bool PersistentTebLocalPlanner::reportTargetApproachIfReady() {
     approach = installed_target_goal_;
     approach.header.stamp = ros::Time::now();
     transaction_id = installed_target_transaction_;
+    terminal_hold_active_.store(true, std::memory_order_release);
     if (already_reported) {
       return true;
     }
@@ -433,8 +491,48 @@ void PersistentTebLocalPlanner::onTaskDone(
   task_done_.store(message->data);
 }
 
+void PersistentTebLocalPlanner::onMissionCommand(
+    const PersistentGoalCommandConstPtr& message) {
+  if (message->kind != PersistentGoalCommand::KIND_MISSION ||
+      message->transaction_id == 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(plan_mutex_);
+  if (message->transaction_id == latest_mission_transaction_) {
+    return;
+  }
+  // A new mission transaction may reuse the exact same Navfn geometry (for
+  // example, a second Portal probe at the same endpoint).  Path equivalence
+  // must not suppress that transaction's endpoint report.
+  latest_mission_transaction_ = message->transaction_id;
+  has_reported_frontier_goal_ = false;
+  reported_frontier_route_version_ = 0;
+  terminal_hold_active_.store(false, std::memory_order_release);
+}
+
 void PersistentTebLocalPlanner::onInstalledTargetCommand(
     const PersistentGoalCommandConstPtr& message) {
+  if (message->kind == PersistentGoalCommand::KIND_CLEAR) {
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    const uint32_t sequence = message->transaction_id;
+    // A clear is a tombstone for both provisional and already-installed
+    // target plans.  It may arrive from the StreamingNavfnPlanner after a
+    // target-plan failure, so the local planner must stop classifying the
+    // cached route as a semantic target immediately.
+    if (sequence > 0 && installed_target_transaction_ > sequence) {
+      ROS_DEBUG_STREAM("PersistentTebLocalPlanner ignored stale target clear "
+                       << sequence << " < "
+                       << installed_target_transaction_);
+      return;
+    }
+    has_installed_target_goal_ = false;
+    installed_target_transaction_ = 0;
+    has_reported_target_goal_ = false;
+    terminal_hold_active_.store(false, std::memory_order_release);
+    ROS_INFO_STREAM("PersistentTebLocalPlanner cleared installed target "
+                    << "transaction=" << sequence);
+    return;
+  }
   if (message->kind != PersistentGoalCommand::KIND_TARGET_INSTALLED ||
       message->transaction_id == 0) {
     return;
@@ -451,6 +549,7 @@ void PersistentTebLocalPlanner::onInstalledTargetCommand(
   has_installed_target_goal_ = true;
   if (changed_target) {
     has_reported_target_goal_ = false;
+    terminal_hold_active_.store(false, std::memory_order_release);
   }
 }
 
@@ -828,19 +927,41 @@ void StreamingNavfnPlanner::onTargetCommand(
     // The bridge publishes this tombstone after a target transaction resolves
     // or is superseded. It clears the latched request for a hot move_base
     // restart and prevents repeated validation of an old visual ray.
-    if (sequence > 0 && latest_target_sequence_ > sequence) {
+    const uint32_t clear_sequence =
+        sequence > 0 ? sequence : latest_target_sequence_;
+    if (clear_sequence > 0 && latest_target_sequence_ > clear_sequence) {
       ROS_DEBUG_STREAM("StreamingNavfnPlanner ignored stale target clear "
-                       << sequence << " < " << latest_target_sequence_);
+                       << clear_sequence << " < " << latest_target_sequence_);
       return;
     }
     has_target_goal_ = false;
-    // Keep a just-validated candidate until its matching mission transaction
-    // arrives. The two publishers are independent ROS connections, so their
-    // delivery order is not guaranteed even though the bridge emits approval
-    // before this tombstone.
+    has_validated_target_plan_ = false;
+    validated_target_sequence_ = 0;
+    if (clear_sequence == 0 ||
+        active_target_mission_sequence_ <= clear_sequence) {
+      has_active_target_mission_ = false;
+      active_target_mission_sequence_ = 0;
+    }
+    // Retain the largest rejected sequence as a planner-side tombstone.  A
+    // latched target request with this identity can be delivered again after
+    // a hot restart, but it must not trigger another Navfn search.
+    failed_target_sequence_ = std::max(failed_target_sequence_, clear_sequence);
+    latest_target_sequence_ = std::max(latest_target_sequence_, clear_sequence);
+    // Invalidation is terminal for this target identity. The bridge emits the
+    // clear after any installed-target acknowledgement, so retaining the
+    // candidate here would allow a delayed planner tick to reselect it before
+    // the replacement frontier mission arrives.
     plan_dirty_ = true;
     ++mission_generation_;
-    ROS_INFO("StreamingNavfnPlanner cleared provisional target request");
+    if (installed_target_command_publisher_) {
+      PersistentGoalCommand installed_clear;
+      installed_clear.kind = PersistentGoalCommand::KIND_CLEAR;
+      installed_clear.transaction_id = clear_sequence;
+      installed_clear.goal = message->goal;
+      installed_target_command_publisher_.publish(installed_clear);
+    }
+    ROS_INFO_STREAM("StreamingNavfnPlanner cleared target request transaction="
+                    << clear_sequence);
     return;
   }
   if (message->kind != PersistentGoalCommand::KIND_TARGET_REQUEST ||
@@ -908,7 +1029,14 @@ bool StreamingNavfnPlanner::transformToGlobalFrame(
     return true;
   }
   try {
-    transform_listener_->transformPose(global_frame_, source, transformed);
+    // Mission endpoints are geometric route data, not historical sensor
+    // observations. Portal endpoints are intentionally frozen in odom, so a
+    // timestamp from activation becomes invalid as soon as the TF buffer
+    // advances. Ask TF for the latest transform on every replan instead of
+    // repeatedly rejecting an otherwise valid crossing route as stale.
+    geometry_msgs::PoseStamped latest = source;
+    latest.header.stamp = ros::Time(0);
+    transform_listener_->transformPose(global_frame_, latest, transformed);
     return true;
   } catch (const tf::TransformException& error) {
     ROS_WARN_THROTTLE(1.0, "StreamingNavfnPlanner TF transform failed: %s",

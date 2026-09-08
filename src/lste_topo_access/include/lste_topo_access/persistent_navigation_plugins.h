@@ -38,6 +38,7 @@ class PersistentTebLocalPlanner : public nav_core::BaseLocalPlanner {
 
  private:
   void onTaskDone(const std_msgs::BoolConstPtr& message);
+  void onMissionCommand(const PersistentGoalCommandConstPtr& message);
   void onInstalledTargetCommand(
       const PersistentGoalCommandConstPtr& message);
   bool isInstalledTargetPlanLocked();
@@ -58,6 +59,12 @@ class PersistentTebLocalPlanner : public nav_core::BaseLocalPlanner {
   bool has_installed_target_goal_;
   bool has_reported_target_goal_;
   bool has_reported_frontier_goal_;
+  // Once the persistent local planner has reported a verified endpoint, keep
+  // returning a valid zero command until the graph installs a successor. This
+  // is a controller lease state, not MoveBase goal completion; without it,
+  // TEB can briefly lose its geometric goal and MoveBase starts recovery while
+  // the graph is still committing the next Place/Portal transition.
+  std::atomic<bool> terminal_hold_active_;
   geometry_msgs::PoseStamped installed_target_goal_;
   geometry_msgs::PoseStamped reported_target_goal_;
   geometry_msgs::PoseStamped reported_frontier_goal_;
@@ -81,7 +88,14 @@ class PersistentTebLocalPlanner : public nav_core::BaseLocalPlanner {
   std::atomic<uint64_t> route_version_;
   std::atomic<uint64_t> route_geometry_hash_;
   uint32_t installed_target_transaction_;
+  std::atomic<uint32_t> latest_mission_transaction_;
+  // The persistent bridge can change route semantics without changing the
+  // Navfn cell endpoint (for example, frontier observation -> Portal
+  // crossing). A new mission transaction must therefore force one plan
+  // installation before the old endpoint may be reported again.
+  std::atomic<uint32_t> installed_mission_transaction_;
   ros::Subscriber task_done_subscriber_;
+  ros::Subscriber mission_command_subscriber_;
   ros::Subscriber installed_target_command_subscriber_;
   ros::Publisher target_approach_publisher_;
   ros::Publisher target_approach_result_publisher_;

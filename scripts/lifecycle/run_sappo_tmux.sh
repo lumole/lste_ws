@@ -7,21 +7,7 @@ ENV_SESSION="lste-env"
 SESSION="sappo-lste"
 PIPELINE_CONFIG=${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}
 if [[ -f "$PIPELINE_CONFIG" ]]; then
-  eval "$(
-    python - "$PIPELINE_CONFIG" <<'PY' || true
-import sys
-import shlex
-try:
-    import yaml
-except ImportError:
-    sys.exit(0)
-with open(sys.argv[1], 'r', encoding='utf-8') as f:
-    data = yaml.safe_load(f) or {}
-for key, value in data.items():
-    if isinstance(value, (str, int, float)):
-        print(f'CFG_{key}={shlex.quote(str(value))}')
-PY
-  )"
+  eval "$("$WS/scripts/config/load_pipeline_config.sh" "$PIPELINE_CONFIG")"
 fi
 PRO3_SPAWN_X=${PRO3_SPAWN_X:-${CFG_PRO3_SPAWN_X:-0.0}}
 PRO3_SPAWN_Y=${PRO3_SPAWN_Y:-${CFG_PRO3_SPAWN_Y:-0.0}}

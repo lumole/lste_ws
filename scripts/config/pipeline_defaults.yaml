@@ -77,20 +77,27 @@ TARGET_DONE_MIN_HOLD_TIME: 0.30
 TARGET_DONE_MIN_FRESH_HITS: 3
 # Ignore a close box if the detector has stopped publishing for this long.
 TARGET_DONE_MAX_DETECTION_AGE: 0.75
-# A close 2-D box alone is not proof that the car reached the object. When
-# true, task completion starts counting only after TEB has successfully
-# completed a validated target-approach segment. Set false only for a static
-# inspection task whose robot intentionally starts beside the target.
-TARGET_DONE_REQUIRE_APPROACH_TERMINAL: true
+# A close 2-D box still needs a confirmed target track and three fresh detector
+# messages. false (recommended) also permits that direct close evidence to
+# finish from the current safe viewpoint, rather than forcing one more blind
+# visual step toward furniture that can hide the object. true restores the
+# stricter legacy policy requiring a completed TEB target-approach segment.
+TARGET_DONE_REQUIRE_APPROACH_TERMINAL: false
 # Target-follow evidence is separate from task completion. A qualifying small
 # box is kept briefly so a slower detector cannot be lost between Goal Manager
-# timer ticks. The candidate timeout limits one-frame false positives; a
-# second detector message in the confirmation window promotes it to long-lived
-# follow mode. Score and box size are normalized to [0, 1].
+# timer ticks. If no second frame arrives by this candidate timeout, the
+# controller makes one Navfn-validated short reinspection along the last target
+# bearing before returning to frontier coverage. This direct-target path never
+# requires monitor/context detections. A second detector message in the
+# confirmation window promotes it to long-lived follow mode. Score and box size
+# are normalized to [0, 1].
 TARGET_FOLLOW_MIN_SCORE: 0.20
 TARGET_FOLLOW_MIN_BOX_SIZE: 0.01
 TARGET_FOLLOW_CANDIDATE_TIMEOUT: 8.0
 TARGET_FOLLOW_CONFIRM_HITS: 2
+# A confirmed direct target keeps the current room/viewpoint for this whole
+# evidence window while it waits for the remaining close-confirmation frames.
+# Missing monitor/context boxes never shorten this window.
 TARGET_FOLLOW_CONFIRM_WINDOW: 20.0
 # Weak target boxes (low score and smaller than 5% of the image) need a
 # longer, spatially consistent run. This prevents a tiny false WeDetect box
@@ -248,16 +255,12 @@ TEB_ACTION_HANDOFF_RADIUS: 0.30
 TEB_ACTION_PROGRESS_TIMEOUT: 12.0
 TEB_ACTION_PROGRESS_EPSILON: 0.12
 TEB_ACTION_HANDOFF_MIN_INTERVAL: 4.0
-# A frontier goal is an observation region, whereas a visual target remains a
-# precise approach goal. When an already validated next frontier is waiting,
-# TEB completes the current exploration route inside this radius instead of
-# spending the no-progress timeout trying to settle on its exact map cell.
-# Set 0 only to compare with the former point-goal-only behavior.
-# A frontier is an observation boundary, not a parking point. Once the base is
-# within this radius and GlobalFrontier has prevalidated a successor, the bridge
-# atomically replaces the MoveBase action. TEB remains the sole velocity owner;
-# it can keep moving through a corridor or decelerate naturally for a turn.
-TEB_FRONTIER_OBSERVATION_COMPLETION_RADIUS: 0.85
+# A frontier endpoint remains an atomic MoveBase action. The former
+# observation-radius shortcut cancelled a healthy action before the place graph
+# had committed its next edge; a stale latched endpoint could then be retried.
+# Portal transitions now provide the explicit high-level handoff instead, so
+# production keeps this at zero and waits for the normal MoveBase terminal.
+TEB_FRONTIER_OBSERVATION_COMPLETION_RADIUS: 0.0
 # Maximum actual TEB linear speed for a frontier endpoint terminal. The bridge
 # reads the raw TEB planner output, rather than a possibly stale predicted
 # trajectory, before allowing the successor to replace this route.
@@ -444,6 +447,36 @@ GLOBAL_FRONTIER_REJECTED_TIMEOUT: 180.0
 # the explorer from revisiting an already inspected doorway after its short
 # temporary-stall retry timeout has expired.
 GLOBAL_FRONTIER_COMPLETED_RADIUS: 1.25
+# Reproducible exploration-method boundary. This is deliberately not a list
+# of score/timeout tweaks: all choices retain the same SLAM, Navfn, TEB,
+# detector, task and world. Valid values:
+#   frontier                  conventional information/path frontier, no memory
+#   frontier_distance_dedup   frontier plus reached-endpoint radius memory
+#   place_portal              physical Place + certified Portal, no WorkItem
+#   place_portal_workitem     full proposed method (default), including the
+#                             task-conditioned Place/Portal belief. Once a
+#                             Place has one real viewpoint but no task evidence,
+#                             a certified new Portal may bypass only local
+#                             candidates without durable viewpoint geometry;
+#                             rehydratable WorkItems close the Place first.
+#                             This is a discrete policy, not an extra
+#                             score/timeout parameter.
+GLOBAL_FRONTIER_METHOD: place_portal_workitem
+# Optional actual Gazebo Classic random seed. The office experiment launcher
+# forwards a non-empty value as gzserver's `--seed` and logs it per trial.
+GAZEBO_RANDOM_SEED: ""
+# Point completion alone cannot describe an office room: one room may expose
+# several frontier endpoints as SLAM reveals its walls and furniture. The
+# region memory visits new observation regions before revisits. A region turns
+# dormant after no local unknown-space progress or two failed routes, and it
+# can reactivate only when new unknown evidence appears.
+GLOBAL_FRONTIER_REGION_MEMORY_RADIUS: 3.0
+# Minimum local unknown-cell change that counts as information progress while
+# the robot is still observing an open region.  It does not revive a dormant
+# region: a new run resets the static-map exploration memory.
+GLOBAL_FRONTIER_REGION_INFORMATION_DELTA: 8
+GLOBAL_FRONTIER_REGION_STAGNATION_TIMEOUT: 20.0
+GLOBAL_FRONTIER_REGION_FAILURE_LIMIT: 2
 # Indoor-search bias: frontiers near observed walls tend to be doors, corridor
 # turns, or rooms; a max-range boundary across an empty floor has little local
 # structure. These values guide coverage without using object coordinates.
@@ -639,11 +672,12 @@ TEB_MAX_LINEAR_SPEED: 0.50
 # default: the current blocked case has a deterministic pre-route alignment
 # defect, which must be evaluated independently before adding candidates.
 TEB_HOMOTOPY_CLASS_PLANNING: false
-# Convert the rolling local costmap's occupied cells into clustered convex
-# obstacles before TEB optimizes. This reduces scan/cell quantization wobble
-# and local oscillation in indoor corridors. Set the plugin to `disabled` only
-# for a controlled raw-local-costmap comparison. The DBSMCCH line plugin
-# was tested and rejected because it crashes move_base in this configuration.
+# The production TEB obstacle representation is the rolling local costmap
+# itself. The DBSMCCH polygon converter remains an explicit A/B option, but
+# its local polygons caused a reproducible endpoint stall in the T-junction
+# experiment. Set this to `costmap_converter::CostmapToPolygonsDBSMCCH` only
+# when reproducing that comparison. The line-converter plugin is unsupported
+# because it crashes the installed Noetic move_base process.
 TEB_COSTMAP_CONVERTER_PLUGIN: disabled
 # Run conversion in its own callback thread. This keeps the 5 Hz polygon
 # update from blocking move_base's 20 Hz control callback when SLAM enlarges a
