@@ -16,7 +16,13 @@ from clock_provider import now_for
 
 class TebGoalBridgeActionClientMixin:
     def _effective_action_epoch_locked(self):
-        """Use graph epoch for frontier routes and target epoch otherwise."""
+        """Use the map snapshot epoch for every executable route kind."""
+        route_map_epoch = getattr(self, "latest_route_map_epoch", None)
+        if route_map_epoch is not None:
+            try:
+                return int(route_map_epoch)
+            except (TypeError, ValueError):
+                pass
         source = str(
             getattr(self, "latest_intent_source", "unknown") or "unknown"
         ).strip().lower()
@@ -31,11 +37,9 @@ class TebGoalBridgeActionClientMixin:
 
     def _remember_last_dispatch_identity_locked(self):
         """Retain the semantic identity paired with ``last_dispatched_goal``."""
-        map_epoch = getattr(self, "latest_frontier_map_epoch", None)
-        if str(
-            getattr(self, "latest_intent_source", "unknown") or "unknown"
-        ).strip().lower() != "global_slam_frontier":
-            map_epoch = None
+        map_epoch = getattr(self, "latest_route_map_epoch", None)
+        if map_epoch is None:
+            map_epoch = getattr(self, "latest_frontier_map_epoch", None)
         self.last_dispatch_identity = {
             "action_generation": int(getattr(self, "action_generation", 0) or 0),
             "transaction_id": int(
@@ -135,6 +139,15 @@ class TebGoalBridgeActionClientMixin:
         self.active_mission_route_kind = self.latest_mission_route_kind
         self.active_route_id = int(self.latest_route_id)
         self.active_target_epoch = int(self.latest_target_epoch)
+        self.active_route_map_epoch = getattr(
+            self, "latest_route_map_epoch", None
+        )
+        self.active_graph_action = str(
+            getattr(self, "latest_graph_action", "") or ""
+        )
+        self.active_graph_obligation_kind = str(
+            getattr(self, "latest_graph_obligation_kind", "") or ""
+        )
         self.active_frontier_map_epoch = (
             getattr(self, "latest_frontier_map_epoch", None)
             if str(
@@ -196,9 +209,15 @@ class TebGoalBridgeActionClientMixin:
             ),
             "route_id": int(self.latest_route_id),
             "epoch": self._effective_action_epoch_locked(),
-            "map_epoch": self.active_frontier_map_epoch,
+            "map_epoch": self.active_route_map_epoch,
             "route_kind": str(self.latest_route_kind or ""),
             "mission_route_kind": str(self.latest_mission_route_kind or ""),
+            "graph_action": str(
+                getattr(self, "latest_graph_action", "") or ""
+            ),
+            "graph_obligation_kind": str(
+                getattr(self, "latest_graph_obligation_kind", "") or ""
+            ),
             "source": str(self.latest_intent_source or "unknown"),
             "priority": int(self.latest_intent_priority),
             "source_goal": copy.deepcopy(source_goal),

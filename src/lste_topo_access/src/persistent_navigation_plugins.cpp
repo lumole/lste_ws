@@ -19,6 +19,7 @@ PersistentTebLocalPlanner::PersistentTebLocalPlanner()
       has_reported_target_goal_(false),
       has_reported_frontier_goal_(false),
       terminal_hold_active_(false),
+      hard_reset_hold_(false),
       reported_frontier_route_version_(0),
       target_goal_epsilon_(0.05),
       frontier_endpoint_equivalence_distance_(0.05),
@@ -194,6 +195,7 @@ bool PersistentTebLocalPlanner::setPlan(
     // A newly installed route owns the controller again. Equivalent Navfn
     // refreshes deliberately retain the hold above and do not reset TEB.
     terminal_hold_active_.store(false, std::memory_order_release);
+    hard_reset_hold_.store(false, std::memory_order_release);
   }
   plan_installed_count_.fetch_add(1, std::memory_order_relaxed);
   route_geometry_hash_.store(geometryHash(plan), std::memory_order_relaxed);
@@ -315,6 +317,10 @@ bool PersistentTebLocalPlanner::planIsEquivalentLocked(
 
 bool PersistentTebLocalPlanner::computeVelocityCommands(
     geometry_msgs::Twist& cmd_vel) {
+  if (hard_reset_hold_.load(std::memory_order_acquire)) {
+    cmd_vel = geometry_msgs::Twist();
+    return true;
+  }
   const bool command_available = teb_.computeVelocityCommands(cmd_vel);
   if (!persistent_execution_ || task_done_.load()) {
     return command_available;
@@ -362,6 +368,9 @@ bool PersistentTebLocalPlanner::computeVelocityCommands(
 }
 
 bool PersistentTebLocalPlanner::isGoalReached() {
+  if (hard_reset_hold_.load(std::memory_order_acquire)) {
+    return false;
+  }
   if (!persistent_execution_) {
     return teb_.isGoalReached();
   }
@@ -493,6 +502,22 @@ void PersistentTebLocalPlanner::onTaskDone(
 
 void PersistentTebLocalPlanner::onMissionCommand(
     const PersistentGoalCommandConstPtr& message) {
+  if (message->kind == PersistentGoalCommand::KIND_CLEAR &&
+      message->transaction_id == 0) {
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    has_installed_target_goal_ = false;
+    has_reported_target_goal_ = false;
+    has_reported_frontier_goal_ = false;
+    installed_target_transaction_ = 0;
+    reported_frontier_route_version_ = 0;
+    current_plan_goal_ = geometry_msgs::PoseStamped();
+    applied_plan_.clear();
+    terminal_hold_active_.store(true, std::memory_order_release);
+    hard_reset_hold_.store(true, std::memory_order_release);
+    publishPlanEvent("hard_reset_cleared", applied_plan_);
+    ROS_INFO("PersistentTebLocalPlanner cleared mission route for hard reset");
+    return;
+  }
   if (message->kind != PersistentGoalCommand::KIND_MISSION ||
       message->transaction_id == 0) {
     return;
@@ -528,7 +553,15 @@ void PersistentTebLocalPlanner::onInstalledTargetCommand(
     has_installed_target_goal_ = false;
     installed_target_transaction_ = 0;
     has_reported_target_goal_ = false;
-    terminal_hold_active_.store(false, std::memory_order_release);
+    if (sequence == 0) {
+      current_plan_goal_ = geometry_msgs::PoseStamped();
+      applied_plan_.clear();
+      terminal_hold_active_.store(true, std::memory_order_release);
+      hard_reset_hold_.store(true, std::memory_order_release);
+      publishPlanEvent("hard_reset_cleared", applied_plan_);
+    } else {
+      terminal_hold_active_.store(false, std::memory_order_release);
+    }
     ROS_INFO_STREAM("PersistentTebLocalPlanner cleared installed target "
                     << "transaction=" << sequence);
     return;
@@ -584,6 +617,11 @@ StreamingNavfnPlanner::StreamingNavfnPlanner()
       active_target_mission_sequence_(0),
       validated_target_sequence_(0),
       failed_target_sequence_(0),
+      latest_target_map_epoch_(0),
+      latest_target_route_kind_(),
+      latest_target_mission_route_kind_(),
+      latest_target_graph_action_(),
+      latest_target_graph_obligation_kind_(),
       mission_generation_(0),
       target_failure_reported_generation_(0) {}
 
@@ -662,6 +700,13 @@ void StreamingNavfnPlanner::publishTargetPlanResult(
   std::ostringstream payload;
   payload << "{\"event\":\"" << event << "\",\"transaction_id\":"
           << transaction_id << ",\"frame_id\":\"" << goal.header.frame_id
+          << "\",\"map_epoch\":" << latest_target_map_epoch_
+          << ",\"route_kind\":\"" << latest_target_route_kind_
+          << "\",\"mission_route_kind\":\""
+          << latest_target_mission_route_kind_
+          << "\",\"graph_action\":\"" << latest_target_graph_action_
+          << "\",\"graph_obligation_kind\":\""
+          << latest_target_graph_obligation_kind_
           << "\",\"goal\":[" << goal.pose.position.x << ","
           << goal.pose.position.y << "]}";
   std_msgs::String message;
@@ -856,6 +901,11 @@ bool StreamingNavfnPlanner::makePlan(
     PersistentGoalCommand installed_command;
     installed_command.transaction_id = selected_target_sequence;
     installed_command.kind = PersistentGoalCommand::KIND_TARGET_INSTALLED;
+    installed_command.map_epoch = latest_target_map_epoch_;
+    installed_command.route_kind = latest_target_route_kind_;
+    installed_command.mission_route_kind = latest_target_mission_route_kind_;
+    installed_command.graph_action = latest_target_graph_action_;
+    installed_command.graph_obligation_kind = latest_target_graph_obligation_kind_;
     installed_command.goal = installed;
     installed_target_command_publisher_.publish(installed_command);
     ROS_INFO_STREAM("StreamingNavfnPlanner validated target transaction="
@@ -871,6 +921,35 @@ bool StreamingNavfnPlanner::makePlan(
 
 void StreamingNavfnPlanner::onMissionCommand(
     const PersistentGoalCommandConstPtr& message) {
+  if (message->kind == PersistentGoalCommand::KIND_CLEAR &&
+      message->transaction_id == 0) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    has_mission_goal_ = false;
+    has_target_goal_ = false;
+    has_validated_target_plan_ = false;
+    has_active_target_mission_ = false;
+    plan_dirty_ = true;
+    mission_goal_ = geometry_msgs::PoseStamped();
+    target_goal_ = geometry_msgs::PoseStamped();
+    validated_target_goal_ = geometry_msgs::PoseStamped();
+    cached_goal_ = geometry_msgs::PoseStamped();
+    last_plan_start_ = geometry_msgs::PoseStamped();
+    cached_plan_.clear();
+    validated_target_plan_.clear();
+    latest_mission_sequence_ = 0;
+    latest_target_sequence_ = 0;
+    latest_target_map_epoch_ = 0;
+    latest_target_route_kind_.clear();
+    latest_target_mission_route_kind_.clear();
+    latest_target_graph_action_.clear();
+    latest_target_graph_obligation_kind_.clear();
+    active_target_mission_sequence_ = 0;
+    validated_target_sequence_ = 0;
+    failed_target_sequence_ = 0;
+    ++mission_generation_;
+    ROS_INFO("StreamingNavfnPlanner cleared mission and target routes for hard reset");
+    return;
+  }
   if (message->kind != PersistentGoalCommand::KIND_MISSION ||
       message->transaction_id == 0) {
     return;
@@ -929,6 +1008,45 @@ void StreamingNavfnPlanner::onTargetCommand(
     // restart and prevents repeated validation of an old visual ray.
     const uint32_t clear_sequence =
         sequence > 0 ? sequence : latest_target_sequence_;
+    if (sequence == 0) {
+      has_mission_goal_ = false;
+      has_target_goal_ = false;
+      has_validated_target_plan_ = false;
+      has_active_target_mission_ = false;
+      plan_dirty_ = true;
+      mission_goal_ = geometry_msgs::PoseStamped();
+      target_goal_ = geometry_msgs::PoseStamped();
+      validated_target_goal_ = geometry_msgs::PoseStamped();
+      cached_goal_ = geometry_msgs::PoseStamped();
+      last_plan_start_ = geometry_msgs::PoseStamped();
+      cached_plan_.clear();
+      validated_target_plan_.clear();
+      latest_mission_sequence_ = 0;
+      latest_target_sequence_ = 0;
+      latest_target_map_epoch_ = 0;
+      latest_target_route_kind_.clear();
+      latest_target_mission_route_kind_.clear();
+      latest_target_graph_action_.clear();
+      latest_target_graph_obligation_kind_.clear();
+      active_target_mission_sequence_ = 0;
+      validated_target_sequence_ = 0;
+      failed_target_sequence_ = 0;
+      ++mission_generation_;
+      if (installed_target_command_publisher_) {
+        PersistentGoalCommand installed_clear;
+      installed_clear.kind = PersistentGoalCommand::KIND_CLEAR;
+      installed_clear.transaction_id = 0;
+      installed_clear.map_epoch = message->map_epoch;
+      installed_clear.route_kind = message->route_kind;
+      installed_clear.mission_route_kind = message->mission_route_kind;
+      installed_clear.graph_action = message->graph_action;
+      installed_clear.graph_obligation_kind = message->graph_obligation_kind;
+      installed_clear.goal = message->goal;
+        installed_target_command_publisher_.publish(installed_clear);
+      }
+      ROS_INFO("StreamingNavfnPlanner cleared all routes for hard reset");
+      return;
+    }
     if (clear_sequence > 0 && latest_target_sequence_ > clear_sequence) {
       ROS_DEBUG_STREAM("StreamingNavfnPlanner ignored stale target clear "
                        << clear_sequence << " < " << latest_target_sequence_);
@@ -955,9 +1073,14 @@ void StreamingNavfnPlanner::onTargetCommand(
     ++mission_generation_;
     if (installed_target_command_publisher_) {
       PersistentGoalCommand installed_clear;
-      installed_clear.kind = PersistentGoalCommand::KIND_CLEAR;
-      installed_clear.transaction_id = clear_sequence;
-      installed_clear.goal = message->goal;
+    installed_clear.kind = PersistentGoalCommand::KIND_CLEAR;
+    installed_clear.transaction_id = clear_sequence;
+    installed_clear.map_epoch = message->map_epoch;
+    installed_clear.route_kind = message->route_kind;
+    installed_clear.mission_route_kind = message->mission_route_kind;
+    installed_clear.graph_action = message->graph_action;
+    installed_clear.graph_obligation_kind = message->graph_obligation_kind;
+    installed_clear.goal = message->goal;
       installed_target_command_publisher_.publish(installed_clear);
     }
     ROS_INFO_STREAM("StreamingNavfnPlanner cleared target request transaction="
@@ -987,6 +1110,11 @@ void StreamingNavfnPlanner::onTargetCommand(
   }
   target_goal_ = message->goal;
   latest_target_sequence_ = sequence;
+  latest_target_map_epoch_ = message->map_epoch;
+  latest_target_route_kind_ = message->route_kind;
+  latest_target_mission_route_kind_ = message->mission_route_kind;
+  latest_target_graph_action_ = message->graph_action;
+  latest_target_graph_obligation_kind_ = message->graph_obligation_kind;
   has_target_goal_ = true;
   has_validated_target_plan_ = false;
   failed_target_sequence_ = 0;

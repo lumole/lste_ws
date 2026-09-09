@@ -50,10 +50,16 @@ class TebGoalBridgeMissionRuntimeMixin:
                 ),
                 "route_id": int(self.latest_route_id),
                 "epoch": self._effective_action_epoch_locked(),
-                "map_epoch": self.active_frontier_map_epoch,
+                "map_epoch": self.active_route_map_epoch,
                 "route_kind": str(self.latest_route_kind or ""),
                 "mission_route_kind": str(
                     self.latest_mission_route_kind or ""
+                ),
+                "graph_action": str(
+                    getattr(self, "latest_graph_action", "") or ""
+                ),
+                "graph_obligation_kind": str(
+                    getattr(self, "latest_graph_obligation_kind", "") or ""
                 ),
                 "source": str(self.latest_intent_source or "unknown"),
                 "priority": int(self.latest_intent_priority),
@@ -112,6 +118,12 @@ class TebGoalBridgeMissionRuntimeMixin:
         self.active_goal_transaction_id = int(self.latest_goal_transaction_id)
         self.active_route_kind = self.latest_route_kind
         self.active_mission_route_kind = self.latest_mission_route_kind
+        self.active_graph_action = str(
+            getattr(self, "latest_graph_action", "") or ""
+        )
+        self.active_graph_obligation_kind = str(
+            getattr(self, "latest_graph_obligation_kind", "") or ""
+        )
         self.active_route_id = int(self.latest_route_id)
         if self.active_route_kind == "portal_transition":
             if (
@@ -123,6 +135,9 @@ class TebGoalBridgeMissionRuntimeMixin:
         else:
             self.active_portal_source_goal = None
         self.active_target_epoch = int(self.latest_target_epoch)
+        self.active_route_map_epoch = getattr(
+            self, "latest_route_map_epoch", None
+        )
         self.active_frontier_map_epoch = getattr(
             self, "latest_frontier_map_epoch", None
         ) if self.active_intent_source == "global_slam_frontier" else None

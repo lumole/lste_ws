@@ -114,6 +114,11 @@ class GoalManagerGoalOutputMixin:
             "transaction_id": int(self.goal_command_id),
             "source": "target_terminal_observation",
             "priority": 2,
+            "route_kind": "direct_goal",
+            "mission_route_kind": "direct_goal",
+            "map_epoch": max(
+                1, int(getattr(self, "navigation_map_epoch", 1) or 1)
+            ),
             "task_id": str(getattr(self, "current_task_id", "")),
             "mission_id": str(getattr(self, "current_mission_id", "")),
             "task_version": str(getattr(self, "current_task_version", "")),
@@ -375,8 +380,27 @@ class GoalManagerGoalOutputMixin:
                 self.global_frontier_transition_distance
             )
             intent["goal_context"] = dict(frontier_context)
+            intent["map_epoch"] = max(
+                1,
+                int(
+                    getattr(self, "global_frontier_map_epoch", None)
+                    or getattr(self, "navigation_map_epoch", 1)
+                    or 1
+                ),
+            )
+            intent["graph_action"] = str(
+                getattr(self, "global_frontier_graph_action", "") or ""
+            )
+            intent["graph_obligation_kind"] = str(
+                getattr(self, "global_frontier_graph_obligation_kind", "") or ""
+            )
         if self.goal_source.startswith("target_"):
             intent["target_epoch"] = int(self.target_observation_epoch)
+            intent["route_kind"] = "direct_goal"
+            intent["mission_route_kind"] = "direct_goal"
+            intent["map_epoch"] = max(
+                1, int(getattr(self, "navigation_map_epoch", 1) or 1)
+            )
             intent["target_approach_epoch"] = int(
                 getattr(
                     getattr(self, "target_approach_transaction", None),

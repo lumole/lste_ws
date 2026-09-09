@@ -5,7 +5,9 @@ from copy import deepcopy
 import json
 
 import rospy
+from std_msgs.msg import Bool
 
+from experiment_reset_contract import decode_reset_request, publish_reset_ack
 from lifecycle_manager import EventType, LifecycleManager, State
 from goal_manager_frontier import GoalManagerFrontierMixin
 from goal_manager_goal_output import GoalManagerGoalOutputMixin
@@ -30,6 +32,9 @@ class GoalManagerLifecycleMixin:
             },
         )
         self._lifecycle_event_transaction_id = None
+        self._last_hard_reset_id = None
+        self._last_hard_reset_transaction_id = 0
+        self._hard_reset_count = 0
 
     def lifecycle_state(self):
         return self.lifecycle_manager.current_state
@@ -87,6 +92,10 @@ class GoalManagerLifecycleMixin:
 
     def on_pose(self, message):
         return self._enqueue_lifecycle_event(EventType.POSE_UPDATED, message)
+
+    def on_map(self, message):
+        """Queue map snapshots used to version target-route validation."""
+        return self._enqueue_lifecycle_event(EventType.MAP_UPDATED, message)
 
     def on_cam_info(self, message):
         return self._enqueue_lifecycle_event(
@@ -169,6 +178,10 @@ class GoalManagerLifecycleMixin:
             EventType.TASK_COMPLETED, message
         )
 
+    def on_hard_reset(self, message):
+        """Queue the reset so goal ownership is cleared by the lifecycle tick."""
+        return self._enqueue_lifecycle_event(EventType.RESET, deepcopy(message))
+
     def on_timer(self, event):
         return self.lifecycle_manager.tick(
             compute_handler=lambda _now: GoalManagerSchedulingMixin.on_timer(
@@ -189,6 +202,8 @@ class GoalManagerLifecycleMixin:
 
     def _handle_lifecycle_event(self, event):
         self._lifecycle_event_transaction_id = None
+        if event.type == EventType.RESET:
+            return self._apply_hard_reset(event)
         if event.type in (
             EventType.GLOBAL_FRONTIER_COMMAND,
             EventType.GLOBAL_FRONTIER_STATUS,
@@ -206,6 +221,7 @@ class GoalManagerLifecycleMixin:
             EventType.DETECTIONS_UPDATED: GoalManagerInputCallbacksMixin.apply_dets,
             EventType.SCORES_UPDATED: GoalManagerInputCallbacksMixin.apply_scores,
             EventType.POSE_UPDATED: GoalManagerInputCallbacksMixin.apply_pose,
+            EventType.MAP_UPDATED: GoalManagerLifecycleMixin._apply_map_epoch,
             EventType.CAMERA_INFO_UPDATED: GoalManagerInputCallbacksMixin.apply_cam_info,
             EventType.DEPTH_UPDATED: GoalManagerInputCallbacksMixin.apply_depth,
             EventType.FRONTIER_UPDATED: GoalManagerInputCallbacksMixin.apply_frontier,
@@ -247,6 +263,79 @@ class GoalManagerLifecycleMixin:
             return None
         finally:
             self._lifecycle_event_transaction_id = None
+
+    def _apply_hard_reset(self, event):
+        """Clear target evidence and goal ownership for one warm slice."""
+        request = decode_reset_request(event.payload)
+        if request is None:
+            return None
+        reset_id = request["reset_id"]
+        if reset_id == self._last_hard_reset_id:
+            publish_reset_ack(
+                self.pub_hard_reset_ack,
+                "lste_goal_manager",
+                request,
+                state=State.IDLE.value,
+                transaction_id=int(
+                    getattr(self, "_last_hard_reset_transaction_id", 0) or 0
+                ),
+                duplicate=True,
+                active_goal=False,
+                route_owner=False,
+                goal_command_id=0,
+            )
+            return None
+
+        task = deepcopy(getattr(self, "latest_task", None))
+        previous_goal = bool(getattr(self, "last_goal", None))
+        previous_goal_command_id = int(getattr(self, "goal_command_id", 0) or 0)
+        new_transaction_id = self.lifecycle_manager.hard_reset(
+            event=event,
+            now=rospy.Time.now().to_sec(),
+            transaction_id=request.get("transaction_id"),
+        )
+        self._initialize_runtime_state(rospy.get_param)
+        if task is not None:
+            GoalManagerInputCallbacksMixin.apply_task(self, task)
+        # Both are latched safety gates. Publish explicitly even when the
+        # freshly initialized booleans already happen to be false.
+        self.pub_task_done.publish(Bool(data=False))
+        self.pub_navigation_hold.publish(Bool(data=False))
+        self._last_hard_reset_id = reset_id
+        self._last_hard_reset_transaction_id = int(new_transaction_id)
+        self._hard_reset_count += 1
+        self.publish_goal_arbitration(
+            "hard_reset_complete",
+            reset_id=reset_id,
+            reason=request["reason"],
+            previous_goal_active=previous_goal,
+            previous_goal_command_id=previous_goal_command_id,
+            state=State.IDLE.value,
+            hard_reset_count=int(self._hard_reset_count),
+        )
+        publish_reset_ack(
+            self.pub_hard_reset_ack,
+            "lste_goal_manager",
+            request,
+            state=State.IDLE.value,
+            transaction_id=new_transaction_id,
+            active_goal=bool(getattr(self, "last_goal", None)),
+            route_owner=False,
+            goal_command_id=int(getattr(self, "goal_command_id", 0) or 0),
+            task_preserved=task is not None,
+        )
+        return None
+
+    def _apply_map_epoch(self, message):
+        """Advance the local route-validation epoch for each map snapshot."""
+        self.navigation_map_epoch = max(
+            1, int(getattr(self, "navigation_map_epoch", 0) or 0) + 1
+        )
+        stamp = getattr(getattr(message, "header", None), "stamp", None)
+        try:
+            self.navigation_map_last_stamp = float(stamp.to_sec())
+        except (AttributeError, TypeError, ValueError):
+            self.navigation_map_last_stamp = 0.0
 
     def _on_lifecycle_transition(self, previous, current, event):
         publish = getattr(self, "publish_goal_arbitration", None)

@@ -44,6 +44,8 @@ class GraphRoutePlan:
 
     status: str
     action: str
+    # The graph decision is valid only for this immutable map snapshot.
+    map_epoch: object = None
     current_place_id: object = None
     target_place_id: object = None
     obligation_kind: str = ""
@@ -84,6 +86,7 @@ class GraphRoutePlan:
         return {
             "status": str(self.status),
             "action": str(self.action),
+            "map_epoch": self.map_epoch,
             "current_place_id": self.current_place_id,
             "target_place_id": self.target_place_id,
             "obligation_kind": str(self.obligation_kind),
@@ -101,6 +104,7 @@ class GraphRoutePlan:
         return (
             self.status,
             self.action,
+            self.map_epoch,
             self.current_place_id,
             self.target_place_id,
             self.obligation_kind,

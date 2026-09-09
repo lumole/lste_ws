@@ -621,6 +621,21 @@ class GlobalFrontierReportingMixin:
         self, frame_id, x, y, yaw, route_kind, mission_route_kind=None,
     ):
         """Publish one self-contained route command transaction."""
+        graph_transaction = getattr(
+            self, "graph_route_action_transaction", None
+        )
+        route_map_epoch = (
+            getattr(graph_transaction, "map_epoch", None)
+            if graph_transaction is not None
+            else getattr(self, "last_map_epoch", None)
+        )
+        if route_map_epoch is None:
+            # A route command is only published after snapshot construction.
+            # Keep the wire contract non-empty even for compatibility fixtures
+            # that omit the structural epoch object.
+            route_map_epoch = max(
+                1, int(getattr(self, "topology_component_epoch", 1) or 1)
+            )
         payload = {
             "event": "route_command",
             "frame_id": str(frame_id or "map").strip().lstrip("/") or "map",
@@ -642,6 +657,20 @@ class GlobalFrontierReportingMixin:
                 or route_kind
                 or "frontier_endpoint"
             ),
+            "graph_action": str(
+                getattr(
+                    getattr(self, "last_graph_route_plan", None),
+                    "action",
+                    "",
+                ) or ""
+            ),
+            "graph_obligation_kind": str(
+                getattr(
+                    getattr(self, "last_graph_route_plan", None),
+                    "obligation_kind",
+                    "",
+                ) or ""
+            ),
             "portal_probe_phase": str(
                 getattr(self, "active_portal_probe_phase", "") or ""
             ),
@@ -654,16 +683,7 @@ class GlobalFrontierReportingMixin:
             ),
             "goal_context": self.active_goal_context(route_kind),
             "portal_transaction": self.portal_transaction_report(),
-            "map_epoch": (
-                getattr(
-                    getattr(self, "graph_route_action_transaction", None),
-                    "map_epoch",
-                    None,
-                )
-                if getattr(self, "graph_route_action_transaction", None)
-                is not None
-                else getattr(self, "last_map_epoch", None)
-            ),
+            "map_epoch": int(route_map_epoch),
             "stamp": rospy.Time.now().to_sec(),
         }
         decision_scheduler = getattr(self, "decision_wake_scheduler", None)

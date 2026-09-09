@@ -101,6 +101,12 @@ class TebTurnSupervisorCallbacksMixin:
             self.active_action_target_track_id = str(
                 payload.get("active_target_track_id", "")
             ).strip()
+            try:
+                self.active_action_transaction_id = int(
+                    payload.get("lifecycle_transaction_id", 0) or 0
+                )
+            except (TypeError, ValueError):
+                self.active_action_transaction_id = 0
             self.latest_target_track_id = str(
                 payload.get("latest_target_track_id", self.latest_target_track_id)
             ).strip()
@@ -216,6 +222,16 @@ class TebTurnSupervisorCallbacksMixin:
         with self.lock:
             self.latest_planner_command = copy.deepcopy(message)
             self.latest_planner_command_wall = now_for(self)
+            self.planner_command_sequence += 1
+            self.planner_command_transaction_id = int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
+            )
+            self.planner_command_action_identity = self.active_action_identity
 
     def on_teb_feedback(self, message):
         """Cache the selected TEB velocity for a bounded raw-command gap."""

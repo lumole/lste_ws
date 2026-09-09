@@ -191,6 +191,7 @@ catkin_install_python(PROGRAMS
 # as a devel-space launch.
 install(FILES
   scripts/clock_provider.py
+  scripts/experiment_reset_contract.py
   scripts/lifecycle_manager.py
   scripts/global_frontier_lifecycle.py
   scripts/goal_manager_lifecycle.py

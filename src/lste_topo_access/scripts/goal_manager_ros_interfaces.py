@@ -4,10 +4,13 @@
 
 import rospy
 from geometry_msgs.msg import Pose2D, PoseStamped, Twist, Vector3Stamped
+from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import CameraInfo, Image, LaserScan
 from std_msgs.msg import Bool, String, UInt8
 
 from lste_msgs.msg import LsteDetections, LsteFrontiers, LsteScores, LsteState, LsteTask
+
+from experiment_reset_contract import HARD_RESET_ACK_TOPIC, HARD_RESET_TOPIC
 
 class GoalManagerRosInterfacesMixin:
     def _setup_ros_interfaces(self):
@@ -45,6 +48,9 @@ class GoalManagerRosInterfacesMixin:
         self.pub_navigation_hold = rospy.Publisher(
             self.navigation_hold_topic, Bool, queue_size=1, latch=True
         )
+        self.pub_hard_reset_ack = rospy.Publisher(
+            HARD_RESET_ACK_TOPIC, String, queue_size=20
+        )
         self.pub_navigation_hold.publish(Bool(data=False))
 
         # 订阅
@@ -52,6 +58,12 @@ class GoalManagerRosInterfacesMixin:
         self.sub_dets = rospy.Subscriber("/lste/detections", LsteDetections, self.on_dets, queue_size=1)
         self.sub_scores = rospy.Subscriber("/lste/scores", LsteScores, self.on_scores, queue_size=1)
         self.sub_task = rospy.Subscriber("/lste/task", LsteTask, self.on_task, queue_size=1)
+        self.sub_hard_reset = rospy.Subscriber(
+            HARD_RESET_TOPIC, String, self.on_hard_reset, queue_size=5
+        )
+        self.sub_map = rospy.Subscriber(
+            "/map", OccupancyGrid, self.on_map, queue_size=1
+        )
         self.sub_pose = rospy.Subscriber("/rbt_pose", Pose2D, self.on_pose, queue_size=1)
         self.sub_cam_info = rospy.Subscriber("/kinect/hd/camera_info", CameraInfo, self.on_cam_info, queue_size=1)
         if self.use_depth:
@@ -105,4 +117,3 @@ class GoalManagerRosInterfacesMixin:
             )
 
         self.timer = rospy.Timer(rospy.Duration(0.2), self.on_timer)  # 5Hz
-

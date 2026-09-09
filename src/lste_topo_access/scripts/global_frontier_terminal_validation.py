@@ -48,6 +48,25 @@ class GlobalFrontierTerminalValidationMixin:
                 self.active_route_kind,
             )
             return None
+        try:
+            terminal_epoch = int(getattr(message, "map_epoch", 0) or 0)
+        except (TypeError, ValueError):
+            terminal_epoch = 0
+        active_epoch = getattr(self, "active_route_map_epoch", None)
+        if terminal_epoch > 0 and active_epoch is not None:
+            try:
+                if terminal_epoch != int(active_epoch):
+                    rospy.loginfo_throttle(
+                        2.0,
+                        "Global frontier ignored execution terminal map epoch "
+                        "mismatch route_id=%d terminal=%d active=%d",
+                        terminal_route_id,
+                        terminal_epoch,
+                        int(active_epoch),
+                    )
+                    return None
+            except (TypeError, ValueError):
+                return None
         terminal_goal = getattr(message, "goal", None)
         if terminal_goal is None:
             return None

@@ -90,6 +90,9 @@ class TebGoalBridgePersistentTargetResultMixin:
                 ],
                 "goal_frame": source_goal.header.frame_id,
                 "target_epoch": target_epoch,
+                "map_epoch": getattr(self, "active_route_map_epoch", None),
+                "route_kind": "direct_goal",
+                "mission_route_kind": "direct_goal",
                 "target_track_id": target_track_id,
                 "target_viewpoint_candidate_id": str(
                     getattr(self, "latest_target_viewpoint_candidate_id", "") or ""
@@ -107,6 +110,36 @@ class TebGoalBridgePersistentTargetResultMixin:
             released = self._release_failed_target_controller_lease_locked(
                 "target_plan_failed"
             )
+            # The transport lease was invalidated above, but retain a bounded
+            # failure contract so a silent downstream handoff still produces a
+            # deterministic cleanup event instead of an unbounded wait.
+            arm_watchdog = getattr(
+                self, "_arm_route_lease_watchdog_locked", None
+            )
+            if callable(arm_watchdog):
+                failure_contract = {
+                    "generation": int(getattr(self, "action_generation", 0) or 0),
+                    "transaction_id": transaction_id,
+                    "lifecycle_transaction_id": int(
+                        getattr(
+                            getattr(self, "lifecycle_manager", None),
+                            "current_transaction_id",
+                            0,
+                        )
+                        or 0
+                    ),
+                    "route_id": int(getattr(self, "active_route_id", 0) or 0),
+                    "map_epoch": getattr(self, "active_route_map_epoch", None),
+                    "epoch": target_epoch,
+                    "route_kind": "direct_goal",
+                    "mission_route_kind": "direct_goal",
+                    "source": "target_plan_failure",
+                    "priority": 2,
+                }
+                arm_watchdog(
+                    reason="persistent_target_plan_failure",
+                    action_contract=failure_contract,
+                )
             failure.update(
                 {
                     "controller_lease": "released" if released else "unchanged",

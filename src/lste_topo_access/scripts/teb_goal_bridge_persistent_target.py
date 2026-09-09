@@ -68,11 +68,26 @@ class TebGoalBridgePersistentTargetMixin:
         )
 
     @staticmethod
-    def _persistent_goal_command(kind, transaction_id, goal):
+    def _persistent_goal_command(
+        kind,
+        transaction_id,
+        goal,
+        *,
+        map_epoch=0,
+        route_kind="",
+        mission_route_kind="",
+        graph_action="",
+        graph_obligation_kind="",
+    ):
         """Build the typed cross-node ownership command."""
         command = PersistentGoalCommand()
         command.kind = int(kind)
         command.transaction_id = max(0, int(transaction_id))
+        command.map_epoch = max(0, int(map_epoch or 0))
+        command.route_kind = str(route_kind or "")
+        command.mission_route_kind = str(mission_route_kind or "")
+        command.graph_action = str(graph_action or "")
+        command.graph_obligation_kind = str(graph_obligation_kind or "")
         command.goal = copy.deepcopy(goal)
         return command
 
@@ -92,6 +107,18 @@ class TebGoalBridgePersistentTargetMixin:
                 PersistentGoalCommand.KIND_TARGET_REQUEST,
                 transaction_id,
                 target_request,
+                map_epoch=max(
+                    1, int(getattr(self, "latest_route_map_epoch", 0) or 0)
+                ),
+                route_kind=str(self.latest_route_kind or "direct_goal"),
+                mission_route_kind=str(
+                    self.latest_mission_route_kind or self.latest_route_kind
+                    or "direct_goal"
+                ),
+                graph_action=str(getattr(self, "latest_graph_action", "") or ""),
+                graph_obligation_kind=str(
+                    getattr(self, "latest_graph_obligation_kind", "") or ""
+                ),
             )
         )
         self.publish_bridge_status(
@@ -142,6 +169,9 @@ class TebGoalBridgePersistentTargetMixin:
                 PersistentGoalCommand.KIND_CLEAR,
                 cleared_transaction,
                 tombstone,
+                map_epoch=max(
+                    1, int(getattr(self, "latest_route_map_epoch", 0) or 0)
+                ),
             )
         )
         self.persistent_target_request_transaction = 0
@@ -149,6 +179,32 @@ class TebGoalBridgePersistentTargetMixin:
             "persistent_target_request_cleared",
             reason=str(reason),
             cleared_transaction_id=cleared_transaction,
+        )
+        return True
+
+    def _publish_persistent_hard_reset_locked(self, reason):
+        """Publish zero-identity tombstones for both persistent route streams."""
+        if not self.persistent_execution:
+            return True
+        tombstone = PoseStamped()
+        tombstone.header.stamp = rospy.Time.now()
+        tombstone.header.frame_id = self.global_frame
+        self.persistent_target_goal_pub.publish(tombstone)
+        self.persistent_target_command_pub.publish(
+            self._persistent_goal_command(
+                PersistentGoalCommand.KIND_CLEAR, 0, tombstone
+            )
+        )
+        self.persistent_mission_goal_pub.publish(tombstone)
+        self.persistent_mission_command_pub.publish(
+            self._persistent_goal_command(
+                PersistentGoalCommand.KIND_CLEAR, 0, tombstone
+            )
+        )
+        self.publish_bridge_status(
+            "persistent_hard_reset_commands_published",
+            reason=str(reason),
+            cleared_transaction_id=0,
         )
         return True
 
@@ -164,6 +220,18 @@ class TebGoalBridgePersistentTargetMixin:
                 PersistentGoalCommand.KIND_MISSION,
                 int(self.latest_goal_transaction_id),
                 approved,
+                map_epoch=max(
+                    1, int(getattr(self, "latest_route_map_epoch", 0) or 0)
+                ),
+                route_kind=str(self.latest_route_kind or "direct_goal"),
+                mission_route_kind=str(
+                    self.latest_mission_route_kind or self.latest_route_kind
+                    or "direct_goal"
+                ),
+                graph_action=str(getattr(self, "latest_graph_action", "") or ""),
+                graph_obligation_kind=str(
+                    getattr(self, "latest_graph_obligation_kind", "") or ""
+                ),
             )
         )
         self.publish_bridge_status(

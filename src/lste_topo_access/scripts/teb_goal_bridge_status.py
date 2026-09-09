@@ -67,6 +67,18 @@ class TebGoalBridgeStatusMixin:
             "latest_route_kind": self.latest_route_kind,
             "active_mission_route_kind": self.active_mission_route_kind,
             "latest_mission_route_kind": self.latest_mission_route_kind,
+            "active_graph_action": str(
+                getattr(self, "active_graph_action", "") or ""
+            ),
+            "latest_graph_action": str(
+                getattr(self, "latest_graph_action", "") or ""
+            ),
+            "active_graph_obligation_kind": str(
+                getattr(self, "active_graph_obligation_kind", "") or ""
+            ),
+            "latest_graph_obligation_kind": str(
+                getattr(self, "latest_graph_obligation_kind", "") or ""
+            ),
             "active_route_id": int(self.active_route_id),
             "latest_route_id": int(self.latest_route_id),
             "frontier_lease_released_route_id": int(
@@ -126,6 +138,8 @@ class TebGoalBridgeStatusMixin:
             "latest_target_epoch": int(self.latest_target_epoch),
             "active_map_epoch": getattr(self, "active_frontier_map_epoch", None),
             "latest_map_epoch": getattr(self, "latest_frontier_map_epoch", None),
+            "active_route_map_epoch": getattr(self, "active_route_map_epoch", None),
+            "latest_route_map_epoch": getattr(self, "latest_route_map_epoch", None),
             "active_epoch": int(getattr(self, "active_target_epoch", 0) or 0),
             "latest_epoch": int(getattr(self, "latest_target_epoch", 0) or 0),
             "active_target_track_id": self.active_target_track_id,

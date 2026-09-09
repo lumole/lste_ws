@@ -151,6 +151,17 @@ class GoalManagerFrontierMixin:
         self.latest_global_frontier_goal = goal
         self.last_frontier_goal = goal
         self.global_frontier_route_id = route_id
+        try:
+            map_epoch = int(payload.get("map_epoch", 0) or 0)
+        except (TypeError, ValueError):
+            map_epoch = 0
+        self.global_frontier_map_epoch = map_epoch if map_epoch > 0 else None
+        self.global_frontier_graph_action = str(
+            payload.get("graph_action", "") or ""
+        ).strip().lower()
+        self.global_frontier_graph_obligation_kind = str(
+            payload.get("graph_obligation_kind", "") or ""
+        ).strip().lower()
         self.global_frontier_goal_context = self.normalize_frontier_goal_context(
             payload.get("goal_context")
         )
@@ -189,6 +200,7 @@ class GoalManagerFrontierMixin:
             "frontier_endpoint",
             "portal_transition",
             "local_egress",
+            "portal_probe",
         ):
             self.global_frontier_mission_route_kind = mission_route_kind
         # A completed frontier segment can start the next map-connected one
@@ -269,6 +281,7 @@ class GoalManagerFrontierMixin:
             "frontier_endpoint",
             "portal_transition",
             "local_egress",
+            "portal_probe",
         ):
             self.global_frontier_route_kind = route_kind
             mission_route_kind = str(
@@ -281,6 +294,18 @@ class GoalManagerFrontierMixin:
                 "portal_probe",
             ):
                 self.global_frontier_mission_route_kind = mission_route_kind
+            try:
+                map_epoch = int(payload.get("map_epoch", 0) or 0)
+            except (TypeError, ValueError):
+                map_epoch = 0
+            if map_epoch > 0:
+                self.global_frontier_map_epoch = map_epoch
+            self.global_frontier_graph_action = str(
+                payload.get("graph_action", "") or ""
+            ).strip().lower()
+            self.global_frontier_graph_obligation_kind = str(
+                payload.get("graph_obligation_kind", "") or ""
+            ).strip().lower()
         route_id = int(payload.get("route_id", 0) or 0)
         command_goal = payload.get("command_goal")
         if (

@@ -83,6 +83,14 @@ class TebGoalBridgePersistentTargetApproachMixin:
             ],
             lifecycle="single_action_target_approach",
         )
+        arm_watchdog = getattr(
+            self, "_arm_route_lease_watchdog_locked", None
+        )
+        if callable(arm_watchdog):
+            arm_watchdog(
+                reason="persistent_target_approach_terminal",
+                action_contract=getattr(self, "active_action_contract", None),
+            )
         rospy.loginfo(
             "TEB goal bridge forwarded persistent target approach: "
             "transaction=%d received=%d track=%s",

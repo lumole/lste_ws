@@ -7,14 +7,22 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, String
 from teb_local_planner.msg import FeedbackMsg
 
+from experiment_reset_contract import HARD_RESET_ACK_TOPIC, HARD_RESET_TOPIC
+
 
 def connect_turn_supervisor_ros(supervisor):
     """Connect all runtime endpoints after parameters and state are ready."""
     supervisor.output_pub = rospy.Publisher(
         supervisor.output_cmd_topic, Twist, queue_size=10
     )
+    supervisor.command_contract_pub = rospy.Publisher(
+        supervisor.command_contract_topic, String, queue_size=10
+    )
     supervisor.status_pub = rospy.Publisher(
         supervisor.status_topic, String, queue_size=10, latch=True
+    )
+    supervisor.hard_reset_ack_pub = rospy.Publisher(
+        HARD_RESET_ACK_TOPIC, String, queue_size=20
     )
     rospy.Subscriber(
         supervisor.planner_cmd_topic, Twist, supervisor.on_planner_command,
@@ -42,6 +50,9 @@ def connect_turn_supervisor_ros(supervisor):
     rospy.Subscriber(
         supervisor.navigation_hold_topic, Bool, supervisor.on_navigation_hold,
         queue_size=1,
+    )
+    rospy.Subscriber(
+        HARD_RESET_TOPIC, String, supervisor.on_hard_reset, queue_size=5
     )
     supervisor.timer = rospy.Timer(
         rospy.Duration(1.0 / supervisor.command_frequency), supervisor.on_timer

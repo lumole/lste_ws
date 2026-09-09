@@ -10,4 +10,9 @@ uint8 KIND_TARGET_INSTALLED=3
 
 uint32 transaction_id
 uint8 kind
+uint64 map_epoch
+string route_kind
+string mission_route_kind
+string graph_action
+string graph_obligation_kind
 geometry_msgs/PoseStamped goal

@@ -15,6 +15,8 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, String
 from lste_msgs.msg import LsteDetections, LsteTask
 
+from experiment_reset_contract import HARD_RESET_ACK_TOPIC, HARD_RESET_TOPIC
+
 
 class GlobalFrontierRosInterfacesMixin:
     def _setup_ros_interfaces(self):
@@ -27,6 +29,9 @@ class GlobalFrontierRosInterfacesMixin:
         )
         self.status_publisher = rospy.Publisher(
             self.status_topic, String, queue_size=10, latch=True
+        )
+        self.hard_reset_ack_publisher = rospy.Publisher(
+            HARD_RESET_ACK_TOPIC, String, queue_size=20
         )
         rospy.Subscriber(self.map_topic, OccupancyGrid, self.on_map, queue_size=1)
         rospy.Subscriber(self.costmap_topic, OccupancyGrid, self.on_costmap, queue_size=1)
@@ -78,6 +83,9 @@ class GlobalFrontierRosInterfacesMixin:
             FrontierExecutionTerminal,
             self.on_execution_terminal,
             queue_size=10,
+        )
+        rospy.Subscriber(
+            HARD_RESET_TOPIC, String, self.on_hard_reset, queue_size=5
         )
         rospy.Timer(
             rospy.Duration(

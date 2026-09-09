@@ -8,6 +8,8 @@ from nav_msgs.msg import OccupancyGrid, Path
 from std_msgs.msg import Bool, String
 from teb_local_planner.msg import FeedbackMsg
 
+from experiment_reset_contract import HARD_RESET_ACK_TOPIC, HARD_RESET_TOPIC
+
 
 def connect_bridge_ros(bridge):
     """Connect the already initialized bridge to ROS exactly once."""
@@ -52,15 +54,23 @@ def _create_publishers(bridge):
     bridge.bridge_status_pub = rospy.Publisher(
         bridge.bridge_status_topic, String, queue_size=10, latch=True
     )
+    bridge.hard_reset_ack_pub = rospy.Publisher(
+        HARD_RESET_ACK_TOPIC, String, queue_size=20
+    )
 
 
 def _create_subscribers(bridge):
-    rospy.Subscriber(bridge.goal_topic, PoseStamped, bridge.on_goal, queue_size=1)
-    rospy.Subscriber(bridge.intent_topic, String, bridge.on_intent, queue_size=1)
     if bridge.use_goal_command:
+        # Atomic mission commands are the sole bridge ownership boundary.
+        # Keeping the legacy pose and intent streams in this lifecycle queue
+        # lets their independently ordered transaction ids advance the bridge
+        # ahead of the command that carries the matching goal.
         rospy.Subscriber(
             bridge.goal_command_topic, String, bridge.on_goal_command, queue_size=1
         )
+    else:
+        rospy.Subscriber(bridge.goal_topic, PoseStamped, bridge.on_goal, queue_size=1)
+        rospy.Subscriber(bridge.intent_topic, String, bridge.on_intent, queue_size=1)
     rospy.Subscriber(
         bridge.frontier_status_topic, String, bridge.on_frontier_status, queue_size=10
     )
@@ -100,4 +110,7 @@ def _create_subscribers(bridge):
         PoseStamped,
         bridge.on_persistent_frontier_endpoint_reached,
         queue_size=10,
+    )
+    rospy.Subscriber(
+        HARD_RESET_TOPIC, String, bridge.on_hard_reset, queue_size=5
     )

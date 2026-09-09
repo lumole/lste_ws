@@ -43,8 +43,22 @@ class CmdVelMuxNode:
         self.teb_turn_transition_count = 0
         self.teb_filter_events = 0
         self.teb_reverse_clamp_count = 0
+        self.teb_command_contract_topic = rospy.get_param(
+            "~teb_command_contract_topic", "/lste/cmd_vel/teb_contract"
+        )
+        self.require_teb_command_contract = str(
+            rospy.get_param("~require_teb_command_contract", True)
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self.teb_contract_last_transaction_id = 0
+        self.teb_contract_last_sequence = 0
+        self.teb_contract_rejection_count = 0
+        self.teb_contract_identity = None
         self.task_done = False
         self.navigation_hold = False
+        self.hard_reset_hold = False
+        self.last_hard_reset_id = ""
+        self.last_hard_reset_transaction_id = 0
+        self.hard_reset_identity_history = []
         self.lock = threading.Lock()
         self.output_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
         # This is an observer contract for the real actuator boundary.  It is
@@ -88,9 +102,20 @@ class CmdVelMuxNode:
         self.teleop_sub = rospy.Subscriber(
             "/lste/cmd_vel/teleop", Twist, self.on_teleop_cmd, queue_size=1
         )
-        self.teb_sub = rospy.Subscriber(
-            "/lste/cmd_vel/teb", Twist, self.on_teb_cmd, queue_size=1
+        self.teb_contract_sub = rospy.Subscriber(
+            self.teb_command_contract_topic,
+            String,
+            self.on_teb_command_contract,
+            queue_size=10,
         )
+        # Keep the raw callback for compatibility with isolated tools, but do
+        # not wire it into the production mux. A bare Twist has no lifecycle
+        # identity and cannot safely cross a warm-slice route boundary.
+        self.teb_sub = None
+        if not self.require_teb_command_contract:
+            self.teb_sub = rospy.Subscriber(
+                "/lste/cmd_vel/teb", Twist, self.on_teb_cmd, queue_size=1
+            )
         self.teb_feedback_sub = rospy.Subscriber(
             "/move_base/TebLocalPlannerROS/teb_feedback",
             FeedbackMsg,
@@ -109,6 +134,21 @@ class CmdVelMuxNode:
             self.on_navigation_hold,
             queue_size=1,
         )
+        self.hard_reset_ack_pub = rospy.Publisher(
+            "/lste/experiment/hard_reset_ack", String, queue_size=20
+        )
+        self.hard_reset_release_sub = rospy.Subscriber(
+            "/lste/experiment/hard_reset_release",
+            String,
+            self.on_hard_reset_release,
+            queue_size=5,
+        )
+        self.hard_reset_sub = rospy.Subscriber(
+            "/lste/experiment/hard_reset",
+            String,
+            self.on_hard_reset,
+            queue_size=5,
+        )
         rospy.loginfo(
             "Command velocity mux ready: initial_mode=%s teb_forward_only=%s "
             "teb_angular_switch=%.3f teb_angular_deadband=%.3f",
@@ -116,6 +156,11 @@ class CmdVelMuxNode:
             self.teb_forward_only,
             self.teb_angular_sign_switch_threshold,
             self.teb_angular_deadband,
+        )
+        rospy.loginfo(
+            "Command velocity mux TEB contract: topic=%s required=%s",
+            self.teb_command_contract_topic,
+            self.require_teb_command_contract,
         )
 
     def reset_teb_filter(self):
@@ -265,6 +310,7 @@ class CmdVelMuxNode:
         governor_reason,
         governor_limit,
         filter_reason,
+        command_identity=None,
     ):
         """Publish the exact mode/safety decision associated with one output."""
         with self.lock:
@@ -296,10 +342,18 @@ class CmdVelMuxNode:
                 "scan_age_seconds": (
                     None if scan_age is None else round(float(scan_age), 5)
                 ),
+                "command_identity": command_identity,
             }
         self.status_pub.publish(String(data=json.dumps(payload, sort_keys=True)))
 
-    def forward(self, source, message, filter_reason="none", input_command=None):
+    def forward(
+        self,
+        source,
+        message,
+        filter_reason="none",
+        input_command=None,
+        command_identity=None,
+    ):
         if input_command is None:
             input_command = message
         with self.lock:
@@ -307,6 +361,7 @@ class CmdVelMuxNode:
                 source == self.mode
                 and not self.task_done
                 and not self.navigation_hold
+                and not self.hard_reset_hold
             )
             if source != self.mode:
                 block_reason = "source_not_selected"
@@ -314,6 +369,8 @@ class CmdVelMuxNode:
                 block_reason = "task_complete"
             elif self.navigation_hold:
                 block_reason = "navigation_hold"
+            elif self.hard_reset_hold:
+                block_reason = "hard_reset_hold"
             else:
                 block_reason = "none"
         if not active:
@@ -326,6 +383,7 @@ class CmdVelMuxNode:
                 governor_reason="not_evaluated",
                 governor_limit=None,
                 filter_reason=filter_reason,
+                command_identity=command_identity,
             )
             return
         # Apply the forward-collision governor to every selected source (TEB,
@@ -345,12 +403,16 @@ class CmdVelMuxNode:
             governor_reason=governor_reason,
             governor_limit=governor_limit,
             filter_reason=filter_reason,
+            command_identity=command_identity,
         )
 
     def on_task_done(self, message):
         with self.lock:
             changed = bool(message.data) != self.task_done
             self.task_done = bool(message.data)
+            # ``task_done=false`` is a mission-state update, not permission to
+            # cross a reset barrier.  Only the explicit reset-release message
+            # may clear ``hard_reset_hold`` after all participants are idle.
         if self.task_done:
             # Completion is a safety gate, not a suggestion to the currently
             # selected controller. Stop both autonomous and keyboard commands.
@@ -370,6 +432,105 @@ class CmdVelMuxNode:
                 rospy.loginfo("Command velocity output locked at zero: task complete")
         elif changed:
             rospy.loginfo("Command velocity output unlocked: new task")
+
+    def on_hard_reset(self, message):
+        """Zero the actuator boundary until the next task is announced."""
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict) or payload.get("event") != "hard_reset":
+            return
+        reset_id = str(payload.get("reset_id", "") or "").strip()
+        if not reset_id:
+            return
+        try:
+            reset_transaction_id = int(payload.get("transaction_id", 0) or 0)
+        except (TypeError, ValueError):
+            reset_transaction_id = 0
+        reset_identity = (reset_id, reset_transaction_id)
+        duplicate = False
+        with self.lock:
+            duplicate = reset_identity in self.hard_reset_identity_history
+            if not duplicate:
+                self.last_hard_reset_id = reset_id
+                self.last_hard_reset_transaction_id = reset_transaction_id
+                self.hard_reset_identity_history.append(reset_identity)
+                del self.hard_reset_identity_history[:-16]
+                self.hard_reset_hold = True
+                self.task_done = False
+                self.navigation_hold = False
+                self.teb_contract_last_transaction_id = 0
+                self.teb_contract_last_sequence = 0
+                self.teb_contract_identity = None
+                self.reset_teb_filter()
+                self.scan_forward_min = float("inf")
+                self.scan_stamp = None
+                self.scan_received_time = None
+            # The ACK describes the reset snapshot, not the later release
+            # state.  A duplicate callback can be delivered after release;
+            # reporting the live hold value there would overwrite a valid
+            # snapshot in the reset verifier.
+            reset_snapshot_hold = True
+        if not duplicate:
+            self.output_pub.publish(Twist())
+            self.publish_status(
+                source="none",
+                input_command=None,
+                output_command=Twist(),
+                active=False,
+                block_reason="hard_reset",
+                governor_reason="not_evaluated",
+                governor_limit=None,
+                filter_reason="reset",
+            )
+        self.hard_reset_ack_pub.publish(String(data=json.dumps({
+            "event": "hard_reset_ack",
+            "node": "lste_cmd_vel_mux",
+            "reset_id": reset_id,
+            "reason": str(payload.get("reason", "slice_boundary")),
+            "reset_transaction_id": reset_transaction_id,
+            "state": "IDLE",
+            "actuator_zero": reset_snapshot_hold,
+            "hard_reset_hold": reset_snapshot_hold,
+            "duplicate": duplicate,
+            "wall_time": rospy.get_time(),
+        }, sort_keys=True)))
+        if not duplicate:
+            rospy.loginfo(
+                "Command velocity mux hard reset complete: reset_id=%s state=IDLE "
+                "actuator_zero=true",
+                reset_id,
+            )
+
+    def on_hard_reset_release(self, message):
+        """Release the zero-output barrier after every reset participant is idle."""
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict) or payload.get("event") != "hard_reset_release":
+            return
+        reset_id = str(payload.get("reset_id", "") or "").strip()
+        if not reset_id or reset_id != self.last_hard_reset_id:
+            return
+        with self.lock:
+            self.hard_reset_hold = False
+        self.hard_reset_ack_pub.publish(String(data=json.dumps({
+            "event": "hard_reset_release_ack",
+            "node": "lste_cmd_vel_mux",
+            "reset_id": reset_id,
+            "reason": str(payload.get("reason", "slice_boundary")),
+            "state": "IDLE",
+            "actuator_zero": True,
+            "hard_reset_hold": False,
+            "wall_time": rospy.get_time(),
+        }, sort_keys=True)))
+        rospy.loginfo(
+            "Command velocity mux hard reset release complete: reset_id=%s "
+            "hard_reset_hold=false",
+            reset_id,
+        )
 
     def on_navigation_hold(self, message):
         """Gate motion for a mission observation window without changing goal."""
@@ -402,7 +563,97 @@ class CmdVelMuxNode:
     def on_teleop_cmd(self, message):
         self.forward("teleop", message)
 
-    def on_teb_cmd(self, message):
+    def _reject_teb_contract(self, reason, identity=None, input_command=None):
+        """Stop on an untrusted command instead of executing stale motion."""
+        with self.lock:
+            self.teb_contract_rejection_count += 1
+        zero = Twist()
+        self.reset_teb_filter()
+        self.output_pub.publish(zero)
+        self.publish_status(
+            source="teb",
+            input_command=input_command,
+            output_command=zero,
+            active=False,
+            block_reason=reason,
+            governor_reason="not_evaluated",
+            governor_limit=None,
+            filter_reason="transaction_rejected",
+            command_identity=identity,
+        )
+        rospy.logwarn_throttle(
+            2.0,
+            "Rejected TEB command contract: reason=%s identity=%s count=%d",
+            reason,
+            identity,
+            self.teb_contract_rejection_count,
+        )
+
+    def on_teb_command_contract(self, message):
+        """Accept only the supervisor command carrying a current transaction."""
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self._reject_teb_contract("malformed_command_contract")
+            return
+        if not isinstance(payload, dict) or payload.get("event") != "teb_command":
+            self._reject_teb_contract("invalid_command_contract")
+            return
+        try:
+            transaction_id = int(payload.get("transaction_id", 0) or 0)
+            command_sequence = int(payload.get("command_sequence", 0) or 0)
+            planner_transaction_id = int(
+                payload.get("planner_transaction_id", 0) or 0
+            )
+            active_transaction_id = int(
+                payload.get("active_action_transaction_id", 0) or 0
+            )
+            linear_x = float(payload.get("linear_x", 0.0) or 0.0)
+            angular_z = float(payload.get("angular_z", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            self._reject_teb_contract("invalid_command_identity")
+            return
+        identity = {
+            "transaction_id": transaction_id,
+            "command_sequence": command_sequence,
+            "planner_command_sequence": int(
+                payload.get("planner_command_sequence", 0) or 0
+            ),
+            "planner_transaction_id": planner_transaction_id,
+            "active_action_transaction_id": active_transaction_id,
+            "decision": str(payload.get("decision", "unknown") or "unknown"),
+            "state": str(payload.get("state", "unknown") or "unknown"),
+        }
+        input_command = Twist()
+        input_command.linear.x = linear_x
+        input_command.angular.z = angular_z
+        nonzero = abs(linear_x) > 0.001 or abs(angular_z) > 0.001
+        with self.lock:
+            last_transaction_id = self.teb_contract_last_transaction_id
+            last_sequence = self.teb_contract_last_sequence
+            if transaction_id <= 0:
+                reason = "missing_transaction_id"
+            elif transaction_id < last_transaction_id or (
+                transaction_id == last_transaction_id
+                and command_sequence <= last_sequence
+            ):
+                reason = "stale_command_transaction"
+            elif nonzero and planner_transaction_id != transaction_id:
+                reason = "planner_transaction_mismatch"
+            elif nonzero and active_transaction_id not in (0, transaction_id):
+                reason = "active_transaction_mismatch"
+            else:
+                reason = ""
+            if not reason:
+                self.teb_contract_last_transaction_id = transaction_id
+                self.teb_contract_last_sequence = command_sequence
+                self.teb_contract_identity = identity
+        if reason:
+            self._reject_teb_contract(reason, identity, input_command)
+            return
+        self._process_teb_command(input_command, identity)
+
+    def _process_teb_command(self, message, command_identity=None):
         command = copy.deepcopy(message)
         filter_reason = "none"
         if self.teb_forward_only and message.linear.x < 0.0:
@@ -459,7 +710,15 @@ class CmdVelMuxNode:
             command,
             filter_reason=filter_reason,
             input_command=message,
+            command_identity=command_identity,
         )
+
+    def on_teb_cmd(self, message):
+        """Compatibility callback for isolated legacy launches."""
+        if self.require_teb_command_contract:
+            self._reject_teb_contract("missing_transaction_identity", input_command=message)
+            return
+        self._process_teb_command(message, self.teb_contract_identity)
 
     def on_teb_feedback(self, message):
         """Cache the next angular motion in TEB's selected trajectory.

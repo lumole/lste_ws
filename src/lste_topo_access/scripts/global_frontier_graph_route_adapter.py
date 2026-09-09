@@ -5,6 +5,8 @@ selection/egress helpers.  It never computes geometry or publishes a velocity
 command; Navfn and TEB remain the only motion authorities.
 """
 
+from dataclasses import replace
+
 import rospy
 
 from global_frontier_graph_route_planner import (
@@ -730,6 +732,16 @@ class GlobalFrontierGraphRouteAdapterMixin:
             excluded_work_item_ids,
             excluded_probe_ids,
         ) = self._graph_route_materialization_exclusions(map_epoch)
+        map_epoch = self._normalise_graph_map_epoch(map_epoch)
+        if map_epoch is None:
+            map_epoch = max(
+                1,
+                int(
+                    getattr(self, "last_map_epoch", None)
+                    or getattr(self, "topology_component_epoch", 1)
+                    or 1
+                ),
+            )
         plan = planner.plan(
             current_place_id,
             places=getattr(getattr(self, "region_memory", None), "regions", ()),
@@ -751,6 +763,8 @@ class GlobalFrontierGraphRouteAdapterMixin:
             excluded_work_item_ids=excluded_work_item_ids,
             excluded_probe_ids=excluded_probe_ids,
         )
+        if getattr(plan, "map_epoch", None) != map_epoch:
+            plan = replace(plan, map_epoch=map_epoch)
         if not commit:
             # This is the read-only first phase of snapshot planning.  It
             # supplies the candidate collector with one durable identity

@@ -29,6 +29,13 @@ class TebGoalBridgeFrontierStatusMixin:
             self.latest_frontier_map_epoch = epoch
         elif route_id == previous_route_id and epoch is not None:
             self.latest_frontier_map_epoch = epoch
+        if epoch is not None and (
+            not bool(getattr(self, "intent_seen", False))
+            or str(getattr(self, "latest_intent_source", "") or "").strip().lower()
+            == "global_slam_frontier"
+            or route_id >= int(getattr(self, "latest_route_id", 0) or 0)
+        ):
+            self.latest_route_map_epoch = epoch
 
     def _handle_frontier_route_unavailable_locked(self, payload):
         """Release an idle route, or defer while its controller still runs.

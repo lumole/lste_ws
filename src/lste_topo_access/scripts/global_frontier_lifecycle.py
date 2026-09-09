@@ -7,6 +7,7 @@ import json
 import rospy
 
 from clock_provider import ClockProvider, now_for
+from experiment_reset_contract import decode_reset_request, publish_reset_ack
 from lifecycle_manager import EventType, LifecycleManager, State
 from global_frontier_event_callbacks import GlobalFrontierEventCallbacksMixin
 from global_frontier_planning_runtime import GlobalFrontierPlanningRuntimeMixin
@@ -40,6 +41,9 @@ class GlobalFrontierLifecycleMixin:
         )
         self._lifecycle_sync_seen = set()
         self._lifecycle_sync_started_transaction = 0
+        self._last_hard_reset_id = None
+        self._last_hard_reset_transaction_id = 0
+        self._hard_reset_count = 0
 
     def lifecycle_state(self):
         return self.lifecycle_manager.current_state
@@ -199,6 +203,12 @@ class GlobalFrontierLifecycleMixin:
             EventType.EXECUTION_TERMINAL, deepcopy(message)
         )
 
+    def on_hard_reset(self, message):
+        """Queue a slice reset; domain state changes stay inside ``tick``."""
+        return self._enqueue_lifecycle_event(
+            EventType.RESET, deepcopy(message)
+        )
+
     def on_immediate_plan(self, event):
         del event
         return self._enqueue_lifecycle_event(
@@ -221,6 +231,8 @@ class GlobalFrontierLifecycleMixin:
 
     def _handle_lifecycle_event(self, event):
         """Apply one gathered fact from inside ``LifecycleManager.tick``."""
+        if event.type == EventType.RESET:
+            return self._apply_hard_reset(event)
         handlers = {
             EventType.MAP_UPDATED: self._apply_map,
             EventType.POSE_UPDATED: self._apply_pose,
@@ -278,6 +290,77 @@ class GlobalFrontierLifecycleMixin:
             return State.IDLE
         if event.type == EventType.TASK_COMPLETED:
             return State.COMPLETED if bool(getattr(event.payload, "data", False)) else State.IDLE
+        return None
+
+    def _apply_hard_reset(self, event):
+        """Clear the complete explorer projection for one warm slice."""
+        request = decode_reset_request(event.payload)
+        if request is None:
+            return None
+        reset_id = request["reset_id"]
+        if reset_id == self._last_hard_reset_id:
+            publish_reset_ack(
+                self.hard_reset_ack_publisher,
+                "lste_global_frontier",
+                request,
+                state=State.IDLE.value,
+                transaction_id=int(
+                    getattr(self, "_last_hard_reset_transaction_id", 0) or 0
+                ),
+                duplicate=True,
+                active_route_id=0,
+                route_owner=False,
+                graph_transaction_active=False,
+                graph_route_lease_active=False,
+            )
+            return None
+
+        task = deepcopy(getattr(self, "latest_task", None))
+        previous_route_id = int(getattr(self, "active_route_id", 0) or 0)
+        previous_graph_transaction = bool(
+            getattr(self, "graph_route_action_transaction", None)
+        )
+        previous_owner = bool(getattr(self, "active_frontier", None))
+        new_transaction_id = self.lifecycle_manager.hard_reset(
+            event=event,
+            now=now_for(self),
+            transaction_id=request.get("transaction_id"),
+        )
+        # Re-running the existing initializer is the authoritative clear list
+        # for every graph ledger, route history, lease, and map projection.
+        self._initialize_runtime_state()
+        if task is not None:
+            GlobalFrontierEventCallbacksMixin.on_task(self, task)
+        self._last_hard_reset_id = reset_id
+        self._last_hard_reset_transaction_id = int(new_transaction_id)
+        self._hard_reset_count += 1
+        self.publish_status(
+            "hard_reset_complete",
+            reset_id=reset_id,
+            reason=request["reason"],
+            previous_active_route_id=previous_route_id,
+            previous_route_owner=previous_owner,
+            previous_graph_transaction_active=previous_graph_transaction,
+            state=State.IDLE.value,
+            hard_reset_count=int(self._hard_reset_count),
+        )
+        publish_reset_ack(
+            self.hard_reset_ack_publisher,
+            "lste_global_frontier",
+            request,
+            state=State.IDLE.value,
+            transaction_id=new_transaction_id,
+            active_route_id=int(getattr(self, "active_route_id", 0) or 0),
+            route_owner=bool(getattr(self, "active_frontier", None)),
+            graph_transaction_active=bool(
+                getattr(self, "graph_route_action_transaction", None)
+            ),
+            graph_route_lease_active=bool(
+                getattr(self, "graph_route_plan_lease_active", False)
+            ),
+            map_epoch=getattr(self, "last_map_epoch", None),
+            task_preserved=task is not None,
+        )
         return None
 
     def _on_lifecycle_transition(self, previous, current, event):

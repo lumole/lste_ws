@@ -1,10 +1,12 @@
 """Command continuity and timer-driven output for the TEB turn supervisor."""
 
 import copy
+import json
 import math
 
 import rospy
 from geometry_msgs.msg import Twist
+from std_msgs.msg import String
 
 from clock_provider import now_for
 
@@ -17,6 +19,74 @@ from teb_turn_supervisor_contract import (
 
 class TebTurnSupervisorControlMixin:
     """Forward TEB commands, with narrowly bounded execution-phase handling."""
+
+    def _lifecycle_transaction_id_locked(self):
+        return int(
+            getattr(
+                getattr(self, "lifecycle_manager", None),
+                "current_transaction_id",
+                0,
+            )
+            or 0
+        )
+
+    def _planner_command_rejection_reason_locked(self, now):
+        """Return the causal reason a raw planner command cannot be forwarded."""
+        current_transaction_id = self._lifecycle_transaction_id_locked()
+        planner_transaction_id = int(
+            getattr(self, "planner_command_transaction_id", 0) or 0
+        )
+        if current_transaction_id <= 0:
+            return "no_lifecycle_transaction"
+        if self.latest_planner_command_wall <= 0.0:
+            return "no_planner_command"
+        if now - self.latest_planner_command_wall > self.planner_command_timeout:
+            return "planner_command_stale"
+        if planner_transaction_id != current_transaction_id:
+            return "planner_transaction_mismatch"
+        active_transaction_id = int(
+            getattr(self, "active_action_transaction_id", 0) or 0
+        )
+        if active_transaction_id > 0 and active_transaction_id != current_transaction_id:
+            return "active_transaction_mismatch"
+        if not self.active_action and (
+            abs(float(self.latest_planner_command.linear.x)) > 0.001
+            or abs(float(self.latest_planner_command.angular.z)) > 0.001
+        ):
+            return "no_active_action"
+        if (
+            self.active_action_identity is not None
+            and self.planner_command_action_identity is not None
+            and self.active_action_identity != self.planner_command_action_identity
+        ):
+            return "planner_route_identity_mismatch"
+        return ""
+
+    def _publish_command_contract(self, command, transaction_id, decision):
+        """Publish the exact command consumed by the mux with its identity."""
+        publisher = getattr(self, "command_contract_pub", None)
+        if publisher is None:
+            return
+        payload = {
+            "event": "teb_command",
+            "transaction_id": int(transaction_id),
+            "command_sequence": int(getattr(self, "output_sequence", 0) or 0),
+            "planner_command_sequence": int(
+                getattr(self, "planner_command_sequence", 0) or 0
+            ),
+            "planner_transaction_id": int(
+                getattr(self, "planner_command_transaction_id", 0) or 0
+            ),
+            "active_action_transaction_id": int(
+                getattr(self, "active_action_transaction_id", 0) or 0
+            ),
+            "active_action": bool(self.active_action),
+            "state": str(self.state),
+            "decision": str(decision),
+            "linear_x": round(float(command.linear.x), 6),
+            "angular_z": round(float(command.angular.z), 6),
+        }
+        publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
 
     def _trajectory_feedback_timeout_locked(self):
         """Return bounded freshness based on the observed feedback cadence."""
@@ -237,6 +307,8 @@ class TebTurnSupervisorControlMixin:
     def on_timer(self, _event):
         now = now_for(self)
         with self.lock:
+            command = Twist()
+            decision = "inactive"
             if (
                 self.mode == self.active_mode
                 and not self.task_done
@@ -252,34 +324,33 @@ class TebTurnSupervisorControlMixin:
                         completed=False,
                     )
                     command = copy.deepcopy(self.latest_planner_command)
+                    decision = "turn_clearance_release"
                 else:
                     command = self._turn_command_locked(
                         1.0 / self.command_frequency
                     )
+                    decision = "turn"
                 state = self.state
             elif (
                 self.mode == self.active_mode
                 and not self.task_done
                 and not self.navigation_hold
             ):
-                planner_command_stale = (
-                    now - self.latest_planner_command_wall
-                    > self.planner_command_timeout
-                )
-                if not planner_command_stale:
+                rejection_reason = self._planner_command_rejection_reason_locked(now)
+                if rejection_reason:
+                    command = Twist()
+                    decision = rejection_reason
+                else:
                     command = copy.deepcopy(self.latest_planner_command)
                     continuity = self._trajectory_continuity_command_locked(
-                        now
+                        now,
+                        planner_command_stale=False,
                     )
                     if continuity is not None:
                         command = continuity
-                else:
-                    command = Twist()
-                    continuity = self._trajectory_continuity_command_locked(
-                        now, planner_command_stale=True
-                    )
-                    if continuity is not None:
-                        command = continuity
+                        decision = "trajectory_continuity"
+                    else:
+                        decision = "pass_through"
                 if (
                     self.turn_settle_until_wall > 0.0
                     and self.pose is not None
@@ -291,6 +362,7 @@ class TebTurnSupervisorControlMixin:
                         )
                         command = copy.deepcopy(command)
                         command.angular.z = max(-0.20, min(0.20, yaw_err * 0.6))
+                        decision = "turn_settle"
                     else:
                         self.turn_settle_until_wall = 0.0
                         self.turn_settle_yaw = None
@@ -299,6 +371,12 @@ class TebTurnSupervisorControlMixin:
                 command = Twist()
                 self.trajectory_zero_started_wall = 0.0
                 state = self.state
+                if self.task_done:
+                    decision = "task_done"
+                elif self.navigation_hold:
+                    decision = "navigation_hold"
+                elif self.mode != self.active_mode:
+                    decision = "controller_mode"
             if (
                 state == STATE_PASS_THROUGH
                 and self._is_managed_action_locked()
@@ -306,7 +384,12 @@ class TebTurnSupervisorControlMixin:
                 and not self.navigation_hold
             ):
                 self._activate_turn_locked()
+            transaction_id = self._lifecycle_transaction_id_locked()
+            self.output_sequence += 1
+            self.last_output_transaction_id = transaction_id
+            self.last_output_decision = decision
         self.output_pub.publish(command)
+        self._publish_command_contract(command, transaction_id, decision)
         with self.lock:
             if now - self.last_status_wall >= 1.0:
                 self.last_status_wall = now

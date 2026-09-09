@@ -46,6 +46,12 @@ class GoalManagerRuntimeStateMixin:
         self.latest_scan: Optional[LaserScan] = None
         self.latest_cmd_vel: Optional[Twist] = None
         self.latest_global_frontier_goal: Optional[PoseStamped] = None
+        # Target routes are validated against the live Navfn/map snapshot even
+        # when the exploration executive is disabled. Keep a local monotonic
+        # epoch so direct target goals carry the same snapshot identity as
+        # frontier routes.
+        self.navigation_map_epoch = 1
+        self.navigation_map_last_stamp = 0.0
         # The frontier planner labels whether the current goal is a validated
         # route connector or the final approach point.  This semantic is
         # forwarded with the goal intent so the TEB bridge can perform an
@@ -58,6 +64,9 @@ class GoalManagerRuntimeStateMixin:
         # coordinate alone cannot tell the TEB bridge whether a map update is
         # a continuous path extension or an unrelated branch.
         self.global_frontier_route_id = 0
+        self.global_frontier_map_epoch = None
+        self.global_frontier_graph_action = ""
+        self.global_frontier_graph_obligation_kind = ""
         self.global_frontier_transition_kind = "initial"
         self.global_frontier_predecessor_route_id = 0
         self.global_frontier_transition_distance = None

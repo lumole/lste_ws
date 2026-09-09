@@ -7,8 +7,9 @@ consume events, change state, advance a transaction, or invoke business
 handlers.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
+import json
 import queue
 import threading
 import uuid
@@ -97,6 +98,14 @@ class Event:
     transaction_id: int
     payload: Any = None
     created_at: float = 0.0
+    # Events created through ``make_event`` carry the lifecycle generation in
+    # which they entered the transport boundary.  This prevents a callback
+    # racing a hard reset from reintroducing pre-reset sensor state.
+    generation: int = 0
+    # A repeated wire reset must be observable by the domain handler so it can
+    # resend its ACK, but it must not trigger the destructive reset fallback a
+    # second time.
+    reset_duplicate: bool = False
 
 
 @dataclass(frozen=True)
@@ -237,6 +246,10 @@ class LifecycleManager:
         self._tick_active = False
         self._has_ticked = False
         self._reset_failed_on_next_tick = False
+        self._event_generation = 1
+        self._accepted_reset_identity = None
+        self._reset_identity_history = []
+        self._duplicate_reset_pending = False
         self._max_events_per_tick = max(1, int(max_events_per_tick))
         self._coalesced_events = {}
         self._coalesced_markers = set()
@@ -325,12 +338,96 @@ class LifecycleManager:
                 if transaction_id is None
                 else int(transaction_id)
             )
+            generation = self._event_generation
         return Event(
             type=event_type,
             transaction_id=tx,
             payload=payload,
             created_at=self._time_fn() if created_at is None else float(created_at),
+            generation=generation,
         )
+
+    def _drop_pending_events_locked(self):
+        """Discard queued facts while the inbox lock is held."""
+        while True:
+            try:
+                self.inbox.get_nowait()
+            except queue.Empty:
+                break
+        self._coalesced_events.clear()
+        self._coalesced_markers.clear()
+        self._duplicate_reset_pending = False
+
+    @staticmethod
+    def _reset_identity(event: Event):
+        """Return the stable wire identity used to make reset idempotent."""
+        raw = getattr(event.payload, "data", event.payload)
+        if isinstance(raw, Mapping):
+            payload = raw
+        else:
+            try:
+                payload = json.loads(str(raw))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+        if not isinstance(payload, Mapping):
+            return None
+        reset_id = str(payload.get("reset_id", "") or "").strip()
+        if not reset_id:
+            return None
+        try:
+            transaction_id = int(
+                payload.get("transaction_id", event.transaction_id)
+                or event.transaction_id
+                or 0
+            )
+        except (TypeError, ValueError):
+            transaction_id = int(event.transaction_id or 0)
+        return reset_id, transaction_id
+
+    def hard_reset(
+        self,
+        event: Optional[Event] = None,
+        now: Optional[float] = None,
+        transaction_id: Optional[int] = None,
+    ):
+        """Start a fresh IDLE transaction and discard all pending old facts.
+
+        This is deliberately callable only from the timer-owned tick.  Node
+        handlers clear their domain state before calling it; this method then
+        supplies the common transaction and transport barrier.
+        """
+        if not self._tick_active:
+            raise RuntimeError("hard resets are owned by tick()")
+        reset_time = self._time_fn() if now is None else float(now)
+        with self._state_lock:
+            previous = self.current_state
+            requested = 0 if transaction_id is None else int(transaction_id)
+            candidate = requested if requested > 0 else self._new_transaction_id()
+            if candidate <= self.current_transaction_id:
+                candidate = self.current_transaction_id + 1
+            self.current_transaction_id = candidate
+            self._next_transaction_id = candidate
+            self.current_state = State.IDLE
+            self.state_entry_time = reset_time
+            self._reset_failed_on_next_tick = False
+            self._event_generation += 1
+            generation = self._event_generation
+        with self._inbox_state_lock:
+            self._drop_pending_events_locked()
+            self._highest_accepted_transaction_id = candidate
+        reset_event = event or Event(
+            EventType.RESET,
+            candidate,
+            {"reset_id": "unknown"},
+            reset_time,
+            generation,
+        )
+        if (
+            self._transition_handler is not None
+            and previous != State.IDLE
+        ):
+            self._transition_handler(previous, State.IDLE, reset_event)
+        return candidate
 
     def adopt_transaction(
         self,
@@ -372,6 +469,51 @@ class LifecycleManager:
         """Push one immutable fact; this is the only callback-safe method."""
         if not isinstance(event, Event):
             raise TypeError("event must be an Event")
+        if event.type == EventType.RESET:
+            # The first reset for an identity is a transport barrier.  Repeated
+            # wire requests only provide an ACK retry; they must not discard a
+            # successor goal that arrived after the barrier.
+            reset_identity = self._reset_identity(event)
+            with self._inbox_state_lock:
+                duplicate = (
+                    reset_identity is not None
+                    and reset_identity == self._accepted_reset_identity
+                )
+                if (
+                    reset_identity is not None
+                    and reset_identity in self._reset_identity_history
+                    and not duplicate
+                ):
+                    # A delayed reset from an older slice is stale transport,
+                    # not a new lifecycle boundary. Ignore it without
+                    # disturbing the current mission event queue.
+                    return True
+                if duplicate and self._duplicate_reset_pending:
+                    return True
+                if not duplicate:
+                    self._drop_pending_events_locked()
+                queued_event = (
+                    replace(event, reset_duplicate=True)
+                    if duplicate else event
+                )
+                try:
+                    self.inbox.put_nowait(queued_event)
+                except queue.Full:
+                    self.dropped_events += 1
+                    self.dropped_causal_events += 1
+                    return False
+                if duplicate:
+                    self._duplicate_reset_pending = True
+                else:
+                    self._accepted_reset_identity = reset_identity
+                    if reset_identity is not None:
+                        self._reset_identity_history.append(reset_identity)
+                        del self._reset_identity_history[:-32]
+                self._highest_accepted_transaction_id = max(
+                    self._highest_accepted_transaction_id,
+                    int(event.transaction_id),
+                )
+            return True
         key = self._coalescing_key(event)
         if key is not None:
             with self._inbox_state_lock:
@@ -398,6 +540,7 @@ class LifecycleManager:
                     event.transaction_id,
                     ("__coalesced__", key[2]),
                     event.created_at,
+                    event.generation,
                 )
                 try:
                     self.inbox.put_nowait(marker)
@@ -483,6 +626,7 @@ class LifecycleManager:
                 event.transaction_id,
                 ("resync", None),
                 max(previous.created_at, event.created_at),
+                event.generation,
             )
         return event
 
@@ -579,6 +723,7 @@ class LifecycleManager:
                 self._reset_failed_on_next_tick = False
                 self.begin_transaction(State.IDLE, now=tick_time)
             processed = stale = future = adopted_future = 0
+            reset_processed = False
             event_limit = (
                 self._max_events_per_tick
                 if max_events is None
@@ -591,6 +736,34 @@ class LifecycleManager:
                     except queue.Empty:
                         break
                     event = self._materialize_event(marker)
+                if event.type == EventType.RESET:
+                    reset_processed = True
+                    duplicate_reset = bool(event.reset_duplicate)
+                    if duplicate_reset:
+                        with self._inbox_state_lock:
+                            self._duplicate_reset_pending = False
+                    generation_before = self._event_generation
+                    requested_state = None
+                    if self._event_handler is not None:
+                        requested_state = self._event_handler(event)
+                    if (
+                        not duplicate_reset
+                        and self._event_generation == generation_before
+                    ):
+                        # A narrow compatibility handler may only observe the
+                        # reset. Still enforce the common lifecycle barrier.
+                        self.hard_reset(event=event, now=tick_time)
+                    self.processed_events += 1
+                    processed += 1
+                    # Domain handlers may have queued fresh sensor samples
+                    # after clearing the inbox. Start those on the next tick.
+                    break
+                if (
+                    event.generation not in (0, self._event_generation)
+                ):
+                    self.discarded_stale_events += 1
+                    stale += 1
+                    continue
                 if event.type in self._TRANSACTION_INDEPENDENT_EVENT_TYPES:
                     # Apply the latest sampled state to whichever mission
                     # transaction is current when the timer owns the tick.
@@ -643,7 +816,11 @@ class LifecycleManager:
                     self.transition_to(requested_state, event, now=tick_time)
                 self.processed_events += 1
                 processed += 1
-            if compute_handler is not None and self.current_state != State.FAILED:
+            if (
+                compute_handler is not None
+                and self.current_state != State.FAILED
+                and not reset_processed
+            ):
                 compute_handler(tick_time)
             timed_out = self.check_timeouts(tick_time)
             self._last_tick_time = tick_time

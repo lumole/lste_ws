@@ -64,6 +64,9 @@ class TebGoalBridgeMissionInputMixin:
                     target_epoch = max(
                         0, int(payload.get("target_epoch", 0) or 0)
                     )
+                    map_epoch = max(
+                        0, int(payload.get("map_epoch", 0) or 0)
+                    )
                 except (TypeError, ValueError):
                     return
                 with self.lock:
@@ -143,6 +146,9 @@ class TebGoalBridgeMissionInputMixin:
                     self.latest_intent_priority = 2
                     self.latest_route_kind = ""
                     self.latest_mission_route_kind = ""
+                    self.latest_route_map_epoch = map_epoch or None
+                    self.latest_graph_action = ""
+                    self.latest_graph_obligation_kind = ""
                     self.latest_route_id = 0
                     self.latest_intent_goal = None
                     self.latest_target_epoch = target_epoch
@@ -198,6 +204,7 @@ class TebGoalBridgeMissionInputMixin:
             route_id = max(0, int(payload.get("route_id", 0) or 0))
             target_epoch = max(0, int(payload.get("target_epoch", 0) or 0))
             transaction_id = max(0, int(payload.get("transaction_id", 0) or 0))
+            map_epoch = max(0, int(payload.get("map_epoch", 0) or 0))
         except (TypeError, ValueError):
             return
         frame = str(payload.get("frame_id", self.global_frame)).strip().lstrip("/")
@@ -211,6 +218,15 @@ class TebGoalBridgeMissionInputMixin:
         goal.pose.orientation.z = math.sin(0.5 * yaw)
         goal.pose.orientation.w = math.cos(0.5 * yaw)
         with self.lock:
+            if map_epoch <= 0:
+                self.publish_bridge_status(
+                    "mission_goal_ignored",
+                    reason="missing_map_epoch",
+                    source=str(payload.get("source", "unknown") or "unknown"),
+                    route_kind=str(payload.get("route_kind", "") or ""),
+                    transaction_id=transaction_id,
+                )
+                return
             command_source = payload.get("source", "unknown")
             normalized_source = (
                 str(command_source or "unknown").strip().lower() or "unknown"
@@ -447,9 +463,20 @@ class TebGoalBridgeMissionInputMixin:
                 str(payload.get("source", "unknown")).strip().lower() or "unknown"
             )
             self.latest_intent_priority = priority
-            self.latest_route_kind = str(payload.get("route_kind", "")).strip().lower()
+            self.latest_route_kind = str(
+                payload.get("route_kind", "")
+            ).strip().lower() or (
+                "direct_goal" if priority >= 2 else "frontier_endpoint"
+            )
             self.latest_mission_route_kind = str(
                 payload.get("mission_route_kind", self.latest_route_kind)
+            ).strip().lower() or self.latest_route_kind
+            self.latest_route_map_epoch = map_epoch or None
+            self.latest_graph_action = str(
+                payload.get("graph_action", "") or ""
+            ).strip().lower()
+            self.latest_graph_obligation_kind = str(
+                payload.get("graph_obligation_kind", "") or ""
             ).strip().lower()
             self.latest_route_id = route_id
             self.latest_target_epoch = target_epoch

@@ -5,11 +5,14 @@ from copy import deepcopy
 import json
 
 import rospy
+from geometry_msgs.msg import Twist
 
+from experiment_reset_contract import decode_reset_request, publish_reset_ack
 from lifecycle_manager import EventType, LifecycleManager, State
 from teb_turn_supervisor_callbacks import TebTurnSupervisorCallbacksMixin
 from teb_turn_supervisor_control import TebTurnSupervisorControlMixin
 from teb_turn_supervisor_contract import STATE_PASS_THROUGH
+from teb_turn_supervisor_state import initialize_turn_supervisor_state
 
 
 class TebTurnSupervisorLifecycleMixin:
@@ -27,6 +30,9 @@ class TebTurnSupervisorLifecycleMixin:
                 ),
             },
         )
+        self._last_hard_reset_id = None
+        self._last_hard_reset_transaction_id = 0
+        self._hard_reset_count = 0
 
     def _transaction_id_from_message(self, message):
         try:
@@ -100,6 +106,10 @@ class TebTurnSupervisorLifecycleMixin:
             EventType.BRIDGE_NAVIGATION_HOLD, message
         )
 
+    def on_hard_reset(self, message):
+        """Queue reset with the same timer-owned boundary as other inputs."""
+        return self._enqueue_turn_event(EventType.RESET, deepcopy(message))
+
     def on_timer(self, event):
         def compute(now):
             pending_hold = self.latest_navigation_hold_sample
@@ -115,6 +125,8 @@ class TebTurnSupervisorLifecycleMixin:
         )
 
     def _handle_lifecycle_event(self, event):
+        if event.type == EventType.RESET:
+            return self._apply_hard_reset(event)
         if (
             self.lifecycle_manager.current_transaction_id == 0
             and event.type in (EventType.BRIDGE_INTENT, EventType.BRIDGE_GOAL)
@@ -146,6 +158,82 @@ class TebTurnSupervisorLifecycleMixin:
             getattr(event.payload, "data", False)
         ):
             return State.COMPLETED
+        return None
+
+    def _apply_hard_reset(self, event):
+        """Clear every cached action/command before a warm slice resumes."""
+        request = decode_reset_request(event.payload)
+        if request is None:
+            return None
+        reset_id = request["reset_id"]
+        if reset_id == self._last_hard_reset_id:
+            publish_reset_ack(
+                self.hard_reset_ack_pub,
+                "lste_teb_turn_supervisor",
+                request,
+                # A duplicate request is an idempotent acknowledgement of the
+                # original cleared snapshot.  Do not expose live control-tick
+                # counters or a later mission transaction here.
+                state=State.IDLE.value,
+                transaction_id=int(
+                    getattr(self, "_last_hard_reset_transaction_id", 0) or 0
+                ),
+                duplicate=True,
+                active_action=False,
+                planner_command_sequence=0,
+                planner_transaction_id=0,
+                output_sequence=0,
+                command=[0.0, 0.0],
+                planner_command_cleared=True,
+            )
+            return None
+
+        previous_state = str(getattr(self, "state", STATE_PASS_THROUGH))
+        previous_action = bool(getattr(self, "active_action", False))
+        previous_task_done = bool(getattr(self, "task_done", False))
+        new_transaction_id = self.lifecycle_manager.hard_reset(
+            event=event,
+            now=rospy.Time.now().to_sec(),
+            transaction_id=request.get("transaction_id"),
+        )
+        # Keep publishers, parameters, and the timer intact; only reset the
+        # supervisor's mutable execution state.  Late callbacks already queued
+        # before this call are discarded by LifecycleManager.hard_reset().
+        initialize_turn_supervisor_state(self)
+        self._last_hard_reset_id = reset_id
+        self._last_hard_reset_transaction_id = int(new_transaction_id)
+        self._hard_reset_count += 1
+        self.output_pub.publish(Twist())
+        self.publish_status_locked(
+            "hard_reset_complete",
+            reset_id=reset_id,
+            reason=request["reason"],
+            state=State.IDLE.value,
+            previous_state=previous_state,
+            previous_active_action=previous_action,
+            previous_task_done=previous_task_done,
+            hard_reset_count=int(self._hard_reset_count),
+            planner_command_cleared=True,
+            output_command=[0.0, 0.0],
+        )
+        publish_reset_ack(
+            self.hard_reset_ack_pub,
+            "lste_teb_turn_supervisor",
+            request,
+            state=State.IDLE.value,
+            transaction_id=new_transaction_id,
+            active_action=False,
+            planner_command_sequence=0,
+            planner_transaction_id=0,
+            output_sequence=0,
+            command=[0.0, 0.0],
+            planner_command_cleared=True,
+        )
+        rospy.loginfo(
+            "TEB turn supervisor hard reset complete: reset_id=%s "
+            "state=IDLE planner_command_cleared=true",
+            reset_id,
+        )
         return None
 
     def _on_lifecycle_transition(self, previous, current, event):

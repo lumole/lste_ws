@@ -65,6 +65,9 @@ class PersistentTebLocalPlanner : public nav_core::BaseLocalPlanner {
   // TEB can briefly lose its geometric goal and MoveBase starts recovery while
   // the graph is still committing the next Place/Portal transition.
   std::atomic<bool> terminal_hold_active_;
+  // A warm-slice reset holds the local planner at zero until a new Navfn plan
+  // is installed. This covers the cancellation-to-clear propagation window.
+  std::atomic<bool> hard_reset_hold_;
   geometry_msgs::PoseStamped installed_target_goal_;
   geometry_msgs::PoseStamped reported_target_goal_;
   geometry_msgs::PoseStamped reported_frontier_goal_;
@@ -163,6 +166,11 @@ class StreamingNavfnPlanner : public nav_core::BaseGlobalPlanner {
   uint32_t active_target_mission_sequence_;
   uint32_t validated_target_sequence_;
   uint32_t failed_target_sequence_;
+  uint64_t latest_target_map_epoch_;
+  std::string latest_target_route_kind_;
+  std::string latest_target_mission_route_kind_;
+  std::string latest_target_graph_action_;
+  std::string latest_target_graph_obligation_kind_;
   uint64_t mission_generation_;
   uint64_t target_failure_reported_generation_;
 };

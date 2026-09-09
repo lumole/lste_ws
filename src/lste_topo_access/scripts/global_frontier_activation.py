@@ -221,6 +221,20 @@ class GlobalFrontierActivationMixin:
         if not self.place_departure.active:
             self._clear_active_place_departure()
         self.active_route_id += 1
+        graph_transaction = getattr(
+            self, "graph_route_action_transaction", None
+        )
+        route_epoch = (
+            getattr(graph_transaction, "map_epoch", None)
+            if graph_transaction is not None
+            else getattr(self, "last_map_epoch", None)
+        )
+        try:
+            self.active_route_map_epoch = max(1, int(route_epoch or 0))
+        except (TypeError, ValueError):
+            self.active_route_map_epoch = max(
+                1, int(getattr(self, "topology_component_epoch", 1) or 1)
+            )
         # A strictly newer graph route supersedes any delayed terminal from
         # the previous controller lease.  Clearing the tombstone here keeps
         # late callbacks from being attributed to the new route.

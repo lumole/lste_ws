@@ -55,7 +55,9 @@ def _initialize_action_state(bridge):
     bridge.route_lease_watchdog_timer = None
     bridge.latest_frontier_map_epoch = None
     bridge.latest_frontier_map_route_id = 0
+    bridge.latest_route_map_epoch = None
     bridge.active_frontier_map_epoch = None
+    bridge.active_route_map_epoch = None
     bridge.active_goal_global = None
     # A failed action releases controller-scoped health metrics but keeps the
     # durable route lease identity until Global Frontier publishes a successor.
@@ -134,7 +136,10 @@ def _initialize_mission_state(bridge):
     bridge.latest_intent_priority = 0
     bridge.latest_route_kind = ""
     bridge.latest_mission_route_kind = ""
+    bridge.latest_graph_action = ""
+    bridge.latest_graph_obligation_kind = ""
     bridge.latest_route_id = 0
+    bridge.latest_route_map_epoch = None
     bridge.latest_target_epoch = 0
     bridge.latest_target_track_id = ""
     bridge.latest_target_viewpoint_candidate_id = ""
@@ -162,7 +167,10 @@ def _initialize_mission_state(bridge):
     bridge.active_goal_transaction_id = 0
     bridge.active_route_kind = ""
     bridge.active_mission_route_kind = ""
+    bridge.active_graph_action = ""
+    bridge.active_graph_obligation_kind = ""
     bridge.active_route_id = 0
+    bridge.active_route_map_epoch = None
     bridge.active_target_epoch = 0
     bridge.active_frontier_map_epoch = None
     bridge.active_target_track_id = ""

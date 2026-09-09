@@ -39,6 +39,9 @@ class TebTurnSupervisorTurnLifecycleMixin:
             "mode": self.mode,
             "route_kind": self.latest_route_kind,
             "active_action": bool(self.active_action),
+            "active_action_transaction_id": int(
+                getattr(self, "active_action_transaction_id", 0) or 0
+            ),
             "navigation_hold": bool(self.navigation_hold),
             "active_route_kind": self.active_action_route_kind,
             "intent_source": self.latest_intent_source,
@@ -73,6 +76,22 @@ class TebTurnSupervisorTurnLifecycleMixin:
                 else round(
                     max(0.0, now - self.latest_planner_command_wall), 4
                 )
+            ),
+            "planner_command_sequence": int(
+                getattr(self, "planner_command_sequence", 0) or 0
+            ),
+            "planner_command_transaction_id": int(
+                getattr(self, "planner_command_transaction_id", 0) or 0
+            ),
+            "output_sequence": int(
+                getattr(self, "output_sequence", 0) or 0
+            ),
+            "output_transaction_id": int(
+                getattr(self, "last_output_transaction_id", 0) or 0
+            ),
+            "output_decision": str(
+                getattr(self, "last_output_decision", "unknown")
+                or "unknown"
             ),
             "turns": int(self.turn_count),
             "completed_turns": int(self.turn_completed_count),

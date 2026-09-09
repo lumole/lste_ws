@@ -37,6 +37,12 @@ class TebGoalBridgeActionTerminalMixin:
             "mission_route_kind": str(
                 action_contract.get("mission_route_kind", "") or ""
             ),
+            "graph_action": str(
+                action_contract.get("graph_action", "") or ""
+            ),
+            "graph_obligation_kind": str(
+                action_contract.get("graph_obligation_kind", "") or ""
+            ),
             "intent_source": str(
                 action_contract.get("source", "unknown") or "unknown"
             ),
@@ -97,6 +103,17 @@ class TebGoalBridgeActionTerminalMixin:
             and route_id > 0
         )
         terminal.route_id = route_id if is_frontier else 0
+        try:
+            terminal.map_epoch = max(
+                0,
+                int(
+                    action_contract.get("map_epoch", 0)
+                    if action_contract is not None
+                    else getattr(self, "active_route_map_epoch", 0) or 0
+                ),
+            )
+        except (TypeError, ValueError):
+            terminal.map_epoch = 0
         lifecycle_transaction_id = (
             int(action_contract.get("lifecycle_transaction_id", 0) or 0)
             if action_contract is not None
@@ -114,6 +131,24 @@ class TebGoalBridgeActionTerminalMixin:
         terminal.route_kind = (
             route_kind or "frontier_endpoint"
             if is_frontier else "non_frontier"
+        )
+        terminal.mission_route_kind = str(
+            action_contract.get("mission_route_kind", "")
+            if action_contract is not None
+            else getattr(self, "active_mission_route_kind", "")
+            or terminal.route_kind
+        )
+        terminal.graph_action = str(
+            action_contract.get("graph_action", "")
+            if action_contract is not None
+            else getattr(self, "active_graph_action", "")
+            or ""
+        )
+        terminal.graph_obligation_kind = str(
+            action_contract.get("graph_obligation_kind", "")
+            if action_contract is not None
+            else getattr(self, "active_graph_obligation_kind", "")
+            or ""
         )
         terminal.goal = terminal_goal
         self.terminal_contract_pub.publish(terminal)
@@ -221,6 +256,15 @@ class TebGoalBridgeActionTerminalMixin:
             status_text="SUCCEEDED_XY_WAITING_YAW",
             **self._action_contract_status_fields(action_contract),
         )
+        arm_watchdog = getattr(
+            self, "_arm_route_lease_watchdog_locked", None
+        )
+        if callable(arm_watchdog):
+            arm_watchdog(
+                status=status,
+                reason="turn_execution_terminal_waiting_yaw",
+                action_contract=action_contract,
+            )
         rospy.loginfo(
             "TEB connector reached XY terminal; retaining logical action "
             "until turn supervisor completes yaw"

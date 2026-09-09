@@ -62,6 +62,8 @@ start_teb_navigation_windows() {
       _initial_mode:=$LSTE_CONTROLLER _teb_forward_only:=$TEB_FORWARD_ONLY \\
       _teb_angular_sign_switch_threshold:=$TEB_ANGULAR_SIGN_SWITCH_THRESHOLD \\
       _teb_angular_deadband:=$TEB_ANGULAR_DEADBAND _scan_topic:=/pro3/rlscan \\
+      _teb_command_contract_topic:=/lste/cmd_vel/teb_contract \\
+      _require_teb_command_contract:=true \\
       _governor_decel:=$MUX_GOVERNOR_DECEL _governor_min_gap:=$MUX_GOVERNOR_MIN_GAP \\
       _governor_max_speed:=$MUX_GOVERNOR_MAX_SPEED"
   tmux_new_window 16 "$WS" "health" \

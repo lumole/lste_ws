@@ -289,6 +289,7 @@ class GlobalFrontierRuntimeStateMixin:
         # only when a new BFS branch is selected; an early handoff preserves
         # it only after the discrete path-prefix test proves continuity.
         self.active_route_id = 0
+        self.active_route_map_epoch = None
         # Route id, rather than a bare Boolean, makes a late recovery message
         # harmless after the selector has already promoted a new branch.
         self.recovery_pending_route_id = 0
@@ -428,6 +429,8 @@ class GlobalFrontierRuntimeStateMixin:
         self.graph_route_materialization_exclusions = {}
         self.last_graph_route_materialization_negative_evidence = None
         self.last_map_epoch = None
+        # The hard-reset handler re-runs this initializer, so no graph route
+        # identity or map snapshot epoch can leak into the next slice.
         # The graph method records the category/Pareto decision separately
         # from the legacy scalar diagnostics so experiment replay can prove
         # which policy actually selected a route.

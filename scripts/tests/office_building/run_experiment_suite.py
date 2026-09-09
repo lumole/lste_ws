@@ -33,6 +33,7 @@ from navigation_failure_report import render_markdown as render_failure_report  
 
 
 RUNNER = ROOT / "scripts/tests/office_building/run_office_building.sh"
+HARD_RESET_RUNTIME = ROOT / "scripts/tools/hard_reset_runtime.py"
 SUMMARY_SCRIPT = ROOT / "scripts/tests/office_building/summarize_run.py"
 VERIFY_SCRIPT = ROOT / "scripts/tests/office_building/verify_topology_exploration.py"
 CURRENT = ROOT / "runtime/office_building_benchmark/current"
@@ -1392,6 +1393,91 @@ def _run_benchmark_start(trial, environment):
         raise subprocess.CalledProcessError(return_code, command)
 
 
+def _run_warm_slice_hard_reset(runtime, trial, slice_id, reason):
+    """Reset every stateful participant before another slice can start."""
+    required = [
+        "lste_goal_manager",
+        "lste_teb_goal_bridge",
+        "lste_teb_turn_supervisor",
+        "lste_cmd_vel_mux",
+    ]
+    if str(trial.profile).strip().lower() != "target_entry":
+        required.append("lste_global_frontier")
+    reset_id = "%s-R0001" % slice_id
+    _append_lifecycle_event(
+        runtime.run_dir,
+        "warm_slice_reset_requested",
+        level="WARN" if reason != "slice_timeout" else "INFO",
+        slice_id=slice_id,
+        reset_id=reset_id,
+        reason=reason,
+        required_nodes=required,
+    )
+    command = [
+        sys.executable,
+        str(HARD_RESET_RUNTIME),
+        "--reset-id",
+        reset_id,
+        "--slice-id",
+        slice_id,
+        "--reason",
+        reason,
+        "--timeout",
+        "15",
+    ]
+    for node in required:
+        command.extend(("--require", node))
+    # A warm target-entry slice is an independent local experiment. Keep the
+    # ROS/Gazebo processes alive, but restore the spawned robot pose while the
+    # mux hold is still engaged so the next slice does not inherit the prior
+    # slice's physical endpoint.
+    if str(trial.profile).strip().lower() == "target_entry":
+        command.append("--reset-world")
+    with _interrupt_safe_cleanup():
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=runtime.environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20.0,
+        )
+    output = (completed.stdout or "").strip().splitlines()
+    result = {}
+    if output:
+        try:
+            parsed = json.loads(output[-1])
+            if isinstance(parsed, dict):
+                result = parsed
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result = {}
+    result.setdefault("reset_id", reset_id)
+    result.setdefault("slice_id", slice_id)
+    result["return_code"] = completed.returncode
+    result["stdout_tail"] = output[-4:]
+    result["all_nodes_idle"] = bool(
+        result.get("all_nodes_idle") and completed.returncode == 0
+    )
+    _append_lifecycle_event(
+        runtime.run_dir,
+        "warm_slice_reset_verified",
+        level="INFO" if result["all_nodes_idle"] else "ERROR",
+        slice_id=slice_id,
+        reset_id=reset_id,
+        reason=reason,
+        all_nodes_idle=result["all_nodes_idle"],
+        acknowledged_nodes=result.get("acknowledged_nodes", []),
+        clean_nodes=result.get("clean_nodes", []),
+        return_code=completed.returncode,
+    )
+    if not result["all_nodes_idle"]:
+        raise RuntimeError(
+            "warm slice hard reset failed: %s" % json.dumps(result, sort_keys=True)
+        )
+    return result
+
+
 def _launcher_start_metadata(run_dir: Path):
     """Read the small immutable identity written by the office launcher."""
     lifecycle = Path(run_dir) / (Path(run_dir).name + "_lifecycle.log")
@@ -2292,6 +2378,25 @@ def _warm_slice_record(
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             diagnostic = None
+    reset = None
+    reset_error = None
+    try:
+        reset = _run_warm_slice_hard_reset(
+            runtime,
+            trial,
+            slice_id,
+            "slice_interrupted" if interrupted else "slice_boundary",
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        reset_error = "%s:%s" % (type(exc).__name__, exc)
+        _append_lifecycle_event(
+            runtime.run_dir,
+            "warm_slice_reset_failed",
+            level="ERROR",
+            session_id=session_id,
+            slice_id=slice_id,
+            reason=reset_error,
+        )
     _append_lifecycle_event(
         runtime.run_dir,
         "diagnostic_slice_finished",
@@ -2355,6 +2460,9 @@ def _warm_slice_record(
         "video_status": "disabled_warm_session",
         "video_override": "warm_session_no_video",
         "interrupted": interrupted,
+        "hard_reset": reset,
+        "hard_reset_error": reset_error,
+        "infrastructure_failure": reset_error,
     })
     artifact_path = runtime.run_dir / (
         "%s_slice_%04d_experiment_record.json"
@@ -2461,7 +2569,12 @@ def run_warm_session(
                 stop_on_failure=stop_on_failure,
             )
             slice_records.append(record)
-            if record.get("outcome") in {"failure_snapshot", "interrupted"}:
+            if (
+                record.get("outcome") in {"failure_snapshot", "interrupted"}
+                or record.get("hard_reset_error")
+            ):
+                if record.get("hard_reset_error"):
+                    session_failure = record.get("hard_reset_error")
                 break
     except KeyboardInterrupt:
         session_failure = "operator_interrupt"

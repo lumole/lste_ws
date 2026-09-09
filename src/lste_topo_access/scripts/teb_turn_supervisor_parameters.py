@@ -19,6 +19,9 @@ def configure_turn_supervisor_parameters(supervisor):
     supervisor.planner_cmd_topic = gp(
         "~planner_cmd_topic", "/lste/cmd_vel/teb_planner"
     )
+    supervisor.command_contract_topic = gp(
+        "~command_contract_topic", "/lste/cmd_vel/teb_contract"
+    )
     supervisor.navfn_plan_topic = gp(
         "~navfn_plan_topic", "/move_base/NavfnROS/plan"
     )

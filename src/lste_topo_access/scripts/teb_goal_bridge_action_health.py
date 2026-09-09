@@ -80,17 +80,11 @@ class TebGoalBridgeActionHealthMixin:
                 getattr(self, "active_route_id", 0)
                 or getattr(self, "latest_route_id", 0)
             )
-            raw_epoch = getattr(self, "active_target_epoch", None)
-            epoch_source = "target_epoch"
-            if (
-                str(getattr(self, "active_intent_source", "unknown") or "unknown")
-                .strip()
-                .lower()
-                == "global_slam_frontier"
-                and getattr(self, "active_frontier_map_epoch", None) is not None
-            ):
-                raw_epoch = self.active_frontier_map_epoch
-                epoch_source = "map_epoch"
+            raw_epoch = getattr(self, "active_route_map_epoch", None)
+            epoch_source = "map_epoch"
+            if raw_epoch is None:
+                raw_epoch = getattr(self, "active_target_epoch", None)
+                epoch_source = "target_epoch"
             source = str(
                 getattr(self, "active_intent_source", "unknown") or "unknown"
             )
@@ -113,14 +107,20 @@ class TebGoalBridgeActionHealthMixin:
             "action_generation": generation,
             "epoch": epoch,
             "epoch_source": epoch_source if epoch is not None else "unavailable",
-            "map_epoch": (
-                None
-                if contract is None
-                else contract.get("map_epoch")
-            ),
+            "map_epoch": raw_map_epoch if contract is not None else raw_epoch,
             "source": source.strip().lower() or "unknown",
             "route_kind": route_kind.strip().lower(),
             "mission_route_kind": mission_route_kind.strip().lower(),
+            "graph_action": str(
+                (contract.get("graph_action", "") if contract is not None
+                 else getattr(self, "active_graph_action", ""))
+                or ""
+            ).strip().lower(),
+            "graph_obligation_kind": str(
+                (contract.get("graph_obligation_kind", "") if contract is not None
+                 else getattr(self, "active_graph_obligation_kind", ""))
+                or ""
+            ).strip().lower(),
             "priority": priority,
         }
 
@@ -791,6 +791,7 @@ class TebGoalBridgeActionHealthMixin:
         self.active_goal_transaction_id = 0
         self.active_route_kind = ""
         self.active_route_id = 0
+        self.active_route_map_epoch = None
         self.active_target_epoch = 0
         self.active_target_track_id = ""
 

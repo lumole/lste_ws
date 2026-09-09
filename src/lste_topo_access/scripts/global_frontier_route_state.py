@@ -461,6 +461,7 @@ class GlobalFrontierRouteStateMixin:
         self.active_last_waypoint_map = None
         self.active_last_waypoint_yaw = None
         self.active_route_kind = "frontier_endpoint"
+        self.active_route_map_epoch = None
         self.active_portal_retry = False
         self.active_local_egress_resumes_portal = False
         self.active_terminal_received = False
