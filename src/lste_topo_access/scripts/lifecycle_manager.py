@@ -167,8 +167,18 @@ class LifecycleManager:
     # Navigation hold is a sampled actuator gate, not ownership of a mission
     # transaction. It must survive a bridge transaction boundary so a queued
     # release cannot be discarded as stale after a successor goal is adopted.
+    # The physical sensor streams below have the same lifetime semantics. A
+    # task or route transaction may change while the robot is stationary, and
+    # a latched map/costmap may not publish again after that boundary. Treating
+    # those observations as route-owned can therefore discard the only map
+    # sample and deadlock the frontier executive before it can dispatch its
+    # first safe route.
     _TRANSACTION_INDEPENDENT_EVENT_TYPES = frozenset({
         EventType.BRIDGE_NAVIGATION_HOLD,
+        EventType.MAP_UPDATED,
+        EventType.COSTMAP_UPDATED,
+        EventType.POSE_UPDATED,
+        EventType.SCAN_UPDATED,
     })
     _TRANSACTION_UNIQUE_BITS = 64
     _TRANSACTION_ID_LOCK = threading.Lock()

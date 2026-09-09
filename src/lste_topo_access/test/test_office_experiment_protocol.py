@@ -66,7 +66,7 @@ class OfficeExperimentProtocolTest(unittest.TestCase):
     def test_main_phase_expands_to_independent_process_restarts(self):
         matrix = load_matrix(BENCHMARK / "experiment_matrix.yaml")
         trials = build_trials(matrix, "topology_main")
-        self.assertEqual(len(trials), 54)
+        self.assertEqual(len(trials), 72)
         self.assertEqual({trial.trial_id for trial in trials}, {1, 2, 3})
         self.assertEqual({trial.seed for trial in trials}, {20260905, 20260906, 20260907})
         self.assertEqual({trial.startup_timeout_seconds for trial in trials}, {180})
@@ -75,7 +75,7 @@ class OfficeExperimentProtocolTest(unittest.TestCase):
         )
         self.assertEqual(
             {trial.level for trial in trials},
-            {"level_2", "level_3", "level_4"},
+            {"level_1", "level_2", "level_3", "level_4"},
         )
 
     def test_trial_environment_overrides_inherited_controller(self):

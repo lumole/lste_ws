@@ -30,7 +30,7 @@ class OfficeExperimentAggregationTest(unittest.TestCase):
 
         self.assertTrue(result["complete"])
         self.assertEqual(result["status"], "complete")
-        self.assertEqual(result["expected_trial_count"], 108)
+        self.assertEqual(result["expected_trial_count"], 144)
         self.assertEqual(result["missing_trial_count"], 0)
         self.assertEqual(result["unexpected_trial_count"], 0)
         self.assertEqual(result["duplicate_trial_count"], 0)

@@ -301,11 +301,20 @@ class GlobalFrontierCandidateLifecycleMixin:
         if region_tier == "ready_to_exit":
             self.last_ready_to_exit_reentry_skips += 1
             return None
-        if self.region_memory.is_observed_region_reentry(
-            region,
-            context.source_component,
-            component,
+        if (
+            not is_work_item_rehydration
+            and self.region_memory.is_observed_region_reentry(
+                region,
+                context.source_component,
+                component,
+            )
         ):
+            # A durable WorkItem is already owned by the current physical
+            # Place. Its endpoint may land in a different transient SLAM
+            # component after map growth, but that is not a Place re-entry.
+            # Applying this guard here discarded valid rehydrated candidates
+            # after they had passed the BFS/costmap/ledger checks, leaving the
+            # graph planner with a different WorkItem than its report.
             self.last_observed_place_reentry_skips += 1
             return None
 

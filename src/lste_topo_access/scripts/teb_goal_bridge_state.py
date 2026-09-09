@@ -48,6 +48,14 @@ def _initialize_action_state(bridge):
     bridge.terminal_count = 0
     bridge.action_generation = 0
     bridge.active_action_contract = None
+    # A terminal route remains identifiable for a bounded handoff window.
+    # The timer callback only wakes the lifecycle queue; cleanup itself stays
+    # inside the single lifecycle tick owner.
+    bridge.route_lease_watchdog = None
+    bridge.route_lease_watchdog_timer = None
+    bridge.latest_frontier_map_epoch = None
+    bridge.latest_frontier_map_route_id = 0
+    bridge.active_frontier_map_epoch = None
     bridge.active_goal_global = None
     # A failed action releases controller-scoped health metrics but keeps the
     # durable route lease identity until Global Frontier publishes a successor.
@@ -148,14 +156,15 @@ def _initialize_mission_state(bridge):
     bridge.intent_seen = False
     bridge.active_intent_source = "unknown"
     bridge.active_intent_priority = 0
-    # Semantic transaction currently driving the persistent route. This can be
-    # newer than ``active_action_contract`` when a stream adoption happens
-    # without creating a new MoveBase action.
+    # Semantic transaction currently driving the persistent route. The action
+    # generation may stay stable across stream adoption, while its contract is
+    # refreshed to this semantic lease before a terminal callback arrives.
     bridge.active_goal_transaction_id = 0
     bridge.active_route_kind = ""
     bridge.active_mission_route_kind = ""
     bridge.active_route_id = 0
     bridge.active_target_epoch = 0
+    bridge.active_frontier_map_epoch = None
     bridge.active_target_track_id = ""
     bridge.active_target_viewpoint_candidate_id = ""
     bridge.active_target_viewpoint_attempt_id = ""

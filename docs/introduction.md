@@ -62,6 +62,7 @@
 | [20260907_targeted_navigation_experiments.md](development/20260907_targeted_navigation_experiments.md) | 从秒级最小故障回放逐步扩展到 Level 4 的实验阶梯 |
 | [20260908_navigation_failure_evidence.md](development/20260908_navigation_failure_evidence.md) | 失败 episode、route stall 归因、目标 lease 释放和标准摘要 |
 | [20260908_single_threaded_event_queue_tick_fsm.md](development/20260908_single_threaded_event_queue_tick_fsm.md) | 任务与路线生命周期的单线程事件队列、Tick FSM 实现和验证结果 |
+| [20260909_current_navigation_blocker.md](development/20260909_current_navigation_blocker.md) | 面向导航人员的当前目标、系统状态、route 9 卡点和后续架构边界 |
 
 ## reporting
 

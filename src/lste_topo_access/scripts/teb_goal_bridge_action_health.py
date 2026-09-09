@@ -18,6 +18,515 @@ from clock_provider import now_for
 
 
 class TebGoalBridgeActionHealthMixin:
+    _ROUTE_LEASE_WATCHDOG_SECONDS = 10.0
+
+    @staticmethod
+    def _watchdog_int(value, default=0):
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _route_lease_watchdog_identity_locked(self, action_contract=None):
+        """Build the immutable identity that a terminal route hands off."""
+        contract = action_contract
+        if contract is None:
+            contract = getattr(self, "active_action_contract", None)
+        if contract is None:
+            contract = getattr(self, "last_dispatch_identity", None)
+
+        if contract is not None:
+            generation = self._watchdog_int(
+                contract.get("generation", contract.get("action_generation", 0))
+            )
+            transaction_id = self._watchdog_int(
+                contract.get("transaction_id", 0)
+            )
+            lifecycle_transaction_id = self._watchdog_int(
+                contract.get("lifecycle_transaction_id", 0)
+            )
+            route_id = self._watchdog_int(contract.get("route_id", 0))
+            raw_map_epoch = contract.get("map_epoch")
+            raw_epoch = (
+                raw_map_epoch
+                if raw_map_epoch is not None
+                else contract.get("epoch", contract.get("target_epoch", None))
+            )
+            epoch_source = (
+                "map_epoch" if raw_map_epoch is not None else "target_epoch"
+            )
+            source = str(contract.get("source", "unknown") or "unknown")
+            route_kind = str(contract.get("route_kind", "") or "")
+            mission_route_kind = str(
+                contract.get("mission_route_kind", "") or ""
+            )
+            priority = self._watchdog_int(contract.get("priority", 0))
+        else:
+            generation = self._watchdog_int(
+                getattr(self, "action_generation", 0)
+            )
+            transaction_id = self._watchdog_int(
+                getattr(self, "active_goal_transaction_id", 0)
+                or getattr(self, "latest_goal_transaction_id", 0)
+            )
+            lifecycle_transaction_id = self._watchdog_int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+            )
+            route_id = self._watchdog_int(
+                getattr(self, "active_route_id", 0)
+                or getattr(self, "latest_route_id", 0)
+            )
+            raw_epoch = getattr(self, "active_target_epoch", None)
+            epoch_source = "target_epoch"
+            if (
+                str(getattr(self, "active_intent_source", "unknown") or "unknown")
+                .strip()
+                .lower()
+                == "global_slam_frontier"
+                and getattr(self, "active_frontier_map_epoch", None) is not None
+            ):
+                raw_epoch = self.active_frontier_map_epoch
+                epoch_source = "map_epoch"
+            source = str(
+                getattr(self, "active_intent_source", "unknown") or "unknown"
+            )
+            route_kind = str(getattr(self, "active_route_kind", "") or "")
+            mission_route_kind = str(
+                getattr(self, "active_mission_route_kind", "") or ""
+            )
+            priority = self._watchdog_int(
+                getattr(self, "active_intent_priority", 0)
+            )
+
+        try:
+            epoch = None if raw_epoch is None else max(0, int(raw_epoch))
+        except (TypeError, ValueError):
+            epoch = None
+        return {
+            "route_id": route_id,
+            "transaction_id": transaction_id,
+            "lifecycle_transaction_id": lifecycle_transaction_id,
+            "action_generation": generation,
+            "epoch": epoch,
+            "epoch_source": epoch_source if epoch is not None else "unavailable",
+            "map_epoch": (
+                None
+                if contract is None
+                else contract.get("map_epoch")
+            ),
+            "source": source.strip().lower() or "unknown",
+            "route_kind": route_kind.strip().lower(),
+            "mission_route_kind": mission_route_kind.strip().lower(),
+            "priority": priority,
+        }
+
+    def _shutdown_route_lease_watchdog_timer_locked(self):
+        timer = getattr(self, "route_lease_watchdog_timer", None)
+        self.route_lease_watchdog_timer = None
+        if timer is None:
+            return
+        shutdown = getattr(timer, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception as exc:  # pragma: no cover - ROS shutdown edge
+                rospy.logwarn(
+                    "P0 route lease watchdog timer shutdown failed: "
+                    "transaction_id=%d epoch=%s error=%s",
+                    self._watchdog_int(
+                        getattr(self, "route_lease_watchdog", {}).get(
+                            "transaction_id", 0
+                        )
+                    ),
+                    getattr(self, "route_lease_watchdog", {}).get("epoch"),
+                    exc,
+                )
+
+    def _cancel_route_lease_watchdog_locked(self, reason):
+        """Cancel the one pending route lease watchdog, if any."""
+        record = getattr(self, "route_lease_watchdog", None)
+        if record is None:
+            return False
+        self._shutdown_route_lease_watchdog_timer_locked()
+        self.route_lease_watchdog = None
+        self.publish_bridge_status(
+            "route_lease_watchdog_cancelled",
+            route_id=self._watchdog_int(record.get("route_id")),
+            transaction_id=self._watchdog_int(record.get("transaction_id")),
+            action_generation=self._watchdog_int(
+                record.get("action_generation")
+            ),
+            lifecycle_transaction_id=self._watchdog_int(
+                record.get("lifecycle_transaction_id")
+            ),
+            epoch=record.get("epoch"),
+            map_epoch=record.get("map_epoch"),
+            epoch_source=str(record.get("epoch_source", "unavailable")),
+            reason=str(reason),
+            watchdog_record=dict(record),
+            severity="INFO",
+            priority="P0",
+            machine_readable=True,
+        )
+        return True
+
+    def _arm_route_lease_watchdog_locked(
+        self, status=None, reason="move_base_terminal", action_contract=None
+    ):
+        """Arm one bounded handoff lease after a real MoveBase terminal."""
+        identity = self._route_lease_watchdog_identity_locked(action_contract)
+        if identity["action_generation"] <= 0 and getattr(
+            self, "last_dispatched_goal", None
+        ) is None:
+            return False
+        if getattr(self, "route_lease_watchdog", None) is not None:
+            self._cancel_route_lease_watchdog_locked("rearmed")
+
+        now = float(now_for(self))
+        try:
+            status_code = None if status is None else int(status)
+        except (TypeError, ValueError):
+            status_code = None
+        if status_code is None:
+            status_text = "UNKNOWN"
+        else:
+            status_text = GoalStatus.to_string(status_code)
+        record = dict(identity)
+        record.update(
+            {
+                "armed_at": now,
+                "deadline": now + self._ROUTE_LEASE_WATCHDOG_SECONDS,
+                "status": status_code,
+                "status_text": status_text,
+                "reason": str(reason),
+            }
+        )
+        self.route_lease_watchdog = record
+        self.route_lease_watchdog_timer = None
+        try:
+            is_shutdown = getattr(rospy, "is_shutdown", lambda: False)
+            if not is_shutdown():
+                self.route_lease_watchdog_timer = rospy.Timer(
+                    rospy.Duration(self._ROUTE_LEASE_WATCHDOG_SECONDS),
+                    self._route_lease_watchdog_timer_callback,
+                    oneshot=True,
+                )
+        except Exception as exc:  # pragma: no cover - ROS startup edge
+            # The regular lifecycle tick still enforces the deadline. Keep the
+            # record armed so a timer construction failure cannot leak owner.
+            rospy.logerr(
+                "P0 route lease watchdog timer start failed: "
+                "transaction_id=%d epoch=%s error=%s",
+                identity["transaction_id"],
+                identity["epoch"],
+                exc,
+            )
+        self.publish_bridge_status(
+            "route_lease_watchdog_armed",
+            route_id=identity["route_id"],
+            transaction_id=identity["transaction_id"],
+            action_generation=identity["action_generation"],
+            lifecycle_transaction_id=identity["lifecycle_transaction_id"],
+            epoch=identity["epoch"],
+            map_epoch=identity.get("map_epoch"),
+            epoch_source=identity["epoch_source"],
+            status=status_code,
+            status_text=status_text,
+            deadline=record["deadline"],
+            timeout_seconds=self._ROUTE_LEASE_WATCHDOG_SECONDS,
+            reason=str(reason),
+            watchdog_record=dict(record),
+            severity="WARN",
+            priority="P0",
+            machine_readable=True,
+        )
+        rospy.logwarn(
+            "P0 route lease watchdog armed: route_id=%d transaction_id=%d "
+            "action_generation=%d epoch=%s status=%s deadline=%.3f",
+            identity["route_id"],
+            identity["transaction_id"],
+            identity["action_generation"],
+            identity["epoch"],
+            status_text,
+            record["deadline"],
+        )
+        return True
+
+    def _route_lease_watchdog_has_new_route_locked(self, record):
+        """Return true when a successor route or dispatch has been observed."""
+        captured_route = self._watchdog_int(record.get("route_id"))
+        captured_transaction = self._watchdog_int(
+            record.get("transaction_id")
+        )
+        captured_generation = self._watchdog_int(
+            record.get("action_generation")
+        )
+        if self._watchdog_int(getattr(self, "action_generation", 0)) > captured_generation:
+            return True
+        latest_route = self._watchdog_int(
+            getattr(self, "latest_route_id", 0)
+        )
+        active_route = self._watchdog_int(
+            getattr(self, "active_route_id", 0)
+        )
+        if latest_route > captured_route or active_route > captured_route:
+            return True
+        latest_transaction = self._watchdog_int(
+            getattr(self, "latest_goal_transaction_id", 0)
+        )
+        if (
+            latest_transaction > 0
+            and latest_transaction > captured_transaction
+        ):
+            return True
+        if getattr(self, "latest_goal", None) is None:
+            return False
+        return bool(
+            latest_route != captured_route
+            or str(getattr(self, "latest_route_kind", "") or "").strip().lower()
+            != str(record.get("route_kind", "") or "").strip().lower()
+            or str(
+                getattr(self, "latest_mission_route_kind", "") or ""
+            ).strip().lower()
+            != str(record.get("mission_route_kind", "") or "").strip().lower()
+            or str(
+                getattr(self, "latest_intent_source", "unknown") or "unknown"
+            ).strip().lower()
+            != str(record.get("source", "unknown") or "unknown").strip().lower()
+            or self._watchdog_int(getattr(self, "latest_intent_priority", 0))
+            != self._watchdog_int(record.get("priority"))
+        )
+
+    def _observe_route_lease_watchdog_status_locked(self, payload):
+        """Consume explicit downstream acknowledgements for the old route."""
+        record = getattr(self, "route_lease_watchdog", None)
+        if not isinstance(payload, dict) or record is None:
+            return False
+        event = str(payload.get("event", "") or "").strip().lower()
+        ack_events = {
+            "frontier_route_unavailable",
+            "frontier_prefetched",
+            "replan_acknowledged",
+            "terminal_replan_requested",
+            "terminal_prefetch_promoted",
+            "route_invalidated",
+        }
+        acknowledged = bool(
+            payload.get("ack")
+            or payload.get("acknowledged")
+            or payload.get("accepted")
+            or payload.get("successor_route_id")
+        )
+        route_ids = []
+        for key in (
+            "route_id",
+            "acknowledged_route_id",
+            "released_route_id",
+            "pending_route_id",
+            "successor_route_id",
+        ):
+            value = self._watchdog_int(payload.get(key))
+            if value > 0:
+                route_ids.append(value)
+        captured_route = self._watchdog_int(record.get("route_id"))
+        matching_route = not route_ids or captured_route in route_ids
+        newer_route = any(value > captured_route for value in route_ids)
+        explicit_ack = acknowledged and matching_route
+        repeated_route_command = event == "route_command" and not newer_route
+        if (event in ack_events or explicit_ack) and matching_route and not repeated_route_command:
+            self._cancel_route_lease_watchdog_locked(
+                "downstream_ack:%s" % (event or "unspecified")
+            )
+            return True
+        if newer_route:
+            self._cancel_route_lease_watchdog_locked("new_route_observed")
+            return True
+        return False
+
+    def _route_lease_watchdog_timer_callback(self, _event):
+        """Wake the lifecycle owner; this callback never mutates route state."""
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        enqueue = getattr(lifecycle, "enqueue_type", None)
+        if callable(enqueue):
+            from lifecycle_manager import EventType
+
+            enqueue(EventType.BRIDGE_WAKE, None)
+            return
+        with self.lock:
+            self._tick_route_lease_watchdog_locked(now_for(self))
+
+    def _tick_route_lease_watchdog_locked(self, now=None):
+        """Run the watchdog state machine from the single lifecycle tick."""
+        record = getattr(self, "route_lease_watchdog", None)
+        if record is None:
+            return False
+        if self._route_lease_watchdog_has_new_route_locked(record):
+            self._cancel_route_lease_watchdog_locked("new_route_or_dispatch")
+            return False
+        current = float(now_for(self) if now is None else now)
+        if current < float(record.get("deadline", current)):
+            return False
+        return self._expire_route_lease_watchdog_locked(current)
+
+    def _expire_route_lease_watchdog_locked(self, now=None):
+        """Force release a terminal route whose downstream handoff is silent."""
+        record = getattr(self, "route_lease_watchdog", None)
+        if record is None:
+            return False
+        if self._route_lease_watchdog_has_new_route_locked(record):
+            self._cancel_route_lease_watchdog_locked("new_route_or_dispatch")
+            return False
+        self._shutdown_route_lease_watchdog_timer_locked()
+        self.route_lease_watchdog = None
+        current = float(now_for(self) if now is None else now)
+        route_id = self._watchdog_int(record.get("route_id"))
+        transaction_id = self._watchdog_int(record.get("transaction_id"))
+        action_generation = self._watchdog_int(
+            record.get("action_generation")
+        )
+        epoch = record.get("epoch")
+        transport_cancelled = False
+        transport_error = None
+        cancel_goal = getattr(
+            getattr(self, "action_client", None), "cancel_goal", None
+        )
+        if callable(cancel_goal):
+            try:
+                cancel_goal()
+                transport_cancelled = True
+            except Exception as exc:  # pragma: no cover - actionlib edge
+                transport_error = str(exc)
+        else:
+            transport_error = "cancel_goal_unavailable"
+
+        # Invalidate any late actionlib callback before clearing its contract.
+        self.action_generation = max(
+            self._watchdog_int(getattr(self, "action_generation", 0)),
+            action_generation,
+        ) + 1
+        self.action_active = False
+        self.handoff_requested = False
+        self.frontier_observation_completion_pending = None
+        self.frontier_continuous_prefetch_handoff_pending = None
+        clear_request = getattr(
+            self, "_clear_persistent_target_request_locked", None
+        )
+        if callable(clear_request) and getattr(
+            self, "persistent_execution", False
+        ):
+            clear_request("route_lease_watchdog_expired", force=True)
+        self.persistent_target_pending_transaction = 0
+        self.persistent_target_pending_goal = None
+        self.persistent_installed_target_goal = None
+        self.persistent_installed_target_transaction = 0
+        self.persistent_target_request_transaction = 0
+        clear_health = getattr(self, "_clear_action_health_locked", None)
+        if callable(clear_health):
+            clear_health()
+        self._clear_failed_route_lease_locked()
+
+        source = str(record.get("source", "unknown") or "unknown")
+        if source == "global_slam_frontier" and route_id > 0:
+            self.frontier_lease_released_route_id = max(
+                self._watchdog_int(
+                    getattr(self, "frontier_lease_released_route_id", 0)
+                ),
+                route_id,
+            )
+            self.frontier_lease_released_reason = (
+                "route_lease_watchdog_expired"
+            )
+        if self._watchdog_int(record.get("priority")) >= 2:
+            self.target_lease_tombstone_transaction_id = max(
+                self._watchdog_int(
+                    getattr(self, "target_lease_tombstone_transaction_id", 0)
+                ),
+                transaction_id,
+            )
+            if epoch is not None:
+                self.target_lease_tombstone_epoch = max(
+                    self._watchdog_int(
+                        getattr(self, "target_lease_tombstone_epoch", 0)
+                    ),
+                    self._watchdog_int(epoch),
+                )
+
+        # Keep transaction tombstones for stale-message rejection, but remove
+        # all live route/intent ownership and goal geometry.
+        self.latest_goal = None
+        self.last_dispatched_goal = None
+        self.last_dispatch_identity = None
+        self.last_terminal_goal = None
+        self.latest_intent_source = "waiting_global_slam_frontier"
+        self.latest_intent_priority = 0
+        self.latest_route_kind = ""
+        self.latest_mission_route_kind = ""
+        self.latest_route_id = 0
+        self.latest_intent_goal = None
+        self.latest_target_epoch = 0
+        self.latest_target_track_id = ""
+        self.latest_target_viewpoint_candidate_id = ""
+        self.latest_target_viewpoint_attempt_id = ""
+        self.latest_goal_context = {}
+        self.intent_seen = False
+        self.active_intent_source = "unknown"
+        self.active_intent_priority = 0
+        self.active_goal_transaction_id = 0
+        self.active_route_kind = ""
+        self.active_mission_route_kind = ""
+        self.active_route_id = 0
+        self.active_target_epoch = 0
+        self.active_target_track_id = ""
+        self.active_target_viewpoint_candidate_id = ""
+        self.active_target_viewpoint_attempt_id = ""
+        self.active_goal_context = {}
+        self.persistent_target_terminal_boundary_transaction = 0
+        self.last_result_status = record.get("status")
+        self.last_result_monotonic = current
+        self.publish_bridge_status(
+            "route_lease_watchdog_expired",
+            route_id=route_id,
+            transaction_id=transaction_id,
+            action_generation=action_generation,
+            lifecycle_transaction_id=self._watchdog_int(
+                record.get("lifecycle_transaction_id")
+            ),
+            epoch=epoch,
+            map_epoch=record.get("map_epoch"),
+            epoch_source=str(record.get("epoch_source", "unavailable")),
+            timeout_seconds=self._ROUTE_LEASE_WATCHDOG_SECONDS,
+            armed_at=record.get("armed_at"),
+            expired_at=current,
+            status=record.get("status"),
+            status_text=record.get("status_text"),
+            reason=str(record.get("reason", "move_base_terminal")),
+            severity="ERROR",
+            priority="P0",
+            machine_readable=True,
+            watchdog_action="force_release",
+            transport_cancelled=transport_cancelled,
+            transport_error=transport_error,
+            owner_revoked=True,
+            route_intent_cleared=True,
+            cleanup_complete=True,
+            watchdog_record=dict(record),
+        )
+        rospy.logerr(
+            "P0 route lease watchdog expired: route_id=%d transaction_id=%d "
+            "action_generation=%d epoch=%s transport_cancelled=%s "
+            "owner_revoked=true route_intent_cleared=true",
+            route_id,
+            transaction_id,
+            action_generation,
+            epoch,
+            transport_cancelled,
+        )
+        return True
+
     def _clear_failed_route_lease_locked(self):
         """Forget a failed route only when a new lifecycle supersedes it."""
         self.failed_route_id = 0
@@ -66,6 +575,11 @@ class TebGoalBridgeActionHealthMixin:
         )
         if not target_owned:
             return False
+        cancel_watchdog = getattr(
+            self, "_cancel_route_lease_watchdog_locked", None
+        )
+        if callable(cancel_watchdog):
+            cancel_watchdog("target_lease_released")
         route_id = int(
             getattr(self, "active_route_id", 0)
             or getattr(self, "latest_route_id", 0)
@@ -184,6 +698,11 @@ class TebGoalBridgeActionHealthMixin:
         )
         active_kind = str(getattr(self, "active_route_kind", "") or "")
         was_active = bool(self.action_active)
+        cancel_watchdog = getattr(
+            self, "_cancel_route_lease_watchdog_locked", None
+        )
+        if callable(cancel_watchdog):
+            cancel_watchdog("frontier_lease_released")
         self.frontier_lease_released_route_id = max(
             int(getattr(self, "frontier_lease_released_route_id", 0) or 0),
             route_id,
@@ -221,6 +740,11 @@ class TebGoalBridgeActionHealthMixin:
         return True
 
     def cancel_locked(self, reason):
+        cancel_watchdog = getattr(
+            self, "_cancel_route_lease_watchdog_locked", None
+        )
+        if callable(cancel_watchdog):
+            cancel_watchdog("cancel:%s" % reason)
         self.action_generation += 1
         was_active = bool(self.action_active)
         if was_active:

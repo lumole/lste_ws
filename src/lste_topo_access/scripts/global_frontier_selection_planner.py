@@ -156,28 +156,27 @@ class GlobalFrontierSelectionPlannerMixin:
         if graph_route_planning and graph_prepare is not None and getattr(
             self, "graph_route_planner_enabled", False
         ):
+            snapshot_epoch = getattr(
+                getattr(request, "components", None), "epoch", None
+            )
             reuse_graph_plan_lease = bool(
                 getattr(self, "graph_route_plan_lease_active", False)
             )
-            try:
-                prepare_kwargs = {
-                    "visible_work_item_ids": getattr(
-                        context, "work_item_details", None
-                    ),
-                    "reuse_existing_plan": reuse_graph_plan_lease,
-                }
-                if not reuse_graph_plan_lease:
-                    # The first pass only installs an identity preference for
-                    # candidate collection.  It must not create a graph
-                    # transaction before the complete snapshot is known.
-                    prepare_kwargs["stage_only"] = True
-                graph_plan, _unused_graph_candidate = graph_prepare(
-                    None, **prepare_kwargs,
-                )
-            except TypeError:
-                # Keep narrow legacy fixtures/source-compatible while the ROS
-                # adapter adopts the named visibility contract.
-                graph_plan, _unused_graph_candidate = graph_prepare(None)
+            prepare_kwargs = {
+                "visible_work_item_ids": getattr(
+                    context, "work_item_details", None
+                ),
+                "reuse_existing_plan": reuse_graph_plan_lease,
+                "map_epoch": snapshot_epoch,
+            }
+            if not reuse_graph_plan_lease:
+                # The first pass only installs an identity preference for
+                # candidate collection.  It must not create a graph
+                # transaction before the complete snapshot is known.
+                prepare_kwargs["stage_only"] = True
+            graph_plan, _unused_graph_candidate = graph_prepare(
+                None, **prepare_kwargs,
+            )
         # A failed physical viewpoint is retried only through another safe
         # endpoint tied to the same WorkItem support, never as a generic goal.
         ranking_action_tiers = unique_action_tiers(
@@ -324,15 +323,13 @@ class GlobalFrontierSelectionPlannerMixin:
                 for candidate in graph_obligation_candidates
                 if getattr(candidate, "portal_id", None) is not None
             }
-            try:
-                graph_plan, _unused_graph_candidate = graph_prepare(
-                    None,
-                    visible_work_item_ids=visible_ids,
-                    visible_probe_ids=visible_probe_ids,
-                    reuse_existing_plan=reuse_graph_plan_lease,
-                )
-            except TypeError:
-                graph_plan, _unused_graph_candidate = graph_prepare(None)
+            graph_plan, _unused_graph_candidate = graph_prepare(
+                None,
+                visible_work_item_ids=visible_ids,
+                visible_probe_ids=visible_probe_ids,
+                reuse_existing_plan=reuse_graph_plan_lease,
+                map_epoch=getattr(request.components, "epoch", None),
+            )
 
         # ``hold`` is a graph decision, not an empty score pool. Once the
         # durable planner reports a blocked plan, stop this snapshot before
@@ -404,9 +401,6 @@ class GlobalFrontierSelectionPlannerMixin:
             if selected is not None:
                 self.graph_route_probe_id = None
                 self.graph_route_portal_id = None
-                clear_lease = getattr(self, "_clear_graph_route_plan_lease", None)
-                if clear_lease is not None:
-                    clear_lease("graph_candidate_selected")
                 self.last_graph_candidate_unavailable_signature = None
                 self.last_graph_materialization_wait_signature = None
                 return selected
@@ -417,6 +411,15 @@ class GlobalFrontierSelectionPlannerMixin:
             retain_lease = getattr(self, "_retain_graph_route_plan_lease", None)
             if retain_lease is not None:
                 retain_lease(graph_plan, "durable_identity_not_in_current_frontier_snapshot")
+            record_miss = getattr(
+                self, "_record_graph_route_materialization_miss", None
+            )
+            if callable(record_miss) and record_miss(
+                graph_plan,
+                getattr(request.components, "epoch", None),
+                "durable_identity_not_in_current_frontier_snapshot",
+            ):
+                return None
             signature = graph_plan.signature()
             if signature != getattr(
                 self, "last_graph_candidate_unavailable_signature", None

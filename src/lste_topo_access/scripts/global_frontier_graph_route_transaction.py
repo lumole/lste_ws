@@ -235,6 +235,22 @@ def _accepted(
         updates["portal_path"] = tuple(portal_path)
     if first_portal_id is not None:
         updates["first_portal_id"] = first_portal_id
+    # ``GraphRoutePlan.__post_init__`` derives evidence owner IDs from the
+    # durable action fields. Reconciliation changes those fields explicitly;
+    # retaining the old evidence tuple would report the predecessor WorkItem
+    # as the owner of the newly committed candidate.
+    if any(
+        key in updates
+        for key in (
+            "action",
+            "obligation_kind",
+            "obligation_id",
+            "target_place_id",
+            "first_portal_id",
+        )
+    ):
+        updates["required_evidence"] = ()
+        updates["produces_evidence"] = ()
     committed = replace(plan, reason=reason or plan.reason, **updates)
     return GraphRouteMaterialization(
         accepted=True,

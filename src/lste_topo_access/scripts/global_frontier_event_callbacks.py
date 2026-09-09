@@ -525,29 +525,153 @@ class GlobalFrontierEventCallbacksMixin:
             self, EventType.NAV_FAILED, message, self.apply_bridge_status
         )
 
+    @staticmethod
+    def _bridge_status_contract(payload):
+        """Extract the immutable dispatch identity from one bridge event."""
+        identity = payload.get("last_dispatch_identity")
+        identity = identity if isinstance(identity, dict) else {}
+
+        def positive_int(*values):
+            for value in values:
+                try:
+                    value = int(value or 0)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    return value
+            return 0
+
+        def text_value(*values):
+            for value in values:
+                value = str(value or "").strip().lower()
+                if value:
+                    return value
+            return ""
+
+        return {
+            "route_id": positive_int(
+                payload.get("route_id"), identity.get("route_id")
+            ),
+            "action_generation": positive_int(
+                payload.get("action_generation"),
+                identity.get("action_generation"),
+            ),
+            "transaction_id": positive_int(
+                payload.get("transaction_id"), identity.get("transaction_id")
+            ),
+            "route_kind": text_value(
+                payload.get("route_kind"), identity.get("route_kind")
+            ),
+            "mission_route_kind": text_value(
+                payload.get("mission_route_kind"),
+                identity.get("mission_route_kind"),
+            ),
+            "source": text_value(
+                payload.get("intent_source"),
+                identity.get("source"),
+                payload.get("active_intent_source"),
+                payload.get("source"),
+            ),
+            "priority": positive_int(
+                payload.get("intent_priority"),
+                identity.get("priority"),
+                payload.get("active_intent_priority"),
+            ),
+        }
+
+    def _remember_bridge_dispatch_contract(self, payload):
+        """Remember only routes admitted by the bridge execution boundary."""
+        event = str(payload.get("event", "")).strip()
+        if event not in {"dispatch", "persistent_mission_path_adopted"}:
+            return None
+        contract = self._bridge_status_contract(payload)
+        if (
+            contract["route_id"] <= 0
+            or contract["action_generation"] <= 0
+            or contract["source"] != "global_slam_frontier"
+            or contract["priority"] != 0
+            or contract["route_kind"]
+            not in {"frontier_endpoint", "portal_transition", "local_egress"}
+        ):
+            return None
+        contracts = getattr(self, "_bridge_dispatch_contracts", None)
+        if contracts is None:
+            contracts = {}
+            self._bridge_dispatch_contracts = contracts
+        previous = contracts.get(contract["route_id"])
+        if previous is None or contract["action_generation"] >= previous["action_generation"]:
+            contracts[contract["route_id"]] = contract
+        # Route IDs are monotonic. Keep the evidence lookup bounded during a
+        # long exploration run.
+        for route_id in sorted(contracts)[:-64]:
+            contracts.pop(route_id, None)
+        return contracts.get(contract["route_id"])
+
+    def _bridge_terminal_matches_dispatch(self, payload, contract):
+        """Reject terminal failures that have no matching real dispatch."""
+        if contract is None:
+            return False, "dispatch_contract_missing"
+        expected = getattr(self, "_bridge_dispatch_contracts", {}).get(
+            contract["route_id"]
+        )
+        if expected is None:
+            return False, "dispatch_contract_missing"
+        if contract["action_generation"] <= 0:
+            return False, "action_generation_missing"
+        for field in (
+            "action_generation",
+            "route_kind",
+            "mission_route_kind",
+            "source",
+            "priority",
+        ):
+            if contract[field] != expected[field]:
+                return False, "dispatch_contract_%s_mismatch" % field
+        if (
+            contract["transaction_id"] > 0
+            and expected["transaction_id"] > 0
+            and contract["transaction_id"] != expected["transaction_id"]
+        ):
+            return False, "dispatch_contract_transaction_mismatch"
+        return True, "matched"
+
     def on_bridge_status(self, message):
         """Promote only a matching failed frontier action to a route change."""
         try:
             payload = json.loads(message.data)
         except (TypeError, ValueError, json.JSONDecodeError):
             return False
-        if not isinstance(payload, dict) or payload.get("event") != "terminal":
+        if not isinstance(payload, dict):
+            return False
+        if self._remember_bridge_dispatch_contract(payload) is not None:
+            return False
+        if payload.get("event") != "terminal":
             return False
         if self.task_done:
             return False
-        route_id = max(0, int(payload.get("active_route_id", 0) or 0))
-        if route_id <= 0 or route_id != self.active_route_id:
+        status = int(payload.get("status", -1) or -1)
+        # PREEMPTED is an intentional lifecycle handoff/cancel and therefore
+        # cannot be used as evidence that the frontier is unreachable.
+        if status not in (4, 5, 8, 9):  # ABORTED, REJECTED, RECALLED, LOST
             return False
-        if str(payload.get("active_intent_source", "")) != "global_slam_frontier":
+        contract = self._bridge_status_contract(payload)
+        if contract["route_id"] <= 0 or contract["route_id"] != self.active_route_id:
             return False
-        route_kind = str(payload.get("active_route_kind", ""))
-        mission_route_kind = str(payload.get("active_mission_route_kind", ""))
-        if route_kind not in ("frontier_endpoint", "portal_transition") and mission_route_kind not in (
-            "frontier_endpoint",
-            "portal_transition",
-            "portal_probe",
-        ):
+        matches, mismatch_reason = self._bridge_terminal_matches_dispatch(
+            payload, contract
+        )
+        if not matches:
+            self.publish_status(
+                "bridge_terminal_ignored",
+                reason=mismatch_reason,
+                terminal_route_id=contract["route_id"],
+                active_route_id=int(self.active_route_id),
+                action_generation=contract["action_generation"],
+            )
             return False
+        route_id = contract["route_id"]
+        route_kind = contract["route_kind"]
+        mission_route_kind = contract["mission_route_kind"]
         active_frontier_live = self.active_frontier is not None
         released_kind = str(
             getattr(self, "last_released_route_kind", "") or ""
@@ -568,11 +692,6 @@ class GlobalFrontierEventCallbacksMixin:
             # prove that a controller still owns the route. A delayed action
             # callback is admissible only through the explicit release
             # tombstone recorded by ``release_active_frontier``.
-            return False
-        status = int(payload.get("status", -1) or -1)
-        # PREEMPTED is an intentional lifecycle handoff/cancel and therefore
-        # cannot be used as evidence that the frontier is unreachable.
-        if status not in (4, 5, 8, 9):  # ABORTED, REJECTED, RECALLED, LOST
             return False
         status_name = str(payload.get("status_text", "FAILED")).upper()
         self.recovery_pending_route_id = route_id

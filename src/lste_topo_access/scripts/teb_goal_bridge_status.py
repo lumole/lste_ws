@@ -50,6 +50,12 @@ class TebGoalBridgeStatusMixin:
             "last_dispatch_identity": _identity_snapshot(
                 getattr(self, "last_dispatch_identity", None)
             ),
+            "route_lease_watchdog": _watchdog_snapshot(
+                getattr(self, "route_lease_watchdog", None), now
+            ),
+            "route_lease_watchdog_active": bool(
+                getattr(self, "route_lease_watchdog", None) is not None
+            ),
             "target_terminal_boundary_transaction": int(
                 getattr(
                     self, "persistent_target_terminal_boundary_transaction", 0
@@ -118,6 +124,10 @@ class TebGoalBridgeStatusMixin:
             "prefetched_frontier_route_id": int(self.prefetched_frontier_route_id),
             "active_target_epoch": int(self.active_target_epoch),
             "latest_target_epoch": int(self.latest_target_epoch),
+            "active_map_epoch": getattr(self, "active_frontier_map_epoch", None),
+            "latest_map_epoch": getattr(self, "latest_frontier_map_epoch", None),
+            "active_epoch": int(getattr(self, "active_target_epoch", 0) or 0),
+            "latest_epoch": int(getattr(self, "latest_target_epoch", 0) or 0),
             "active_target_track_id": self.active_target_track_id,
             "latest_target_track_id": self.latest_target_track_id,
             "active_target_viewpoint_candidate_id": str(
@@ -165,14 +175,52 @@ def _identity_snapshot(identity):
     if not isinstance(identity, dict):
         return None
     return {
+        "action_generation": int(identity.get("action_generation", 0) or 0),
         "transaction_id": int(identity.get("transaction_id", 0) or 0),
+        "lifecycle_transaction_id": int(
+            identity.get("lifecycle_transaction_id", 0) or 0
+        ),
         "route_id": int(identity.get("route_id", 0) or 0),
+        "epoch": identity.get("epoch", identity.get("target_epoch", 0)),
+        "map_epoch": identity.get("map_epoch"),
         "route_kind": str(identity.get("route_kind", "") or ""),
         "mission_route_kind": str(
             identity.get("mission_route_kind", "") or ""
         ),
         "source": str(identity.get("source", "unknown") or "unknown"),
         "priority": int(identity.get("priority", 0) or 0),
+    }
+
+
+def _watchdog_snapshot(record, now):
+    """Return the scalar watchdog contract for machine-readable status."""
+    if not isinstance(record, dict):
+        return None
+    deadline = record.get("deadline")
+    try:
+        remaining = None if deadline is None else round(
+            max(0.0, float(deadline) - float(now)), 3
+        )
+    except (TypeError, ValueError):
+        remaining = None
+    return {
+        "route_id": int(record.get("route_id", 0) or 0),
+        "transaction_id": int(record.get("transaction_id", 0) or 0),
+        "lifecycle_transaction_id": int(
+            record.get("lifecycle_transaction_id", 0) or 0
+        ),
+        "action_generation": int(record.get("action_generation", 0) or 0),
+        "epoch": record.get("epoch"),
+        "map_epoch": record.get("map_epoch"),
+        "epoch_source": str(record.get("epoch_source", "unavailable") or "unavailable"),
+        "source": str(record.get("source", "unknown") or "unknown"),
+        "route_kind": str(record.get("route_kind", "") or ""),
+        "status": record.get("status"),
+        "status_text": str(record.get("status_text", "UNKNOWN") or "UNKNOWN"),
+        "reason": str(record.get("reason", "") or ""),
+        "armed_at": record.get("armed_at"),
+        "deadline": deadline,
+        "remaining_seconds": remaining,
     }
 
 

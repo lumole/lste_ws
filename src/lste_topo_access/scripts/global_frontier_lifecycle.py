@@ -67,6 +67,12 @@ class GlobalFrontierLifecycleMixin:
     @staticmethod
     def _transaction_id_from_message(message, event_type=None):
         """Read a distributed lifecycle identity without applying the event."""
+        # Bridge status is an observation stream, not an owner of this
+        # lifecycle. Importing the bridge's local transaction here can adopt a
+        # newer ID while a frontier route is being selected and lets a stale
+        # status event cross the route boundary.
+        if event_type == EventType.NAV_FAILED:
+            return None
         try:
             value = int(getattr(message, "lifecycle_transaction_id", 0) or 0)
         except (TypeError, ValueError):
@@ -287,6 +293,9 @@ class GlobalFrontierLifecycleMixin:
                 ),
             )
         if current == State.FAILED:
+            self._settle_failed_route_obligations(
+                now_for(self), reason="lifecycle_failed"
+            )
             active_frontier = getattr(self, "active_frontier", None)
             release = getattr(self, "release_active_frontier", None)
             if active_frontier is not None and callable(release):
@@ -318,6 +327,28 @@ class GlobalFrontierLifecycleMixin:
                         self.lifecycle_manager._timeouts.get(State.SYNCING, 0.0)
                     ),
                 )
+
+    def _settle_failed_route_obligations(self, now, reason):
+        """Close semantic attempts before releasing their physical route.
+
+        Lifecycle failure cleanup is the common boundary for controller
+        failures. Clearing the active route first used to orphan a durable
+        PortalProbe/WorkItem attempt, so every later planning pass saw an
+        active owner and returned ``hold`` forever.
+        """
+        settle_probe = getattr(self, "settle_active_portal_probe", None)
+        if (
+            callable(settle_probe)
+            and getattr(self, "active_portal_probe_id", None) is not None
+        ):
+            settle_probe("failed", now, reason)
+
+        settle_work_item = getattr(self, "settle_active_work_item", None)
+        if (
+            callable(settle_work_item)
+            and getattr(self, "active_work_item_id", None) is not None
+        ):
+            settle_work_item(now, "deferred", reason)
 
     def _enqueue_sync_snapshot(self):
         """Feed valid cached map state back through the SYNCING FSM.
@@ -449,7 +480,10 @@ class GlobalFrontierLifecycleMixin:
         accepted = GlobalFrontierEventCallbacksMixin.apply_bridge_status(
             self, message
         )
-        return State.FAILED if accepted else None
+        # NAV_FAILED is also the ingress type for non-terminal bridge status
+        # events. Returning the current state suppresses LifecycleManager's
+        # default NAV_FAILED -> FAILED transition for those observations.
+        return State.FAILED if accepted else self.lifecycle_state()
 
     def _apply_turn_status(self, message):
         return GlobalFrontierEventCallbacksMixin.apply_turn_status(self, message)

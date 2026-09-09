@@ -62,6 +62,10 @@ _STRUCTURAL_EVENTS = frozenset(
         "task_done",
         "graph_recovery_requested",
         "graph_exploration_blocked",
+        "graph_route_materialization_miss",
+        "graph_route_materialization_negative_evidence",
+        "graph_route_materialization_invalidated",
+        "graph_route_next_action",
         "frontier_route_unavailable",
         "frontier_exhausted",
     )

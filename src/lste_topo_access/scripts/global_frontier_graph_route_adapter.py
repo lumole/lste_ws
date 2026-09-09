@@ -5,11 +5,23 @@ selection/egress helpers.  It never computes geometry or publishes a velocity
 command; Navfn and TEB remain the only motion authorities.
 """
 
+import rospy
+
 from global_frontier_graph_route_planner import (
     ACTION_CROSS_PORTAL,
     ACTION_PROBE_PORTAL,
     PLAN_READY,
 )
+
+
+_GRAPH_ROUTE_MATERIALIZATION_MAX_MISSES = 4
+_GRAPH_ROUTE_MATERIALIZATION_MAX_EPOCH_SPAN = 2
+_GRAPH_ROUTE_MATERIALIZATION_EXCLUSION_EPOCHS = 8
+_GRAPH_ROUTE_FSM_SEARCHING = "SEARCHING"
+_GRAPH_ROUTE_FSM_PLANNING = "PLANNING"
+_GRAPH_ROUTE_FSM_WAITING = "WAITING_MATERIALIZATION"
+_GRAPH_ROUTE_FSM_EXECUTING = "EXECUTING"
+_GRAPH_ROUTE_FSM_NEXT_ACTION = "NEXT_ACTION"
 from global_frontier_graph_route_transaction import (
     GraphRouteActionTransaction,
     candidate_action,
@@ -42,6 +54,403 @@ class GlobalFrontierGraphRouteAdapterMixin:
             except (TypeError, ValueError):
                 return value
         return None
+
+    @staticmethod
+    def _normalise_graph_map_epoch(value):
+        """Normalize an optional map epoch without inventing provenance."""
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _transition_graph_route_fsm(
+        self, state, *, transaction_id=0, map_epoch=None, reason=""
+    ):
+        """Record the graph executor's explicit lifecycle state."""
+        previous = str(
+            getattr(self, "graph_route_fsm_state", _GRAPH_ROUTE_FSM_SEARCHING)
+            or _GRAPH_ROUTE_FSM_SEARCHING
+        )
+        state = str(state or _GRAPH_ROUTE_FSM_SEARCHING)
+        if previous == state:
+            return False
+        self.graph_route_fsm_state = state
+        publish = getattr(self, "publish_status", None)
+        if callable(publish):
+            publish(
+                "graph_route_fsm_transition",
+                previous_state=previous,
+                current_state=state,
+                transaction_id=int(transaction_id or 0),
+                map_epoch=map_epoch,
+                reason=str(reason or ""),
+            )
+        if state == _GRAPH_ROUTE_FSM_NEXT_ACTION:
+            rospy.logwarn(
+                "Global frontier graph FSM -> NEXT_ACTION "
+                "transaction_id=%s epoch=%s reason=%s",
+                int(transaction_id or 0),
+                map_epoch,
+                str(reason or ""),
+            )
+        return True
+
+    def _reset_graph_materialization_tracking(self):
+        """Forget miss counts when a new graph obligation is installed."""
+        self.graph_route_materialization_miss_signature = None
+        self.graph_route_materialization_miss_count = 0
+        self.graph_route_materialization_epochs = []
+        self.graph_route_materialization_last_event = None
+
+    def _remember_graph_route_materialization_exclusion(
+        self, map_epoch, kind, identity
+    ):
+        """Exclude one failed identity only from the current map epoch."""
+        epoch = self._normalise_graph_map_epoch(map_epoch)
+        try:
+            identity = int(identity)
+        except (TypeError, ValueError):
+            return False
+        if epoch is None or identity <= 0:
+            return False
+        exclusions = getattr(
+            self, "graph_route_materialization_exclusions", None
+        )
+        if not isinstance(exclusions, dict):
+            exclusions = {}
+            self.graph_route_materialization_exclusions = exclusions
+        bucket = exclusions.setdefault(epoch, {})
+        bucket.setdefault(str(kind), set()).add(identity)
+        if len(exclusions) > _GRAPH_ROUTE_MATERIALIZATION_EXCLUSION_EPOCHS:
+            for old_epoch in sorted(exclusions)[: -_GRAPH_ROUTE_MATERIALIZATION_EXCLUSION_EPOCHS]:
+                exclusions.pop(old_epoch, None)
+        return True
+
+    def _graph_route_materialization_exclusions(self, map_epoch):
+        """Return planner exclusions scoped to one known map epoch."""
+        epoch = self._normalise_graph_map_epoch(map_epoch)
+        if epoch is None:
+            return (), (), ()
+        bucket = getattr(
+            self, "graph_route_materialization_exclusions", {}
+        ).get(epoch, {})
+        return (
+            tuple(sorted(bucket.get("portal_ids", set()))),
+            tuple(sorted(bucket.get("work_item_ids", set()))),
+            tuple(sorted(bucket.get("probe_ids", set()))),
+        )
+
+    def _record_graph_route_negative_evidence(
+        self, plan, map_epoch, reason, miss_count, epoch_span
+    ):
+        """Persist epoch-scoped negative evidence before dropping the plan."""
+        epoch = self._normalise_graph_map_epoch(map_epoch)
+        transaction = getattr(self, "graph_route_action_transaction", None)
+        transaction_id = (
+            0 if transaction is None else int(transaction.transaction_id)
+        )
+        negative = {
+            "transaction_id": transaction_id,
+            "map_epoch": epoch,
+            "action": str(getattr(plan, "action", "") or ""),
+            "obligation_kind": str(
+                getattr(plan, "obligation_kind", "") or ""
+            ),
+            "obligation_id": getattr(plan, "obligation_id", None),
+            "first_portal_id": getattr(plan, "first_portal_id", None),
+            "reason": str(reason or ""),
+            "miss_count": int(miss_count),
+            "epoch_span": int(epoch_span),
+        }
+        portal_id = getattr(plan, "first_portal_id", None)
+        portal_action = str(getattr(plan, "action", "") or "")
+        portal_obligation = str(
+            getattr(plan, "obligation_kind", "") or ""
+        )
+        portal_ledger = getattr(self, "portal_hypothesis_ledger", None)
+        get_portal = getattr(portal_ledger, "get", None)
+        if (
+            portal_id is not None
+            and callable(get_portal)
+            and (
+                portal_action == "cross_portal"
+                or portal_obligation in {"portal_edge", "unbound_portal"}
+            )
+        ):
+            try:
+                portal_id = int(portal_id)
+            except (TypeError, ValueError):
+                portal_id = None
+            record = None if portal_id is None else get_portal(portal_id)
+            if (
+                isinstance(record, dict)
+                and record.get("destination_place_id") is None
+                and str(record.get("state", "")).strip().lower()
+                in {"certified", "selected"}
+            ):
+                mark_rejected = getattr(
+                    portal_ledger, "mark_unbound_rejected", None
+                )
+                if callable(mark_rejected):
+                    marked = mark_rejected(
+                        portal_id,
+                        epoch,
+                        "portal_unmaterializable_at_epoch",
+                    )
+                    negative["portal_negative_evidence"] = {
+                        "portal_id": portal_id,
+                        "map_epoch": epoch,
+                        "reason": "portal_unmaterializable_at_epoch",
+                        "state": (
+                            None if marked is None else marked.get("state")
+                        ),
+                    }
+        if (
+            str(getattr(plan, "action", "") or "") == ACTION_PROBE_PORTAL
+            and str(getattr(plan, "obligation_kind", "") or "")
+            == "portal_probe"
+            and getattr(plan, "obligation_id", None) is not None
+        ):
+            probe_ledger = getattr(self, "portal_probe_ledger", None)
+            park = getattr(probe_ledger, "mark_projection_unavailable", None)
+            if callable(park):
+                parked = park(
+                    plan.obligation_id,
+                    map_epoch=epoch,
+                    reason="probe_unmaterializable_at_epoch",
+                )
+                negative["probe_negative_evidence"] = {
+                    "probe_id": plan.obligation_id,
+                    "map_epoch": epoch,
+                    "reason": "probe_unmaterializable_at_epoch",
+                    "state": None if parked is None else parked.get("state"),
+                }
+                if self._remember_graph_route_materialization_exclusion(
+                    epoch, "probe_ids", plan.obligation_id
+                ):
+                    negative["probe_negative_evidence"][
+                        "excluded_in_map_epoch"
+                    ] = True
+        if epoch is not None:
+            obligation_kind = str(
+                getattr(plan, "obligation_kind", "") or ""
+            )
+            obligation_id = getattr(plan, "obligation_id", None)
+            if (
+                obligation_kind == "work_item"
+                and self._remember_graph_route_materialization_exclusion(
+                    epoch, "work_item_ids", obligation_id
+                )
+            ):
+                negative["work_item_negative_evidence"] = {
+                    "work_item_id": int(obligation_id),
+                    "map_epoch": epoch,
+                    "reason": "work_item_unmaterializable_at_epoch",
+                    "excluded_in_map_epoch": True,
+                }
+            if (
+                portal_id is not None
+                and (
+                    portal_action == ACTION_CROSS_PORTAL
+                    or portal_obligation in {
+                        "portal_edge",
+                        "unbound_portal",
+                    }
+                )
+                and self._remember_graph_route_materialization_exclusion(
+                    epoch, "portal_ids", portal_id
+                )
+            ):
+                negative.setdefault("portal_negative_evidence", {}).update(
+                    {
+                        "excluded_in_map_epoch": True,
+                        "map_epoch": epoch,
+                    }
+                )
+        self.last_graph_route_materialization_negative_evidence = negative
+        publish = getattr(self, "publish_status", None)
+        if callable(publish):
+            publish(
+                "graph_route_materialization_negative_evidence",
+                **negative,
+            )
+        return negative
+
+    def _invalidate_graph_route_for_materialization(
+        self, plan, map_epoch, reason, miss_count, epoch_span
+    ):
+        """Invalidate one exhausted graph plan and enter NEXT_ACTION."""
+        transaction = getattr(self, "graph_route_action_transaction", None)
+        transaction_id = (
+            0 if transaction is None else int(transaction.transaction_id)
+        )
+        epoch = self._normalise_graph_map_epoch(map_epoch)
+        if epoch is None and transaction is not None:
+            epoch = self._normalise_graph_map_epoch(transaction.map_epoch)
+        self._record_graph_route_negative_evidence(
+            plan, epoch, reason, miss_count, epoch_span
+        )
+        self._transition_graph_route_fsm(
+            _GRAPH_ROUTE_FSM_NEXT_ACTION,
+            transaction_id=transaction_id,
+            map_epoch=epoch,
+            reason=str(reason),
+        )
+        publish = getattr(self, "publish_status", None)
+        if callable(publish):
+            publish(
+                "graph_route_materialization_invalidated",
+                transaction_id=transaction_id,
+                map_epoch=epoch,
+                action=str(getattr(plan, "action", "") or ""),
+                obligation_kind=str(
+                    getattr(plan, "obligation_kind", "") or ""
+                ),
+                obligation_id=getattr(plan, "obligation_id", None),
+                first_portal_id=getattr(plan, "first_portal_id", None),
+                portal_path=list(getattr(plan, "portal_path", ()) or ()),
+                miss_count=int(miss_count),
+                epoch_span=int(epoch_span),
+                max_misses=_GRAPH_ROUTE_MATERIALIZATION_MAX_MISSES,
+                max_epoch_span=_GRAPH_ROUTE_MATERIALIZATION_MAX_EPOCH_SPAN,
+                reason=str(reason),
+                next_state=_GRAPH_ROUTE_FSM_NEXT_ACTION,
+                controller_lease="release",
+            )
+        rospy.logwarn(
+            "Global frontier invalidating graph route "
+            "transaction_id=%s epoch=%s misses=%d epoch_span=%d "
+            "obligation=%s portal=%s reason=%s",
+            transaction_id,
+            epoch,
+            int(miss_count),
+            int(epoch_span),
+            getattr(plan, "obligation_id", None),
+            getattr(plan, "first_portal_id", None),
+            str(reason),
+        )
+        publish_unavailable = getattr(
+            self, "_publish_graph_route_unavailable", None
+        )
+        if callable(publish_unavailable):
+            publish_unavailable(
+                plan,
+                "graph_route_materialization_expired",
+                map_epoch=epoch,
+            )
+        scheduler = getattr(self, "decision_wake_scheduler", None)
+        route_id = max(
+            int(getattr(self, "active_route_id", 0) or 0),
+            int(getattr(self, "last_released_route_id", 0) or 0),
+        )
+        if scheduler is not None:
+            advanced = scheduler.finish_route(
+                route_id,
+                "graph_route_materialization_invalidated",
+            )
+            if not advanced:
+                scheduler.request("graph_route_materialization_invalidated")
+        self.last_planning_wall = 0.0
+        self.last_graph_route_plan = None
+        self.last_graph_route_plan_signature = None
+        self.graph_route_action_transaction = None
+        self.graph_route_portal_id = None
+        self.graph_route_probe_id = None
+        self._clear_graph_route_plan_lease(
+            "graph_route_materialization_expired"
+        )
+        self._reset_graph_materialization_tracking()
+        return True
+
+    def _record_graph_route_materialization_miss(
+        self, plan, map_epoch=None, reason="graph_route_materialization_wait"
+    ):
+        """Count materialization misses and force a bounded next action."""
+        if plan is None or getattr(plan, "status", None) != PLAN_READY:
+            return False
+        transaction = getattr(self, "graph_route_action_transaction", None)
+        transaction_epoch = (
+            None if transaction is None else transaction.map_epoch
+        )
+        epoch = self._normalise_graph_map_epoch(map_epoch)
+        if epoch is None:
+            epoch = self._normalise_graph_map_epoch(transaction_epoch)
+        signature = plan.signature()
+        if signature != getattr(
+            self, "graph_route_materialization_miss_signature", None
+        ):
+            self._reset_graph_materialization_tracking()
+            self.graph_route_materialization_miss_signature = signature
+            origin = self._normalise_graph_map_epoch(transaction_epoch)
+            if origin is not None:
+                self.graph_route_materialization_epochs.append(origin)
+        self.graph_route_materialization_miss_count = int(
+            getattr(self, "graph_route_materialization_miss_count", 0)
+        ) + 1
+        epochs = getattr(self, "graph_route_materialization_epochs", [])
+        if epoch is not None and epoch not in epochs:
+            epochs.append(epoch)
+        self.graph_route_materialization_epochs = epochs
+        epoch_span = (
+            0
+            if len(epochs) < 2
+            else max(epochs) - min(epochs)
+        )
+        miss_count = int(self.graph_route_materialization_miss_count)
+        transaction_id = (
+            0 if transaction is None else int(transaction.transaction_id)
+        )
+        self._transition_graph_route_fsm(
+            _GRAPH_ROUTE_FSM_WAITING,
+            transaction_id=transaction_id,
+            map_epoch=epoch,
+            reason=str(reason),
+        )
+        event_key = (signature, epoch, str(reason))
+        if event_key != getattr(
+            self, "graph_route_materialization_last_event", None
+        ):
+            self.graph_route_materialization_last_event = event_key
+            publish = getattr(self, "publish_status", None)
+            if callable(publish):
+                publish(
+                    "graph_route_materialization_miss",
+                    transaction_id=transaction_id,
+                    map_epoch=epoch,
+                    action=str(getattr(plan, "action", "") or ""),
+                    obligation_id=getattr(plan, "obligation_id", None),
+                    first_portal_id=getattr(plan, "first_portal_id", None),
+                    miss_count=miss_count,
+                    observed_epochs=list(epochs),
+                    epoch_span=int(epoch_span),
+                    reason=str(reason),
+                )
+        rospy.logwarn(
+            "Global frontier graph materialization miss "
+            "transaction_id=%s epoch=%s count=%d epoch_span=%d "
+            "obligation=%s portal=%s reason=%s",
+            transaction_id,
+            epoch,
+            miss_count,
+            int(epoch_span),
+            getattr(plan, "obligation_id", None),
+            getattr(plan, "first_portal_id", None),
+            str(reason),
+        )
+        if (
+            miss_count >= _GRAPH_ROUTE_MATERIALIZATION_MAX_MISSES
+            or epoch_span >= _GRAPH_ROUTE_MATERIALIZATION_MAX_EPOCH_SPAN
+        ):
+            return self._invalidate_graph_route_for_materialization(
+                plan,
+                epoch,
+                "graph_route_materialization_expired",
+                miss_count,
+                epoch_span,
+            )
+        return False
 
     @staticmethod
     def _positive_ids(values):
@@ -131,7 +540,7 @@ class GlobalFrontierGraphRouteAdapterMixin:
             return state in {"source_arrived", "destination_active"}
         return True
 
-    def _publish_graph_route_unavailable(self, plan, reason):
+    def _publish_graph_route_unavailable(self, plan, reason, map_epoch=None):
         """Publish a controller handoff when a ready graph route has no edge.
 
         ``graph_route_plan_lease_active`` protects the durable obligation from
@@ -171,15 +580,13 @@ class GlobalFrontierGraphRouteAdapterMixin:
         publish = getattr(self, "publish_status", None)
         if publish is None:
             return False
+        if map_epoch is None:
+            transaction = getattr(self, "graph_route_action_transaction", None)
+            map_epoch = None if transaction is None else transaction.map_epoch
         publish(
             "frontier_route_unavailable",
             route_id=route_id,
-            map_epoch=(
-                None
-                if getattr(getattr(self, "graph_route_action_transaction", None), "map_epoch", None)
-                is None
-                else getattr(self.graph_route_action_transaction, "map_epoch")
-            ),
+            map_epoch=map_epoch,
             successor_route_id=0,
             controller_lease="release",
             route_unavailable=True,
@@ -205,6 +612,15 @@ class GlobalFrontierGraphRouteAdapterMixin:
             return False
         self.graph_route_plan_lease_active = True
         self.graph_route_plan_lease_signature = plan.signature()
+        transaction = getattr(self, "graph_route_action_transaction", None)
+        self._transition_graph_route_fsm(
+            _GRAPH_ROUTE_FSM_WAITING,
+            transaction_id=(
+                0 if transaction is None else int(transaction.transaction_id)
+            ),
+            map_epoch=(None if transaction is None else transaction.map_epoch),
+            reason=str(reason),
+        )
         return True
 
     def _clear_graph_route_plan_lease(self, reason=""):
@@ -309,6 +725,11 @@ class GlobalFrontierGraphRouteAdapterMixin:
             target_work_pending
             or getattr(self, "target_reinspection_pending", False)
         )
+        (
+            excluded_portal_ids,
+            excluded_work_item_ids,
+            excluded_probe_ids,
+        ) = self._graph_route_materialization_exclusions(map_epoch)
         plan = planner.plan(
             current_place_id,
             places=getattr(getattr(self, "region_memory", None), "regions", ()),
@@ -326,6 +747,9 @@ class GlobalFrontierGraphRouteAdapterMixin:
                 getattr(self, "branch_first_enabled", False)
             ),
             map_epoch=map_epoch,
+            excluded_portal_ids=excluded_portal_ids,
+            excluded_work_item_ids=excluded_work_item_ids,
+            excluded_probe_ids=excluded_probe_ids,
         )
         if not commit:
             # This is the read-only first phase of snapshot planning.  It
@@ -343,6 +767,22 @@ class GlobalFrontierGraphRouteAdapterMixin:
             plan=plan,
             map_epoch=map_epoch,
         )
+        self._transition_graph_route_fsm(
+            _GRAPH_ROUTE_FSM_PLANNING,
+            transaction_id=transaction_id,
+            map_epoch=map_epoch,
+            reason="graph_route_plan_selected",
+        )
+        if map_epoch is None:
+            log_error = getattr(rospy, "logerr", None)
+            if not callable(log_error):
+                log_error = getattr(rospy, "logwarn", None)
+            if callable(log_error):
+                log_error(
+                    "Global frontier graph route transaction missing "
+                    "map epoch transaction_id=%s epoch=None",
+                    transaction_id,
+                )
         signature = plan.signature()
         if signature != getattr(self, "last_graph_route_plan_signature", None):
             self.last_graph_route_plan_signature = signature
@@ -358,7 +798,7 @@ class GlobalFrontierGraphRouteAdapterMixin:
 
     def _prepare_graph_route_action(
         self, snapshot, *, visible_work_item_ids=None, visible_probe_ids=None,
-        reuse_existing_plan=False, stage_only=False,
+        reuse_existing_plan=False, stage_only=False, map_epoch=None,
     ):
         """Reserve a planner-selected edge for the next selection pass.
 
@@ -367,18 +807,12 @@ class GlobalFrontierGraphRouteAdapterMixin:
         source-side probes retain a preferred identity and are materialized by
         the ordinary portal selector on the same snapshot.
         """
-        map_epoch = getattr(
-            getattr(getattr(snapshot, "map_context", None), "components", None),
-            "epoch",
-            None,
-        )
         if map_epoch is None:
-            map_epoch = getattr(
-                getattr(getattr(snapshot, "route_graph", None), "validation", None),
-                "epoch",
-                None,
-            )
+            map_epoch = self._graph_snapshot_map_epoch(snapshot)
         existing = getattr(self, "last_graph_route_plan", None)
+        lease_active = bool(
+            getattr(self, "graph_route_plan_lease_active", False)
+        )
         lease_identity_is_present = self._graph_plan_can_reuse_with_candidates(
             existing,
             visible_work_item_ids=visible_work_item_ids,
@@ -387,13 +821,17 @@ class GlobalFrontierGraphRouteAdapterMixin:
         if (
             reuse_existing_plan
             and existing is not None
-            and lease_identity_is_present
+            and lease_active
             # A cleared lease does not make a plan current.  Portal arrival
             # clears the old lease exactly when physical Place ownership
             # changes; reusing that plan would dispatch reverse transit from
             # the previous Place before its new local ledger is reconciled.
             and self._graph_route_plan_lease_matches_current(existing)
         ):
+            # Candidate visibility is a transient projection, not a durable
+            # ownership boundary. Once a plan has a lease, keep its identity
+            # through Navfn/materialization waits even if this pass did not
+            # project that WorkItem.
             plan = existing
             self._install_graph_route_preference(plan)
         else:
@@ -469,11 +907,43 @@ class GlobalFrontierGraphRouteAdapterMixin:
                     ):
                         return plan, None
                     self.graph_route_probe_id = None
-                    self._clear_graph_route_plan_lease("probe_candidate_committed")
                     self._publish_graph_route_materialized(
                         self.last_graph_route_plan, candidate
                     )
                     return plan, candidate
+                if str(probe.get("state", "")).strip().lower() == (
+                    "awaiting_projection"
+                ):
+                    # The probe identity remains durable, but this map cannot
+                    # provide a safe viewpoint. Park only this transient
+                    # projection and select the next graph obligation; a
+                    # newer map epoch will reopen the probe through the ledger.
+                    self.graph_route_probe_id = None
+                    self._clear_graph_route_plan_lease(
+                        "probe_projection_unavailable"
+                    )
+                    replanned = self._set_graph_route_preference(
+                        map_epoch=map_epoch,
+                        visible_work_item_ids=visible_work_item_ids,
+                        visible_probe_ids=visible_probe_ids,
+                    )
+                    publish = getattr(self, "publish_status", None)
+                    if publish is not None:
+                        publish(
+                            "graph_route_materialization_replanned",
+                            previous_probe_id=first_id,
+                            map_epoch=map_epoch,
+                            action=(
+                                None if replanned is None
+                                else str(replanned.action)
+                            ),
+                            obligation_id=(
+                                None if replanned is None
+                                else replanned.obligation_id
+                            ),
+                            reason="probe_projection_unavailable",
+                        )
+                    return replanned, None
                 return plan, None
 
         # An unbound hypothesis or a crossed edge is selected by the portal
@@ -501,7 +971,6 @@ class GlobalFrontierGraphRouteAdapterMixin:
                 ):
                     return plan, None
                 self.graph_route_portal_id = None
-                self._clear_graph_route_plan_lease("egress_candidate_committed")
                 self._publish_graph_route_materialized(
                     self.last_graph_route_plan, candidate
                 )
@@ -526,7 +995,6 @@ class GlobalFrontierGraphRouteAdapterMixin:
                 ):
                     return plan, None
                 self.graph_route_portal_id = None
-                self._clear_graph_route_plan_lease("crossing_candidate_committed")
                 self._publish_graph_route_materialized(
                     self.last_graph_route_plan, candidate
                 )
@@ -663,7 +1131,22 @@ class GlobalFrontierGraphRouteAdapterMixin:
         self.last_graph_route_plan = materialization.plan
         self.last_graph_route_plan_signature = materialization.plan.signature()
         self.graph_route_action_transaction = transaction.commit(materialization)
-        self._clear_graph_route_plan_lease("candidate_committed")
+        self._reset_graph_materialization_tracking()
+        self._transition_graph_route_fsm(
+            _GRAPH_ROUTE_FSM_EXECUTING,
+            transaction_id=int(transaction.transaction_id),
+            map_epoch=transaction.map_epoch,
+            reason="graph_route_candidate_committed",
+        )
+        # The graph transaction is committed before Navfn confirms the
+        # candidate and before activation installs the controller route. Keep
+        # the durable identity leased across that interval; activation clears
+        # it only after the route lifecycle exists.
+        retain_lease = getattr(self, "_retain_graph_route_plan_lease", None)
+        if callable(retain_lease):
+            retain_lease(
+                materialization.plan, "candidate_committed_until_activation"
+            )
         publish = getattr(self, "publish_status", None)
         if publish is not None:
             if materialization.reconciled:

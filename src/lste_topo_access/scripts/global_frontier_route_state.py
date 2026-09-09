@@ -385,6 +385,34 @@ class GlobalFrontierRouteStateMixin:
                         reason=transition.last_reason,
                     )
                     transaction.finish("portal_transaction_aborted")
+            elif transaction.state == "destination_standoff":
+                # A standoff that never proved the destination side is not a
+                # legal transaction rebind point. Close that incomplete
+                # attempt before any later retry can acquire a new route
+                # identity, including the final retry failure.
+                transition = transaction.abort(
+                    "portal_retry_after_unconfirmed_standoff"
+                )
+                if transition is not None:
+                    self.publish_status(
+                        "portal_transaction_aborted",
+                        transaction_id=int(transition.transaction_id),
+                        route_id=int(transition.route_id),
+                        state=transition.state,
+                        reason=transition.last_reason,
+                    )
+                    finished = transaction.finish(
+                        "portal_transaction_closed_before_retry"
+                    )
+                    if finished is not None:
+                        self.publish_status(
+                            "portal_transaction_finished",
+                            transaction_id=int(finished.transaction_id),
+                            portal_id=finished.portal_id,
+                            source_place_id=finished.source_place_id,
+                            state=finished.state,
+                            reason=finished.last_reason,
+                        )
             elif transaction.state == "place_commit":
                 transition = transaction.finish("portal_transaction_finished")
                 if transition is not None:

@@ -19,6 +19,9 @@ if str(SCRIPTS) not in sys.path:
 from teb_goal_bridge_route_monitoring import (  # noqa: E402
     TebGoalBridgeRouteMonitoringMixin,
 )
+from teb_goal_bridge_mission_runtime import (  # noqa: E402
+    TebGoalBridgeMissionRuntimeMixin,
+)
 
 
 class GoalStatusStub:
@@ -107,6 +110,7 @@ class ContractBridge(
     ACTION_TERMINAL_MIXIN,
     ACTION_CLIENT_MIXIN,
     TebGoalBridgeRouteMonitoringMixin,
+    TebGoalBridgeMissionRuntimeMixin,
 ):
     def __init__(self):
         self.lock = threading.RLock()
@@ -184,6 +188,10 @@ class ContractBridge(
 
     def _clear_target_failure_locked(self, _reason):
         pass
+
+    @staticmethod
+    def _goal_in_global_frame(goal):
+        return goal
 
     def _clear_action_health_locked(self):
         self.active_action_contract = None
@@ -313,6 +321,30 @@ class TebBridgeActionContractTest(unittest.TestCase):
         terminal_status = bridge.statuses[-1][1]
         self.assertEqual(terminal_status["route_id"], 15)
         self.assertEqual(terminal_status["route_kind"], "frontier_endpoint")
+
+    def test_persistent_stream_refreshes_contract_for_adopted_route(self):
+        bridge, _source_goal, generation = self._dispatch_route()
+        bridge.persistent_execution = True
+        bridge.latest_goal = bridge.pose("map", 9.0, 10.0)
+        bridge.latest_goal_transaction_id = 16
+        bridge.latest_route_id = 16
+        bridge.latest_route_kind = "frontier_endpoint"
+        bridge.latest_mission_route_kind = "portal_probe"
+        bridge.latest_goal_context = {"route": "probe"}
+        bridge.latest_target_epoch = 0
+        bridge.latest_target_track_id = ""
+        bridge.latest_target_viewpoint_candidate_id = ""
+        bridge.latest_target_viewpoint_attempt_id = ""
+
+        bridge._adopt_persistent_mission_goal_locked()
+
+        contract = bridge.active_action_contract
+        self.assertEqual(contract["generation"], generation)
+        self.assertEqual(contract["route_id"], 16)
+        self.assertEqual(contract["mission_route_kind"], "portal_probe")
+        self.assertEqual(contract["source_goal"].pose.position.x, 9.0)
+        self.assertEqual(contract["execution_goal"].pose.position.y, 10.0)
+        self.assertEqual(bridge.active_mission_route_kind, "portal_probe")
 
 
 if __name__ == "__main__":

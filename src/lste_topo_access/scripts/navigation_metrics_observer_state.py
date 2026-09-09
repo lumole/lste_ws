@@ -239,6 +239,8 @@ class NavigationMetricsObserverStateMixin:
         self.route_recovery_preemptions = 0
         self.pending_route_recovery_preemptions = 0
         self.route_recovery_preemption_reasons = {}
+        self.expected_route_recovery_preemptions = deque(maxlen=8)
+        self.consumed_route_recovery_route_ids = deque(maxlen=16)
         self.aborts = 0
         self.successes = 0
         self.cmd_messages = 0

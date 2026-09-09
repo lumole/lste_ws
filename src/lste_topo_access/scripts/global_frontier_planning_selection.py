@@ -163,16 +163,26 @@ class GlobalFrontierPlanningSelectionMixin:
 
     def select_next_active_frontier(self, snapshot):
         """Choose a terminal successor after resolving cache and claim policy."""
+        snapshot_epoch = getattr(
+            getattr(getattr(snapshot, "map_context", None), "components", None),
+            "epoch",
+            None,
+        )
         transaction = getattr(self, "portal_transaction", None)
         if (
             transaction is not None
             and transaction.active
-            and getattr(self, "pending_local_egress", None) is None
-            and getattr(self, "pending_portal_retry", None) is None
+            and (
+                (
+                    getattr(self, "pending_local_egress", None) is None
+                    and getattr(self, "pending_portal_retry", None) is None
+                )
+                or transaction.state not in ("source_probe", "throat")
+            )
         ):
-            # A crossing_verified transaction may be waiting for the fresh
-            # structural snapshot that can commit its destination Place. A
-            # normal frontier is not an admissible substitute for that edge.
+            # A transaction outside its source-side retry phases owns the
+            # route until its arrival is committed or explicitly closed. A
+            # normal frontier or a premature retry is not a substitute for it.
             self.publish_status(
                 "portal_transaction_selection_blocked",
                 transaction_id=int(transaction.snapshot().transaction_id),
@@ -191,28 +201,6 @@ class GlobalFrontierPlanningSelectionMixin:
         )
         if candidate is not None or wait_for_validation:
             return candidate, selection_mode, wait_for_validation
-
-        # A durable graph action already has a physical identity. Give its
-        # direct materializer first refusal before the generic frontier scorer
-        # scans every boundary cell. This is the fast path for a pending
-        # PortalProbe or remembered egress/crossing after a terminal.
-        place_entry_rehydration_pending = getattr(
-            self, "place_entry_rehydration_pending", None
-        ) is not None
-        if (
-            getattr(self, "graph_route_planner_enabled", False)
-            and not place_entry_rehydration_pending
-        ):
-            graph_prepare = getattr(self, "_prepare_graph_route_action", None)
-            if graph_prepare is not None:
-                try:
-                    _graph_plan, graph_candidate = graph_prepare(
-                        snapshot, reuse_existing_plan=True,
-                    )
-                except TypeError:
-                    _graph_plan, graph_candidate = graph_prepare(snapshot)
-                if graph_candidate is not None:
-                    return graph_candidate, "graph_route_edge", False
 
         # The full graph method is a two-stage planner: the current map first
         # rehydrates WorkItems/Probes, then the durable graph owns the next
@@ -238,7 +226,9 @@ class GlobalFrontierPlanningSelectionMixin:
                         self, "_prepare_graph_route_action", None
                     )
                     if graph_prepare is not None:
-                        graph_plan, _unused_graph_candidate = graph_prepare(None)
+                        graph_plan, _unused_graph_candidate = graph_prepare(
+                            None, map_epoch=snapshot_epoch
+                        )
                 commit = getattr(self, "_commit_graph_route_candidate", None)
                 if graph_plan is None or commit is None:
                     return candidate, self.last_frontier_selection_mode, False
@@ -302,6 +292,22 @@ class GlobalFrontierPlanningSelectionMixin:
                     reason="successor_requires_first_post_arrival_snapshot",
                 )
                 return None, "place_entry_rehydration_wait", True
+            # A terminal can leave a durable graph probe ready while an
+            # unrelated snapshot candidate is still waiting for Navfn. Give
+            # the graph adapter first chance to materialize its successor;
+            # otherwise the ordinary validation wait can strand the released
+            # route until the materialization watchdog fires.
+            graph_prepare = getattr(self, "_prepare_graph_route_action", None)
+            if graph_prepare is None:
+                graph_plan, graph_candidate = None, None
+            else:
+                graph_plan, graph_candidate = graph_prepare(
+                    snapshot,
+                    reuse_existing_plan=True,
+                    map_epoch=snapshot_epoch,
+                )
+            if graph_candidate is not None:
+                return graph_candidate, "graph_route_edge", False
             # ``choose_valid_frontier`` may have selected the exact durable
             # WorkItem/Portal candidate while its asynchronous Navfn check is
             # still pending.  That is a validation wait, not evidence that
@@ -340,22 +346,19 @@ class GlobalFrontierPlanningSelectionMixin:
                             reason="navfn_validation_pending",
                         )
                 return None, "graph_route_materialization_wait", True
-            graph_prepare = getattr(self, "_prepare_graph_route_action", None)
-            if graph_prepare is None:
-                graph_plan, graph_candidate = None, None
-            else:
-                try:
-                    graph_plan, graph_candidate = graph_prepare(
-                        snapshot, reuse_existing_plan=True,
-                    )
-                except TypeError:
-                    graph_plan, graph_candidate = graph_prepare(snapshot)
-            if graph_candidate is not None:
-                return graph_candidate, "graph_route_edge", False
             if (
                 graph_plan is not None
                 and getattr(graph_plan, "status", None) == PLAN_READY
             ):
+                record_miss = getattr(
+                    self, "_record_graph_route_materialization_miss", None
+                )
+                if callable(record_miss) and record_miss(
+                    graph_plan,
+                    snapshot_epoch,
+                    "selected_graph_obligation_not_executable_in_snapshot",
+                ):
+                    return None, "graph_route_next_action", True
                 retain_lease = getattr(self, "_retain_graph_route_plan_lease", None)
                 if retain_lease is not None:
                     retain_lease(

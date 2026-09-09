@@ -24,8 +24,15 @@ class TebGoalBridgeActionTerminalMixin:
             return {}
         return {
             "action_generation": int(action_contract.get("generation", 0) or 0),
+            "lifecycle_transaction_id": int(
+                action_contract.get("lifecycle_transaction_id", 0) or 0
+            ),
             "transaction_id": int(action_contract.get("transaction_id", 0) or 0),
             "route_id": int(action_contract.get("route_id", 0) or 0),
+            "epoch": action_contract.get(
+                "epoch", action_contract.get("target_epoch", 0)
+            ),
+            "map_epoch": action_contract.get("map_epoch"),
             "route_kind": str(action_contract.get("route_kind", "") or ""),
             "mission_route_kind": str(
                 action_contract.get("mission_route_kind", "") or ""
@@ -90,14 +97,19 @@ class TebGoalBridgeActionTerminalMixin:
             and route_id > 0
         )
         terminal.route_id = route_id if is_frontier else 0
-        terminal.lifecycle_transaction_id = str(
-            getattr(
-                getattr(self, "lifecycle_manager", None),
-                "current_transaction_id",
-                0,
+        lifecycle_transaction_id = (
+            int(action_contract.get("lifecycle_transaction_id", 0) or 0)
+            if action_contract is not None
+            else int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
             )
-            or 0
         )
+        terminal.lifecycle_transaction_id = str(lifecycle_transaction_id)
         terminal.action_generation = action_generation
         terminal.route_kind = (
             route_kind or "frontier_endpoint"
@@ -107,7 +119,9 @@ class TebGoalBridgeActionTerminalMixin:
         self.terminal_contract_pub.publish(terminal)
         return terminal_goal
 
-    def _close_observation_region_terminal_locked(self, generation, status):
+    def _close_observation_region_terminal_locked(
+        self, generation, status, action_contract=None
+    ):
         completion = self.frontier_observation_completion_pending
         if (
             completion is None
@@ -138,15 +152,49 @@ class TebGoalBridgeActionTerminalMixin:
             ),
             pending_delta=round(float(completion["pending_delta"]), 3),
             lifecycle="observation_region_terminal",
+            action_generation=int(
+                action_contract.get("generation", generation)
+                if action_contract is not None
+                else generation
+            ),
+            transaction_id=int(
+                action_contract.get("transaction_id", 0) or 0
+                if action_contract is not None
+                else 0
+            ),
+            epoch=(
+                action_contract.get(
+                    "epoch", action_contract.get("target_epoch", 0)
+                )
+                if action_contract is not None
+                else 0
+            ),
         )
+        arm_watchdog = getattr(
+            self, "_arm_route_lease_watchdog_locked", None
+        )
+        if callable(arm_watchdog):
+            arm_watchdog(
+                status=status,
+                reason="frontier_observation_terminal",
+                action_contract=action_contract,
+            )
         self._clear_action_health_locked()
         self._clear_failed_route_lease_locked()
         self.schedule_terminal_dispatch_locked()
         rospy.loginfo(
             "TEB goal bridge closed frontier observation terminal: "
-            "move_base_status=%s route_id=%d",
+            "move_base_status=%s route_id=%d transaction_id=%s epoch=%s",
             GoalStatus.to_string(status),
             int(completion["route_id"]),
+            0
+            if action_contract is None
+            else action_contract.get("transaction_id", 0),
+            0
+            if action_contract is None
+            else action_contract.get(
+                "epoch", action_contract.get("target_epoch", 0)
+            ),
         )
         return True
 
@@ -194,6 +242,15 @@ class TebGoalBridgeActionTerminalMixin:
             status_text="TASK_DONE",
             **self._action_contract_status_fields(action_contract),
         )
+        arm_watchdog = getattr(
+            self, "_arm_route_lease_watchdog_locked", None
+        )
+        if callable(arm_watchdog):
+            arm_watchdog(
+                status=status,
+                reason="persistent_task_complete_terminal",
+                action_contract=action_contract,
+            )
         self._clear_action_health_locked()
         self._clear_failed_route_lease_locked()
         return True
@@ -235,6 +292,15 @@ class TebGoalBridgeActionTerminalMixin:
                 round(terminal_goal.pose.position.y, 3),
             ],
         )
+        arm_watchdog = getattr(
+            self, "_arm_route_lease_watchdog_locked", None
+        )
+        if callable(arm_watchdog):
+            arm_watchdog(
+                status=status,
+                reason="move_base_succeeded_terminal",
+                action_contract=action_contract,
+            )
         rospy.loginfo(
             "TEB goal bridge successful terminal event: target=(%.2f,%.2f)",
             terminal_goal.pose.position.x,
@@ -257,9 +323,18 @@ class TebGoalBridgeActionTerminalMixin:
             status_text=GoalStatus.to_string(status),
             **self._action_contract_status_fields(action_contract),
         )
+        arm_watchdog = getattr(
+            self, "_arm_route_lease_watchdog_locked", None
+        )
+        if callable(arm_watchdog):
+            arm_watchdog(
+                status=status,
+                reason="move_base_failed_terminal",
+                action_contract=action_contract,
+            )
         rospy.logwarn(
             "TEB move_base action finished without success: status=%s "
-            "handoff=%s route_id=%s generation=%s",
+            "handoff=%s route_id=%s generation=%s transaction_id=%s epoch=%s",
             GoalStatus.to_string(status),
             handoff_requested,
             None
@@ -268,6 +343,14 @@ class TebGoalBridgeActionTerminalMixin:
             None
             if action_contract is None
             else action_contract.get("generation"),
+            None
+            if action_contract is None
+            else action_contract.get("transaction_id"),
+            None
+            if action_contract is None
+            else action_contract.get(
+                "epoch", action_contract.get("target_epoch", 0)
+            ),
         )
         self._remember_failed_route_lease_locked(action_contract)
         self._clear_action_health_locked()
@@ -291,7 +374,9 @@ class TebGoalBridgeActionTerminalMixin:
                     generation,
                 )
                 return
-            if self._close_observation_region_terminal_locked(generation, status):
+            if self._close_observation_region_terminal_locked(
+                generation, status, action_contract
+            ):
                 return
             if self._retain_turn_terminal_until_yaw_complete_locked(
                 status, action_contract

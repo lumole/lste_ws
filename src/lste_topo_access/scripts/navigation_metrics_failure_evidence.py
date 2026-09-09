@@ -2868,6 +2868,30 @@ class NavigationMetricsFailureEvidenceMixin:
                 else self.failure_frontier_unavailable_latch.get("key")
             )
             target_failure_latched = bool(sample["bridge_target_failure_latched"])
+            released_route = _sample_route(sample).get(
+                "released_controller_route"
+            )
+            released_route = (
+                released_route if isinstance(released_route, dict) else {}
+            )
+            controller_command = sample.get("cmd_vel") or (0.0, 0.0)
+            try:
+                controller_linear = abs(float(controller_command[0]))
+                controller_angular = abs(float(controller_command[1]))
+            except (IndexError, TypeError, ValueError):
+                controller_linear = 0.0
+                controller_angular = 0.0
+            controller_route_moving = bool(
+                sample.get("bridge_active")
+                and str(sample.get("move_base_status", "")).upper()
+                in {"ACTIVE", "PENDING", "PREEMPTING"}
+                and str(sample.get("teb_status", "")) == "trajectory_valid"
+                and (
+                    controller_linear > 0.08
+                    or controller_angular > 0.05
+                )
+                and not bool(released_route.get("terminal_received"))
+            )
             if (
                 self.active_failure is None
                 and unavailable_since is not None
@@ -2878,6 +2902,11 @@ class NavigationMetricsFailureEvidenceMixin:
                     target_failure_latched
                     or self.failure_frontier_unavailable_count >= 3
                 )
+                # ``frontier_route_unavailable`` is a graph-lease observation.
+                # Do not call it a planner failure while the old controller
+                # route still has a valid TEB trajectory and is moving; the
+                # no-progress/zero-command watchdogs own that boundary.
+                and not controller_route_moving
             ):
                 failure_id = self._begin_failure_episode_locked(
                     "frontier_route_stall",

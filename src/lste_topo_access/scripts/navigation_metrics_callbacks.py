@@ -116,7 +116,6 @@ class NavigationMetricsCallbacksMixin:
                 self.target_approach_terminals += 1
             if event in (
                 "target_route_failed",
-                "target_route_rejected",
                 "target_route_semantic_replan_failed",
             ):
                 self._begin_failure_episode_locked(

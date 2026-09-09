@@ -7,6 +7,29 @@ import rospy
 
 
 class TebGoalBridgeFrontierStatusMixin:
+    def _remember_frontier_map_epoch_locked(self, payload):
+        """Bind the newest frontier route to its graph snapshot epoch."""
+        raw_route_id = payload.get("route_id")
+        try:
+            route_id = max(0, int(raw_route_id or 0))
+        except (TypeError, ValueError):
+            route_id = 0
+        if route_id <= 0:
+            return
+        raw_epoch = payload.get("map_epoch")
+        try:
+            epoch = None if raw_epoch is None else int(raw_epoch)
+        except (TypeError, ValueError):
+            epoch = None
+        previous_route_id = int(
+            getattr(self, "latest_frontier_map_route_id", 0) or 0
+        )
+        if route_id > previous_route_id:
+            self.latest_frontier_map_route_id = route_id
+            self.latest_frontier_map_epoch = epoch
+        elif route_id == previous_route_id and epoch is not None:
+            self.latest_frontier_map_epoch = epoch
+
     def _handle_frontier_route_unavailable_locked(self, payload):
         """Release an idle route, or defer while its controller still runs.
 
@@ -155,6 +178,12 @@ class TebGoalBridgeFrontierStatusMixin:
             return
         event = str(payload.get("event", "")).strip()
         with self.lock:
+            self._remember_frontier_map_epoch_locked(payload)
+            observe_watchdog = getattr(
+                self, "_observe_route_lease_watchdog_status_locked", None
+            )
+            if callable(observe_watchdog):
+                observe_watchdog(payload)
             if event == "frontier_route_unavailable":
                 self._handle_frontier_route_unavailable_locked(payload)
                 return

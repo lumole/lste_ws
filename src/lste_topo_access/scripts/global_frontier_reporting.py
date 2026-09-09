@@ -455,6 +455,11 @@ class GlobalFrontierReportingMixin:
             if graph_transaction is None
             else graph_transaction.as_dict()
         )
+        map_epoch = (
+            getattr(graph_transaction, "map_epoch", None)
+            if graph_transaction is not None
+            else getattr(self, "last_map_epoch", None)
+        )
         payload = {
             "event": str(event),
             "active": self.active_frontier is not None,
@@ -533,6 +538,23 @@ class GlobalFrontierReportingMixin:
             "portal_transaction": self.portal_transaction_report(),
             "graph_route_plan": graph_plan_payload,
             "graph_route_action_transaction": graph_transaction_payload,
+            "map_epoch": map_epoch,
+            "graph_route_fsm_state": str(
+                getattr(self, "graph_route_fsm_state", "SEARCHING")
+            ),
+            "graph_route_materialization": {
+                "miss_count": int(
+                    getattr(self, "graph_route_materialization_miss_count", 0)
+                ),
+                "observed_epochs": list(
+                    getattr(self, "graph_route_materialization_epochs", [])
+                ),
+                "negative_evidence": getattr(
+                    self,
+                    "last_graph_route_materialization_negative_evidence",
+                    None,
+                ),
+            },
             "durable_portal_crossing_unavailable": getattr(
                 self, "last_durable_portal_crossing_unavailable", None
             ),
@@ -632,6 +654,16 @@ class GlobalFrontierReportingMixin:
             ),
             "goal_context": self.active_goal_context(route_kind),
             "portal_transaction": self.portal_transaction_report(),
+            "map_epoch": (
+                getattr(
+                    getattr(self, "graph_route_action_transaction", None),
+                    "map_epoch",
+                    None,
+                )
+                if getattr(self, "graph_route_action_transaction", None)
+                is not None
+                else getattr(self, "last_map_epoch", None)
+            ),
             "stamp": rospy.Time.now().to_sec(),
         }
         decision_scheduler = getattr(self, "decision_wake_scheduler", None)

@@ -1,6 +1,7 @@
 """Timer-driven persistent-mission progression for the TEB bridge."""
 
 import copy
+from types import MappingProxyType
 
 import rospy
 
@@ -11,12 +12,71 @@ from lifecycle_manager import EventType
 class TebGoalBridgeMissionRuntimeMixin:
     def on_timer(self, _event):
         with self.lock:
+            tick_watchdog = getattr(
+                self, "_tick_route_lease_watchdog_locked", None
+            )
+            if callable(tick_watchdog):
+                tick_watchdog()
             if self._is_active_mode():
                 if self.persistent_execution:
                     self._promote_persistent_frontier_prefetch_locked()
                 else:
                     self.maybe_handoff_locked()
                 self.dispatch_locked(force=False, reason="coalesced_global_goal")
+
+    def _refresh_persistent_action_contract_locked(self, semantic_goal):
+        """Bind transport terminal identity to the current stream route.
+
+        Persistent execution keeps one MoveBase action alive while the
+        semantic route changes underneath it. The callback generation stays
+        the same, but its route contract must follow the semantic lease that
+        is actually running; otherwise a later transport failure is reported
+        against the predecessor route and can replay the successor.
+        """
+        contract = getattr(self, "active_action_contract", None)
+        if contract is None:
+            return
+        updated = dict(contract)
+        updated.update(
+            {
+                "transaction_id": int(self.latest_goal_transaction_id),
+                "lifecycle_transaction_id": int(
+                    getattr(
+                        getattr(self, "lifecycle_manager", None),
+                        "current_transaction_id",
+                        0,
+                    )
+                    or 0
+                ),
+                "route_id": int(self.latest_route_id),
+                "epoch": self._effective_action_epoch_locked(),
+                "map_epoch": self.active_frontier_map_epoch,
+                "route_kind": str(self.latest_route_kind or ""),
+                "mission_route_kind": str(
+                    self.latest_mission_route_kind or ""
+                ),
+                "source": str(self.latest_intent_source or "unknown"),
+                "priority": int(self.latest_intent_priority),
+                "source_goal": copy.deepcopy(self.latest_goal),
+                "execution_goal": copy.deepcopy(semantic_goal),
+                "target_epoch": int(self.latest_target_epoch),
+                "target_track_id": str(self.latest_target_track_id or ""),
+                "target_viewpoint_candidate_id": str(
+                    getattr(
+                        self, "latest_target_viewpoint_candidate_id", ""
+                    )
+                    or ""
+                ),
+                "target_viewpoint_attempt_id": str(
+                    getattr(self, "latest_target_viewpoint_attempt_id", "")
+                    or ""
+                ),
+                "goal_context": copy.deepcopy(
+                    dict(self.latest_goal_context)
+                ),
+            }
+        )
+        self.active_action_contract = MappingProxyType(updated)
 
     def _adopt_persistent_mission_goal_locked(self):
         """Advance the semantic route while retaining the actionlib lease."""
@@ -27,6 +87,20 @@ class TebGoalBridgeMissionRuntimeMixin:
             return
         previous_route_kind = self.active_route_kind
         previous_route_id = int(self.active_route_id)
+        previous_transaction_id = int(self.active_goal_transaction_id)
+        previous_epoch = int(self.active_target_epoch)
+        route_changed = bool(
+            previous_route_id != int(self.latest_route_id)
+            or previous_transaction_id != int(self.latest_goal_transaction_id)
+            or previous_epoch != int(self.latest_target_epoch)
+            or previous_route_kind != self.latest_route_kind
+        )
+        if route_changed:
+            cancel_watchdog = getattr(
+                self, "_cancel_route_lease_watchdog_locked", None
+            )
+            if callable(cancel_watchdog):
+                cancel_watchdog("new_route_adopted")
         self.active_goal_global = copy.deepcopy(semantic_goal)
         self.last_dispatched_goal = copy.deepcopy(semantic_goal)
         # Persistent execution changes the semantic route without creating a
@@ -37,6 +111,7 @@ class TebGoalBridgeMissionRuntimeMixin:
         self.active_intent_priority = int(self.latest_intent_priority)
         self.active_goal_transaction_id = int(self.latest_goal_transaction_id)
         self.active_route_kind = self.latest_route_kind
+        self.active_mission_route_kind = self.latest_mission_route_kind
         self.active_route_id = int(self.latest_route_id)
         if self.active_route_kind == "portal_transition":
             if (
@@ -48,6 +123,9 @@ class TebGoalBridgeMissionRuntimeMixin:
         else:
             self.active_portal_source_goal = None
         self.active_target_epoch = int(self.latest_target_epoch)
+        self.active_frontier_map_epoch = getattr(
+            self, "latest_frontier_map_epoch", None
+        ) if self.active_intent_source == "global_slam_frontier" else None
         self.active_target_track_id = self.latest_target_track_id
         self.active_target_viewpoint_candidate_id = str(
             getattr(self, "latest_target_viewpoint_candidate_id", "") or ""
@@ -56,6 +134,7 @@ class TebGoalBridgeMissionRuntimeMixin:
             getattr(self, "latest_target_viewpoint_attempt_id", "") or ""
         )
         self.active_goal_context = dict(self.latest_goal_context)
+        self._refresh_persistent_action_contract_locked(semantic_goal)
         self.active_best_distance = None
         self.active_progress_monotonic = now_for(self)
         self.active_motion_reference = None
@@ -67,10 +146,12 @@ class TebGoalBridgeMissionRuntimeMixin:
         self.active_navfn_progress_monotonic = 0.0
         self.publish_bridge_status(
             "persistent_mission_path_adopted",
+            action_generation=int(self.action_generation),
             route_id=int(self.active_route_id),
             priority=int(self.active_intent_priority),
             source=self.active_intent_source,
             transaction_id=int(self.latest_goal_transaction_id),
+            epoch=int(self.latest_target_epoch),
             target_track_id=self.active_target_track_id,
             goal_context=self.active_goal_context,
             goal=[

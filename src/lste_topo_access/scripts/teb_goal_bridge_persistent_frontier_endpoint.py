@@ -217,6 +217,17 @@ class TebGoalBridgePersistentFrontierEndpointMixin:
                     else "local_teb_endpoint_reached_then_fresh_frontier"
                 ),
             )
+            arm_watchdog = getattr(
+                self, "_arm_route_lease_watchdog_locked", None
+            )
+            if callable(arm_watchdog):
+                arm_watchdog(
+                    status=None,
+                    reason="persistent_frontier_endpoint_terminal",
+                    action_contract=getattr(
+                        self, "active_action_contract", None
+                    ),
+                )
             rospy.loginfo(
                 "TEB goal bridge accepted persistent frontier endpoint: "
                 "route_id=%d successor_route_id=%d canonical_delta=%.3fm "

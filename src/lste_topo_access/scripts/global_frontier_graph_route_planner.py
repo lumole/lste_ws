@@ -374,8 +374,23 @@ class GraphRoutePlanner:
         branch_coverage=None,
         structural_boundary_first=False,
         map_epoch=None,
+        excluded_portal_ids=(),
+        excluded_work_item_ids=(),
+        excluded_probe_ids=(),
     ):
         current = _positive_id(current_place_id)
+        excluded_portals = {
+            value for value in (_positive_id(item) for item in excluded_portal_ids)
+            if value is not None
+        }
+        excluded_work = {
+            value for value in (_positive_id(item) for item in excluded_work_item_ids)
+            if value is not None
+        }
+        excluded_probes = {
+            value for value in (_positive_id(item) for item in excluded_probe_ids)
+            if value is not None
+        }
         place_records = _records(places)
         place_by_id = {
             place_id: place
@@ -392,6 +407,13 @@ class GraphRoutePlanner:
 
         probe_records = _records(probes)
         probe_by_place = _available_probes(probe_records, branch_coverage)
+        if excluded_probes:
+            for place_id, values in tuple(probe_by_place.items()):
+                probe_by_place[place_id] = [
+                    item
+                    for item in values
+                    if _positive_id(item.get("id")) not in excluded_probes
+                ]
         structural_boundary_by_place = _available_structural_boundary_probes(
             probe_records, branch_coverage,
         )
@@ -418,6 +440,13 @@ class GraphRoutePlanner:
         work, unresolved_work = _available_work(
             _records(work_items), excluded_ids=probe_work_ids,
         )
+        if excluded_work:
+            for place_id, values in tuple(work.items()):
+                work[place_id] = [
+                    item
+                    for item in values
+                    if _positive_id(item.get("id")) not in excluded_work
+                ]
         # A durable WorkItem may outlive the frontier arc that currently
         # projects it.  It remains an unresolved obligation, but it is not an
         # executable local action until the current snapshot rehydrates its
@@ -475,6 +504,8 @@ class GraphRoutePlanner:
                 continue
             if destination is None:
                 if state in _UNBOUND_PORTAL_STATES and source in place_by_id:
+                    if portal_id in excluded_portals:
+                        continue
                     # A projection failure is negative evidence for this
                     # *map snapshot*, not for the physical doorway.  The
                     # portal ledger records the epoch so a changed SLAM
@@ -514,7 +545,7 @@ class GraphRoutePlanner:
                 continue
             # Once crossed, a physical doorway is legal transit in either
             # direction.  Sorting makes the plan invariant to ledger order.
-            adjacency[source].append((destination, portal_id))
+                adjacency[source].append((destination, portal_id))
             adjacency[destination].append((source, portal_id))
         for values in adjacency.values():
             values.sort(key=lambda edge: (edge[1], edge[0]))
@@ -685,6 +716,7 @@ class GraphRoutePlanner:
                 unbound_by_place,
                 only_unobserved=True,
                 explicit_target=explicit_target,
+                excluded_portal_ids=excluded_portals,
             )
             if path is not None:
                 return self._cross(current, path, "branch_first_to_unobserved_place")
@@ -749,6 +781,7 @@ class GraphRoutePlanner:
             unbound_by_place,
             only_unobserved=False,
             explicit_target=explicit_target,
+            excluded_portal_ids=excluded_portals,
         )
         if path is not None:
             return self._cross(current, path, "transit_to_pending_graph_obligation")
@@ -889,6 +922,7 @@ class GraphRoutePlanner:
         *,
         only_unobserved,
         explicit_target,
+        excluded_portal_ids=(),
     ):
         """Find a shortest stable path to the next graph obligation."""
         queue = deque([start])
@@ -904,6 +938,8 @@ class GraphRoutePlanner:
         candidates = []
         for place_id, portal_path in paths.items():
             if place_id == start:
+                continue
+            if portal_path and portal_path[0] in excluded_portal_ids:
                 continue
             place = place_by_id[place_id]
             is_unobserved = not _covered(place)

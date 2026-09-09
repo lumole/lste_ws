@@ -143,6 +143,17 @@ class NavigationMetricsActionLifecycleMixin:
                     elif self.pending_frontier_observation_preemptions > 0:
                         self.pending_frontier_observation_preemptions -= 1
                         self.frontier_observation_preemptions += 1
+                    elif (
+                        self._consume_expected_route_recovery_preemption_locked()
+                        is not None
+                    ):
+                        self.route_recovery_preemptions += 1
+                        self._write(
+                            "INFO",
+                            "route_recovery_preemption",
+                            goal_id=status.goal_id.id,
+                            reason="frontier_release_seen_before_move_base_status",
+                        )
                     elif self.pending_route_recovery_preemptions > 0:
                         self.pending_route_recovery_preemptions -= 1
                         self.route_recovery_preemptions += 1

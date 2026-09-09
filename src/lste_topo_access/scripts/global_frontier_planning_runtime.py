@@ -210,6 +210,9 @@ class GlobalFrontierPlanningRuntimeMixin:
             )
         if snapshot is None:
             return
+        self.last_map_epoch = getattr(
+            getattr(snapshot.map_context, "components", None), "epoch", None
+        )
         if self.planning_should_preempt() or (
             token is not None
             and not self._planning_proposal_is_current(

@@ -77,6 +77,28 @@ class LifecycleFailureCleanupTest(unittest.TestCase):
         self.assertEqual(supervisor.released, [("lifecycle_failed", False)])
         self.assertFalse(supervisor.active_action)
 
+    def test_failed_transition_settles_portal_attempt_before_release(self):
+        owner = GlobalFrontierLifecycleMixin()
+        owner.lifecycle_manager = SimpleNamespace(current_transaction_id=9)
+        owner.lifecycle_transaction_id = lambda: 9
+        owner.active_frontier = object()
+        owner.active_portal_probe_id = 7
+        settled = []
+        released = []
+        owner.publish_status = lambda *_args, **_kwargs: None
+        owner.settle_active_portal_probe = (
+            lambda result, timestamp, reason: settled.append(
+                (result, timestamp, reason)
+            )
+        )
+        owner.release_active_frontier = lambda **fields: released.append(fields)
+
+        owner._on_lifecycle_transition(State.DISPATCHED, State.FAILED, None)
+
+        self.assertEqual(settled[0][0], "failed")
+        self.assertEqual(settled[0][2], "lifecycle_failed")
+        self.assertEqual(released, [{"discard_prefetch": True}])
+
 
 if __name__ == "__main__":
     unittest.main()

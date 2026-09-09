@@ -65,6 +65,8 @@ class TebGoalBridgeActionActiveDispatchMixin:
             and self.latest_intent_source == self.active_intent_source
             and self.latest_intent_priority == self.active_intent_priority
             and self.latest_route_kind == self.active_route_kind
+            and self.latest_mission_route_kind
+            == self.active_mission_route_kind
             and self.latest_route_id == self.active_route_id
             and goal_context_identity(self.latest_goal_context)
             == goal_context_identity(self.active_goal_context)

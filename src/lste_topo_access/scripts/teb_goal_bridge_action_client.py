@@ -15,13 +15,43 @@ from clock_provider import now_for
 
 
 class TebGoalBridgeActionClientMixin:
+    def _effective_action_epoch_locked(self):
+        """Use graph epoch for frontier routes and target epoch otherwise."""
+        source = str(
+            getattr(self, "latest_intent_source", "unknown") or "unknown"
+        ).strip().lower()
+        if source == "global_slam_frontier":
+            value = getattr(self, "latest_frontier_map_epoch", None)
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    pass
+        return int(getattr(self, "latest_target_epoch", 0) or 0)
+
     def _remember_last_dispatch_identity_locked(self):
         """Retain the semantic identity paired with ``last_dispatched_goal``."""
+        map_epoch = getattr(self, "latest_frontier_map_epoch", None)
+        if str(
+            getattr(self, "latest_intent_source", "unknown") or "unknown"
+        ).strip().lower() != "global_slam_frontier":
+            map_epoch = None
         self.last_dispatch_identity = {
+            "action_generation": int(getattr(self, "action_generation", 0) or 0),
             "transaction_id": int(
                 getattr(self, "latest_goal_transaction_id", 0) or 0
             ),
+            "lifecycle_transaction_id": int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
+            ),
             "route_id": int(getattr(self, "latest_route_id", 0) or 0),
+            "epoch": self._effective_action_epoch_locked(),
+            "map_epoch": map_epoch,
             "route_kind": str(
                 getattr(self, "latest_route_kind", "") or ""
             ).strip().lower(),
@@ -79,6 +109,11 @@ class TebGoalBridgeActionClientMixin:
 
     def _begin_action_lifecycle_locked(self, source_goal, execution_goal):
         """Reset state which is meaningful only for one MoveBase action."""
+        cancel_watchdog = getattr(
+            self, "_cancel_route_lease_watchdog_locked", None
+        )
+        if callable(cancel_watchdog):
+            cancel_watchdog("new_dispatch")
         self._clear_failed_route_lease_locked()
         self.action_generation += 1
         generation = self.action_generation
@@ -100,6 +135,13 @@ class TebGoalBridgeActionClientMixin:
         self.active_mission_route_kind = self.latest_mission_route_kind
         self.active_route_id = int(self.latest_route_id)
         self.active_target_epoch = int(self.latest_target_epoch)
+        self.active_frontier_map_epoch = (
+            getattr(self, "latest_frontier_map_epoch", None)
+            if str(
+                getattr(self, "latest_intent_source", "unknown") or "unknown"
+            ).strip().lower() == "global_slam_frontier"
+            else None
+        )
         self.active_target_track_id = self.latest_target_track_id
         self.active_target_viewpoint_candidate_id = str(
             getattr(self, "latest_target_viewpoint_candidate_id", "") or ""
@@ -144,7 +186,17 @@ class TebGoalBridgeActionClientMixin:
         self.active_action_contract = MappingProxyType({
             "generation": int(generation),
             "transaction_id": int(self.latest_goal_transaction_id),
+            "lifecycle_transaction_id": int(
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                )
+                or 0
+            ),
             "route_id": int(self.latest_route_id),
+            "epoch": self._effective_action_epoch_locked(),
+            "map_epoch": self.active_frontier_map_epoch,
             "route_kind": str(self.latest_route_kind or ""),
             "mission_route_kind": str(self.latest_mission_route_kind or ""),
             "source": str(self.latest_intent_source or "unknown"),
@@ -199,6 +251,7 @@ class TebGoalBridgeActionClientMixin:
         generation = self._begin_action_lifecycle_locked(
             source_goal, execution_goal
         )
+        dispatch_contract = self.active_action_contract or {}
         self.action_client.send_goal(
             action_goal,
             done_cb=lambda status, result: self.on_done(generation, status, result),
@@ -207,6 +260,18 @@ class TebGoalBridgeActionClientMixin:
         )
         dispatch_fields = {
             "reason": reason,
+            "action_generation": int(generation),
+            "transaction_id": int(self.active_goal_transaction_id),
+            "epoch": int(
+                dispatch_contract.get("epoch", self.active_target_epoch) or 0
+            ),
+            "map_epoch": dispatch_contract.get("map_epoch"),
+            "lifecycle_transaction_id": int(
+                dispatch_contract.get("lifecycle_transaction_id", 0)
+                or 0
+            ),
+            "route_id": int(self.active_route_id),
+            "mission_route_kind": self.active_mission_route_kind,
             "source_goal": [
                 round(source_goal.pose.position.x, 3),
                 round(source_goal.pose.position.y, 3),

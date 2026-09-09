@@ -81,15 +81,37 @@ class GlobalFrontierActivationMixin:
                 getattr(self, "current_physical_place_id", None)
                 if selection.place_hops == 0 else None
             )
-            region = self.activate_frontier_region(
-                selection.x,
-                selection.y,
-                selection.information,
-                now,
-                selection_mode,
-                component=selection.component,
-                physical_place_id=physical_place_id,
+            probe = getattr(selection, "portal_observation_probe", None)
+            destination_probe_reobserve = (
+                probe is not None
+                and str(getattr(probe, "phase", "source")).strip().lower()
+                == "destination"
+                and physical_place_id is not None
             )
+            if destination_probe_reobserve:
+                # A destination-side probe is a second evidence phase for an
+                # existing physical doorway. It must be executable even when
+                # the current Place is already covered/transit-only; reopening
+                # that Place through ``activate_frontier_region`` would reject
+                # the probe and leave its graph lease stranded.
+                region = self.region_memory.by_id(physical_place_id)
+                if region is not None:
+                    region["route_dispatches"] = int(
+                        region.get("route_dispatches", 0)
+                    ) + 1
+                    region["last_selected"] = float(now)
+                    region["last_association"] = "current_physical_place_owner"
+                    self.last_frontier_region_tier = "reobserve"
+            else:
+                region = self.activate_frontier_region(
+                    selection.x,
+                    selection.y,
+                    selection.information,
+                    now,
+                    selection_mode,
+                    component=selection.component,
+                    physical_place_id=physical_place_id,
+                )
             if region is None:
                 # An immediate terminal/recovery callback can make a candidate
                 # dormant after selection. Keep the active route untouched and
@@ -101,8 +123,35 @@ class GlobalFrontierActivationMixin:
             # Geometry baselines never acquire a hidden Place simply because
             # a frontier has been accepted by Navfn. Their durable state is
             # limited to the declared endpoint-distance memory.
-            self.current_physical_place_id = None
+                self.current_physical_place_id = None
         return region, departed_place
+
+    def _rollback_failed_activation(self, now, reason):
+        """Undo a partially installed route before the next graph wake."""
+        settle_probe = getattr(self, "settle_active_portal_probe", None)
+        if (
+            callable(settle_probe)
+            and getattr(self, "active_portal_probe_id", None) is not None
+        ):
+            settle_probe("failed", now, reason)
+
+        release = getattr(self, "release_active_frontier", None)
+        if callable(release) and getattr(self, "active_frontier", None) is not None:
+            release(discard_prefetch=True)
+        else:
+            self.active_portal_probe_id = None
+            self.active_portal_probe_phase = ""
+
+        clear_lease = getattr(self, "_clear_graph_route_plan_lease", None)
+        if callable(clear_lease):
+            clear_lease("activation_rejected:%s" % str(reason))
+
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        if (
+            lifecycle is not None
+            and getattr(lifecycle, "current_state", None) == State.DISPATCHED
+        ):
+            lifecycle.begin_transaction(State.IDLE, now=now)
 
     def initialize_active_frontier_route(
         self, selection, region, now, robot_map, probe_record=None,
@@ -566,6 +615,7 @@ class GlobalFrontierActivationMixin:
             and transaction.active
             and selection.route_kind == "portal_transition"
             and selection_mode == "portal_recovery_retry"
+            and transaction.state in ("source_probe", "throat")
         )
         if transaction is not None and transaction.active and not (
             transaction_rebind
@@ -619,12 +669,7 @@ class GlobalFrontierActivationMixin:
             selection_mode,
         )
         if lifecycle is None:
-            if probe_record is not None:
-                settle_probe = getattr(self, "settle_active_portal_probe", None)
-                if callable(settle_probe):
-                    settle_probe(
-                        "failed", now, "route_lifecycle_rejected",
-                    )
+            self._rollback_failed_activation(now, "route_lifecycle_rejected")
             return False
         region, departed_place = lifecycle
         initialized = self.initialize_active_frontier_route(
@@ -635,12 +680,7 @@ class GlobalFrontierActivationMixin:
             probe_record=probe_record,
         )
         if initialized is False:
-            if probe_record is not None:
-                settle_probe = getattr(self, "settle_active_portal_probe", None)
-                if callable(settle_probe):
-                    settle_probe(
-                        "failed", now, "route_initialization_rejected",
-                    )
+            self._rollback_failed_activation(now, "route_initialization_rejected")
             return False
         if transaction is not None and selection.route_kind == "portal_transition":
             source_place_id = getattr(self.place_departure, "region_id", None)
@@ -703,6 +743,9 @@ class GlobalFrontierActivationMixin:
                     state=transaction.state,
                     reason="invalid_portal_transaction_transition",
                 )
+                self._rollback_failed_activation(
+                    now, "invalid_portal_transaction_transition"
+                )
                 return False
             self.publish_status(
                 transaction_event,
@@ -739,5 +782,8 @@ class GlobalFrontierActivationMixin:
             departed_place,
             selection_mode,
         )
+        clear_lease = getattr(self, "_clear_graph_route_plan_lease", None)
+        if callable(clear_lease):
+            clear_lease("route_activated")
         self.complete_pending_replan(selection)
         return True

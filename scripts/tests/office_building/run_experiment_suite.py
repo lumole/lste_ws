@@ -2,15 +2,16 @@
 """Run or plan independently restarted office-building method comparisons.
 
 The default is deliberately read-only. ``--execute`` is the explicit opt-in
-because each trial starts Gazebo and takes exclusive ownership of the LSTE
-tmux sessions.
+because a cold trial starts Gazebo and takes exclusive ownership of the LSTE
+tmux sessions. Diagnostic warm mode keeps one compatible runtime alive across
+bounded slices so startup is paid once rather than once per slice.
 """
 
 from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -48,6 +49,20 @@ _METRICS_EVENT_RE = re.compile(
 )
 _DEFAULT_STARTUP_READINESS_TIMEOUT_SECONDS = 45.0
 _TRIAL_END_SAMPLE_WINDOW = 16
+_MAX_WARM_SLICE_SECONDS = 60.0
+
+
+@dataclass
+class WarmRuntime:
+    """One live ROS/Gazebo runtime shared by bounded diagnostic slices."""
+
+    run_dir: Path
+    metrics_path: Path
+    environment: dict
+    startup_elapsed_wall_seconds: float
+    startup_readiness: dict
+    started_here: bool
+    stop_at_end: bool
 
 
 def trial_as_dict(trial):
@@ -139,9 +154,32 @@ def wait_for_metrics_log(run_dir: Path, timeout_seconds: float = 30.0):
     return metrics_path_for_run(run_dir)
 
 
-def terminal_event_observed(metrics_path: Path, terminal_event: str) -> bool:
-    """Read only the last bounded log tail while a trial is running."""
-    tail = _tail_file(metrics_path, limit=262144)
+def _bounded_metrics_text(
+    metrics_path: Path | None,
+    start_offset: int = 0,
+    limit: int = 262144,
+):
+    """Read a bounded log segment without mixing an earlier warm slice."""
+    if metrics_path is None:
+        return ""
+    path = Path(metrics_path)
+    try:
+        with path.open("rb") as stream:
+            size = stream.seek(0, os.SEEK_END)
+            start = max(int(start_offset or 0), size - limit)
+            stream.seek(start, os.SEEK_SET)
+            return stream.read(limit).decode("utf-8", errors="replace")
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def terminal_event_observed(
+    metrics_path: Path,
+    terminal_event: str,
+    start_offset: int = 0,
+) -> bool:
+    """Read only the current bounded slice of the metrics log."""
+    tail = _bounded_metrics_text(metrics_path, start_offset=start_offset)
     if terminal_event == "task_done":
         return 'event=task_done ' in tail
     if terminal_event == "frontier_exhausted":
@@ -149,13 +187,14 @@ def terminal_event_observed(metrics_path: Path, terminal_event: str) -> bool:
     raise ValueError("unsupported terminal event: %s" % terminal_event)
 
 
-def latest_failure_snapshot(metrics_path: Path):
+def latest_failure_snapshot(metrics_path: Path, exclude_failure_ids=()):
     """Return the newest closed failure episode from the metrics tail.
 
     ``failure_snapshot_ready`` is emitted only after the configured pre/post
     evidence window has been serialized.  Reading the bounded tail keeps the
     diagnostic stop path cheap even when a metrics log is large.
     """
+    excluded = {str(value) for value in (exclude_failure_ids or ())}
     tail = _tail_file(metrics_path, limit=262144)
     matches = re.findall(r"event=failure_snapshot_ready data=(\{.*\})$", tail, re.MULTILINE)
     for payload in reversed(matches):
@@ -163,9 +202,33 @@ def latest_failure_snapshot(metrics_path: Path):
             value = json.loads(payload)
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
-        if isinstance(value, dict) and str(value.get("failure_id", "")).strip():
+        if (
+            isinstance(value, dict)
+            and str(value.get("failure_id", "")).strip()
+            and str(value.get("failure_id")) not in excluded
+        ):
             return value
     return None
+
+
+def failure_snapshot_ids(metrics_path: Path | None):
+    """Return closed failure IDs already present before a warm slice."""
+    tail = _tail_file(metrics_path, limit=262144)
+    result = set()
+    matches = re.findall(
+        r"event=failure_snapshot_ready data=(\{.*\})$",
+        tail,
+        re.MULTILINE,
+    )
+    for payload in matches:
+        try:
+            value = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        failure_id = value.get("failure_id") if isinstance(value, dict) else None
+        if str(failure_id or "").strip():
+            result.add(str(failure_id))
+    return result
 
 
 _TRIAL_END_SAMPLE_KEYS = (
@@ -533,7 +596,7 @@ def _terminal_boundary_evidence(records):
     return False, None
 
 
-def build_trial_end_diagnostic(metrics_path: Path):
+def build_trial_end_diagnostic(metrics_path: Path, start_offset: int = 0):
     """Reduce the last metrics sample to a non-failure termination state.
 
     A trial timeout is an experiment boundary, not proof of a navigation
@@ -549,6 +612,7 @@ def build_trial_end_diagnostic(metrics_path: Path):
     records = _startup_metrics_records(
         metrics_path,
         limit=max(_STARTUP_TAIL_BYTES, 1024 * 1024),
+        start_offset=start_offset,
     )
     sample_window = [
         _compact_trial_end_sample(payload)
@@ -714,6 +778,8 @@ def write_trial_end_diagnostic_artifact(
     diagnostic: dict,
     metrics_path: Path | None = None,
     outcome: str = "timeout",
+    artifact_name: str | None = None,
+    slice_id: str | None = None,
 ):
     """Atomically persist one timeout/termination evidence pointer.
 
@@ -725,13 +791,16 @@ def write_trial_end_diagnostic_artifact(
     run_dir = Path(run_dir)
     diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
     run_timestamp = run_dir.name
-    artifact_path = run_dir / (run_timestamp + "_trial_end_diagnostic.json")
+    artifact_path = run_dir / (
+        artifact_name or (run_timestamp + "_trial_end_diagnostic.json")
+    )
     payload = {
         "schema_version": 1,
         "artifact_kind": "trial_end_diagnostic",
         "created_at": _startup_failure_timestamp(),
         "run_timestamp": run_timestamp,
         "outcome": str(outcome),
+        "slice_id": slice_id,
         "trial": trial_as_dict(trial),
         "metrics_log": None if metrics_path is None else str(metrics_path),
         "termination_id": diagnostic.get("termination_id"),
@@ -753,6 +822,7 @@ def write_trial_end_diagnostic_artifact(
         outcome=str(outcome),
         state=diagnostic.get("state"),
         reason=diagnostic.get("reason"),
+        slice_id=slice_id,
         artifact_path=str(artifact_path),
     )
     return str(artifact_path)
@@ -776,10 +846,15 @@ def _tail_file(path: Path | None, limit: int = _STARTUP_TAIL_BYTES):
 def _startup_metrics_records(
     metrics_path: Path | None,
     limit: int = _STARTUP_TAIL_BYTES,
+    start_offset: int = 0,
 ):
     """Decode a bounded metrics tail for a compact evidence view."""
     records = []
-    for line in _tail_file(metrics_path, limit=limit).splitlines():
+    for line in _bounded_metrics_text(
+        metrics_path,
+        start_offset=start_offset,
+        limit=limit,
+    ).splitlines():
         match = _METRICS_EVENT_RE.search(line)
         if match is None:
             continue
@@ -1315,6 +1390,180 @@ def _run_benchmark_start(trial, environment):
         raise
     if return_code:
         raise subprocess.CalledProcessError(return_code, command)
+
+
+def _launcher_start_metadata(run_dir: Path):
+    """Read the small immutable identity written by the office launcher."""
+    lifecycle = Path(run_dir) / (Path(run_dir).name + "_lifecycle.log")
+    try:
+        text = lifecycle.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    line = next(
+        (item for item in text.splitlines() if "event=run_start" in item),
+        "",
+    )
+    metadata = {}
+    for key in (
+        "level", "profile", "gazebo_seed", "exploration_method",
+        "controller", "task_id", "world",
+    ):
+        match = re.search(r"(?:^| )%s=([^ ]+)" % re.escape(key), line)
+        if match:
+            metadata[key] = match.group(1)
+    return metadata
+
+
+def _assert_reusable_runtime(run_dir: Path, trial):
+    """Reject reuse when the live process identity differs from the trial."""
+    metadata = _launcher_start_metadata(run_dir)
+    expected = {
+        "level": trial.level,
+        "profile": trial.profile,
+        "gazebo_seed": str(trial.seed),
+        "exploration_method": trial.method,
+        "controller": trial.controller,
+        "task_id": trial.task_id,
+    }
+    expected_world = ROOT / (
+        "worlds/benchmark/office_building_v1_%s_no_pro3.world" % trial.level
+    )
+    mismatches = []
+    for key, value in expected.items():
+        actual = metadata.get(key)
+        if actual != str(value):
+            mismatches.append("%s=%s (runtime=%s)" % (key, value, actual or "missing"))
+    if metadata.get("world") != str(expected_world):
+        mismatches.append(
+            "world=%s (runtime=%s)"
+            % (expected_world, metadata.get("world") or "missing")
+        )
+    if mismatches:
+        raise ValueError(
+            "existing runtime is not compatible with this diagnostic slice: "
+            + ", ".join(mismatches)
+        )
+
+
+def _runtime_nodes_alive():
+    """Require the benchmark nodes, not merely a stale ``current`` link."""
+    try:
+        completed = subprocess.run(
+            ["rosnode", "list"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if completed.returncode != 0:
+        return False
+    nodes = set((completed.stdout or "").splitlines())
+    return {"/lste_navigation_metrics", "/move_base"}.issubset(nodes)
+
+
+def _prepare_warm_runtime(
+    trial,
+    reuse_existing=False,
+    failure_post_window=None,
+    failure_pre_window=None,
+):
+    """Start once, or attach to a compatible live runtime without waiting."""
+    environment = trial_environment(
+        trial,
+        failure_post_window=failure_post_window,
+        failure_pre_window=failure_pre_window,
+    )
+    if reuse_existing:
+        run_dir = current_run_directory()
+        if run_dir is None:
+            raise RuntimeError("--reuse-runtime requires an active benchmark run")
+        if not _runtime_nodes_alive():
+            raise RuntimeError(
+                "--reuse-runtime found a run directory but benchmark nodes are not alive"
+            )
+        _assert_reusable_runtime(run_dir, trial)
+        metrics_path = wait_for_metrics_log(run_dir, timeout_seconds=2.0)
+        if metrics_path is None:
+            raise RuntimeError(
+                "--reuse-runtime found no navigation metrics log in %s" % run_dir
+            )
+        return WarmRuntime(
+            run_dir=run_dir,
+            metrics_path=metrics_path,
+            environment=environment,
+            startup_elapsed_wall_seconds=0.0,
+            startup_readiness={
+                "status": "reused",
+                "ready": True,
+                "reason": "existing_runtime_reused",
+                "elapsed_wall_seconds": 0.0,
+            },
+            started_here=False,
+            stop_at_end=False,
+        )
+
+    previous_run_dir = current_run_directory()
+    startup_started = time.monotonic()
+    try:
+        _run_benchmark_start(trial, environment)
+    except (OSError, subprocess.SubprocessError) as exc:
+        elapsed = round(time.monotonic() - startup_started, 3)
+        run_dir = current_run_directory()
+        if run_dir is not None and run_dir != previous_run_dir:
+            _append_lifecycle_event(
+                run_dir,
+                "warm_session_start_failed",
+                level="ERROR",
+                reason=type(exc).__name__,
+                elapsed_wall_seconds=elapsed,
+            )
+        raise RuntimeError("warm session startup failed: %s" % type(exc).__name__) from exc
+
+    run_dir = current_run_directory()
+    if run_dir is None or run_dir == previous_run_dir:
+        raise RuntimeError("warm session did not create a new benchmark run")
+    metrics_path = wait_for_metrics_log(
+        run_dir,
+        timeout_seconds=min(30.0, trial_startup_readiness_timeout(trial)),
+    )
+    if metrics_path is None:
+        raise RuntimeError("warm session navigation metrics log did not appear")
+    readiness = wait_for_startup_readiness(
+        run_dir,
+        metrics_path,
+        trial_startup_readiness_timeout(trial),
+        require_frontier=(trial.profile != "target_entry"),
+    )
+    if not readiness.get("ready"):
+        write_startup_failure_artifact(
+            run_dir,
+            trial,
+            readiness,
+            reason=readiness.get("failure_reason", readiness.get("reason")),
+        )
+        raise RuntimeError(
+            "warm session readiness failed: %s"
+            % readiness.get("failure_reason", readiness.get("reason"))
+        )
+    startup_elapsed = round(time.monotonic() - startup_started, 3)
+    _append_lifecycle_event(
+        run_dir,
+        "warm_session_ready",
+        startup_elapsed_wall_seconds=startup_elapsed,
+        readiness=readiness,
+    )
+    return WarmRuntime(
+        run_dir=run_dir,
+        metrics_path=metrics_path,
+        environment=environment,
+        startup_elapsed_wall_seconds=startup_elapsed,
+        startup_readiness=readiness,
+        started_here=True,
+        stop_at_end=True,
+    )
 
 
 def run_trial(
@@ -1914,6 +2163,420 @@ def run_trial(
     return record
 
 
+def _metrics_file_offset(path: Path):
+    try:
+        return int(Path(path).stat().st_size)
+    except OSError:
+        return 0
+
+
+def _next_warm_slice_index(run_dir: Path):
+    """Allocate a monotonic slice number across separate reuse invocations."""
+    pattern = re.compile(
+        r"^%s_slice_(\d{4})_experiment_record\.json$"
+        % re.escape(Path(run_dir).name)
+    )
+    indices = []
+    for path in Path(run_dir).glob(
+        Path(run_dir).name + "_slice_*_experiment_record.json"
+    ):
+        match = pattern.match(path.name)
+        if match:
+            indices.append(int(match.group(1)))
+    return max(indices, default=0) + 1
+
+
+def _next_warm_session_index(run_dir: Path):
+    """Allocate a monotonic session number without touching earlier evidence."""
+    run_name = Path(run_dir).name
+    pattern = re.compile(
+        r"^%s_warm_session_(\d{4})\.json$" % re.escape(run_name)
+    )
+    indices = []
+    for path in Path(run_dir).glob(run_name + "_warm_session_*.json"):
+        match = pattern.match(path.name)
+        if match:
+            indices.append(int(match.group(1)))
+    # The first implementation used one fixed name. Treat it as session 1 so
+    # a later reuse invocation never overwrites it again.
+    if (Path(run_dir) / (run_name + "_warm_session_record.json")).is_file():
+        indices.append(1)
+    return max(indices, default=0) + 1
+
+
+def _warm_slice_record(
+    runtime: WarmRuntime,
+    trial,
+    slice_index: int,
+    session_id: str,
+    stop_on_failure=False,
+):
+    """Run one bounded continuation window without restarting ROS/Gazebo."""
+    slice_id = "%s-D%04d" % (runtime.run_dir.name, slice_index)
+    slice_started = time.monotonic()
+    metrics_offset = _metrics_file_offset(runtime.metrics_path)
+    known_failure_ids = failure_snapshot_ids(runtime.metrics_path)
+    timeout_seconds = min(float(trial.timeout_seconds), _MAX_WARM_SLICE_SECONDS)
+    outcome = "timeout"
+    failure_stop = None
+    interrupted = False
+    _append_lifecycle_event(
+        runtime.run_dir,
+        "diagnostic_slice_started",
+        session_id=session_id,
+        slice_id=slice_id,
+        slice_index=slice_index,
+        timeout_seconds=timeout_seconds,
+        metrics_offset=metrics_offset,
+        startup_reused=True,
+    )
+    deadline = slice_started + timeout_seconds
+    try:
+        while time.monotonic() < deadline:
+            if stop_on_failure:
+                failure_stop = latest_failure_snapshot(
+                    runtime.metrics_path,
+                    exclude_failure_ids=known_failure_ids,
+                )
+                if failure_stop is not None:
+                    outcome = "failure_snapshot"
+                    _append_lifecycle_event(
+                        runtime.run_dir,
+                        "diagnostic_slice_failure_observed",
+                        level="WARN",
+                        session_id=session_id,
+                        slice_id=slice_id,
+                        failure_id=failure_stop.get("failure_id"),
+                        classification=failure_stop.get("classification"),
+                    )
+                    break
+            if terminal_event_observed(
+                runtime.metrics_path,
+                trial.terminal_event,
+                start_offset=metrics_offset,
+            ):
+                outcome = trial.terminal_event
+                break
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        outcome = "interrupted"
+        interrupted = True
+        _append_lifecycle_event(
+            runtime.run_dir,
+            "diagnostic_slice_interrupted",
+            level="WARN",
+            session_id=session_id,
+            slice_id=slice_id,
+        )
+
+    elapsed = round(time.monotonic() - slice_started, 3)
+    diagnostic = None
+    diagnostic_path = None
+    if outcome in {"timeout", "interrupted"}:
+        try:
+            diagnostic = build_trial_end_diagnostic(
+                runtime.metrics_path,
+                start_offset=metrics_offset,
+            )
+            diagnostic_path = write_trial_end_diagnostic_artifact(
+                runtime.run_dir,
+                trial,
+                diagnostic,
+                metrics_path=runtime.metrics_path,
+                outcome=outcome,
+                artifact_name=(
+                    "%s_slice_%04d_trial_end_diagnostic.json"
+                    % (runtime.run_dir.name, slice_index)
+                ),
+                slice_id=slice_id,
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            diagnostic = None
+    _append_lifecycle_event(
+        runtime.run_dir,
+        "diagnostic_slice_finished",
+        level="WARN" if outcome in {"failure_snapshot", "interrupted"} else "INFO",
+        session_id=session_id,
+        slice_id=slice_id,
+        outcome=outcome,
+        elapsed_wall_seconds=elapsed,
+        failure_id=(None if failure_stop is None else failure_stop.get("failure_id")),
+        diagnostic_path=diagnostic_path,
+    )
+    record = trial_as_dict(trial)
+    record.update({
+        "outcome": outcome,
+        "session_id": session_id,
+        "slice_id": slice_id,
+        "slice_index": slice_index,
+        "runtime_reused": True,
+        "runtime_run_directory": str(runtime.run_dir),
+        "run_directory": str(runtime.run_dir),
+        "metrics_log": str(runtime.metrics_path),
+        "startup_elapsed_wall_seconds": 0.0,
+        "startup_reused_from_session": True,
+        "startup_readiness": runtime.startup_readiness,
+        "startup_readiness_elapsed_wall_seconds": 0.0,
+        "elapsed_wall_seconds": elapsed,
+        "trial_elapsed_wall_seconds": elapsed,
+        "stop_on_failure": bool(stop_on_failure),
+        "failure_stop_id": (
+            None if failure_stop is None else failure_stop.get("failure_id")
+        ),
+        "failure_stop_classification": (
+            None if failure_stop is None else failure_stop.get("classification")
+        ),
+        "failure_stop_artifact_path": (
+            None if failure_stop is None else failure_stop.get("artifact_path")
+        ),
+        "failure_stop_diagnosis": (
+            None if failure_stop is None else failure_stop.get("diagnosis")
+        ),
+        "trial_end_diagnostic_path": diagnostic_path,
+        "trial_end_diagnostic_state": (
+            None if diagnostic is None else diagnostic.get("state")
+        ),
+        "trial_end_diagnostic_reason": (
+            None if diagnostic is None else diagnostic.get("reason")
+        ),
+        "phase_timings": {
+            "launcher_start_seconds": 0.0,
+            "readiness_wait_seconds": 0.0,
+            "navigation_trial_seconds": elapsed,
+            "failure_evidence_window_seconds": (
+                None
+                if failure_stop is None
+                else failure_stop.get("duration_seconds")
+            ),
+            "cleanup_seconds": 0.0,
+            "summary_seconds": None,
+            "total_seconds": elapsed,
+        },
+        "video_status": "disabled_warm_session",
+        "video_override": "warm_session_no_video",
+        "interrupted": interrupted,
+    })
+    artifact_path = runtime.run_dir / (
+        "%s_slice_%04d_experiment_record.json"
+        % (runtime.run_dir.name, slice_index)
+    )
+    record["experiment_record"] = str(artifact_path)
+    artifact_path.write_text(
+        json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return record
+
+
+def _write_warm_session_summary(
+    runtime: WarmRuntime,
+    slice_records,
+    cleanup,
+    session_id: str,
+):
+    """Persist the session-level pointer; detailed evidence stays per slice."""
+    session_path = runtime.run_dir / (
+        runtime.run_dir.name + "_warm_session_%s.json" % session_id[-4:]
+    )
+    payload = {
+        "schema_version": 1,
+        "artifact_kind": "warm_diagnostic_session",
+        "run_timestamp": runtime.run_dir.name,
+        "session_id": session_id,
+        "runtime_reused": not runtime.started_here,
+        "startup_elapsed_wall_seconds": runtime.startup_elapsed_wall_seconds,
+        "startup_readiness": runtime.startup_readiness,
+        "slice_count": len(slice_records),
+        "slices": slice_records,
+        "cleanup": cleanup,
+        "metrics_log": str(runtime.metrics_path),
+        "run_directory": str(runtime.run_dir),
+        "artifact_path": str(session_path),
+    }
+    temporary_path = session_path.with_name(session_path.name + ".tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary_path, session_path)
+    return session_path
+
+
+def run_warm_session(
+    trial,
+    slice_count: int,
+    stop_on_failure=False,
+    reuse_existing=False,
+    failure_post_window=None,
+    failure_pre_window=None,
+):
+    """Run short continuation slices against one live ROS/Gazebo runtime."""
+    if slice_count <= 0:
+        raise ValueError("warm slice count must be positive")
+    if float(trial.timeout_seconds) > _MAX_WARM_SLICE_SECONDS:
+        raise ValueError(
+            "warm diagnostic slices must be <= %.0f seconds; select a short "
+            "phase or pass --max-trial-seconds" % _MAX_WARM_SLICE_SECONDS
+        )
+    previous_run_dir = current_run_directory()
+    runtime = None
+    slice_records = []
+    session_id = None
+    slice_start_index = 1
+    session_failure = None
+    cleanup = {
+        "performed": False,
+        "return_code": None,
+        "elapsed_wall_seconds": 0.0,
+        "failure": None,
+    }
+    try:
+        runtime = _prepare_warm_runtime(
+            trial,
+            reuse_existing=reuse_existing,
+            failure_post_window=failure_post_window,
+            failure_pre_window=failure_pre_window,
+        )
+        _append_lifecycle_event(
+            runtime.run_dir,
+            "diagnostic_warm_session_started",
+            session_id=(
+                "%s-W%04d" % (runtime.run_dir.name, _next_warm_session_index(runtime.run_dir))
+            ),
+            slice_count=slice_count,
+            startup_reused=not runtime.started_here,
+            startup_elapsed_wall_seconds=runtime.startup_elapsed_wall_seconds,
+        )
+        session_id = "%s-W%04d" % (
+            runtime.run_dir.name,
+            _next_warm_session_index(runtime.run_dir),
+        )
+        slice_start_index = _next_warm_slice_index(runtime.run_dir)
+        for slice_index in range(slice_start_index, slice_start_index + slice_count):
+            record = _warm_slice_record(
+                runtime,
+                trial,
+                slice_index,
+                session_id,
+                stop_on_failure=stop_on_failure,
+            )
+            slice_records.append(record)
+            if record.get("outcome") in {"failure_snapshot", "interrupted"}:
+                break
+    except KeyboardInterrupt:
+        session_failure = "operator_interrupt"
+    except (OSError, RuntimeError, ValueError) as exc:
+        session_failure = "%s:%s" % (type(exc).__name__, exc)
+    finally:
+        candidate_run_dir = (
+            None if runtime is not None else current_run_directory()
+        )
+        if runtime is not None and runtime.stop_at_end:
+            stop_reason = "warm_session_complete"
+            if slice_records:
+                last = slice_records[-1]
+                if last.get("outcome") == "failure_snapshot":
+                    stop_reason = "failure_snapshot:%s" % (
+                        last.get("failure_stop_id") or "unknown"
+                    )
+                elif last.get("outcome") == "interrupted":
+                    stop_reason = "operator_interrupt"
+            if session_failure is not None:
+                stop_reason = session_failure
+            runtime.environment["OFFICE_BUILDING_STOP_REASON"] = stop_reason
+            _append_lifecycle_event(
+                runtime.run_dir,
+                "warm_session_stop_requested",
+                level="WARN" if session_failure else "INFO",
+                reason=stop_reason,
+            )
+            started = time.monotonic()
+            try:
+                cleanup["return_code"] = _run_benchmark_stop(runtime.environment)
+                if cleanup["return_code"] not in (None, 0):
+                    cleanup["failure"] = "benchmark_stop_failed:exit_%s" % (
+                        cleanup["return_code"]
+                    )
+            except (OSError, subprocess.SubprocessError) as exc:
+                cleanup["failure"] = "benchmark_stop_failed:%s" % type(exc).__name__
+            cleanup["elapsed_wall_seconds"] = round(time.monotonic() - started, 3)
+            cleanup["performed"] = True
+            _append_lifecycle_event(
+                runtime.run_dir,
+                "warm_session_stop_completed",
+                level="ERROR" if cleanup["failure"] else "INFO",
+                reason=stop_reason,
+                return_code=cleanup["return_code"],
+                elapsed_wall_seconds=cleanup["elapsed_wall_seconds"],
+                cleanup_failure=cleanup["failure"],
+            )
+        elif runtime is not None:
+            _append_lifecycle_event(
+                runtime.run_dir,
+                "diagnostic_warm_session_detached",
+                reason="runtime_left_running_by_request",
+            )
+        elif not reuse_existing and candidate_run_dir is not None \
+                and candidate_run_dir != previous_run_dir:
+            # Startup can fail after creating the run directory but before the
+            # WarmRuntime object is returned. Clean only that newly created run.
+            environment = trial_environment(
+                trial,
+                failure_post_window=failure_post_window,
+                failure_pre_window=failure_pre_window,
+            )
+            environment["OFFICE_BUILDING_STOP_REASON"] = session_failure or (
+                "warm_session_start_failed"
+            )
+            try:
+                _run_benchmark_stop(environment)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    if runtime is None:
+        return {
+            "session": {
+                "outcome": "startup_failure",
+                "infrastructure_failure": session_failure,
+                "slice_count": 0,
+            },
+            "records": slice_records,
+        }
+    failure_report = write_navigation_failure_report(runtime.run_dir)
+    session_path = _write_warm_session_summary(
+        runtime,
+        slice_records,
+        cleanup,
+        session_id or "%s-W%04d" % (
+            runtime.run_dir.name,
+            _next_warm_session_index(runtime.run_dir),
+        ),
+    )
+    session = {
+        "outcome": (
+            "failure_snapshot"
+            if any(item.get("outcome") == "failure_snapshot" for item in slice_records)
+            else ("interrupted" if session_failure == "operator_interrupt" else "completed")
+        ),
+        "run_directory": str(runtime.run_dir),
+        "metrics_log": str(runtime.metrics_path),
+        "warm_session_record": str(session_path),
+        "failure_report_json": failure_report.get("json_path"),
+        "failure_report_markdown": failure_report.get("markdown_path"),
+        "slice_count": len(slice_records),
+        "startup_reused": not runtime.started_here,
+        "startup_elapsed_wall_seconds": runtime.startup_elapsed_wall_seconds,
+        "cleanup": cleanup,
+    }
+    if session_failure is not None:
+        session["infrastructure_failure"] = session_failure
+    if cleanup.get("failure"):
+        session["infrastructure_failure"] = session.get(
+            "infrastructure_failure"
+        ) or cleanup["failure"]
+    return {"session": session, "records": slice_records}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1985,8 +2648,25 @@ def main() -> int:
         type=float,
         help=(
             "diagnostic-only upper bound for the navigation episode; use with "
-            "--stop-on-failure to reproduce a local condition without waiting "
-            "for the formal matrix timeout"
+            "--stop-on-failure, or with --warm-slices, to reproduce a local "
+            "condition without waiting for the formal matrix timeout"
+        ),
+    )
+    parser.add_argument(
+        "--warm-slices",
+        type=int,
+        metavar="N",
+        help=(
+            "run N bounded diagnostic slices in one ROS/Gazebo session; "
+            "requires exactly one selected trial and keeps every slice <= 60s"
+        ),
+    )
+    parser.add_argument(
+        "--reuse-runtime",
+        action="store_true",
+        help=(
+            "reuse a compatible already-running benchmark runtime; skips "
+            "launcher startup, readiness wait, and automatic stop"
         ),
     )
     parser.add_argument(
@@ -1995,7 +2675,7 @@ def main() -> int:
         action="store_true",
         help=(
             "diagnostic-only: skip screen recording to shorten local failure "
-            "reproduction; requires --stop-on-failure"
+            "reproduction; requires --stop-on-failure unless using warm mode"
         ),
     )
     parser.add_argument("--output", type=Path)
@@ -2034,13 +2714,22 @@ def main() -> int:
         trials = [replace(trial, profile=profile) for trial in trials]
     if not trials:
         raise SystemExit("selection filters produced no trials")
+    warm_mode = args.warm_slices is not None or args.reuse_runtime
+    if warm_mode and len(trials) != 1:
+        raise SystemExit(
+            "warm diagnostic mode requires exactly one selected trial; "
+            "use --method/--level/--seed to select it"
+        )
+    warm_slices = args.warm_slices if args.warm_slices is not None else 1
+    if warm_mode and warm_slices <= 0:
+        raise SystemExit("warm-slices must be positive")
     if (
         args.failure_post_window is not None
         or args.failure_pre_window is not None
         or args.profile
         or args.max_trial_seconds is not None
         or args.no_video
-    ) and not args.stop_on_failure:
+    ) and not args.stop_on_failure and not warm_mode:
         raise SystemExit(
             "diagnostic profile/window/timeout/video overrides require "
             "--stop-on-failure"
@@ -2058,6 +2747,22 @@ def main() -> int:
             )
             for trial in trials
         ]
+    if warm_mode and float(trials[0].timeout_seconds) > _MAX_WARM_SLICE_SECONDS:
+        raise SystemExit(
+            "warm diagnostic slices must be <= %.0f seconds; pass "
+            "--max-trial-seconds <= %.0f or select diagnostic_short"
+            % (_MAX_WARM_SLICE_SECONDS, _MAX_WARM_SLICE_SECONDS)
+        )
+    if warm_mode:
+        trials = [
+            replace(
+                trials[0],
+                video_required=False,
+                video_override=(
+                    "disabled_by_cli" if args.no_video else "warm_session_no_video"
+                ),
+            )
+        ]
     if args.no_video:
         # The matrix remains the source of truth for formal runs. This
         # replacement is allowed only in the explicitly diagnostic mode above
@@ -2069,7 +2774,12 @@ def main() -> int:
         "failure_post_window": args.failure_post_window,
         "failure_pre_window": args.failure_pre_window,
         "max_trial_seconds": args.max_trial_seconds,
-        "video_override": "disabled_by_cli" if args.no_video else None,
+        "video_override": (
+            "disabled_by_cli" if args.no_video
+            else ("warm_session_no_video" if warm_mode else None)
+        ),
+        "warm_slices": warm_slices if warm_mode else None,
+        "reuse_runtime": bool(args.reuse_runtime),
         "trials": [trial_as_dict(t) for t in trials],
     }
     if not args.execute:
@@ -2077,23 +2787,43 @@ def main() -> int:
         return 0
 
     records = []
-    for trial in trials:
-        record = run_trial(
-            trial,
+    session = None
+    if warm_mode:
+        result = run_warm_session(
+            trials[0],
+            warm_slices,
             stop_on_failure=args.stop_on_failure,
+            reuse_existing=args.reuse_runtime,
             failure_post_window=args.failure_post_window,
             failure_pre_window=args.failure_pre_window,
         )
-        records.append(record)
-        # An operator interrupt is a deliberate end to the diagnostic batch;
-        # never launch the next matrix trial after its cleanup completes.
-        if record.get("outcome") == "interrupted":
-            break
-    rendered = json.dumps({"plan": plan, "records": records}, ensure_ascii=False, indent=2, sort_keys=True)
+        records = result["records"]
+        session = result["session"]
+    else:
+        for trial in trials:
+            record = run_trial(
+                trial,
+                stop_on_failure=args.stop_on_failure,
+                failure_post_window=args.failure_post_window,
+                failure_pre_window=args.failure_pre_window,
+            )
+            records.append(record)
+            # An operator interrupt is a deliberate end to the diagnostic batch;
+            # never launch the next matrix trial after its cleanup completes.
+            if record.get("outcome") == "interrupted":
+                break
+    rendered = json.dumps(
+        {"plan": plan, "session": session, "records": records},
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
     print(rendered)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(rendered + "\n", encoding="utf-8")
+    if warm_mode:
+        return 1 if session is None or session.get("infrastructure_failure") else 0
     incomplete = [
         record for record, trial in zip(records, trials)
         if record.get("infrastructure_failure")

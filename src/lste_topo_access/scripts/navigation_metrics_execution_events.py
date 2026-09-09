@@ -32,6 +32,62 @@ def route_recovery_preemption_reason(event, payload, status_code):
     return None
 
 
+_EXPECTED_ROUTE_RECOVERY_WINDOW_SECONDS = 10.0
+
+
+def route_recovery_route_id(payload):
+    """Return the route identity carried by a bridge/frontier event."""
+    if not isinstance(payload, dict):
+        return None
+    released = payload.get("released_controller_route")
+    released = released if isinstance(released, dict) else {}
+    for value in (
+        payload.get("route_id"),
+        payload.get("released_route_id"),
+        payload.get("active_route_id"),
+        released.get("route_id"),
+    ):
+        try:
+            value = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def route_recovery_preemption_from_frontier_event(event, payload):
+    """Detect a frontier release that will cause an intentional PREEMPTED.
+
+    The frontier status and the bridge status use separate ROS topics. The
+    frontier release can therefore arrive before the bridge publishes its
+    ``controller_lease_released`` event, while move_base may publish PREEMPTED
+    in between. Only the explicit terminal boundary is strong enough to arm
+    this correlation; a deferred unavailable snapshot is not.
+    """
+    if str(event or "").strip() != "frontier_route_unavailable":
+        return None
+    payload = payload if isinstance(payload, dict) else {}
+    released = payload.get("released_controller_route")
+    released = released if isinstance(released, dict) else {}
+    if not (
+        bool(released.get("controller_pending"))
+        and bool(released.get("terminal_received"))
+    ):
+        return None
+    route_id = route_recovery_route_id(payload)
+    if route_id is None:
+        return None
+    reason = str(payload.get("reason", "frontier_route_unavailable")).strip()
+    return {
+        "route_id": route_id,
+        "reason": "endpoint_terminal_%s" % (
+            reason or "frontier_route_unavailable"
+        ),
+        "source_event": str(event),
+    }
+
+
 def route_invalidation_failure_trigger(event, payload):
     """Map an explicit frontier route invalidation to a failure trigger.
 
@@ -66,6 +122,81 @@ def route_invalidation_failure_trigger(event, payload):
 
 
 class NavigationMetricsExecutionEventsMixin:
+    def _purge_route_recovery_expectations_locked(self, now=None):
+        """Drop preemption expectations that outlived their route boundary."""
+        now = time.monotonic() if now is None else float(now)
+        pending = getattr(self, "expected_route_recovery_preemptions", None)
+        if pending is None:
+            return
+        while pending and (
+            now - float(pending[0].get("armed_wall", now))
+            > _EXPECTED_ROUTE_RECOVERY_WINDOW_SECONDS
+        ):
+            pending.popleft()
+
+    def _arm_expected_route_recovery_preemption_locked(self, expectation):
+        """Remember a route-specific cancellation before transport reports it."""
+        if not isinstance(expectation, dict):
+            return False
+        route_id = route_recovery_route_id(expectation)
+        if route_id is None:
+            return False
+        now = time.monotonic()
+        self._purge_route_recovery_expectations_locked(now)
+        pending = self.expected_route_recovery_preemptions
+        consumed = self.consumed_route_recovery_route_ids
+        if route_id in consumed or any(
+            int(item.get("route_id", 0) or 0) == route_id for item in pending
+        ):
+            return False
+        # A bridge release may win the topic race. In that case the existing
+        # legacy counter already represents this exact pending PREEMPTED.
+        if int(getattr(self, "pending_route_recovery_preemptions", 0) or 0) > 0:
+            return False
+        item = {
+            "route_id": route_id,
+            "reason": str(expectation.get("reason", "route_released")),
+            "source_event": str(expectation.get("source_event", "frontier")),
+            "armed_wall": now,
+        }
+        pending.append(item)
+        self._write(
+            "INFO",
+            "expected_route_recovery_preemption",
+            route_id=route_id,
+            reason=item["reason"],
+            source_event=item["source_event"],
+            correlation_window_seconds=_EXPECTED_ROUTE_RECOVERY_WINDOW_SECONDS,
+        )
+        return True
+
+    def _consume_expected_route_recovery_preemption_locked(self):
+        """Consume the oldest still-valid route-specific PREEMPTED expectation."""
+        now = time.monotonic()
+        self._purge_route_recovery_expectations_locked(now)
+        pending = self.expected_route_recovery_preemptions
+        if not pending:
+            return None
+        item = pending.popleft()
+        route_id = int(item.get("route_id", 0) or 0)
+        if route_id > 0:
+            self.consumed_route_recovery_route_ids.append(route_id)
+        return item
+
+    def _route_recovery_preemption_already_accounted_locked(self, payload):
+        """Avoid counting the bridge release after frontier-side correlation."""
+        route_id = route_recovery_route_id(payload)
+        if route_id is None:
+            return False
+        now = time.monotonic()
+        self._purge_route_recovery_expectations_locked(now)
+        if route_id in self.consumed_route_recovery_route_ids:
+            return True
+        return any(
+            int(item.get("route_id", 0) or 0) == route_id
+            for item in self.expected_route_recovery_preemptions
+        )
+
     def on_scan(self, message):
         all_ranges = list(message.ranges)
         forward, left, right = [], [], []
@@ -126,7 +257,12 @@ class NavigationMetricsExecutionEventsMixin:
             route_recovery_reason = route_recovery_preemption_reason(
                 event, payload, status_code
             )
-            if route_recovery_reason is not None:
+            if (
+                route_recovery_reason is not None
+                and not self._route_recovery_preemption_already_accounted_locked(
+                    payload
+                )
+            ):
                 self.pending_route_recovery_preemptions += 1
                 self._increment_reason(
                     self.route_recovery_preemption_reasons,
@@ -357,11 +493,18 @@ class NavigationMetricsExecutionEventsMixin:
         with self.lock:
             event = str(payload.pop("event", "unknown")).strip() or "unknown"
             now = time.monotonic()
+            expected_preemption = route_recovery_preemption_from_frontier_event(
+                event, payload
+            )
+            if expected_preemption is not None:
+                self._arm_expected_route_recovery_preemption_locked(
+                    expected_preemption
+                )
             self._failure_record_context_locked("frontier", event, payload)
             route_failure_trigger = route_invalidation_failure_trigger(
                 event, payload
             )
-            if event in (
+            if not self.task_done and event in (
                 "execution_terminal_failure",
                 "frontier_route_failed",
                 "portal_hypothesis_failed",
@@ -370,7 +513,7 @@ class NavigationMetricsExecutionEventsMixin:
                 self._begin_failure_episode_locked(
                     "frontier_route_failure", "global_frontier", payload
                 )
-            elif route_failure_trigger is not None:
+            elif route_failure_trigger is not None and not self.task_done:
                 # The following bridge PREEMPTED is an intentional recovery
                 # action, but the invalidation itself is already a failure
                 # boundary. Keep both facts with one failure ID.

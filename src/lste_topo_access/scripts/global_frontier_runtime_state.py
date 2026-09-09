@@ -282,6 +282,9 @@ class GlobalFrontierRuntimeStateMixin:
         self.last_released_route_kind = ""
         self.last_released_route_terminal_received = False
         self.last_released_route_controller_pending = False
+        # Bridge terminal failures are accepted only after this process has
+        # observed the matching action dispatch contract.
+        self._bridge_dispatch_contracts = {}
         # Stable identity for an exploration route transaction. It changes
         # only when a new BFS branch is selected; an early handoff preserves
         # it only after the discrete path-prefix test proves continuity.
@@ -417,6 +420,14 @@ class GlobalFrontierRuntimeStateMixin:
         self.graph_route_plan_lease_active = False
         self.graph_route_plan_lease_signature = None
         self.last_graph_materialization_wait_signature = None
+        self.graph_route_fsm_state = "SEARCHING"
+        self.graph_route_materialization_miss_signature = None
+        self.graph_route_materialization_miss_count = 0
+        self.graph_route_materialization_epochs = []
+        self.graph_route_materialization_last_event = None
+        self.graph_route_materialization_exclusions = {}
+        self.last_graph_route_materialization_negative_evidence = None
+        self.last_map_epoch = None
         # The graph method records the category/Pareto decision separately
         # from the legacy scalar diagnostics so experiment replay can prove
         # which policy actually selected a route.
