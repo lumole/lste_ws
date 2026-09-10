@@ -59,16 +59,15 @@ class TebGoalBridgePersistentTargetApproachMixin:
                 latest_transaction_id=int(self.latest_goal_transaction_id),
             )
             return
-        source_goal = self.latest_goal
-        termination = self._commit_termination(
-            "persistent_target_approach_terminal",
-            source_goal=source_goal,
-            action_contract=getattr(self, "active_action_contract", None),
-            watchdog_reason="persistent_target_approach_terminal",
-        )
-        if not termination.get("committed", False):
+        # This is a semantic target-segment boundary, not the end of the
+        # persistent MoveBase lease.  The next viewpoint must be able to enter
+        # the same Navfn/TEB stream immediately; using the generic termination
+        # transaction here would revoke the action generation and leave the
+        # successor blocked behind a controller-release ACK that target routes
+        # do not produce.
+        terminal_goal = self._publish_execution_terminal_locked(self.latest_goal)
+        if terminal_goal is None:
             return
-        terminal_goal = getattr(self, "last_terminal_goal", None) or source_goal
         self.persistent_target_approach_reported_transaction = int(
             self.latest_goal_transaction_id
         )
