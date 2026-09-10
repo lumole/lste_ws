@@ -28,6 +28,9 @@ class TebGoalBridgeActionTerminalMixin:
                 action_contract.get("lifecycle_transaction_id", 0) or 0
             ),
             "transaction_id": int(action_contract.get("transaction_id", 0) or 0),
+            "graph_transaction_id": int(
+                action_contract.get("graph_transaction_id", 0) or 0
+            ),
             "route_id": int(action_contract.get("route_id", 0) or 0),
             "epoch": action_contract.get(
                 "epoch", action_contract.get("target_epoch", 0)
@@ -60,7 +63,7 @@ class TebGoalBridgeActionTerminalMixin:
         }
 
     def _publish_execution_terminal_locked(
-        self, source_goal, action_contract=None
+        self, source_goal, action_contract=None, invalidate_feedback=True
     ):
         """Publish a terminal using an explicit action or semantic contract.
 
@@ -75,6 +78,24 @@ class TebGoalBridgeActionTerminalMixin:
                 source_goal = contract_goal
         if source_goal is None:
             return None
+        invalidate = getattr(self, "_invalidate_teb_feedback_locked", None)
+        if invalidate_feedback and callable(invalidate):
+            route_kind = str(
+                action_contract.get("route_kind", "")
+                if action_contract is not None
+                else getattr(self, "active_route_kind", "")
+                or ""
+            ).strip().lower()
+            invalidate(
+                "persistent_endpoint_terminal"
+                if route_kind in {
+                    "frontier_endpoint",
+                    "portal_transition",
+                    "local_egress",
+                }
+                else "execution_terminal",
+                clear_planner=True,
+            )
         if action_contract is not None:
             route_id = int(action_contract.get("route_id", 0) or 0)
             route_kind = str(action_contract.get("route_kind", "") or "")
@@ -94,6 +115,16 @@ class TebGoalBridgeActionTerminalMixin:
         terminal_goal = copy.deepcopy(source_goal)
         terminal_goal.header.stamp = rospy.Time.now()
         self.last_terminal_goal = copy.deepcopy(terminal_goal)
+        if action_contract is not None:
+            # Reaffirm the real dispatch immediately before publishing the
+            # terminal. The two topics are independent, so Global Frontier may
+            # otherwise observe the terminal before the original dispatch
+            # status even though the bridge created the action first.
+            self.publish_bridge_status(
+                "dispatch_contract_reaffirmed",
+                reason="terminal_contract",
+                **self._action_contract_status_fields(action_contract),
+            )
         self.terminal_pub.publish(terminal_goal)
 
         terminal = FrontierExecutionTerminal()
@@ -114,6 +145,11 @@ class TebGoalBridgeActionTerminalMixin:
             )
         except (TypeError, ValueError):
             terminal.map_epoch = 0
+        terminal.graph_transaction_id = int(
+            action_contract.get("graph_transaction_id", 0) or 0
+            if action_contract is not None
+            else getattr(self, "active_graph_transaction_id", 0) or 0
+        )
         lifecycle_transaction_id = (
             int(action_contract.get("lifecycle_transaction_id", 0) or 0)
             if action_contract is not None
@@ -322,9 +358,16 @@ class TebGoalBridgeActionTerminalMixin:
     ):
         if status != GoalStatus.SUCCEEDED or source_goal is None:
             return False
-        terminal_goal = self._publish_execution_terminal_locked(
-            source_goal, action_contract=action_contract
+        termination = self._commit_termination(
+            "move_base_succeeded_terminal",
+            source_goal=source_goal,
+            action_contract=action_contract,
+            terminal_status=status,
+            watchdog_reason="move_base_succeeded_terminal",
         )
+        if not termination.get("committed", False):
+            return False
+        terminal_goal = getattr(self, "last_terminal_goal", None) or source_goal
         self.terminal_count += 1
         self.publish_bridge_status(
             "terminal",
@@ -336,15 +379,6 @@ class TebGoalBridgeActionTerminalMixin:
                 round(terminal_goal.pose.position.y, 3),
             ],
         )
-        arm_watchdog = getattr(
-            self, "_arm_route_lease_watchdog_locked", None
-        )
-        if callable(arm_watchdog):
-            arm_watchdog(
-                status=status,
-                reason="move_base_succeeded_terminal",
-                action_contract=action_contract,
-            )
         rospy.loginfo(
             "TEB goal bridge successful terminal event: target=(%.2f,%.2f)",
             terminal_goal.pose.position.x,
@@ -361,21 +395,20 @@ class TebGoalBridgeActionTerminalMixin:
         self, status, handoff_requested, action_contract=None
     ):
         """Report a failure once, then leave route replacement to Frontier."""
+        self._commit_termination(
+            "move_base_failed_terminal",
+            source_goal=getattr(self, "last_dispatched_goal", None),
+            action_contract=action_contract,
+            terminal_status=status,
+            watchdog_reason="move_base_failed_terminal",
+            publish_terminal=False,
+        )
         self.publish_bridge_status(
             "terminal",
             status=int(status),
             status_text=GoalStatus.to_string(status),
             **self._action_contract_status_fields(action_contract),
         )
-        arm_watchdog = getattr(
-            self, "_arm_route_lease_watchdog_locked", None
-        )
-        if callable(arm_watchdog):
-            arm_watchdog(
-                status=status,
-                reason="move_base_failed_terminal",
-                action_contract=action_contract,
-            )
         rospy.logwarn(
             "TEB move_base action finished without success: status=%s "
             "handoff=%s route_id=%s generation=%s transaction_id=%s epoch=%s",
@@ -408,6 +441,13 @@ class TebGoalBridgeActionTerminalMixin:
         """Close one action; do not send actions from the actionlib callback."""
         with self.lock:
             if generation != self.action_generation:
+                self.publish_bridge_status(
+                    "stale_action_terminal_ignored",
+                    callback_action_generation=int(generation),
+                    current_action_generation=int(self.action_generation),
+                    status=int(status),
+                    reason="action_generation_mismatch",
+                )
                 return
             action_contract = self._action_contract_for_generation_locked(generation)
             if action_contract is None:

@@ -33,6 +33,7 @@ def route_recovery_preemption_reason(event, payload, status_code):
 
 
 _EXPECTED_ROUTE_RECOVERY_WINDOW_SECONDS = 10.0
+_EXPECTED_HARD_RESET_PREEMPTION_WINDOW_SECONDS = 10.0
 
 
 def route_recovery_route_id(payload):
@@ -121,7 +122,279 @@ def route_invalidation_failure_trigger(event, payload):
     return "route_invalidated_failure"
 
 
+def recoverable_portal_route_failure(event, payload):
+    """Return whether one Portal route failure should await successor replanning.
+
+    A self-loop or rejected Portal destination is a terminal fact for the
+    current route, but the exploration executive can legitimately select a
+    different probe/work item immediately afterwards.  Treat that narrow
+    boundary as context first; the sustained unavailable-route watchdog still
+    promotes it to a formal episode when no successor is materialized.
+    """
+    if str(event or "").strip() not in {
+        "portal_hypothesis_failed",
+        "portal_execution_failure_observed",
+        "frontier_route_failed",
+    } or not isinstance(payload, dict):
+        return None
+    reason = str(payload.get("reason", "") or "").strip().lower()
+    route_kind = str(
+        payload.get("route_kind")
+        or payload.get("active_route_kind")
+        or payload.get("mission_route_kind")
+        or ""
+    ).strip().lower()
+    if route_kind not in {"portal_transition", "portal_probe"}:
+        return None
+    if reason not in {
+        "portal_self_loop_rejected",
+        "portal_destination_binding_rejected",
+        "portal_destination_component_rejected",
+    }:
+        return None
+    route_id = route_recovery_route_id(payload)
+    if route_id is None:
+        return None
+    return {
+        "route_id": route_id,
+        "route_kind": route_kind,
+        "reason": reason,
+        "successor_replan_expected": True,
+    }
+
+
 class NavigationMetricsExecutionEventsMixin:
+    @staticmethod
+    def _metrics_int(value, default=0):
+        raw = default if value is None or value == "" else value
+        try:
+            return int(raw or 0)
+        except (TypeError, ValueError):
+            try:
+                return int(default or 0)
+            except (TypeError, ValueError):
+                return 0
+
+    @classmethod
+    def _bridge_dispatch_contract_from_payload(cls, payload):
+        """Extract one bridge dispatch identity from its JSON status."""
+        route_kind = payload.get("route_kind")
+        if route_kind is None:
+            route_kind = payload.get("active_route_kind", "")
+        return {
+            "transaction_id": cls._metrics_int(
+                payload.get("transaction_id"),
+                payload.get("active_goal_transaction_id", 0),
+            ),
+            "route_id": cls._metrics_int(
+                payload.get("route_id"), payload.get("active_route_id", 0)
+            ),
+            "graph_transaction_id": cls._metrics_int(
+                payload.get("graph_transaction_id"),
+                payload.get("active_graph_transaction_id", 0),
+            ),
+            "map_epoch": (
+                payload.get("map_epoch")
+                if payload.get("map_epoch") is not None
+                else payload.get("active_route_map_epoch")
+            ),
+            "lifecycle_transaction_id": cls._metrics_int(
+                payload.get("lifecycle_transaction_id")
+            ),
+            "action_generation": cls._metrics_int(
+                payload.get("action_generation"),
+                payload.get("active_action_generation", 0),
+            ),
+            "route_kind": str(route_kind or "").strip().lower(),
+            "mission_route_kind": str(
+                payload.get("mission_route_kind")
+                or payload.get("active_mission_route_kind", "")
+                or ""
+            ).strip().lower(),
+        }
+
+    def _remember_metrics_bridge_dispatch_locked(self, payload):
+        event = str(payload.get("event", "") or "").strip()
+        if event not in {
+            "dispatch",
+            "dispatch_contract_reaffirmed",
+            "successor_dispatched",
+        }:
+            return None
+        contract = self._bridge_dispatch_contract_from_payload(payload)
+        if contract["action_generation"] <= 0:
+            return None
+        self.bridge_latest_dispatch_contract = dict(contract)
+        route_id = contract["route_id"]
+        if route_id > 0:
+            previous = self.bridge_dispatch_contracts.get(route_id)
+            if (
+                previous is None
+                or contract["action_generation"] >= previous["action_generation"]
+            ):
+                self.bridge_dispatch_contracts[route_id] = dict(contract)
+            for old_route_id in sorted(self.bridge_dispatch_contracts)[:-64]:
+                self.bridge_dispatch_contracts.pop(old_route_id, None)
+        return contract
+
+    def _terminal_contract_reference_locked(self, identity):
+        if identity["route_id"] > 0:
+            return self.bridge_dispatch_contracts.get(identity["route_id"])
+        return self.bridge_latest_dispatch_contract
+
+    def _validate_terminal_contract_locked(self, identity):
+        """Validate the typed terminal against the bridge dispatch identity."""
+        if identity["lifecycle_transaction_id"] <= 0:
+            return "missing_lifecycle_transaction_id"
+        if identity["action_generation"] <= 0:
+            return "missing_action_generation"
+        reference = self._terminal_contract_reference_locked(identity)
+        if reference is None:
+            return "pending_bridge_dispatch"
+        for field in (
+            "route_id",
+            "lifecycle_transaction_id",
+            "action_generation",
+            "graph_transaction_id",
+        ):
+            expected = self._metrics_int(reference.get(field))
+            if expected > 0 and identity[field] != expected:
+                return "terminal_%s_mismatch" % field
+        expected_map_epoch = reference.get("map_epoch")
+        if expected_map_epoch is not None:
+            try:
+                if identity["map_epoch"] != int(expected_map_epoch):
+                    return "terminal_map_epoch_mismatch"
+            except (TypeError, ValueError):
+                return "terminal_map_epoch_invalid"
+        for field in ("route_kind", "mission_route_kind"):
+            expected = str(reference.get(field, "") or "").strip().lower()
+            received = str(identity.get(field, "") or "").strip().lower()
+            if expected and received and expected != received:
+                return "terminal_%s_mismatch" % field
+        return ""
+
+    @staticmethod
+    def _terminal_contract_identity(message):
+        """Extract typed terminal identity without using endpoint geometry."""
+        def integer(value, default=0):
+            try:
+                return int(value or default)
+            except (TypeError, ValueError):
+                return int(default)
+
+        return {
+            "route_id": integer(getattr(message, "route_id", 0)),
+            "map_epoch": integer(getattr(message, "map_epoch", 0)),
+            "graph_transaction_id": integer(
+                getattr(message, "graph_transaction_id", 0)
+            ),
+            "lifecycle_transaction_id": integer(
+                getattr(message, "lifecycle_transaction_id", "")
+            ),
+            "action_generation": integer(
+                getattr(message, "action_generation", 0)
+            ),
+            "route_kind": str(getattr(message, "route_kind", "") or ""),
+            "mission_route_kind": str(
+                getattr(message, "mission_route_kind", "") or ""
+            ),
+        }
+
+    def _record_terminal_contract_locked(self, identity, reconciled=False):
+        validation = self._validate_terminal_contract_locked(identity)
+        if validation == "pending_bridge_dispatch":
+            self.pending_terminal_contracts.append(dict(identity))
+        elif validation:
+            self.terminal_contract_rejections += 1
+        else:
+            self.terminal_contract_identity = dict(identity)
+            self.terminal_contract_validation = "accepted"
+        if validation:
+            self.terminal_contract_validation = validation
+        self._write(
+            "WARN" if validation and validation != "pending_bridge_dispatch" else "INFO",
+            "frontier_execution_terminal_contract",
+            validation=validation or "accepted",
+            reconciled=bool(reconciled),
+            contract_identity=identity,
+        )
+
+    def _reconcile_pending_terminal_contracts_locked(self):
+        pending = getattr(self, "pending_terminal_contracts", None)
+        if not pending:
+            return
+        unresolved = []
+        for identity in list(pending):
+            validation = self._validate_terminal_contract_locked(identity)
+            if validation == "pending_bridge_dispatch":
+                unresolved.append(identity)
+            else:
+                self._record_terminal_contract_locked(identity, reconciled=True)
+        pending.clear()
+        pending.extend(unresolved)
+
+    def on_frontier_execution_terminal(self, message):
+        """Observe the identity-bearing terminal before geometry is analyzed."""
+        with self.lock:
+            self.terminal_contract_count += 1
+            self._record_terminal_contract_locked(
+                self._terminal_contract_identity(message)
+            )
+
+    def _arm_hard_reset_preemption_locked(self, had_active_action=None):
+        """Correlate the transport PREEMPTED caused by a warm hard reset."""
+        if had_active_action is None:
+            had_active_action = bool(
+                getattr(self, "bridge_active", False)
+                or str(getattr(self, "last_move_base_status", "")).upper()
+                in {"ACTIVE", "PENDING", "PREEMPTING"}
+            )
+        if not had_active_action:
+            return False
+        now = time.monotonic()
+        if (
+            int(getattr(self, "pending_hard_reset_preemptions", 0) or 0) > 0
+            and float(
+                getattr(self, "hard_reset_preemption_deadline_wall", 0.0)
+                or 0.0
+            ) > now
+        ):
+            return True
+        self.pending_hard_reset_preemptions = 1
+        self.hard_reset_preemption_deadline_wall = (
+            now + _EXPECTED_HARD_RESET_PREEMPTION_WINDOW_SECONDS
+        )
+        self._write(
+            "INFO",
+            "expected_hard_reset_preemption",
+            correlation_window_seconds=(
+                _EXPECTED_HARD_RESET_PREEMPTION_WINDOW_SECONDS
+            ),
+        )
+        return True
+
+    def _consume_hard_reset_preemption_locked(self):
+        """Consume one reset cancellation, rejecting stale expectations."""
+        pending = int(getattr(self, "pending_hard_reset_preemptions", 0) or 0)
+        if pending <= 0:
+            return False
+        deadline = float(
+            getattr(self, "hard_reset_preemption_deadline_wall", 0.0) or 0.0
+        )
+        now = time.monotonic()
+        if deadline > 0.0 and now > deadline:
+            self.pending_hard_reset_preemptions = 0
+            self.hard_reset_preemption_deadline_wall = 0.0
+            self._write(
+                "WARN",
+                "expected_hard_reset_preemption_expired",
+            )
+            return False
+        self.pending_hard_reset_preemptions = pending - 1
+        self.hard_reset_preemption_deadline_wall = 0.0
+        return True
+
     def _purge_route_recovery_expectations_locked(self, now=None):
         """Drop preemption expectations that outlived their route boundary."""
         now = time.monotonic() if now is None else float(now)
@@ -182,6 +455,75 @@ class NavigationMetricsExecutionEventsMixin:
         if route_id > 0:
             self.consumed_route_recovery_route_ids.append(route_id)
         return item
+
+    def _consume_recent_frontier_release_preemption_locked(self):
+        """Correlate a release that raced the bridge/action status topics.
+
+        Frontier, bridge, and move_base publish on separate ROS topics. In a
+        busy callback cycle the explicit expectation can be observed after
+        the bridge release but before actionlib reports PREEMPTED, or the
+        legacy counter can be consumed by that same ordering. The bounded
+        context history still contains the causal release and is sufficient
+        to distinguish this handoff from an unexplained preemption.
+        """
+        history = getattr(self, "failure_event_history", ())
+        if not history:
+            return None
+        now_elapsed = max(
+            0.0,
+            time.monotonic() - float(getattr(self, "start_wall", time.monotonic())),
+        )
+        for context in reversed(history):
+            if not isinstance(context, dict):
+                continue
+            try:
+                age = now_elapsed - float(context.get("wall_elapsed_seconds", 0.0))
+            except (TypeError, ValueError):
+                age = float("inf")
+            if age > _EXPECTED_ROUTE_RECOVERY_WINDOW_SECONDS:
+                break
+            event = str(context.get("event", "") or "").strip().lower()
+            source = str(context.get("source", "") or "").strip().lower()
+            if event not in {
+                "frontier_route_unavailable",
+                "controller_lease_released",
+            }:
+                continue
+            payload = context.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            released = payload.get("released_controller_route")
+            released = released if isinstance(released, dict) else {}
+            try:
+                status = int(
+                    payload.get("status", payload.get("result_status", 2))
+                    or 2
+                )
+            except (TypeError, ValueError):
+                status = 2
+            if event == "controller_lease_released" and status != 2:
+                continue
+            if event == "frontier_route_unavailable" and not (
+                bool(released.get("controller_pending"))
+                and bool(released.get("terminal_received"))
+            ):
+                continue
+            route_id = route_recovery_route_id(payload)
+            if route_id is None:
+                route_id = route_recovery_route_id(released)
+            if route_id is None:
+                continue
+            self.consumed_route_recovery_route_ids.append(route_id)
+            return {
+                "route_id": route_id,
+                "reason": str(
+                    payload.get("reason")
+                    or released.get("reason")
+                    or "frontier_release_context"
+                ),
+                "source_event": event,
+                "source": source,
+            }
+        return None
 
     def _route_recovery_preemption_already_accounted_locked(self, payload):
         """Avoid counting the bridge release after frontier-side correlation."""
@@ -246,6 +588,16 @@ class NavigationMetricsExecutionEventsMixin:
             payload = {"event": "invalid", "raw": message.data}
         with self.lock:
             event = str(payload.get("event", "unknown"))
+            dispatch_contract = self._remember_metrics_bridge_dispatch_locked(
+                payload
+            )
+            if dispatch_contract is not None:
+                self._reconcile_pending_terminal_contracts_locked()
+                reconcile_planner = getattr(
+                    self, "_reconcile_pending_planner_contract_locked", None
+                )
+                if callable(reconcile_planner):
+                    reconcile_planner()
             context_payload = dict(payload)
             self._failure_record_context_locked("bridge", event, context_payload)
             # Bridge status calls this field ``result_status`` while
@@ -268,7 +620,28 @@ class NavigationMetricsExecutionEventsMixin:
                     self.route_recovery_preemption_reasons,
                     route_recovery_reason,
                 )
-            if event in (
+            if (
+                event == "cancel"
+                and str(payload.get("reason", "") or "").strip()
+                == "experiment_hard_reset"
+            ):
+                # The hard-reset topic is delivered independently to each
+                # node. The bridge's explicit cancel event is the earliest
+                # cross-node evidence that the following PREEMPTED belongs to
+                # the warm-slice reset, so arm correlation here as well as in
+                # the metrics reset callback.
+                self._arm_hard_reset_preemption_locked(True)
+            if event == "route_lease_watchdog_expired" and not self.task_done:
+                # The bridge has already enforced the ten-second transport
+                # boundary and revoked the old owner. Preserve that explicit
+                # handoff failure instead of letting the subsequent idle
+                # sample degrade into a generic no-route timeout.
+                self._begin_failure_episode_locked(
+                    "handoff_timeout",
+                    "teb_goal_bridge",
+                    context_payload,
+                )
+            elif event in (
                 "target_route_failed",
                 "persistent_target_plan_failed",
                 "target_plan_failed",
@@ -296,10 +669,64 @@ class NavigationMetricsExecutionEventsMixin:
             self.bridge_latest_intent_source = str(
                 payload.get("latest_intent_source", self.bridge_latest_intent_source)
             )
+            active_route_id = int(payload.get("active_route_id", 0) or 0)
+            active_goal_transaction_id = int(
+                payload.get("active_goal_transaction_id", 0) or 0
+            )
+            active_generation = int(
+                payload.get("active_action_generation", 0) or 0
+            )
+            active_graph_transaction_id = int(
+                payload.get("active_graph_transaction_id", 0) or 0
+            )
+            active_map_epoch = payload.get("active_route_map_epoch")
+            owner_identity = (
+                active_generation,
+                active_goal_transaction_id,
+                active_route_id,
+                active_graph_transaction_id,
+                active_map_epoch,
+            ) if self.bridge_active else None
+            previous_owner_identity = getattr(
+                self, "teb_feedback_owner_identity", None
+            )
+            self.teb_feedback_owner_identity = owner_identity
+            invalidate_feedback = getattr(
+                self, "_invalidate_teb_feedback_locked", None
+            )
+            if callable(invalidate_feedback):
+                if (
+                    previous_owner_identity is not None
+                    and owner_identity != previous_owner_identity
+                ):
+                    invalidate_feedback(
+                        "route_owner_changed", clear_planner=True
+                    )
+                elif not self.bridge_active:
+                    invalidate_feedback("bridge_inactive", clear_planner=True)
+                elif (
+                    event == "teb_feedback_invalidated"
+                    or payload.get("teb_feedback_valid") is False
+                ):
+                    invalid_reason = str(
+                        payload.get(
+                            "teb_feedback_invalid_reason",
+                            payload.get("reason", "bridge_feedback_invalidated"),
+                        )
+                        or "bridge_feedback_invalidated"
+                    )
+                    invalidate_feedback(
+                        invalid_reason,
+                        clear_planner=bool(payload.get("clear_planner", False)),
+                    )
             if event == "goal_deferred":
                 self.bridge_deferred_goal_updates += 1
             elif event == "dispatch":
                 self.bridge_dispatches += 1
+            elif event == "endpoint_detected":
+                self.bridge_endpoint_detections += 1
+            elif event == "successor_dispatched":
+                self.bridge_successor_dispatches += 1
             elif event == "terminal":
                 self.bridge_terminal_events += 1
                 self._mark_action_terminal_locked(time.monotonic(), "bridge_terminal")
@@ -501,6 +928,9 @@ class NavigationMetricsExecutionEventsMixin:
                     expected_preemption
                 )
             self._failure_record_context_locked("frontier", event, payload)
+            deferred_portal_failure = recoverable_portal_route_failure(
+                event, payload
+            )
             route_failure_trigger = route_invalidation_failure_trigger(
                 event, payload
             )
@@ -510,9 +940,16 @@ class NavigationMetricsExecutionEventsMixin:
                 "portal_hypothesis_failed",
                 "portal_execution_failure_observed",
             ):
-                self._begin_failure_episode_locked(
-                    "frontier_route_failure", "global_frontier", payload
-                )
+                if deferred_portal_failure is not None:
+                    self._write(
+                        "INFO",
+                        "frontier_route_failure_deferred",
+                        **deferred_portal_failure,
+                    )
+                else:
+                    self._begin_failure_episode_locked(
+                        "frontier_route_failure", "global_frontier", payload
+                    )
             elif route_failure_trigger is not None and not self.task_done:
                 # The following bridge PREEMPTED is an intentional recovery
                 # action, but the invalidation itself is already a failure

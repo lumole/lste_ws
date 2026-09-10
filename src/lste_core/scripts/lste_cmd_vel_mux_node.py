@@ -567,6 +567,13 @@ class CmdVelMuxNode:
         """Stop on an untrusted command instead of executing stale motion."""
         with self.lock:
             self.teb_contract_rejection_count += 1
+        rejection_identity = dict(identity or {})
+        rejection_identity.update(
+            {
+                "identity_mismatch": True,
+                "rejection_reason": str(reason),
+            }
+        )
         zero = Twist()
         self.reset_teb_filter()
         self.output_pub.publish(zero)
@@ -579,11 +586,12 @@ class CmdVelMuxNode:
             governor_reason="not_evaluated",
             governor_limit=None,
             filter_reason="transaction_rejected",
-            command_identity=identity,
+            command_identity=rejection_identity,
         )
         rospy.logwarn_throttle(
             2.0,
-            "Rejected TEB command contract: reason=%s identity=%s count=%d",
+            "Rejected TEB command contract: identity_mismatch=true reason=%s "
+            "identity=%s count=%d",
             reason,
             identity,
             self.teb_contract_rejection_count,
@@ -608,6 +616,48 @@ class CmdVelMuxNode:
             active_transaction_id = int(
                 payload.get("active_action_transaction_id", 0) or 0
             )
+            graph_transaction_id = int(
+                payload.get("graph_transaction_id", 0) or 0
+            )
+            planner_graph_transaction_id = int(
+                payload.get("planner_graph_transaction_id", 0) or 0
+            )
+            active_graph_transaction_id = int(
+                payload.get("active_action_graph_transaction_id", 0) or 0
+            )
+            route_id = int(payload.get("route_id", 0) or 0)
+            planner_route_id = int(payload.get("planner_route_id", 0) or 0)
+            active_route_id = int(
+                payload.get("active_action_route_id", 0) or 0
+            )
+            planner_action_generation = int(
+                payload.get("planner_action_generation", 0) or 0
+            )
+            active_action_generation = int(
+                payload.get("active_action_generation", 0) or 0
+            )
+            planner_contract_sequence = int(
+                payload.get("planner_contract_sequence", 0) or 0
+            )
+            active_action = bool(payload.get("active_action", False))
+            raw_map_epoch = payload.get("map_epoch")
+            map_epoch = (
+                None
+                if raw_map_epoch is None
+                else int(raw_map_epoch or 0)
+            )
+            raw_planner_map_epoch = payload.get("planner_map_epoch")
+            planner_map_epoch = (
+                None
+                if raw_planner_map_epoch is None
+                else int(raw_planner_map_epoch or 0)
+            )
+            raw_active_map_epoch = payload.get("active_action_map_epoch")
+            active_map_epoch = (
+                None
+                if raw_active_map_epoch is None
+                else int(raw_active_map_epoch or 0)
+            )
             linear_x = float(payload.get("linear_x", 0.0) or 0.0)
             angular_z = float(payload.get("angular_z", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -621,6 +671,19 @@ class CmdVelMuxNode:
             ),
             "planner_transaction_id": planner_transaction_id,
             "active_action_transaction_id": active_transaction_id,
+            "graph_transaction_id": graph_transaction_id,
+            "planner_graph_transaction_id": planner_graph_transaction_id,
+            "active_action_graph_transaction_id": active_graph_transaction_id,
+            "route_id": route_id,
+            "planner_route_id": planner_route_id,
+            "active_action_route_id": active_route_id,
+            "planner_action_generation": planner_action_generation,
+            "active_action_generation": active_action_generation,
+            "planner_contract_sequence": planner_contract_sequence,
+            "active_action": active_action,
+            "map_epoch": map_epoch,
+            "planner_map_epoch": planner_map_epoch,
+            "active_action_map_epoch": active_map_epoch,
             "decision": str(payload.get("decision", "unknown") or "unknown"),
             "state": str(payload.get("state", "unknown") or "unknown"),
         }
@@ -640,8 +703,61 @@ class CmdVelMuxNode:
                 reason = "stale_command_transaction"
             elif nonzero and planner_transaction_id != transaction_id:
                 reason = "planner_transaction_mismatch"
+            elif nonzero and route_id <= 0:
+                reason = "missing_route_id"
+            elif nonzero and planner_route_id <= 0:
+                reason = "missing_planner_route_id"
+            elif nonzero and not active_action:
+                reason = "no_active_action"
+            elif nonzero and planner_action_generation <= 0:
+                reason = "missing_action_generation"
+            elif nonzero and active_action and active_action_generation <= 0:
+                reason = "active_action_generation_missing"
+            elif nonzero and active_action and active_transaction_id <= 0:
+                reason = "active_action_transaction_missing"
+            elif nonzero and active_action and active_route_id <= 0:
+                reason = "active_action_route_id_missing"
+            elif (
+                nonzero
+                and active_action_generation > 0
+                and planner_action_generation != active_action_generation
+            ):
+                reason = "action_generation_mismatch"
+            elif nonzero and active_action_generation <= 0 and active_action:
+                reason = "active_action_generation_missing"
             elif nonzero and active_transaction_id not in (0, transaction_id):
                 reason = "active_transaction_mismatch"
+            elif nonzero and route_id > 0 and graph_transaction_id <= 0:
+                reason = "missing_graph_transaction_id"
+            elif nonzero and graph_transaction_id != planner_graph_transaction_id:
+                reason = "graph_transaction_mismatch"
+            elif (
+                nonzero
+                and active_graph_transaction_id > 0
+                and graph_transaction_id != active_graph_transaction_id
+            ):
+                reason = "active_graph_transaction_mismatch"
+            elif nonzero and route_id != planner_route_id:
+                reason = "route_id_mismatch"
+            elif (
+                nonzero
+                and active_route_id > 0
+                and route_id != active_route_id
+            ):
+                reason = "active_route_id_mismatch"
+            elif nonzero and route_id > 0 and map_epoch is None:
+                reason = "missing_map_epoch"
+            elif (
+                nonzero
+                and map_epoch != planner_map_epoch
+            ):
+                reason = "map_epoch_mismatch"
+            elif (
+                nonzero
+                and active_map_epoch is not None
+                and map_epoch != active_map_epoch
+            ):
+                reason = "active_map_epoch_mismatch"
             else:
                 reason = ""
             if not reason:

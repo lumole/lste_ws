@@ -60,6 +60,8 @@ class NavigationMetricsObserverStateMixin:
         self.bridge_deferred_goal_updates = 0
         self.bridge_dispatches = 0
         self.bridge_terminal_events = 0
+        self.bridge_endpoint_detections = 0
+        self.bridge_successor_dispatches = 0
         self.bridge_priority_handoffs = 0
         self.bridge_target_retries = 0
         self.bridge_target_segment_handoffs = 0
@@ -141,6 +143,35 @@ class NavigationMetricsObserverStateMixin:
         # the receive time so a one-tick raw-zero can be distinguished from a
         # real planner stop when the selected trajectory is still forward.
         self.teb_feedback_wall = None
+        # FeedbackMsg carries no route identity. Keep the bridge/scheduler
+        # invalidation contract alongside the raw sample so diagnosis cannot
+        # mistake a completed route's feedback for live planner output.
+        self.teb_feedback_valid = False
+        self.teb_feedback_invalid_reason = "no_feedback"
+        self.teb_feedback_requires_fresh_planner_command = True
+        self.teb_feedback_identity = None
+        self.teb_feedback_owner_identity = None
+        self.teb_feedback_invalidation_count = 0
+        # Typed planner/terminal contracts are observed independently from
+        # identity-free TEB feedback. Keep the latest validation result and a
+        # bounded set of contracts that arrived before their bridge dispatch
+        # status due to ROS topic scheduling.
+        self.planner_contract_identity = None
+        self.planner_contract_state = None
+        self.planner_contract_validation = "unobserved"
+        self.planner_contract_reason = "startup"
+        self.planner_contract_authorized = 0
+        self.planner_contract_rejections = 0
+        self.planner_contract_sequence_by_producer = {}
+        self.pending_planner_contract = None
+        self.terminal_contract_identity = None
+        self.terminal_contract_validation = "unobserved"
+        self.terminal_contract_rejections = 0
+        self.terminal_contract_count = 0
+        self.pending_terminal_contracts = deque(maxlen=16)
+        self.bridge_dispatch_contracts = {}
+        self.bridge_latest_dispatch_contract = None
+        self.bridge_active_contract = None
         self.teb_control_cycle_gap_max_feedback_age = max(
             0.05,
             float(rospy.get_param("~teb_control_cycle_gap_max_feedback_age", 0.60)),
@@ -233,6 +264,11 @@ class NavigationMetricsObserverStateMixin:
         self.pending_target_terminal_observation_preemptions = 0
         self.pending_priority_preemptions = 0
         self.pending_task_done_preemptions = 0
+        # A warm-slice hard reset intentionally cancels the active MoveBase
+        # goal. Keep that expected PREEMPTED separate from route recovery and
+        # expire it if the transport never reports the cancellation.
+        self.pending_hard_reset_preemptions = 0
+        self.hard_reset_preemption_deadline_wall = 0.0
         # A frontier route can be intentionally cancelled after the graph
         # invalidates its geometric projection. Keep this lifecycle separate
         # from unexplained PREEMPTED controller failures.

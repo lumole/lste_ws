@@ -802,11 +802,18 @@ class GlobalFrontierGraphRouteAdapterMixin:
             self.last_graph_route_plan_signature = signature
             publish = getattr(self, "publish_status", None)
             if publish is not None:
+                plan_fields = plan.as_dict()
+                # ``GraphRoutePlan.as_dict`` already contains map_epoch. Build
+                # the event payload once so the reporting boundary cannot
+                # receive the same keyword through both ``**plan_fields`` and
+                # an explicit argument.
+                plan_fields.update({
+                    "transaction_id": transaction_id,
+                    "map_epoch": map_epoch,
+                })
                 publish(
                     "graph_route_plan_selected",
-                    **plan.as_dict(),
-                    transaction_id=transaction_id,
-                    map_epoch=map_epoch,
+                    **plan_fields,
                 )
         return plan
 

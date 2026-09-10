@@ -79,6 +79,13 @@ class NavigationMetricsSetupMixin:
             self.run_timestamp, self.log_dir = self._create_run_dir()
         self.log_path = self.log_dir / (self.run_timestamp + "_navigation_metrics.log")
         self.stream = self.log_path.open("w", encoding="utf-8", buffering=1)
+        # This parameter is written by the benchmark stop boundary.  Remove a
+        # value left by an older process so a normal/manual shutdown cannot be
+        # mistaken for the next trial's timeout.
+        try:
+            rospy.delete_param("/lste_navigation_metrics/termination_reason")
+        except (KeyError, rospy.ROSException):
+            pass
 
         self.start_wall = time.monotonic()
         self.start_ros = rospy.Time.now().to_sec()

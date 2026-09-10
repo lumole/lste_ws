@@ -183,7 +183,53 @@ class TebGoalBridgePersistentFrontierEndpointMixin:
                 and getattr(self, "active_portal_source_goal", None) is not None
                 else self.last_dispatched_goal
             )
-            self._publish_execution_terminal_locked(terminal_source_goal)
+            action_contract = getattr(self, "active_action_contract", None)
+            try:
+                contract = dict(action_contract or {})
+            except (TypeError, ValueError):
+                contract = {}
+            self.publish_bridge_status(
+                "endpoint_detected",
+                route_id=route_id,
+                transaction_id=int(contract.get("transaction_id", 0) or 0),
+                lifecycle_transaction_id=int(
+                    contract.get("lifecycle_transaction_id", 0) or 0
+                ),
+                action_generation=int(
+                    contract.get(
+                        "generation", contract.get("action_generation", 0)
+                    )
+                    or 0
+                ),
+                graph_transaction_id=int(
+                    contract.get("graph_transaction_id", 0) or 0
+                ),
+                map_epoch=contract.get("map_epoch"),
+                route_kind=active_route_kind,
+                mission_route_kind=str(
+                    contract.get("mission_route_kind", "") or ""
+                ),
+                endpoint=[
+                    round(float(reported_goal.pose.position.x), 3),
+                    round(float(reported_goal.pose.position.y), 3),
+                ],
+                endpoint_match_basis=endpoint_match_basis,
+                canonical_delta=round(canonical_delta, 4),
+                action_delta=round(action_delta, 4),
+                navfn_endpoint_delta=(
+                    None
+                    if navfn_endpoint_delta is None
+                    else round(navfn_endpoint_delta, 4)
+                ),
+            )
+            termination = self._commit_termination(
+                "persistent_frontier_endpoint_terminal",
+                source_goal=terminal_source_goal,
+                action_contract=action_contract,
+                watchdog_reason="persistent_frontier_endpoint_terminal",
+            )
+            if not termination.get("committed", False):
+                return
             self.persistent_frontier_endpoint_terminal_routes.add(route_id)
             self._clear_target_failure_locked("persistent_frontier_endpoint")
             self.terminal_count += 1
@@ -217,17 +263,6 @@ class TebGoalBridgePersistentFrontierEndpointMixin:
                     else "local_teb_endpoint_reached_then_fresh_frontier"
                 ),
             )
-            arm_watchdog = getattr(
-                self, "_arm_route_lease_watchdog_locked", None
-            )
-            if callable(arm_watchdog):
-                arm_watchdog(
-                    status=None,
-                    reason="persistent_frontier_endpoint_terminal",
-                    action_contract=getattr(
-                        self, "active_action_contract", None
-                    ),
-                )
             rospy.loginfo(
                 "TEB goal bridge accepted persistent frontier endpoint: "
                 "route_id=%d successor_route_id=%d canonical_delta=%.3fm "

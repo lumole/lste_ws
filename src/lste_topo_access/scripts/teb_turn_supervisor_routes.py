@@ -173,6 +173,16 @@ class TebTurnSupervisorRoutesMixin:
         return (
             self.active_action_route_kind,
             self.active_action_source,
+            int(getattr(self, "active_action_route_id", 0) or 0),
+            getattr(self, "active_action_map_epoch", None),
+            int(
+                getattr(self, "active_action_graph_transaction_id", 0) or 0
+            ),
+            int(
+                getattr(self, "active_action_goal_transaction_id", 0) or 0
+            ),
+            int(getattr(self, "active_action_transaction_id", 0) or 0),
+            int(getattr(self, "active_action_generation", 0) or 0),
             round(float(goal.pose.position.x), 3),
             round(float(goal.pose.position.y), 3),
             round(normalize_angle(angle_from_pose(goal)), 3),

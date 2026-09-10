@@ -49,6 +49,9 @@ class TebGoalBridgeMissionRuntimeMixin:
                     or 0
                 ),
                 "route_id": int(self.latest_route_id),
+                "graph_transaction_id": int(
+                    getattr(self, "latest_graph_transaction_id", 0) or 0
+                ),
                 "epoch": self._effective_action_epoch_locked(),
                 "map_epoch": self.active_route_map_epoch,
                 "route_kind": str(self.latest_route_kind or ""),
@@ -95,13 +98,42 @@ class TebGoalBridgeMissionRuntimeMixin:
         previous_route_id = int(self.active_route_id)
         previous_transaction_id = int(self.active_goal_transaction_id)
         previous_epoch = int(self.active_target_epoch)
+        previous_graph_transaction_id = int(
+            getattr(self, "active_graph_transaction_id", 0) or 0
+        )
+        previous_source = str(
+            getattr(self, "active_intent_source", "unknown") or "unknown"
+        ).strip().lower()
+        previous_priority = int(getattr(self, "active_intent_priority", 0) or 0)
+        previous_mission_route_kind = str(
+            getattr(self, "active_mission_route_kind", "") or ""
+        ).strip().lower()
+        previous_map_epoch = getattr(self, "active_route_map_epoch", None)
+        previous_target_track_id = str(
+            getattr(self, "active_target_track_id", "") or ""
+        )
         route_changed = bool(
             previous_route_id != int(self.latest_route_id)
             or previous_transaction_id != int(self.latest_goal_transaction_id)
             or previous_epoch != int(self.latest_target_epoch)
+            or previous_graph_transaction_id
+            != int(getattr(self, "latest_graph_transaction_id", 0) or 0)
             or previous_route_kind != self.latest_route_kind
+            or previous_source
+            != str(self.latest_intent_source or "unknown").strip().lower()
+            or previous_priority != int(self.latest_intent_priority)
+            or previous_mission_route_kind
+            != str(self.latest_mission_route_kind or "").strip().lower()
+            or previous_map_epoch != getattr(self, "latest_route_map_epoch", None)
+            or previous_target_track_id
+            != str(self.latest_target_track_id or "")
         )
         if route_changed:
+            invalidate_feedback = getattr(
+                self, "_invalidate_teb_feedback_locked", None
+            )
+            if callable(invalidate_feedback):
+                invalidate_feedback("route_owner_changed", clear_planner=True)
             cancel_watchdog = getattr(
                 self, "_cancel_route_lease_watchdog_locked", None
             )
@@ -125,6 +157,9 @@ class TebGoalBridgeMissionRuntimeMixin:
             getattr(self, "latest_graph_obligation_kind", "") or ""
         )
         self.active_route_id = int(self.latest_route_id)
+        self.active_graph_transaction_id = int(
+            getattr(self, "latest_graph_transaction_id", 0) or 0
+        )
         if self.active_route_kind == "portal_transition":
             if (
                 previous_route_kind != "portal_transition"
@@ -166,6 +201,7 @@ class TebGoalBridgeMissionRuntimeMixin:
             priority=int(self.active_intent_priority),
             source=self.active_intent_source,
             transaction_id=int(self.latest_goal_transaction_id),
+            graph_transaction_id=int(self.active_graph_transaction_id),
             epoch=int(self.latest_target_epoch),
             target_track_id=self.active_target_track_id,
             goal_context=self.active_goal_context,
@@ -220,10 +256,18 @@ class TebGoalBridgeMissionRuntimeMixin:
         source_goal = copy.deepcopy(self.last_dispatched_goal)
         feedback_distance = float(self.active_feedback_distance)
         self.persistent_frontier_prefetch_promoted_pairs.add(route_pair)
-        self._publish_execution_terminal_locked(source_goal)
+        termination = self._commit_termination(
+            "persistent_frontier_prefetch_progress",
+            source_goal=source_goal,
+            action_contract=getattr(self, "active_action_contract", None),
+            watchdog_reason="persistent_frontier_prefetch_progress",
+        )
+        if not termination.get("committed", False):
+            self.persistent_frontier_prefetch_promoted_pairs.discard(route_pair)
+            return False
         self._clear_target_failure_locked("persistent_frontier_prefetch_progress")
-        # The terminal event releases the successor. StreamingNavfnPlanner
-        # updates the route under the existing move_base action, with no cancel.
+        # The terminal event releases the successor. The successor is admitted
+        # only after Global Frontier acknowledges the predecessor release.
         self.terminal_count += 1
         transition_kind = (
             str(admission.get("transition_kind", "smooth_handoff"))

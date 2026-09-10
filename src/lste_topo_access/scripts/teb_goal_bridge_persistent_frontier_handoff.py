@@ -91,9 +91,15 @@ class TebGoalBridgePersistentFrontierHandoffMixin:
             "started_monotonic": now_for(self),
         }
         self.frontier_continuous_prefetch_handoff_pending = pending
-        # This is a logical terminal only. The old action deliberately keeps
-        # running until the successor transaction reaches this bridge.
-        self._publish_execution_terminal_locked(source_goal)
+        termination = self._commit_termination(
+            "frontier_continuous_prefetch_handoff",
+            source_goal=source_goal,
+            action_contract=getattr(self, "active_action_contract", None),
+            watchdog_reason="frontier_continuous_prefetch_handoff",
+        )
+        if not termination.get("committed", False):
+            self.frontier_continuous_prefetch_handoff_pending = None
+            return False
         self._clear_target_failure_locked("frontier_continuous_prefetch_progress")
         self.publish_bridge_status(
             "frontier_continuous_prefetch_handoff_requested",
@@ -107,7 +113,7 @@ class TebGoalBridgePersistentFrontierHandoffMixin:
             timeout_seconds=round(
                 self.frontier_continuous_prefetch_handoff_timeout, 3
             ),
-            lifecycle="logical_terminal_then_native_action_replacement",
+            lifecycle="terminal_then_successor_dispatch_after_release_ack",
         )
         rospy.loginfo(
             "TEB goal bridge requested continuous frontier handoff: "
@@ -133,12 +139,17 @@ class TebGoalBridgePersistentFrontierHandoffMixin:
         self.frontier_continuous_prefetch_handoff_pending = None
         self.frontier_continuous_prefetch_handoff_fallback_count += 1
         # The source terminal was already delivered to the mission planner.
-        # Reuse the existing intentional-observation completion handling so a
-        # transport PREEMPTED cannot become an unexpected action failure.
+        # Close any remaining transport lease through the same termination
+        # helper; the old action generation remains a tombstone.
         self.frontier_observation_completion_pending = pending
         self.handoff_requested = True
-        if self.action_active:
-            self.action_client.cancel_goal()
+        self._commit_termination(
+            "prefetch_promotion_timeout",
+            source_goal=pending["source_goal"],
+            action_contract=getattr(self, "active_action_contract", None),
+            watchdog_reason="prefetch_promotion_timeout",
+            publish_terminal=False,
+        )
         self.publish_bridge_status(
             "frontier_continuous_prefetch_handoff_fallback",
             route_id=int(pending["route_id"]),

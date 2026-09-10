@@ -24,6 +24,9 @@ class TebTurnSupervisorLifecycleMixin:
             event_handler=self._handle_lifecycle_event,
             transition_handler=self._on_lifecycle_transition,
             timeout_handler=self._on_lifecycle_timeout,
+            allow_local_transactions=not bool(
+                getattr(self, "require_planner_command_contract", False)
+            ),
             timeouts={
                 State.DISPATCHED: max(
                     1.0, float(gp("~lifecycle_dispatch_timeout", 120.0))
@@ -42,13 +45,7 @@ class TebTurnSupervisorLifecycleMixin:
         if not isinstance(payload, dict):
             return None
         try:
-            value = int(
-                payload.get(
-                    "lifecycle_transaction_id",
-                    payload.get("transaction_id", 0),
-                )
-                or 0
-            )
+            value = int(payload.get("lifecycle_transaction_id", 0) or 0)
         except (TypeError, ValueError):
             return None
         return value if value > 0 else None
@@ -56,6 +53,16 @@ class TebTurnSupervisorLifecycleMixin:
     def _enqueue_turn_event(self, event_type, payload=None, transaction_id=None):
         if transaction_id is None:
             transaction_id = self._transaction_id_from_message(payload)
+        if (
+            transaction_id is not None
+            and self.lifecycle_manager.is_stale_transaction(transaction_id)
+        ):
+            self.publish_status_locked(
+                "stale_rejected",
+                reason="lifecycle_transaction_id_below_high_water",
+                received_lifecycle_transaction_id=int(transaction_id),
+            )
+            return False
         return self.lifecycle_manager.enqueue_type(
             event_type,
             deepcopy(payload),
@@ -86,6 +93,17 @@ class TebTurnSupervisorLifecycleMixin:
 
     def on_planner_command(self, message):
         return self._enqueue_turn_event(EventType.BRIDGE_PLANNER_COMMAND, message)
+
+    def on_planner_command_contract(self, message):
+        try:
+            transaction_id = int(message.lifecycle_transaction_id or 0)
+        except (AttributeError, TypeError, ValueError):
+            transaction_id = None
+        return self._enqueue_turn_event(
+            EventType.BRIDGE_PLANNER_COMMAND_CONTRACT,
+            message,
+            transaction_id if transaction_id and transaction_id > 0 else None,
+        )
 
     def on_teb_feedback(self, message):
         return self._enqueue_turn_event(EventType.BRIDGE_TEB_FEEDBACK, message)
@@ -128,6 +146,8 @@ class TebTurnSupervisorLifecycleMixin:
         if event.type == EventType.RESET:
             return self._apply_hard_reset(event)
         if (
+            not getattr(self, "require_planner_command_contract", False)
+            and
             self.lifecycle_manager.current_transaction_id == 0
             and event.type in (EventType.BRIDGE_INTENT, EventType.BRIDGE_GOAL)
         ):
@@ -140,6 +160,7 @@ class TebTurnSupervisorLifecycleMixin:
             EventType.BRIDGE_POSE: TebTurnSupervisorCallbacksMixin.on_pose,
             EventType.SCAN_UPDATED: TebTurnSupervisorCallbacksMixin.on_scan,
             EventType.BRIDGE_PLANNER_COMMAND: TebTurnSupervisorCallbacksMixin.on_planner_command,
+            EventType.BRIDGE_PLANNER_COMMAND_CONTRACT: TebTurnSupervisorCallbacksMixin.on_planner_command_contract,
             EventType.BRIDGE_TEB_FEEDBACK: TebTurnSupervisorCallbacksMixin.on_teb_feedback,
             EventType.BRIDGE_MODE: TebTurnSupervisorControlMixin.on_mode,
             EventType.BRIDGE_TASK_DONE: TebTurnSupervisorControlMixin.on_task_done,

@@ -47,6 +47,26 @@ def _initialize_action_state(bridge):
     bridge.dispatch_count = 0
     bridge.terminal_count = 0
     bridge.action_generation = 0
+    bridge.canonical_lifecycle_high_water = 0
+    bridge.canonical_route_high_water = 0
+    bridge.canonical_graph_high_water = 0
+    bridge.canonical_map_epoch_high_water = 0
+    # A prepared terminal revokes the old action generation immediately. The
+    # old contract remains as a tombstone until Global Frontier acknowledges
+    # the release, so a late callback cannot reopen the route.
+    bridge.pending_terminal_prepare = None
+    bridge.pending_lease_release_contract = None
+    # A successor may be dispatched only after the graph's release ACK has
+    # matched this exact predecessor transport contract.
+    bridge.pending_successor_release_ack = None
+    bridge.pending_dispatch_generation = 0
+    bridge.planner_contract_sequence = 0
+    bridge.planner_contract_identity = None
+    bridge.planner_contract_state = None
+    bridge.planner_contract_reason = "startup"
+    bridge.planner_contract_wall = 0.0
+    bridge.planner_contract_awaiting_feedback = True
+    bridge.planner_contract_producer = ""
     bridge.active_action_contract = None
     # A terminal route remains identifiable for a bounded handoff window.
     # The timer callback only wakes the lifecycle queue; cleanup itself stays
@@ -55,9 +75,12 @@ def _initialize_action_state(bridge):
     bridge.route_lease_watchdog_timer = None
     bridge.latest_frontier_map_epoch = None
     bridge.latest_frontier_map_route_id = 0
+    bridge.latest_frontier_graph_transaction_id = 0
     bridge.latest_route_map_epoch = None
+    bridge.latest_graph_transaction_id = 0
     bridge.active_frontier_map_epoch = None
     bridge.active_route_map_epoch = None
+    bridge.active_graph_transaction_id = 0
     bridge.active_goal_global = None
     # A failed action releases controller-scoped health metrics but keeps the
     # durable route lease identity until Global Frontier publishes a successor.
@@ -187,6 +210,18 @@ def _initialize_teb_state(bridge):
     bridge.latest_teb_selected_linear = None
     bridge.latest_teb_selected_angular = None
     bridge.latest_teb_feedback_monotonic = 0.0
+    # TEB feedback has no route identity on the wire.  Keep an explicit local
+    # validity gate so a sample from the previous owner cannot extend the
+    # current route's health clock across a zero command or handoff.
+    bridge.teb_feedback_valid = False
+    bridge.teb_feedback_invalid_reason = "no_feedback"
+    bridge.teb_feedback_requires_fresh_planner_command = True
+    bridge.teb_feedback_generation = 0
+    bridge.teb_feedback_route_id = 0
+    bridge.teb_feedback_transaction_id = 0
+    bridge.teb_feedback_map_epoch = None
+    bridge.teb_feedback_graph_transaction_id = 0
+    bridge.teb_feedback_invalidation_count = 0
     bridge.latest_teb_planner_linear = None
     bridge.latest_teb_planner_angular = None
     bridge.latest_teb_planner_command_monotonic = 0.0

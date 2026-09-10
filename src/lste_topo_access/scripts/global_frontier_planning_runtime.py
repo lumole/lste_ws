@@ -20,8 +20,31 @@ class GlobalFrontierPlanningRuntimeMixin:
         """Return whether the current snapshot has lost execution ownership."""
         return bool(getattr(self, "planning_preempt_requested", False))
 
+    def request_planning_preempt(self, reason="execution_boundary"):
+        """Invalidate the current snapshot from a callback-safe boundary.
+
+        ROS callbacks may run while the lifecycle owner is inside an expensive
+        map/candidate pass.  They cannot mutate route state there, but they can
+        publish this one atomic invalidation fact so the pass stops at its next
+        cooperative checkpoint.
+        """
+        self.planning_preempt_requested = True
+        self.planning_preempt_reason = str(reason or "execution_boundary")
+
+    def clear_planning_preempt(self):
+        """Clear a callback invalidation after its queued fact is applied."""
+        self.planning_preempt_requested = False
+        self.planning_preempt_reason = ""
+
     def _clear_planning_preempt_if_drained(self):
         """Clear terminal invalidation only after its ingress batch is drained."""
+        # In the production node LifecycleManager owns terminal ingress.  The
+        # terminal callback sets the flag before enqueueing, and the lifecycle
+        # handler clears it after applying that exact event.  Clearing here
+        # would let the slow compute phase erase the invalidation before the
+        # queued terminal is observed on the next tick.
+        if getattr(self, "lifecycle_manager", None) is not None:
+            return
         ingress_lock = getattr(self, "terminal_ingress_lock", None)
         pending = getattr(self, "pending_execution_terminals", None)
         if ingress_lock is None or pending is None:
@@ -69,6 +92,21 @@ class GlobalFrontierPlanningRuntimeMixin:
             if drain_terminals is not None:
                 drain_terminals()
             self._clear_planning_preempt_if_drained()
+            if getattr(self, "awaiting_controller_lease_release_ack", False):
+                now = time.monotonic()
+                last_report = float(
+                    getattr(self, "last_controller_lease_wait_report_wall", 0.0)
+                    or 0.0
+                )
+                if now - last_report >= 1.0:
+                    self.last_controller_lease_wait_report_wall = now
+                    self.publish_status(
+                        "controller_lease_release_wait",
+                        pending_controller_lease_release=getattr(
+                            self, "pending_controller_lease_release", None
+                        ),
+                    )
+                return None, True
             decision_wake = None
             decision_scheduler = getattr(self, "decision_wake_scheduler", None)
             event_driven = bool(

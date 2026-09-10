@@ -20,6 +20,16 @@ from teb_turn_supervisor_contract import (
 class TebTurnSupervisorControlMixin:
     """Forward TEB commands, with narrowly bounded execution-phase handling."""
 
+    def _trajectory_feedback_is_current_locked(self, action_identity=None):
+        """Check feedback validity without breaking legacy lightweight fixtures."""
+        if not hasattr(self, "trajectory_feedback_valid"):
+            return True
+        if not bool(self.trajectory_feedback_valid):
+            return False
+        if action_identity is None:
+            action_identity = getattr(self, "active_action_identity", None)
+        return getattr(self, "trajectory_feedback_identity", None) == action_identity
+
     def _lifecycle_transaction_id_locked(self):
         return int(
             getattr(
@@ -32,6 +42,22 @@ class TebTurnSupervisorControlMixin:
 
     def _planner_command_rejection_reason_locked(self, now):
         """Return the causal reason a raw planner command cannot be forwarded."""
+        if getattr(self, "require_planner_command_contract", False):
+            if not bool(getattr(self, "planner_contract_valid", False)):
+                return "planner_contract_missing_or_invalid"
+            if int(
+                getattr(self, "planner_contract_state", 0) or 0
+            ) != 1:
+                return "planner_contract_boundary"
+            mismatch = self._planner_contract_mismatch_locked(
+                getattr(self, "planner_contract_identity", {})
+            )
+            if mismatch:
+                return mismatch
+            if self.planner_contract_wall <= 0.0:
+                return "planner_contract_missing"
+            if now - self.planner_contract_wall > self.planner_command_timeout:
+                return "planner_contract_stale"
         current_transaction_id = self._lifecycle_transaction_id_locked()
         planner_transaction_id = int(
             getattr(self, "planner_command_transaction_id", 0) or 0
@@ -49,6 +75,28 @@ class TebTurnSupervisorControlMixin:
         )
         if active_transaction_id > 0 and active_transaction_id != current_transaction_id:
             return "active_transaction_mismatch"
+        active_graph_transaction_id = int(
+            getattr(self, "active_action_graph_transaction_id", 0) or 0
+        )
+        planner_graph_transaction_id = int(
+            getattr(self, "planner_command_graph_transaction_id", 0) or 0
+        )
+        if (
+            active_graph_transaction_id > 0
+            and planner_graph_transaction_id != active_graph_transaction_id
+        ):
+            return "planner_graph_transaction_mismatch"
+        active_route_id = int(getattr(self, "active_action_route_id", 0) or 0)
+        planner_route_id = int(getattr(self, "planner_command_route_id", 0) or 0)
+        if active_route_id > 0 and planner_route_id != active_route_id:
+            return "planner_route_id_mismatch"
+        active_map_epoch = getattr(self, "active_action_map_epoch", None)
+        planner_map_epoch = getattr(self, "planner_command_map_epoch", None)
+        if (
+            active_map_epoch is not None
+            and planner_map_epoch != active_map_epoch
+        ):
+            return "planner_map_epoch_mismatch"
         if not self.active_action and (
             abs(float(self.latest_planner_command.linear.x)) > 0.001
             or abs(float(self.latest_planner_command.angular.z)) > 0.001
@@ -67,6 +115,19 @@ class TebTurnSupervisorControlMixin:
         publisher = getattr(self, "command_contract_pub", None)
         if publisher is None:
             return
+        active_map_epoch = getattr(self, "active_action_map_epoch", None)
+        planner_map_epoch = getattr(self, "planner_command_map_epoch", None)
+        # A bridge terminal/handoff status can clear the supervisor's active
+        # cache one callback before the planner command cache is cleared. The
+        # planner cache still belongs to the same route identity (validated by
+        # ``_planner_identity_error``), so preserve that epoch in the wire
+        # contract instead of sending a command the mux must reject as
+        # unauthenticated.
+        command_map_epoch = (
+            active_map_epoch
+            if active_map_epoch is not None
+            else planner_map_epoch
+        )
         payload = {
             "event": "teb_command",
             "transaction_id": int(transaction_id),
@@ -74,11 +135,47 @@ class TebTurnSupervisorControlMixin:
             "planner_command_sequence": int(
                 getattr(self, "planner_command_sequence", 0) or 0
             ),
+            "planner_contract_sequence": int(
+                getattr(self, "planner_contract_sequence", 0) or 0
+            ),
+            "planner_action_generation": int(
+                getattr(self, "planner_command_action_generation", 0) or 0
+            ),
+            "active_action_generation": int(
+                getattr(self, "active_action_generation", 0) or 0
+            ),
+            "planner_contract_state": int(
+                getattr(self, "planner_contract_state", 0) or 0
+            ),
+            "planner_contract_valid": bool(
+                getattr(self, "planner_contract_valid", False)
+            ),
             "planner_transaction_id": int(
                 getattr(self, "planner_command_transaction_id", 0) or 0
             ),
             "active_action_transaction_id": int(
                 getattr(self, "active_action_transaction_id", 0) or 0
+            ),
+            "graph_transaction_id": int(
+                getattr(self, "active_action_graph_transaction_id", 0) or 0
+            ),
+            "planner_graph_transaction_id": int(
+                getattr(self, "planner_command_graph_transaction_id", 0) or 0
+            ),
+            "active_action_graph_transaction_id": int(
+                getattr(self, "active_action_graph_transaction_id", 0) or 0
+            ),
+            "route_id": int(getattr(self, "active_action_route_id", 0) or 0),
+            "planner_route_id": int(
+                getattr(self, "planner_command_route_id", 0) or 0
+            ),
+            "active_action_route_id": int(
+                getattr(self, "active_action_route_id", 0) or 0
+            ),
+            "map_epoch": command_map_epoch,
+            "planner_map_epoch": planner_map_epoch,
+            "active_action_map_epoch": getattr(
+                self, "active_action_map_epoch", None
             ),
             "active_action": bool(self.active_action),
             "state": str(self.state),
@@ -171,6 +268,9 @@ class TebTurnSupervisorControlMixin:
             and not self.task_done
             and not self.navigation_hold
             and transient_gap
+            and self._trajectory_feedback_is_current_locked(
+                self.active_action_identity
+            )
             and feedback_age <= feedback_timeout
             and float(self.latest_trajectory_command.linear.x)
             >= self.trajectory_continuity_min_forward
@@ -224,6 +324,13 @@ class TebTurnSupervisorControlMixin:
             previous = self.mode
             self.mode = mode
             if mode != self.active_mode and self.state == STATE_TURNING:
+                invalidate_feedback = getattr(
+                    self, "_invalidate_trajectory_feedback_locked", None
+                )
+                if callable(invalidate_feedback):
+                    invalidate_feedback(
+                        "controller_mode_changed", clear_planner=True
+                    )
                 self._release_turn_locked(
                     "controller_switched_to_%s" % mode, completed=False
                 )
@@ -234,6 +341,11 @@ class TebTurnSupervisorControlMixin:
         with self.lock:
             self.task_done = bool(message.data)
             if self.task_done:
+                invalidate_feedback = getattr(
+                    self, "_invalidate_trajectory_feedback_locked", None
+                )
+                if callable(invalidate_feedback):
+                    invalidate_feedback("task_done", clear_planner=True)
                 self._release_turn_locked("task_done", completed=False)
             else:
                 self.completed_turn_key = None
@@ -243,6 +355,11 @@ class TebTurnSupervisorControlMixin:
         active = bool(active)
         self.navigation_hold = active
         if active:
+            invalidate_feedback = getattr(
+                self, "_invalidate_trajectory_feedback_locked", None
+            )
+            if callable(invalidate_feedback):
+                invalidate_feedback("navigation_hold", clear_planner=True)
             self._release_turn_locked("navigation_hold", completed=False)
         else:
             self._activate_turn_locked()
@@ -310,6 +427,16 @@ class TebTurnSupervisorControlMixin:
             command = Twist()
             decision = "inactive"
             if (
+                getattr(self, "require_planner_command_contract", False)
+                and (
+                    not bool(getattr(self, "planner_contract_valid", False))
+                    or int(getattr(self, "planner_contract_state", 0) or 0) != 1
+                )
+            ):
+                command = Twist()
+                decision = "planner_contract_boundary"
+                state = self.state
+            elif (
                 self.mode == self.active_mode
                 and not self.task_done
                 and not self.navigation_hold

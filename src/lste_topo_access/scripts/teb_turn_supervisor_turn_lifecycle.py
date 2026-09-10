@@ -38,12 +38,32 @@ class TebTurnSupervisorTurnLifecycleMixin:
             "state": self.state,
             "mode": self.mode,
             "route_kind": self.latest_route_kind,
+            "route_id": int(getattr(self, "latest_route_id", 0) or 0),
+            "map_epoch": getattr(self, "latest_map_epoch", None),
+            "graph_transaction_id": int(
+                getattr(self, "latest_graph_transaction_id", 0) or 0
+            ),
             "active_action": bool(self.active_action),
             "active_action_transaction_id": int(
                 getattr(self, "active_action_transaction_id", 0) or 0
             ),
+            "active_action_goal_transaction_id": int(
+                getattr(self, "active_action_goal_transaction_id", 0) or 0
+            ),
+            "active_action_generation": int(
+                getattr(self, "active_action_generation", 0) or 0
+            ),
             "navigation_hold": bool(self.navigation_hold),
             "active_route_kind": self.active_action_route_kind,
+            "active_route_id": int(
+                getattr(self, "active_action_route_id", 0) or 0
+            ),
+            "active_map_epoch": getattr(
+                self, "active_action_map_epoch", None
+            ),
+            "active_graph_transaction_id": int(
+                getattr(self, "active_action_graph_transaction_id", 0) or 0
+            ),
             "intent_source": self.latest_intent_source,
             "intent_priority": int(self.latest_intent_priority),
             "goal": None
@@ -82,6 +102,45 @@ class TebTurnSupervisorTurnLifecycleMixin:
             ),
             "planner_command_transaction_id": int(
                 getattr(self, "planner_command_transaction_id", 0) or 0
+            ),
+            "planner_command_route_id": int(
+                getattr(self, "planner_command_route_id", 0) or 0
+            ),
+            "planner_command_map_epoch": getattr(
+                self, "planner_command_map_epoch", None
+            ),
+            "planner_command_graph_transaction_id": int(
+                getattr(self, "planner_command_graph_transaction_id", 0) or 0
+            ),
+            "planner_command_action_generation": int(
+                getattr(self, "planner_command_action_generation", 0) or 0
+            ),
+            "planner_contract_sequence": int(
+                getattr(self, "planner_contract_sequence", 0) or 0
+            ),
+            "planner_contract_state": int(
+                getattr(self, "planner_contract_state", 0) or 0
+            ),
+            "planner_contract_valid": bool(
+                getattr(self, "planner_contract_valid", False)
+            ),
+            "planner_contract_identity": getattr(
+                self, "planner_contract_identity", None
+            ),
+            "trajectory_feedback_valid": bool(
+                getattr(self, "trajectory_feedback_valid", False)
+            ),
+            "trajectory_feedback_invalid_reason": str(
+                getattr(
+                    self, "trajectory_feedback_invalid_reason", "no_feedback"
+                )
+                or "no_feedback"
+            ),
+            "trajectory_feedback_identity": getattr(
+                self, "trajectory_feedback_identity", None
+            ),
+            "trajectory_feedback_invalidation_count": int(
+                getattr(self, "trajectory_feedback_invalidation_count", 0) or 0
             ),
             "output_sequence": int(
                 getattr(self, "output_sequence", 0) or 0
@@ -168,6 +227,11 @@ class TebTurnSupervisorTurnLifecycleMixin:
             or action_identity is None
             or action_identity == self.stalled_route_completed_identity
             or self.pose is None
+            or not (
+                getattr(self, "_trajectory_feedback_is_current_locked", lambda _identity: True)(
+                    action_identity
+                )
+            )
         ):
             self.stalled_route_candidate_identity = None
             self.stalled_route_candidate_since_wall = 0.0

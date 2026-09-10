@@ -94,6 +94,16 @@ class NavigationMetricsCommandEventsMixin:
             self.teb_planner_command = message
             previous_linear = float(previous.linear.x)
             current_linear = float(message.linear.x)
+            current_angular = float(message.angular.z)
+            if (
+                abs(current_linear) <= 0.001
+                and abs(current_angular) <= 0.01
+            ):
+                invalidate_feedback = getattr(
+                    self, "_invalidate_teb_feedback_locked", None
+                )
+                if callable(invalidate_feedback):
+                    invalidate_feedback("planner_zero_command")
             if previous_linear > 0.05 and current_linear < previous_linear - 0.08:
                 is_stop_brake = current_linear <= 0.05
                 if is_stop_brake:

@@ -157,9 +157,17 @@ class TebGoalBridgeHandoffStallMixin:
     def _cancel_stalled_action_locked(self, now, pending_delta):
         """Cancel an eligible non-frontier stale action and report its evidence."""
         reason = "no_feedback_progress"
-        self.handoff_requested = True
         self.handoff_count += 1
-        self.action_client.cancel_goal()
+        self._commit_termination(
+            "stalled_action_handoff",
+            source_goal=getattr(self, "last_dispatched_goal", None),
+            action_contract=getattr(self, "active_action_contract", None),
+            watchdog_reason="stalled_action_handoff",
+            publish_terminal=False,
+            arm_watchdog=False,
+        )
+        self.pending_terminal_prepare = None
+        self.pending_lease_release_contract = None
         self.publish_bridge_status(
             "handoff_requested",
             reason=reason,

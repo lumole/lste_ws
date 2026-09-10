@@ -11,6 +11,7 @@
 #include <costmap_2d/costmap_2d_ros.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Twist.h>
+#include <lste_topo_access/PlannerCommandContract.h>
 #include <lste_topo_access/PersistentGoalCommand.h>
 #include <nav_core/base_global_planner.h>
 #include <nav_core/base_local_planner.h>
@@ -47,6 +48,9 @@ class PersistentTebLocalPlanner : public nav_core::BaseLocalPlanner {
   void publishPlanEvent(
       const char* event,
       const std::vector<geometry_msgs::PoseStamped>& plan) const;
+  void publishPlannerCommandContract(
+      const geometry_msgs::Twist& command, uint8_t state,
+      const std::string& reason);
   static uint64_t geometryHash(
       const std::vector<geometry_msgs::PoseStamped>& plan);
   bool planIsEquivalentLocked(
@@ -104,7 +108,14 @@ class PersistentTebLocalPlanner : public nav_core::BaseLocalPlanner {
   ros::Publisher target_approach_result_publisher_;
   ros::Publisher frontier_endpoint_publisher_;
   ros::Publisher plan_event_publisher_;
+  ros::Publisher planner_command_contract_publisher_;
   teb_local_planner::TebLocalPlannerROS teb_;
+  uint32_t latest_route_id_;
+  uint64_t latest_graph_transaction_id_;
+  uint64_t latest_map_epoch_;
+  std::string latest_lifecycle_transaction_id_;
+  uint32_t latest_action_generation_;
+  std::atomic<uint64_t> planner_command_sequence_;
 };
 
 // Routes move_base's one active action to the latest mission goal. It caches
@@ -167,6 +178,10 @@ class StreamingNavfnPlanner : public nav_core::BaseGlobalPlanner {
   uint32_t validated_target_sequence_;
   uint32_t failed_target_sequence_;
   uint64_t latest_target_map_epoch_;
+  uint64_t latest_target_graph_transaction_id_;
+  uint32_t latest_target_route_id_;
+  std::string latest_target_lifecycle_transaction_id_;
+  uint32_t latest_target_action_generation_;
   std::string latest_target_route_kind_;
   std::string latest_target_mission_route_kind_;
   std::string latest_target_graph_action_;

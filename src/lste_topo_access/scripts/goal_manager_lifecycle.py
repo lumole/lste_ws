@@ -25,6 +25,7 @@ class GoalManagerLifecycleMixin:
             event_handler=self._handle_lifecycle_event,
             transition_handler=self._on_lifecycle_transition,
             timeout_handler=self._on_lifecycle_timeout,
+            allow_local_transactions=False,
             timeouts={
                 State.DISPATCHED: max(
                     1.0, float(gp("~lifecycle_dispatch_timeout", 120.0))
@@ -43,10 +44,36 @@ class GoalManagerLifecycleMixin:
         return self.lifecycle_manager.current_transaction_id
 
     def _enqueue_lifecycle_event(self, event_type, payload=None):
+        if event_type == EventType.GLOBAL_FRONTIER_COMMAND:
+            identity, reason = self._canonical_route_identity(payload)
+            if reason:
+                self._record_canonical_rejection(reason, identity)
+                return False
+            stale_reason = self._canonical_route_stale_reason(identity)
+            if stale_reason:
+                self._record_canonical_rejection(stale_reason, identity)
+                return False
+            transaction_id = identity["lifecycle_transaction_id"]
+        elif event_type == EventType.GLOBAL_FRONTIER_STATUS:
+            # Status is an audit stream. Only the route_command topic is
+            # allowed to advance the GoalManager's canonical lifecycle.
+            transaction_id = int(
+                getattr(self.lifecycle_manager, "current_transaction_id", 0) or 0
+            )
+        else:
+            transaction_id = self._external_transaction_id(payload)
+            if transaction_id is not None and self.lifecycle_manager.is_stale_transaction(
+                transaction_id
+            ):
+                self._record_canonical_rejection(
+                    "lifecycle_transaction_id_below_high_water",
+                    {"lifecycle_transaction_id": transaction_id},
+                )
+                return False
         return self.lifecycle_manager.enqueue_type(
             event_type,
             deepcopy(payload),
-            transaction_id=self._external_transaction_id(payload),
+            transaction_id=transaction_id,
         )
 
     @staticmethod
@@ -64,16 +91,88 @@ class GoalManagerLifecycleMixin:
         if not isinstance(payload, dict):
             return None
         try:
-            value = int(
-                payload.get(
-                    "lifecycle_transaction_id",
-                    payload.get("transaction_id", 0),
-                )
-                or 0
-            )
+            value = int(payload.get("lifecycle_transaction_id", 0) or 0)
         except (TypeError, ValueError):
             return None
         return value if value > 0 else None
+
+    @staticmethod
+    def _canonical_route_identity(message):
+        """Decode the identity Global Frontier owns for one route command."""
+        try:
+            payload = json.loads(message.data)
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return None, "malformed_route_command"
+        if not isinstance(payload, dict) or payload.get("event") != "route_command":
+            return None, "unsupported_route_command"
+
+        def positive(name):
+            try:
+                value = int(payload.get(name, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+            return value if value > 0 else 0
+
+        identity = {
+            "lifecycle_transaction_id": positive("lifecycle_transaction_id"),
+            "route_id": positive("route_id"),
+            "graph_transaction_id": positive("graph_transaction_id"),
+            "map_epoch": positive("map_epoch"),
+        }
+        for name, value in identity.items():
+            if value <= 0:
+                return identity, "missing_%s" % name
+        return identity, ""
+
+    def _canonical_route_stale_reason(self, identity):
+        """Return a reason when a route command is below a local high water."""
+        if not isinstance(identity, dict):
+            return "missing_canonical_identity"
+        lifecycle = self.lifecycle_manager
+        if identity["lifecycle_transaction_id"] < lifecycle.transaction_high_water_mark():
+            return "lifecycle_transaction_id_below_high_water"
+        high_water = (
+            ("route_id", "canonical_route_high_water"),
+            ("graph_transaction_id", "canonical_graph_high_water"),
+            ("map_epoch", "canonical_map_epoch_high_water"),
+        )
+        for field, attribute in high_water:
+            if identity[field] < int(getattr(self, attribute, 0) or 0):
+                return "%s_below_high_water" % field
+        return ""
+
+    def _record_canonical_rejection(self, reason, identity=None):
+        """Record and discard an invalid or stale upstream route command."""
+        identity = identity if isinstance(identity, dict) else {}
+        event = (
+            "stale_rejected"
+            if "below_high_water" in str(reason)
+            else "canonical_identity_rejected"
+        )
+        publish = getattr(self, "publish_goal_arbitration", None)
+        if callable(publish):
+            publish(
+                event,
+                reason=str(reason),
+                received_lifecycle_transaction_id=int(
+                    identity.get("lifecycle_transaction_id", 0) or 0
+                ),
+                received_route_id=int(identity.get("route_id", 0) or 0),
+                received_graph_transaction_id=int(
+                    identity.get("graph_transaction_id", 0) or 0
+                ),
+                received_map_epoch=int(identity.get("map_epoch", 0) or 0),
+            )
+        rospy.logwarn(
+            "GoalManager discarded canonical route command: event=%s reason=%s "
+            "lifecycle=%s route=%s graph=%s map=%s",
+            event,
+            reason,
+            identity.get("lifecycle_transaction_id", 0),
+            identity.get("route_id", 0),
+            identity.get("graph_transaction_id", 0),
+            identity.get("map_epoch", 0),
+        )
 
     # Gather-only ROS callbacks.
     def on_state(self, message):
@@ -204,18 +303,38 @@ class GoalManagerLifecycleMixin:
         self._lifecycle_event_transaction_id = None
         if event.type == EventType.RESET:
             return self._apply_hard_reset(event)
-        if event.type in (
-            EventType.GLOBAL_FRONTIER_COMMAND,
-            EventType.GLOBAL_FRONTIER_STATUS,
-        ):
-            external_id = self._external_transaction_id(event.payload)
-            if external_id is not None:
-                if external_id < self.lifecycle_manager.current_transaction_id:
-                    return None
-                self.lifecycle_manager.adopt_transaction(
-                    external_id, State.IDLE
+        if event.type == EventType.GLOBAL_FRONTIER_COMMAND:
+            identity, reason = self._canonical_route_identity(event.payload)
+            if reason:
+                self._record_canonical_rejection(reason, identity)
+                return None
+            if int(event.transaction_id or 0) != identity[
+                "lifecycle_transaction_id"
+            ]:
+                self._record_canonical_rejection(
+                    "event_lifecycle_transaction_mismatch", identity
                 )
-                self._lifecycle_event_transaction_id = external_id
+                return None
+            # LifecycleManager has already adopted a newer event before this
+            # handler runs. Keep the exact wire ID for GoalManager output;
+            # downstream nodes must see the same canonical value.
+            self._lifecycle_event_transaction_id = int(event.transaction_id)
+            self.canonical_lifecycle_high_water = max(
+                int(getattr(self, "canonical_lifecycle_high_water", 0) or 0),
+                identity["lifecycle_transaction_id"],
+            )
+            self.canonical_route_high_water = max(
+                int(getattr(self, "canonical_route_high_water", 0) or 0),
+                identity["route_id"],
+            )
+            self.canonical_graph_high_water = max(
+                int(getattr(self, "canonical_graph_high_water", 0) or 0),
+                identity["graph_transaction_id"],
+            )
+            self.canonical_map_epoch_high_water = max(
+                int(getattr(self, "canonical_map_epoch_high_water", 0) or 0),
+                identity["map_epoch"],
+            )
         handlers = {
             EventType.STATE_UPDATED: GoalManagerInputCallbacksMixin.apply_state,
             EventType.DETECTIONS_UPDATED: GoalManagerInputCallbacksMixin.apply_dets,
@@ -240,17 +359,7 @@ class GoalManagerLifecycleMixin:
             EventType.TEB_BRIDGE_STATUS: GoalManagerTebCallbacksMixin.apply_teb_bridge_status,
         }
         if event.type == EventType.TASK_UPDATED:
-            previous = (
-                getattr(self, "current_task_id", ""),
-                getattr(self, "current_task_version", ""),
-            )
             GoalManagerInputCallbacksMixin.apply_task(self, event.payload)
-            current = (
-                getattr(self, "current_task_id", ""),
-                getattr(self, "current_task_version", ""),
-            )
-            if current != previous:
-                self.lifecycle_manager.begin_transaction(State.IDLE)
             return None
         if event.type == EventType.TASK_COMPLETED:
             self.task_done_published = bool(event.payload.data)
@@ -303,6 +412,10 @@ class GoalManagerLifecycleMixin:
         self.pub_navigation_hold.publish(Bool(data=False))
         self._last_hard_reset_id = reset_id
         self._last_hard_reset_transaction_id = int(new_transaction_id)
+        self.canonical_lifecycle_high_water = int(new_transaction_id)
+        self.canonical_route_high_water = 0
+        self.canonical_graph_high_water = 0
+        self.canonical_map_epoch_high_water = 0
         self._hard_reset_count += 1
         self.publish_goal_arbitration(
             "hard_reset_complete",
@@ -327,10 +440,7 @@ class GoalManagerLifecycleMixin:
         return None
 
     def _apply_map_epoch(self, message):
-        """Advance the local route-validation epoch for each map snapshot."""
-        self.navigation_map_epoch = max(
-            1, int(getattr(self, "navigation_map_epoch", 0) or 0) + 1
-        )
+        """Record map timing without inventing a downstream map epoch."""
         stamp = getattr(getattr(message, "header", None), "stamp", None)
         try:
             self.navigation_map_last_stamp = float(stamp.to_sec())

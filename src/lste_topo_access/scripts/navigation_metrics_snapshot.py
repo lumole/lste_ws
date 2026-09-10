@@ -30,6 +30,8 @@ class NavigationMetricsSnapshotMixin:
         fields = (
             "route_id", "active_route_id", "route_kind", "active_route_kind",
             "mission_route_kind", "place_id", "source_place_id",
+            "graph_transaction_id", "active_graph_transaction_id",
+            "latest_graph_transaction_id",
             "destination_place_id", "work_item_id", "attempt_id",
             "transaction_id", "region_id", "region_state", "action",
             "graph_action", "obligation_kind", "obligation_id",
@@ -104,6 +106,58 @@ class NavigationMetricsSnapshotMixin:
             "controller_predicted_clearance": None if not math.isfinite(self.controller_predicted_clearance) else round(self.controller_predicted_clearance, 4),
             "teb_status": self.teb_status if self.controller_mode == "teb" else "not_applicable",
             "teb_feedback": self.teb_feedback_state if self.controller_mode == "teb" else None,
+            "teb_feedback_valid": bool(
+                getattr(self, "teb_feedback_valid", False)
+            ),
+            "teb_feedback_invalid_reason": str(
+                getattr(self, "teb_feedback_invalid_reason", "no_feedback")
+                or "no_feedback"
+            ),
+            "teb_feedback_requires_fresh_planner_command": bool(
+                getattr(
+                    self,
+                    "teb_feedback_requires_fresh_planner_command",
+                    True,
+                )
+            ),
+            "teb_feedback_identity": getattr(
+                self, "teb_feedback_identity", None
+            ),
+            "teb_feedback_invalidation_count": int(
+                getattr(self, "teb_feedback_invalidation_count", 0) or 0
+            ),
+            "planner_command_contract": {
+                "identity": getattr(self, "planner_contract_identity", None),
+                "state": getattr(self, "planner_contract_state", None),
+                "validation": getattr(
+                    self, "planner_contract_validation", "unobserved"
+                ),
+                "reason": getattr(self, "planner_contract_reason", "startup"),
+                "authorized": int(
+                    getattr(self, "planner_contract_authorized", 0) or 0
+                ),
+                "rejections": int(
+                    getattr(self, "planner_contract_rejections", 0) or 0
+                ),
+                "pending": bool(
+                    getattr(self, "pending_planner_contract", None) is not None
+                ),
+            },
+            "frontier_execution_terminal_contract": {
+                "identity": getattr(self, "terminal_contract_identity", None),
+                "validation": getattr(
+                    self, "terminal_contract_validation", "unobserved"
+                ),
+                "count": int(
+                    getattr(self, "terminal_contract_count", 0) or 0
+                ),
+                "rejections": int(
+                    getattr(self, "terminal_contract_rejections", 0) or 0
+                ),
+                "pending": len(
+                    getattr(self, "pending_terminal_contracts", ())
+                ),
+            },
             "move_base_feedback": self.move_base_feedback_state,
             "recovery": self.recovery_state,
             "move_base_recovery_events": self.move_base_recovery_events,
@@ -166,6 +220,9 @@ class NavigationMetricsSnapshotMixin:
             ),
             "move_base_priority_preemptions": self.priority_preemptions,
             "move_base_task_done_preemptions": self.task_done_preemptions,
+            "move_base_pending_hard_reset_preemptions": int(
+                getattr(self, "pending_hard_reset_preemptions", 0) or 0
+            ),
             "move_base_route_recovery_preemptions": self.route_recovery_preemptions,
             "move_base_route_recovery_preemption_reasons": dict(
                 self.route_recovery_preemption_reasons
@@ -279,6 +336,8 @@ class NavigationMetricsSnapshotMixin:
             "teb_bridge_deferred_goal_updates": self.bridge_deferred_goal_updates,
             "teb_bridge_dispatches": self.bridge_dispatches,
             "teb_bridge_terminal_events": self.bridge_terminal_events,
+            "teb_bridge_endpoint_detections": self.bridge_endpoint_detections,
+            "teb_bridge_successor_dispatches": self.bridge_successor_dispatches,
             "teb_bridge_priority_handoffs": self.bridge_priority_handoffs,
             "teb_bridge_target_retries": self.bridge_target_retries,
             "teb_bridge_target_segment_handoffs": self.bridge_target_segment_handoffs,
@@ -350,6 +409,34 @@ class NavigationMetricsSnapshotMixin:
 
     def close(self):
         with self.lock:
+            # The benchmark launcher records an explicit terminal reason before
+            # asking ROS to kill this observer.  Promote a timed-out final
+            # state before the normal force-close so no-active routes are not
+            # downgraded to a runner-only trial diagnostic.
+            termination_reason = ""
+            try:
+                termination_reason = str(
+                    rospy.get_param(
+                        "/lste_navigation_metrics/termination_reason", ""
+                    )
+                    or ""
+                ).strip()
+            except Exception:
+                termination_reason = ""
+            if termination_reason in {
+                "trial_timeout",
+                "slice_timeout",
+                "diagnostic_slice_timeout",
+            }:
+                self._close_boundary_failure_locked(
+                    {
+                        "event": "trial_boundary",
+                        "reason": termination_reason,
+                        "termination_reason": termination_reason,
+                    },
+                    sample=self._failure_append_sample_locked(time.monotonic()),
+                    force=True,
+                )
             # Flush an active episode before the compact run summary closes;
             # otherwise a process killed during the post-window would lose the
             # only correlated evidence for its failure.

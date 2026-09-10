@@ -548,6 +548,16 @@ class GlobalFrontierEventCallbacksMixin:
                     return value
             return ""
 
+        def optional_int(*values):
+            for value in values:
+                if value is None:
+                    continue
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+            return None
+
         return {
             "route_id": positive_int(
                 payload.get("route_id"), identity.get("route_id")
@@ -560,11 +570,14 @@ class GlobalFrontierEventCallbacksMixin:
                 payload.get("transaction_id"), identity.get("transaction_id")
             ),
             "route_kind": text_value(
-                payload.get("route_kind"), identity.get("route_kind")
+                payload.get("route_kind"),
+                identity.get("route_kind"),
+                payload.get("active_route_kind"),
             ),
             "mission_route_kind": text_value(
                 payload.get("mission_route_kind"),
                 identity.get("mission_route_kind"),
+                payload.get("active_mission_route_kind"),
             ),
             "source": text_value(
                 payload.get("intent_source"),
@@ -577,12 +590,29 @@ class GlobalFrontierEventCallbacksMixin:
                 identity.get("priority"),
                 payload.get("active_intent_priority"),
             ),
+            "lifecycle_transaction_id": positive_int(
+                payload.get("lifecycle_transaction_id"),
+                identity.get("lifecycle_transaction_id"),
+            ),
+            "graph_transaction_id": positive_int(
+                payload.get("graph_transaction_id"),
+                identity.get("graph_transaction_id"),
+            ),
+            "map_epoch": optional_int(
+                payload.get("map_epoch"),
+                payload.get("active_route_map_epoch"),
+                identity.get("map_epoch"),
+            ),
         }
 
     def _remember_bridge_dispatch_contract(self, payload):
         """Remember only routes admitted by the bridge execution boundary."""
         event = str(payload.get("event", "")).strip()
-        if event not in {"dispatch", "persistent_mission_path_adopted"}:
+        if event not in {
+            "dispatch",
+            "persistent_mission_path_adopted",
+            "dispatch_contract_reaffirmed",
+        }:
             return None
         contract = self._bridge_status_contract(payload)
         if (
@@ -624,9 +654,16 @@ class GlobalFrontierEventCallbacksMixin:
             "mission_route_kind",
             "source",
             "priority",
+            "lifecycle_transaction_id",
+            "graph_transaction_id",
         ):
             if contract[field] != expected[field]:
                 return False, "dispatch_contract_%s_mismatch" % field
+        if (
+            expected.get("map_epoch") is not None
+            and contract.get("map_epoch") != expected.get("map_epoch")
+        ):
+            return False, "dispatch_contract_map_epoch_mismatch"
         if (
             contract["transaction_id"] > 0
             and expected["transaction_id"] > 0
@@ -643,8 +680,14 @@ class GlobalFrontierEventCallbacksMixin:
             return False
         if not isinstance(payload, dict):
             return False
-        if self._remember_bridge_dispatch_contract(payload) is not None:
+        dispatch_contract = self._remember_bridge_dispatch_contract(payload)
+        if dispatch_contract is not None:
+            retry = getattr(self, "_retry_terminals_after_dispatch", None)
+            if callable(retry):
+                retry(dispatch_contract)
             return False
+        if payload.get("event") == "lease_release_ack":
+            return self._accept_controller_lease_release_ack(payload)
         if payload.get("event") != "terminal":
             return False
         if self.task_done:

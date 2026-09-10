@@ -31,6 +31,13 @@ def configure_turn_supervisor_parameters(supervisor):
     supervisor.bridge_status_topic = gp(
         "~bridge_status_topic", "/lste/teb_goal_bridge/status"
     )
+    supervisor.planner_command_contract_topic = gp(
+        "~planner_command_contract_topic",
+        "/lste/persistent_execution/planner_command_contract",
+    )
+    supervisor.require_planner_command_contract = _as_bool(
+        gp("~require_planner_command_contract", False)
+    )
     supervisor.pose_topic = gp("~pose_topic", "/rbt_pose")
     supervisor.pose_frame = (
         str(gp("~pose_frame", "odom")).strip().lstrip("/") or "odom"

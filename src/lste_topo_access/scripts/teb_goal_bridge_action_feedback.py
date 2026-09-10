@@ -10,7 +10,16 @@ class TebGoalBridgeActionFeedbackMixin:
     def on_feedback(self, generation, feedback):
         """Record geometric and Navfn progress without changing route policy."""
         with self.lock:
-            if generation != self.action_generation or not self.action_active:
+            if generation != self.action_generation:
+                self.publish_bridge_status(
+                    "stale_action_callback_ignored",
+                    callback="feedback",
+                    callback_action_generation=int(generation),
+                    current_action_generation=int(self.action_generation),
+                    reason="generation_mismatch",
+                )
+                return
+            if not self.action_active:
                 return
             now = now_for(self)
             self.last_feedback_monotonic = now

@@ -33,8 +33,25 @@ class GlobalFrontierRuntimeStateMixin:
         gp = rospy.get_param
         self.map_msg = None
         self.costmap_msg = None
+        # Keep the most recent authoritative full grid separately from the
+        # mutable delta reconstruction.  A coalesced update can invalidate the
+        # latter even though the last full grid remains a valid reset baseline.
+        self._last_full_costmap = None
         self.costmap_message_count = 0
         self.costmap_last_receive_wall = 0.0
+        # A hard-reset snapshot and the first live pose can straddle one
+        # callback cycle. Do not invalidate the restored full grid on that
+        # single handoff sample; later physical motion follows the normal
+        # stale-costmap rule.
+        self._costmap_rehydrated_pose_grace = False
+        # A coalesced costmap delta can arrive immediately after the reset
+        # snapshot and legitimately request a resync. Keep the authoritative
+        # reset full-grid as a bounded baseline until a newer full grid wins;
+        # otherwise the resync marker erases the only planner input we just
+        # restored and the warm slice remains costmap-blind forever.
+        self._rehydration_costmap_fallback = None
+        self._rehydration_costmap_fallback_active = False
+        self._applying_rehydration_costmap = False
         self.costmap_stationary_pose_epsilon = max(
             0.0, float(gp("~costmap_stationary_pose_epsilon", 0.01))
         )
@@ -268,8 +285,17 @@ class GlobalFrontierRuntimeStateMixin:
         # fresh SLAM snapshot; the route kind below is only the live phase.
         self.active_mission_route_kind = "frontier_endpoint"
         self.active_route_kind = "frontier_endpoint"
-        self.route_failure_authority = "global_watchdog"
-        self.controller_owned_route_failure = False
+        # Configuration is loaded before runtime state.  Do not overwrite the
+        # persistent-stream authority here: during startup the bridge may need
+        # time to acquire the MoveBase action server, and the global watchdog
+        # must not manufacture a route failure in that transport gap.
+        persistent_execution = bool(
+            getattr(self, "persistent_execution", False)
+        )
+        self.route_failure_authority = (
+            "controller_terminal" if persistent_execution else "global_watchdog"
+        )
+        self.controller_owned_route_failure = persistent_execution
         self.last_route_stagnation_reported_route_id = 0
         # Geometry ownership and controller ownership have different
         # lifetimes in persistent execution.  After a logical terminal the
@@ -282,9 +308,23 @@ class GlobalFrontierRuntimeStateMixin:
         self.last_released_route_kind = ""
         self.last_released_route_terminal_received = False
         self.last_released_route_controller_pending = False
+        self.last_released_route_lifecycle_transaction_id = 0
+        self.last_released_route_action_generation = 0
+        self.last_released_route_graph_transaction_id = 0
+        self.last_released_route_map_epoch = None
+        # A terminal releases semantic ownership first.  Successor planning is
+        # held until the bridge confirms that the transport lease is released.
+        self.active_terminal_contract = None
+        self.pending_controller_lease_release = None
+        self.awaiting_controller_lease_release_ack = False
+        self.last_controller_lease_release_ack = None
+        self.last_controller_lease_wait_report_wall = 0.0
         # Bridge terminal failures are accepted only after this process has
         # observed the matching action dispatch contract.
         self._bridge_dispatch_contracts = {}
+        # Terminal and dispatch use independent ROS topics. Keep a bounded
+        # out-of-order terminal until the matching dispatch contract arrives.
+        self._pending_terminals_waiting_for_dispatch = {}
         # Stable identity for an exploration route transaction. It changes
         # only when a new BFS branch is selected; an early handoff preserves
         # it only after the discrete path-prefix test proves continuity.

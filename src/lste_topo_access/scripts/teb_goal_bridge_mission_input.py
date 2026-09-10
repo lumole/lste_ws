@@ -147,6 +147,7 @@ class TebGoalBridgeMissionInputMixin:
                     self.latest_route_kind = ""
                     self.latest_mission_route_kind = ""
                     self.latest_route_map_epoch = map_epoch or None
+                    self.latest_graph_transaction_id = 0
                     self.latest_graph_action = ""
                     self.latest_graph_obligation_kind = ""
                     self.latest_route_id = 0
@@ -205,6 +206,9 @@ class TebGoalBridgeMissionInputMixin:
             target_epoch = max(0, int(payload.get("target_epoch", 0) or 0))
             transaction_id = max(0, int(payload.get("transaction_id", 0) or 0))
             map_epoch = max(0, int(payload.get("map_epoch", 0) or 0))
+            graph_transaction_id = max(
+                0, int(payload.get("graph_transaction_id", 0) or 0)
+            )
         except (TypeError, ValueError):
             return
         frame = str(payload.get("frame_id", self.global_frame)).strip().lstrip("/")
@@ -231,6 +235,19 @@ class TebGoalBridgeMissionInputMixin:
             normalized_source = (
                 str(command_source or "unknown").strip().lower() or "unknown"
             )
+            graph_route = (
+                normalized_source == "global_slam_frontier"
+                and route_id > 0
+            )
+            if graph_route and graph_transaction_id <= 0:
+                self.publish_bridge_status(
+                    "mission_goal_ignored",
+                    reason="missing_graph_transaction_id",
+                    route_id=route_id,
+                    map_epoch=map_epoch,
+                    transaction_id=transaction_id,
+                )
+                return
             # Target and frontier transactions share the wire field for
             # backwards compatibility, but they are different ownership
             # domains. A failed target may deliberately use a newer semantic
@@ -472,6 +489,7 @@ class TebGoalBridgeMissionInputMixin:
                 payload.get("mission_route_kind", self.latest_route_kind)
             ).strip().lower() or self.latest_route_kind
             self.latest_route_map_epoch = map_epoch or None
+            self.latest_graph_transaction_id = graph_transaction_id
             self.latest_graph_action = str(
                 payload.get("graph_action", "") or ""
             ).strip().lower()
@@ -511,6 +529,9 @@ class TebGoalBridgeMissionInputMixin:
                 source=self.latest_intent_source,
                 goal=[round(x, 3), round(y, 3)],
                 goal_context=self.latest_goal_context,
+                route_id=int(self.latest_route_id),
+                map_epoch=self.latest_route_map_epoch,
+                graph_transaction_id=int(self.latest_graph_transaction_id),
             )
             if priority >= 2:
                 # A visual ray remains a request until Navfn installs the route

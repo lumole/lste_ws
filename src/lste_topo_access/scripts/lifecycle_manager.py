@@ -74,6 +74,7 @@ class EventType(Enum):
     BRIDGE_TURN_STATUS = "BRIDGE_TURN_STATUS"
     BRIDGE_TEB_FEEDBACK = "BRIDGE_TEB_FEEDBACK"
     BRIDGE_PLANNER_COMMAND = "BRIDGE_PLANNER_COMMAND"
+    BRIDGE_PLANNER_COMMAND_CONTRACT = "BRIDGE_PLANNER_COMMAND_CONTRACT"
     BRIDGE_NAVFN_PLAN = "BRIDGE_NAVFN_PLAN"
     BRIDGE_COSTMAP = "BRIDGE_COSTMAP"
     BRIDGE_POSE = "BRIDGE_POSE"
@@ -168,6 +169,7 @@ class LifecycleManager:
         EventType.GLOBAL_FRONTIER_UPDATED,
         EventType.BRIDGE_TEB_FEEDBACK,
         EventType.BRIDGE_PLANNER_COMMAND,
+        EventType.BRIDGE_PLANNER_COMMAND_CONTRACT,
         EventType.BRIDGE_NAVFN_PLAN,
         EventType.BRIDGE_COSTMAP,
         EventType.BRIDGE_POSE,
@@ -204,6 +206,7 @@ class LifecycleManager:
         transitions: Optional[Mapping[Tuple[State, EventType], State]] = None,
         max_inbox_size: int = 1024,
         max_events_per_tick: int = 256,
+        allow_local_transactions: bool = True,
     ):
         # A zero/unset capacity used to mean an unbounded queue. Keep a hard
         # lower bound so callback bursts cannot grow process memory forever.
@@ -230,6 +233,10 @@ class LifecycleManager:
         self._event_handler = event_handler
         self._transition_handler = transition_handler
         self._timeout_handler = timeout_handler
+        # Global Frontier is the canonical lifecycle owner for the online
+        # route pipeline. Downstream nodes can adopt its wire identity, but
+        # must not mint a competing transaction of their own.
+        self.allow_local_transactions = bool(allow_local_transactions)
         self._timeouts = {
             state: float(timeout)
             for state, timeout in (timeouts or {}).items()
@@ -278,6 +285,11 @@ class LifecycleManager:
         transaction boundary is a state transition and must be requested from
         the timer-owned compute phase.
         """
+        if not self.allow_local_transactions:
+            raise RuntimeError(
+                "local transaction generation is disabled; adopt a canonical "
+                "wire transaction instead"
+            )
         if self._has_ticked and not self._tick_active:
             raise RuntimeError("transactions are owned by tick()")
         with self._state_lock:
@@ -323,6 +335,28 @@ class LifecycleManager:
         with cls._TRANSACTION_ID_LOCK:
             if int(transaction_id) > cls._LAST_TRANSACTION_ID:
                 cls._LAST_TRANSACTION_ID = int(transaction_id)
+
+    def transaction_high_water_mark(self) -> int:
+        """Return the newest transaction observed by this lifecycle.
+
+        The queue high-water mark includes a newer event which has already
+        entered transport but has not reached the timer yet. This is the
+        boundary needed to reject an older latched command before it can be
+        re-queued behind the newer command.
+        """
+        with self._state_lock:
+            current = int(self.current_transaction_id or 0)
+        with self._inbox_state_lock:
+            queued = int(self._highest_accepted_transaction_id or 0)
+        return max(current, queued)
+
+    def is_stale_transaction(self, transaction_id: int) -> bool:
+        """Return whether a positive wire transaction is below the high water."""
+        try:
+            candidate = int(transaction_id or 0)
+        except (TypeError, ValueError):
+            return True
+        return candidate <= 0 or candidate < self.transaction_high_water_mark()
 
     def make_event(
         self,
@@ -399,11 +433,22 @@ class LifecycleManager:
         if not self._tick_active:
             raise RuntimeError("hard resets are owned by tick()")
         reset_time = self._time_fn() if now is None else float(now)
+        requested = 0 if transaction_id is None else int(transaction_id)
         with self._state_lock:
             previous = self.current_state
-            requested = 0 if transaction_id is None else int(transaction_id)
+            current = int(self.current_transaction_id or 0)
+            if not self.allow_local_transactions and (
+                requested <= 0 or requested <= current
+            ):
+                raise RuntimeError(
+                    "hard reset requires a newer canonical wire transaction"
+                )
             candidate = requested if requested > 0 else self._new_transaction_id()
             if candidate <= self.current_transaction_id:
+                if not self.allow_local_transactions:
+                    raise RuntimeError(
+                        "hard reset cannot derive a local transaction"
+                    )
                 candidate = self.current_transaction_id + 1
             self.current_transaction_id = candidate
             self._next_transaction_id = candidate
@@ -721,7 +766,14 @@ class LifecycleManager:
             tick_time = self._time_fn() if now is None else float(now)
             if self.current_state == State.FAILED and self._reset_failed_on_next_tick:
                 self._reset_failed_on_next_tick = False
-                self.begin_transaction(State.IDLE, now=tick_time)
+                if self.allow_local_transactions:
+                    self.begin_transaction(State.IDLE, now=tick_time)
+                else:
+                    # A downstream lifecycle may recover its local FSM state,
+                    # but only the canonical owner may advance the wire ID.
+                    with self._state_lock:
+                        self.current_state = State.IDLE
+                        self.state_entry_time = tick_time
             processed = stale = future = adopted_future = 0
             reset_processed = False
             event_limit = (

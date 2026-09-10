@@ -50,8 +50,14 @@ class GoalManagerRuntimeStateMixin:
         # when the exploration executive is disabled. Keep a local monotonic
         # epoch so direct target goals carry the same snapshot identity as
         # frontier routes.
+        # Map epochs are issued by Global Frontier for canonical routes.
+        # Keep the legacy value only for fixed-goal/non-frontier experiments.
         self.navigation_map_epoch = 1
         self.navigation_map_last_stamp = 0.0
+        self.canonical_lifecycle_high_water = 0
+        self.canonical_route_high_water = 0
+        self.canonical_graph_high_water = 0
+        self.canonical_map_epoch_high_water = 0
         # The frontier planner labels whether the current goal is a validated
         # route connector or the final approach point.  This semantic is
         # forwarded with the goal intent so the TEB bridge can perform an
@@ -65,6 +71,9 @@ class GoalManagerRuntimeStateMixin:
         # a continuous path extension or an unrelated branch.
         self.global_frontier_route_id = 0
         self.global_frontier_map_epoch = None
+        # Identity of the graph planner transaction.  This is deliberately
+        # separate from GoalManager's mission transaction_id.
+        self.global_frontier_graph_transaction_id = 0
         self.global_frontier_graph_action = ""
         self.global_frontier_graph_obligation_kind = ""
         self.global_frontier_transition_kind = "initial"

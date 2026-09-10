@@ -11,6 +11,7 @@ TURN_ROUTE_KIND = "frontier_turn_connector"
 FRONTIER_ENDPOINT_KIND = "frontier_endpoint"
 PORTAL_TRANSITION_KIND = "portal_transition"
 LOCAL_EGRESS_KIND = "local_egress"
+PORTAL_PROBE_KIND = "portal_probe"
 FRONTIER_SOURCE = "global_slam_frontier"
 STATE_PASS_THROUGH = "PASS_THROUGH"
 STATE_TURNING = "TURNING"
@@ -42,6 +43,7 @@ def is_managed_frontier_route(route_kind, source):
             FRONTIER_ENDPOINT_KIND,
             PORTAL_TRANSITION_KIND,
             LOCAL_EGRESS_KIND,
+            PORTAL_PROBE_KIND,
         )
     )
 

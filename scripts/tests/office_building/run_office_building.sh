@@ -154,6 +154,18 @@ lifecycle_log() {
     >> "$LIFECYCLE_LOG"
 }
 
+notify_metrics_stop_reason() {
+  # ``lste_navigation_metrics`` owns the bounded failure ring.  Pass the
+  # runner's terminal boundary through the parameter server immediately before
+  # rosnode kill so its shutdown callback can promote a final timeout state
+  # into the same formal failure artifact as an in-run watchdog.
+  if command -v rosnode >/dev/null 2>&1 && \
+     rosnode list 2>/dev/null | grep -qx /lste_navigation_metrics; then
+    rosparam set /lste_navigation_metrics/termination_reason "$STOP_REASON" \
+      >/dev/null 2>&1 || true
+  fi
+}
+
 prefix_captured_lines() {
   local process="$1"
   local log_file="$2"
@@ -304,6 +316,7 @@ case "${1:-}" in
         lifecycle_log "stop_requested" "reason=$STOP_REASON"
       fi
     fi
+    notify_metrics_stop_reason
     "$WS/scripts/bin/stopall"
     if [[ -n "${LIFECYCLE_LOG:-}" && -f "$LIFECYCLE_LOG" ]]; then
       lifecycle_log "stop_completed" "reason=$STOP_REASON"

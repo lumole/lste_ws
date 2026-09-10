@@ -64,6 +64,12 @@ class GlobalFrontierReportingMixin:
             mission_id=str(getattr(self, "current_mission_id", "") or ""),
             task_version=str(getattr(self, "current_task_version", "") or ""),
         )
+        graph_transaction = getattr(
+            self, "graph_route_action_transaction", None
+        )
+        context["graph_transaction_id"] = int(
+            getattr(graph_transaction, "graph_transaction_id", 0) or 0
+        )
         if not getattr(self, "place_memory_enabled", True):
             return context
 
@@ -455,6 +461,11 @@ class GlobalFrontierReportingMixin:
             if graph_transaction is None
             else graph_transaction.as_dict()
         )
+        graph_transaction_id = (
+            0
+            if graph_transaction is None
+            else int(getattr(graph_transaction, "graph_transaction_id", 0) or 0)
+        )
         map_epoch = (
             getattr(graph_transaction, "map_epoch", None)
             if graph_transaction is not None
@@ -523,7 +534,37 @@ class GlobalFrontierReportingMixin:
                         self, "last_released_route_controller_pending", False
                     )
                 ),
+                "lifecycle_transaction_id": int(
+                    getattr(
+                        self,
+                        "last_released_route_lifecycle_transaction_id",
+                        0,
+                    )
+                    or 0
+                ),
+                "action_generation": int(
+                    getattr(self, "last_released_route_action_generation", 0)
+                    or 0
+                ),
+                "graph_transaction_id": int(
+                    getattr(
+                        self, "last_released_route_graph_transaction_id", 0
+                    )
+                    or 0
+                ),
+                "map_epoch": getattr(
+                    self, "last_released_route_map_epoch", None
+                ),
             },
+            "awaiting_controller_lease_release_ack": bool(
+                getattr(self, "awaiting_controller_lease_release_ack", False)
+            ),
+            "pending_controller_lease_release": getattr(
+                self, "pending_controller_lease_release", None
+            ),
+            "last_controller_lease_release_ack": getattr(
+                self, "last_controller_lease_release_ack", None
+            ),
             "goal_context": self.active_goal_context(),
             "semantic_place": self.semantic_place_report(),
             "place_progress": self.place_progress_report(),
@@ -538,6 +579,7 @@ class GlobalFrontierReportingMixin:
             "portal_transaction": self.portal_transaction_report(),
             "graph_route_plan": graph_plan_payload,
             "graph_route_action_transaction": graph_transaction_payload,
+            "graph_transaction_id": graph_transaction_id,
             "map_epoch": map_epoch,
             "graph_route_fsm_state": str(
                 getattr(self, "graph_route_fsm_state", "SEARCHING")
@@ -670,6 +712,15 @@ class GlobalFrontierReportingMixin:
                     "obligation_kind",
                     "",
                 ) or ""
+            ),
+            # This is the graph planner transaction, intentionally separate
+            # from GoalManager's mission transaction_id allocated later.
+            "graph_transaction_id": int(
+                getattr(
+                    graph_transaction,
+                    "graph_transaction_id",
+                    0,
+                ) or 0
             ),
             "portal_probe_phase": str(
                 getattr(self, "active_portal_probe_phase", "") or ""

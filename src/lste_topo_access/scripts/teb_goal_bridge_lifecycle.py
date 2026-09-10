@@ -3,6 +3,7 @@
 
 from copy import deepcopy
 import json
+import math
 
 import rospy
 
@@ -39,6 +40,7 @@ class TebGoalBridgeLifecycleMixin:
             event_handler=self._handle_lifecycle_event,
             transition_handler=self._on_lifecycle_transition,
             timeout_handler=self._on_lifecycle_timeout,
+            allow_local_transactions=False,
             timeouts={
                 State.DISPATCHED: max(
                     1.0, float(gp("~lifecycle_dispatch_timeout", 120.0))
@@ -56,19 +58,182 @@ class TebGoalBridgeLifecycleMixin:
             return None
         if not isinstance(payload, dict):
             return None
-        raw = payload.get(
-            "lifecycle_transaction_id",
-            payload.get("transaction_id"),
-        )
+        # ``transaction_id`` is a semantic GoalManager sequence.  It is not a
+        # lifecycle identity and must never be used to advance this FSM.
+        raw = payload.get("lifecycle_transaction_id")
         try:
             value = int(raw or 0)
         except (TypeError, ValueError):
             return None
         return value if value > 0 else None
 
+    def _local_lifecycle_transaction_id(self):
+        return int(
+            getattr(self.lifecycle_manager, "current_transaction_id", 0) or 0
+        )
+
+    @staticmethod
+    def _canonical_instruction_identity(payload):
+        """Decode the lifecycle/route identity carried by a mission command."""
+        try:
+            value = json.loads(payload.data)
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return None, "malformed_payload"
+        if not isinstance(value, dict):
+            return None, "malformed_payload"
+        try:
+            lifecycle_id = int(value.get("lifecycle_transaction_id", 0) or 0)
+            route_id = int(value.get("route_id", 0) or 0)
+            graph_id = int(value.get("graph_transaction_id", 0) or 0)
+            map_epoch = int(value.get("map_epoch", 0) or 0)
+            priority = int(value.get("priority", 0) or 0)
+        except (TypeError, ValueError):
+            return None, "invalid_canonical_identity"
+        try:
+            semantic_transaction_id = int(
+                value.get("transaction_id", 0) or 0
+            )
+        except (TypeError, ValueError):
+            return None, "invalid_canonical_identity"
+        identity = {
+            "lifecycle_transaction_id": lifecycle_id,
+            "route_id": route_id,
+            "graph_transaction_id": graph_id,
+            "map_epoch": map_epoch,
+            "transaction_id": semantic_transaction_id,
+            "priority": priority,
+            "source": str(value.get("source", "") or "").strip().lower(),
+            "event": str(value.get("event", "") or "").strip().lower(),
+        }
+        if lifecycle_id <= 0:
+            return identity, "missing_lifecycle_transaction_id"
+        if map_epoch <= 0:
+            return identity, "missing_map_epoch"
+        if identity["event"] in ("mission_goal", "target_terminal_observation") and (
+            identity["transaction_id"] <= 0
+        ):
+            return identity, "missing_transaction_id"
+        if identity["event"] == "mission_goal":
+            raw_goal = value.get("goal")
+            if not isinstance(raw_goal, (list, tuple)) or len(raw_goal) < 2:
+                return identity, "missing_goal"
+            try:
+                if not all(math.isfinite(float(item)) for item in raw_goal[:2]):
+                    return identity, "invalid_goal"
+            except (TypeError, ValueError):
+                return identity, "invalid_goal"
+        if route_id <= 0 or graph_id <= 0:
+            return identity, "missing_route_identity"
+        return identity, ""
+
+    def _canonical_instruction_stale_reason(self, identity):
+        """Reject an instruction below any local canonical high-water mark."""
+        if not isinstance(identity, dict):
+            return "missing_canonical_identity"
+        if identity["lifecycle_transaction_id"] < self.lifecycle_manager.transaction_high_water_mark():
+            return "lifecycle_transaction_id_below_high_water"
+        for field, attribute in (
+            ("route_id", "canonical_route_high_water"),
+            ("graph_transaction_id", "canonical_graph_high_water"),
+            ("map_epoch", "canonical_map_epoch_high_water"),
+        ):
+            incoming = int(identity.get(field, 0) or 0)
+            high_water = int(getattr(self, attribute, 0) or 0)
+            if incoming > 0 and incoming < high_water:
+                return "%s_below_high_water" % field
+        return ""
+
+    def _remember_canonical_instruction(self, identity):
+        """Advance downstream high-water marks only after command admission."""
+        if not isinstance(identity, dict):
+            return
+        self.canonical_lifecycle_high_water = max(
+            int(getattr(self, "canonical_lifecycle_high_water", 0) or 0),
+            int(identity.get("lifecycle_transaction_id", 0) or 0),
+        )
+        self.canonical_route_high_water = max(
+            int(getattr(self, "canonical_route_high_water", 0) or 0),
+            int(identity.get("route_id", 0) or 0),
+        )
+        self.canonical_graph_high_water = max(
+            int(getattr(self, "canonical_graph_high_water", 0) or 0),
+            int(identity.get("graph_transaction_id", 0) or 0),
+        )
+        self.canonical_map_epoch_high_water = max(
+            int(getattr(self, "canonical_map_epoch_high_water", 0) or 0),
+            int(identity.get("map_epoch", 0) or 0),
+        )
+
+    def _record_canonical_rejection(self, reason, identity=None):
+        """Log a dropped downstream instruction without mutating route state."""
+        identity = identity if isinstance(identity, dict) else {}
+        event = (
+            "stale_rejected"
+            if "below_high_water" in str(reason)
+            else "canonical_identity_rejected"
+        )
+        self.publish_bridge_status(
+            event,
+            reason=str(reason),
+            received_lifecycle_transaction_id=int(
+                identity.get("lifecycle_transaction_id", 0) or 0
+            ),
+            received_transaction_id=int(identity.get("transaction_id", 0) or 0),
+            received_route_id=int(identity.get("route_id", 0) or 0),
+            received_graph_transaction_id=int(
+                identity.get("graph_transaction_id", 0) or 0
+            ),
+            received_map_epoch=int(identity.get("map_epoch", 0) or 0),
+        )
+        rospy.logwarn(
+            "TEB goal bridge discarded instruction: event=%s reason=%s "
+            "lifecycle=%s route=%s graph=%s map=%s",
+            event,
+            reason,
+            identity.get("lifecycle_transaction_id", 0),
+            identity.get("route_id", 0),
+            identity.get("graph_transaction_id", 0),
+            identity.get("map_epoch", 0),
+        )
+
+    @staticmethod
+    def _external_transaction_admission(payload, event_type):
+        """Validate wire fields before importing a canonical lifecycle ID."""
+        if event_type not in (EventType.BRIDGE_GOAL_COMMAND, EventType.BRIDGE_INTENT):
+            return False, "event_is_not_a_mission_owner"
+        _, reason = TebGoalBridgeLifecycleMixin._canonical_instruction_identity(
+            payload
+        )
+        return (False, reason) if reason else (True, "accepted")
+
     def _enqueue_bridge_event(self, event_type, payload=None, transaction_id=None):
-        if transaction_id is None:
+        ownership_event = event_type in (
+            EventType.BRIDGE_GOAL,
+            EventType.BRIDGE_GOAL_COMMAND,
+            EventType.BRIDGE_INTENT,
+        )
+        if ownership_event and getattr(self, "require_canonical_identity", False):
+            identity, reason = self._canonical_instruction_identity(payload)
+            if reason:
+                self._record_canonical_rejection(reason, identity)
+                return False
+            stale_reason = self._canonical_instruction_stale_reason(identity)
+            if stale_reason:
+                self._record_canonical_rejection(stale_reason, identity)
+                return False
+            self._remember_canonical_instruction(identity)
+            transaction_id = identity["lifecycle_transaction_id"]
+        elif transaction_id is None:
             transaction_id = self._transaction_id_from_message(payload)
+            if (
+                transaction_id is not None
+                and self.lifecycle_manager.is_stale_transaction(transaction_id)
+            ):
+                self._record_canonical_rejection(
+                    "lifecycle_transaction_id_below_high_water",
+                    {"lifecycle_transaction_id": transaction_id},
+                )
+                return False
         return self.lifecycle_manager.enqueue_type(
             event_type,
             deepcopy(payload),
@@ -82,15 +247,28 @@ class TebGoalBridgeLifecycleMixin:
         return self._enqueue_bridge_event(EventType.BRIDGE_GOAL, message)
 
     def on_goal_command(self, message):
+        # A mission command is an ownership event.  Let the ingress helper
+        # copy its wire lifecycle identity into the queued event so the tick
+        # can adopt it before the handler runs.  Tagging it with the local ID
+        # first allows the handler to create a newer local transaction and
+        # then incorrectly reject the valid upstream command as stale.
         return self._enqueue_bridge_event(EventType.BRIDGE_GOAL_COMMAND, message)
 
     def on_intent(self, message):
         if self.use_goal_command:
             return False
+        # Legacy intent is also a mission-owner event and must carry the wire
+        # lifecycle identity for the same reason as on_goal_command().
         return self._enqueue_bridge_event(EventType.BRIDGE_INTENT, message)
 
     def on_frontier_status(self, message):
-        return self._enqueue_bridge_event(EventType.BRIDGE_FRONTIER_STATUS, message)
+        # Frontier status is an observation stream.  Its owner's lifecycle ID
+        # must not advance the bridge before an accepted mission command does.
+        return self._enqueue_bridge_event(
+            EventType.BRIDGE_FRONTIER_STATUS,
+            message,
+            transaction_id=self._local_lifecycle_transaction_id(),
+        )
 
     def on_turn_supervisor_status(self, message):
         # Turn-supervisor status is telemetry from a downstream adapter, not a
@@ -112,6 +290,16 @@ class TebGoalBridgeLifecycleMixin:
     def on_teb_planner_command(self, message):
         return self._enqueue_bridge_event(
             EventType.BRIDGE_PLANNER_COMMAND, message
+        )
+
+    def on_planner_command_contract(self, message):
+        # Planner contracts are observations from the current lifecycle, not
+        # new mission ownership. Validate their wire identity in the handler
+        # without letting a delayed planner sample advance this lifecycle.
+        return self._enqueue_bridge_event(
+            EventType.BRIDGE_PLANNER_COMMAND_CONTRACT,
+            message,
+            transaction_id=self._local_lifecycle_transaction_id(),
         )
 
     def on_navfn_plan(self, message):
@@ -154,17 +342,50 @@ class TebGoalBridgeLifecycleMixin:
         return self._enqueue_bridge_event(EventType.RESET, deepcopy(message))
 
     # Actionlib callbacks are also gather-only.
+    def _admit_action_callback_generation(self, callback_name, generation):
+        """Reject late actionlib callbacks before they enter the event queue."""
+        try:
+            callback_generation = int(generation)
+        except (TypeError, ValueError):
+            callback_generation = -1
+        current_generation = int(
+            getattr(self, "action_generation", 0) or 0
+        )
+        if callback_generation == current_generation:
+            return True
+        self.publish_bridge_status(
+            "stale_action_callback_ignored",
+            callback=str(callback_name),
+            callback_action_generation=callback_generation,
+            current_action_generation=current_generation,
+            reason="generation_mismatch",
+        )
+        rospy.logwarn(
+            "TEB goal bridge dropped late action callback: callback=%s "
+            "callback_generation=%s current_generation=%s reason=generation_mismatch",
+            callback_name,
+            callback_generation,
+            current_generation,
+        )
+        return False
+
     def on_active(self, generation):
+        if not self._admit_action_callback_generation("active", generation):
+            return False
         return self._enqueue_bridge_event(
             EventType.ACTION_FEEDBACK, ("active", generation)
         )
 
     def on_feedback(self, generation, feedback):
+        if not self._admit_action_callback_generation("feedback", generation):
+            return False
         return self._enqueue_bridge_event(
             EventType.ACTION_FEEDBACK, ("feedback", generation, deepcopy(feedback))
         )
 
     def on_done(self, generation, status, result):
+        if not self._admit_action_callback_generation("done", generation):
+            return False
         return self._enqueue_bridge_event(
             EventType.ACTION_DONE,
             (generation, status, deepcopy(result)),
@@ -185,7 +406,7 @@ class TebGoalBridgeLifecycleMixin:
         if event.type == EventType.RESET:
             return self._apply_hard_reset(event)
         if (
-            self.lifecycle_manager.current_transaction_id == 0
+            getattr(self, "require_canonical_identity", False)
             and event.type
             in (
                 EventType.BRIDGE_GOAL,
@@ -193,19 +414,17 @@ class TebGoalBridgeLifecycleMixin:
                 EventType.BRIDGE_INTENT,
             )
         ):
-            self.lifecycle_manager.begin_transaction(State.DISPATCHED)
-        if event.type in (
-            EventType.BRIDGE_GOAL_COMMAND,
-            EventType.BRIDGE_INTENT,
-            EventType.BRIDGE_FRONTIER_STATUS,
-        ):
-            external_id = self._transaction_id_from_message(event.payload)
-            if external_id is not None:
-                if external_id < self.lifecycle_manager.current_transaction_id:
-                    return None
-                self.lifecycle_manager.adopt_transaction(
-                    external_id, State.IDLE
+            identity, reason = self._canonical_instruction_identity(event.payload)
+            if reason:
+                self._record_canonical_rejection(reason, identity)
+                return None
+            if int(event.transaction_id or 0) != int(
+                identity["lifecycle_transaction_id"]
+            ):
+                self._record_canonical_rejection(
+                    "event_lifecycle_transaction_mismatch", identity
                 )
+                return None
         handlers = {
             EventType.BRIDGE_GOAL: TebGoalBridgeMissionInputMixin.on_goal,
             EventType.BRIDGE_GOAL_COMMAND: TebGoalBridgeMissionInputMixin.on_goal_command,
@@ -214,6 +433,7 @@ class TebGoalBridgeLifecycleMixin:
             EventType.BRIDGE_TURN_STATUS: TebGoalBridgeTebRuntimeMixin.on_turn_supervisor_status,
             EventType.BRIDGE_TEB_FEEDBACK: TebGoalBridgeTebRuntimeMixin.on_teb_feedback,
             EventType.BRIDGE_PLANNER_COMMAND: TebGoalBridgeTebRuntimeMixin.on_teb_planner_command,
+            EventType.BRIDGE_PLANNER_COMMAND_CONTRACT: TebGoalBridgeTebRuntimeMixin.on_planner_command_contract,
             EventType.BRIDGE_NAVFN_PLAN: TebGoalBridgeRouteMonitoringMixin.on_navfn_plan,
             EventType.BRIDGE_COSTMAP: TebGoalBridgeRouteMonitoringMixin.on_local_costmap,
             EventType.BRIDGE_POSE: TebGoalBridgeTebRuntimeMixin.on_pose,

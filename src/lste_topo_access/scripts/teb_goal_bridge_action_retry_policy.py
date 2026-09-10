@@ -37,6 +37,8 @@ class TebGoalBridgeActionRetryPolicyMixin:
             == int(getattr(self, "latest_goal_transaction_id", 0) or 0)
             and int(identity.get("route_id", 0) or 0)
             == int(getattr(self, "latest_route_id", 0) or 0)
+            and int(identity.get("graph_transaction_id", 0) or 0)
+            == int(getattr(self, "latest_graph_transaction_id", 0) or 0)
             and str(identity.get("route_kind", "") or "").strip().lower()
             == str(getattr(self, "latest_route_kind", "") or "").strip().lower()
             and str(identity.get("mission_route_kind", "") or "").strip().lower()
@@ -213,8 +215,15 @@ class TebGoalBridgeActionRetryPolicyMixin:
             return
 
         if force and self.action_active:
-            self.action_generation += 1
-            self.action_client.cancel_goal()
-            self.action_active = False
+            self._commit_termination(
+                "forced_action_replacement",
+                source_goal=getattr(self, "last_dispatched_goal", None),
+                action_contract=getattr(self, "active_action_contract", None),
+                watchdog_reason="forced_action_replacement",
+                publish_terminal=False,
+                arm_watchdog=False,
+            )
+            self.pending_terminal_prepare = None
+            self.pending_lease_release_contract = None
 
         self._send_goal_locked(self.latest_goal, reason=reason, replacement=False)

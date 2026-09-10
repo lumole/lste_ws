@@ -32,7 +32,13 @@ PersistentTebLocalPlanner::PersistentTebLocalPlanner()
       route_geometry_hash_(0),
       installed_target_transaction_(0),
       latest_mission_transaction_(0),
-      installed_mission_transaction_(0) {}
+      installed_mission_transaction_(0),
+      latest_route_id_(0),
+      latest_graph_transaction_id_(0),
+      latest_map_epoch_(0),
+      latest_lifecycle_transaction_id_(),
+      latest_action_generation_(0),
+      planner_command_sequence_(0) {}
 
 void PersistentTebLocalPlanner::initialize(
     std::string name, tf2_ros::Buffer* tf,
@@ -124,6 +130,13 @@ void PersistentTebLocalPlanner::initialize(
       frontier_endpoint_topic, 1, false);
   plan_event_publisher_ = private_nh.advertise<std_msgs::String>(
       plan_event_topic, 10, false);
+  std::string planner_command_contract_topic;
+  ros::param::param<std::string>(
+      "/move_base/persistent_planner_command_contract_topic",
+      planner_command_contract_topic,
+      "/lste/persistent_execution/planner_command_contract");
+  planner_command_contract_publisher_ = private_nh.advertise<PlannerCommandContract>(
+      planner_command_contract_topic, 20, false);
   initialized_ = true;
   ROS_INFO_STREAM("PersistentTebLocalPlanner initialized: persistent_execution="
                   << (persistent_execution_ ? "true" : "false"));
@@ -201,6 +214,32 @@ bool PersistentTebLocalPlanner::setPlan(
   route_geometry_hash_.store(geometryHash(plan), std::memory_order_relaxed);
   publishPlanEvent("installed", plan);
   return true;
+}
+
+void PersistentTebLocalPlanner::publishPlannerCommandContract(
+    const geometry_msgs::Twist& command, uint8_t state,
+    const std::string& reason) {
+  if (!planner_command_contract_publisher_) {
+    return;
+  }
+  PlannerCommandContract message;
+  {
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    message.transaction_id = latest_mission_transaction_.load(
+        std::memory_order_acquire);
+    message.route_id = latest_route_id_;
+    message.graph_transaction_id = latest_graph_transaction_id_;
+    message.map_epoch = latest_map_epoch_;
+    message.lifecycle_transaction_id = latest_lifecycle_transaction_id_;
+    message.action_generation = latest_action_generation_;
+  }
+  message.planner_sequence = planner_command_sequence_.fetch_add(
+      1, std::memory_order_relaxed) + 1;
+  message.command = command;
+  message.state = state;
+  message.reason = reason;
+  message.producer = "persistent_teb_local_planner";
+  planner_command_contract_publisher_.publish(message);
 }
 
 void PersistentTebLocalPlanner::publishPlanEvent(
@@ -319,16 +358,17 @@ bool PersistentTebLocalPlanner::computeVelocityCommands(
     geometry_msgs::Twist& cmd_vel) {
   if (hard_reset_hold_.load(std::memory_order_acquire)) {
     cmd_vel = geometry_msgs::Twist();
+    publishPlannerCommandContract(
+        cmd_vel, PlannerCommandContract::STATE_INVALIDATED, "hard_reset");
     return true;
   }
-  const bool command_available = teb_.computeVelocityCommands(cmd_vel);
-  if (!persistent_execution_ || task_done_.load()) {
-    return command_available;
+  if (!persistent_execution_) {
+    return teb_.computeVelocityCommands(cmd_vel);
   }
   // Endpoint ownership has already been transferred to the graph. Keep the
   // MoveBase action healthy while the graph commits a successor route. This
   // prevents a transient TEB false result at the old endpoint from entering
-  // recovery; a real successor clears the hold in setPlan/onMissionCommand.
+  // recovery; a real successor clears the hold in setPlan.
   if (terminal_hold_active_.load(std::memory_order_acquire)) {
     if (isInstalledTargetPlanLocked()) {
       reportTargetApproachIfReady();
@@ -336,17 +376,36 @@ bool PersistentTebLocalPlanner::computeVelocityCommands(
       reportFrontierEndpointIfReady();
     }
     cmd_vel = geometry_msgs::Twist();
+    publishPlannerCommandContract(
+        cmd_vel, PlannerCommandContract::STATE_ZERO, "terminal_hold");
     return true;
   }
-  // A newer mission transaction has arrived, but move_base has not yet handed
-  // its corresponding Navfn path to this plugin. The previous path may already
-  // be inside its XY tolerance; do not report that stale endpoint as the new
-  // route's terminal. Keep the action healthy until setPlan installs the
-  // transaction-bound route.
-  if (persistent_execution_ &&
+  // Do not call the underlying TEB while a newer mission transaction is still
+  // waiting for its Navfn plan.  TEB has no transaction identity and would
+  // otherwise return the predecessor route's command, which downstream nodes
+  // could mistake for the successor's first command and use to re-arm stale
+  // feedback.  A zero command is the only valid output for this boundary.
+  if (latest_mission_transaction_.load(std::memory_order_acquire) >
+      installed_mission_transaction_.load(std::memory_order_acquire)) {
+    cmd_vel = geometry_msgs::Twist();
+    publishPlannerCommandContract(
+        cmd_vel, PlannerCommandContract::STATE_ZERO, "mission_plan_pending");
+    return true;
+  }
+
+  const bool command_available = teb_.computeVelocityCommands(cmd_vel);
+
+  // Mission, terminal and task state can change while TEB is computing.  The
+  // second check closes that short callback/control-cycle race before the
+  // command reaches move_base's remapped planner output topic.
+  if (task_done_.load(std::memory_order_acquire) ||
+      terminal_hold_active_.load(std::memory_order_acquire) ||
       latest_mission_transaction_.load(std::memory_order_acquire) >
           installed_mission_transaction_.load(std::memory_order_acquire)) {
-    return command_available;
+    cmd_vel = geometry_msgs::Twist();
+    publishPlannerCommandContract(
+        cmd_vel, PlannerCommandContract::STATE_ZERO, "mission_boundary");
+    return true;
   }
   // TEB returns false at every XY terminal. In the persistent architecture an
   // action is a lease for the whole mission, so both a temporary frontier and
@@ -362,8 +421,18 @@ bool PersistentTebLocalPlanner::computeVelocityCommands(
       reportFrontierEndpointIfReady();
     }
     cmd_vel = geometry_msgs::Twist();
+    publishPlannerCommandContract(
+        cmd_vel, PlannerCommandContract::STATE_ZERO, "endpoint_reached");
     return true;
   }
+  publishPlannerCommandContract(
+      cmd_vel,
+      (command_available &&
+       (std::abs(cmd_vel.linear.x) > 0.001 ||
+        std::abs(cmd_vel.angular.z) > 0.01))
+          ? PlannerCommandContract::STATE_ACTIVE
+          : PlannerCommandContract::STATE_ZERO,
+      command_available ? "planner_command" : "planner_no_command");
   return command_available;
 }
 
@@ -504,12 +573,20 @@ void PersistentTebLocalPlanner::onMissionCommand(
     const PersistentGoalCommandConstPtr& message) {
   if (message->kind == PersistentGoalCommand::KIND_CLEAR &&
       message->transaction_id == 0) {
+    publishPlannerCommandContract(
+        geometry_msgs::Twist(), PlannerCommandContract::STATE_INVALIDATED,
+        "hard_reset_command");
     std::lock_guard<std::mutex> lock(plan_mutex_);
     has_installed_target_goal_ = false;
     has_reported_target_goal_ = false;
     has_reported_frontier_goal_ = false;
     installed_target_transaction_ = 0;
     reported_frontier_route_version_ = 0;
+    latest_route_id_ = 0;
+    latest_graph_transaction_id_ = 0;
+    latest_map_epoch_ = 0;
+    latest_lifecycle_transaction_id_.clear();
+    latest_action_generation_ = 0;
     current_plan_goal_ = geometry_msgs::PoseStamped();
     applied_plan_.clear();
     terminal_hold_active_.store(true, std::memory_order_release);
@@ -526,10 +603,21 @@ void PersistentTebLocalPlanner::onMissionCommand(
   if (message->transaction_id == latest_mission_transaction_) {
     return;
   }
+  if (message->transaction_id < latest_mission_transaction_) {
+    ROS_WARN_STREAM("PersistentTebLocalPlanner ignored stale mission "
+                    << "transaction=" << message->transaction_id << " < "
+                    << latest_mission_transaction_);
+    return;
+  }
   // A new mission transaction may reuse the exact same Navfn geometry (for
   // example, a second Portal probe at the same endpoint).  Path equivalence
   // must not suppress that transaction's endpoint report.
   latest_mission_transaction_ = message->transaction_id;
+  latest_route_id_ = message->route_id;
+  latest_graph_transaction_id_ = message->graph_transaction_id;
+  latest_map_epoch_ = message->map_epoch;
+  latest_lifecycle_transaction_id_ = message->lifecycle_transaction_id;
+  latest_action_generation_ = message->action_generation;
   has_reported_frontier_goal_ = false;
   reported_frontier_route_version_ = 0;
   terminal_hold_active_.store(false, std::memory_order_release);
@@ -618,6 +706,10 @@ StreamingNavfnPlanner::StreamingNavfnPlanner()
       validated_target_sequence_(0),
       failed_target_sequence_(0),
       latest_target_map_epoch_(0),
+      latest_target_graph_transaction_id_(0),
+      latest_target_route_id_(0),
+      latest_target_lifecycle_transaction_id_(),
+      latest_target_action_generation_(0),
       latest_target_route_kind_(),
       latest_target_mission_route_kind_(),
       latest_target_graph_action_(),
@@ -701,6 +793,8 @@ void StreamingNavfnPlanner::publishTargetPlanResult(
   payload << "{\"event\":\"" << event << "\",\"transaction_id\":"
           << transaction_id << ",\"frame_id\":\"" << goal.header.frame_id
           << "\",\"map_epoch\":" << latest_target_map_epoch_
+          << ",\"graph_transaction_id\":"
+          << latest_target_graph_transaction_id_
           << ",\"route_kind\":\"" << latest_target_route_kind_
           << "\",\"mission_route_kind\":\""
           << latest_target_mission_route_kind_
@@ -901,7 +995,12 @@ bool StreamingNavfnPlanner::makePlan(
     PersistentGoalCommand installed_command;
     installed_command.transaction_id = selected_target_sequence;
     installed_command.kind = PersistentGoalCommand::KIND_TARGET_INSTALLED;
+    installed_command.route_id = latest_target_route_id_;
+    installed_command.lifecycle_transaction_id =
+        latest_target_lifecycle_transaction_id_;
+    installed_command.action_generation = latest_target_action_generation_;
     installed_command.map_epoch = latest_target_map_epoch_;
+    installed_command.graph_transaction_id = latest_target_graph_transaction_id_;
     installed_command.route_kind = latest_target_route_kind_;
     installed_command.mission_route_kind = latest_target_mission_route_kind_;
     installed_command.graph_action = latest_target_graph_action_;
@@ -939,6 +1038,10 @@ void StreamingNavfnPlanner::onMissionCommand(
     latest_mission_sequence_ = 0;
     latest_target_sequence_ = 0;
     latest_target_map_epoch_ = 0;
+    latest_target_graph_transaction_id_ = 0;
+    latest_target_route_id_ = 0;
+    latest_target_lifecycle_transaction_id_.clear();
+    latest_target_action_generation_ = 0;
     latest_target_route_kind_.clear();
     latest_target_mission_route_kind_.clear();
     latest_target_graph_action_.clear();
@@ -1024,6 +1127,10 @@ void StreamingNavfnPlanner::onTargetCommand(
       latest_mission_sequence_ = 0;
       latest_target_sequence_ = 0;
       latest_target_map_epoch_ = 0;
+      latest_target_graph_transaction_id_ = 0;
+      latest_target_route_id_ = 0;
+      latest_target_lifecycle_transaction_id_.clear();
+      latest_target_action_generation_ = 0;
       latest_target_route_kind_.clear();
       latest_target_mission_route_kind_.clear();
       latest_target_graph_action_.clear();
@@ -1036,7 +1143,12 @@ void StreamingNavfnPlanner::onTargetCommand(
         PersistentGoalCommand installed_clear;
       installed_clear.kind = PersistentGoalCommand::KIND_CLEAR;
       installed_clear.transaction_id = 0;
+      installed_clear.route_id = message->route_id;
+      installed_clear.lifecycle_transaction_id =
+          message->lifecycle_transaction_id;
+      installed_clear.action_generation = message->action_generation;
       installed_clear.map_epoch = message->map_epoch;
+      installed_clear.graph_transaction_id = message->graph_transaction_id;
       installed_clear.route_kind = message->route_kind;
       installed_clear.mission_route_kind = message->mission_route_kind;
       installed_clear.graph_action = message->graph_action;
@@ -1072,10 +1184,15 @@ void StreamingNavfnPlanner::onTargetCommand(
     plan_dirty_ = true;
     ++mission_generation_;
     if (installed_target_command_publisher_) {
-      PersistentGoalCommand installed_clear;
+    PersistentGoalCommand installed_clear;
     installed_clear.kind = PersistentGoalCommand::KIND_CLEAR;
     installed_clear.transaction_id = clear_sequence;
+    installed_clear.route_id = message->route_id;
+    installed_clear.lifecycle_transaction_id =
+        message->lifecycle_transaction_id;
+    installed_clear.action_generation = message->action_generation;
     installed_clear.map_epoch = message->map_epoch;
+    installed_clear.graph_transaction_id = message->graph_transaction_id;
     installed_clear.route_kind = message->route_kind;
     installed_clear.mission_route_kind = message->mission_route_kind;
     installed_clear.graph_action = message->graph_action;
@@ -1111,6 +1228,10 @@ void StreamingNavfnPlanner::onTargetCommand(
   target_goal_ = message->goal;
   latest_target_sequence_ = sequence;
   latest_target_map_epoch_ = message->map_epoch;
+  latest_target_graph_transaction_id_ = message->graph_transaction_id;
+  latest_target_route_id_ = message->route_id;
+  latest_target_lifecycle_transaction_id_ = message->lifecycle_transaction_id;
+  latest_target_action_generation_ = message->action_generation;
   latest_target_route_kind_ = message->route_kind;
   latest_target_mission_route_kind_ = message->mission_route_kind;
   latest_target_graph_action_ = message->graph_action;

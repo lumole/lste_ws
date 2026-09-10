@@ -56,6 +56,11 @@ class GraphRouteActionTransaction:
     phase: str = "prepared"
     materialization: GraphRouteMaterialization = None
 
+    @property
+    def graph_transaction_id(self):
+        """Expose the graph identity without colliding with mission IDs."""
+        return int(self.transaction_id)
+
     def commit(self, materialization):
         """Return the committed transaction without mutating the old record."""
         if not materialization.accepted:
@@ -72,6 +77,7 @@ class GraphRouteActionTransaction:
         materialization = self.materialization
         return {
             "transaction_id": int(self.transaction_id),
+            "graph_transaction_id": int(self.graph_transaction_id),
             "map_epoch": self.map_epoch,
             "phase": str(self.phase),
             "plan": self.plan.as_dict(),

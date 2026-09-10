@@ -3,7 +3,11 @@
 
 import rospy
 from geometry_msgs.msg import Pose2D, PoseStamped, Twist
-from lste_topo_access.msg import FrontierExecutionTerminal, PersistentGoalCommand
+from lste_topo_access.msg import (
+    FrontierExecutionTerminal,
+    PersistentGoalCommand,
+    PlannerCommandContract,
+)
 from nav_msgs.msg import OccupancyGrid, Path
 from std_msgs.msg import Bool, String
 from teb_local_planner.msg import FeedbackMsg
@@ -57,6 +61,11 @@ def _create_publishers(bridge):
     bridge.hard_reset_ack_pub = rospy.Publisher(
         HARD_RESET_ACK_TOPIC, String, queue_size=20
     )
+    bridge.planner_command_invalidation_pub = rospy.Publisher(
+        bridge.planner_command_contract_topic,
+        PlannerCommandContract,
+        queue_size=20,
+    )
 
 
 def _create_subscribers(bridge):
@@ -87,6 +96,12 @@ def _create_subscribers(bridge):
         bridge.teb_planner_cmd_topic,
         Twist,
         bridge.on_teb_planner_command,
+        queue_size=20,
+    )
+    rospy.Subscriber(
+        bridge.planner_command_contract_topic,
+        PlannerCommandContract,
+        bridge.on_planner_command_contract,
         queue_size=20,
     )
     rospy.Subscriber(bridge.navfn_plan_topic, Path, bridge.on_navfn_plan, queue_size=2)

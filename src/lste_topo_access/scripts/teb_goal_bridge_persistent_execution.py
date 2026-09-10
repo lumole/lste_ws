@@ -58,10 +58,17 @@ class TebGoalBridgePersistentExecutionMixin:
                 - self.last_dispatched_goal.pose.position.y,
             )
 
-        source_goal = copy.deepcopy(self.last_dispatched_goal)
         feedback_distance = float(self.active_feedback_distance)
+        source_goal = copy.deepcopy(self.last_dispatched_goal)
+        action_contract = getattr(self, "active_action_contract", None)
+        old_generation = int(
+            (action_contract or {}).get(
+                "generation", getattr(self, "action_generation", 0)
+            )
+            or 0
+        )
         self.frontier_observation_completion_pending = {
-            "generation": int(self.action_generation),
+            "generation": old_generation,
             "route_id": int(self.active_route_id),
             "source_goal": source_goal,
             "feedback_distance": feedback_distance,
@@ -74,13 +81,20 @@ class TebGoalBridgePersistentExecutionMixin:
             ),
         }
         self.handoff_requested = True
-        # Publish before canceling so the frontier manager can validate and
-        # promote its prefetched successor while actionlib is closing this
-        # transport transaction. dispatch_locked keeps that successor behind
-        # the result callback and its synchronization timer.
-        self._publish_execution_terminal_locked(source_goal)
+        # The termination helper first revokes the old planner/feedback
+        # identity, then closes the transport and publishes the typed terminal.
+        # Global Frontier releases the semantic route and the successor remains
+        # blocked until the exact release ACK arrives.
+        termination = self._commit_termination(
+            "frontier_observation_completion",
+            source_goal=source_goal,
+            action_contract=action_contract,
+            watchdog_reason="frontier_observation_completion",
+        )
+        if not termination.get("committed", False):
+            self.frontier_observation_completion_pending = None
+            return False
         self._clear_target_failure_locked("frontier_observation_progress")
-        self.action_client.cancel_goal()
         self.publish_bridge_status(
             "frontier_observation_completion_requested",
             route_id=int(self.active_route_id),
@@ -128,7 +142,12 @@ class TebGoalBridgePersistentExecutionMixin:
                 and now - self.teb_planner_stationary_since
                 >= self.frontier_observation_stationary_hold
             )
-        if self.latest_teb_selected_linear is None:
+        if (
+            not bool(getattr(self, "teb_feedback_valid", False))
+            or int(getattr(self, "teb_feedback_generation", 0) or 0)
+            != int(getattr(self, "action_generation", 0) or 0)
+            or self.latest_teb_selected_linear is None
+        ):
             return False
         age = now - self.latest_teb_feedback_monotonic
         return (

@@ -14,10 +14,82 @@ from std_msgs.msg import String
 from tf.transformations import quaternion_from_euler, quaternion_matrix
 
 from goal_context import default_goal_context
-from lifecycle_manager import State
 
 class GoalManagerGoalOutputMixin:
     # -------------------- Helpers --------------------
+    def _canonical_lifecycle_transaction_id(self) -> int:
+        """Return the lifecycle identity inherited from Global Frontier."""
+        return int(
+            getattr(
+                getattr(self, "lifecycle_manager", None),
+                "current_transaction_id",
+                0,
+            )
+            or 0
+        )
+
+    def _canonical_map_epoch(self) -> int:
+        """Return a map epoch previously issued by Global Frontier."""
+        try:
+            return max(0, int(getattr(self, "global_frontier_map_epoch", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _canonical_goal_identity_ready(self, source: str) -> bool:
+        """Require complete upstream identity for the online route pipeline."""
+        if not bool(getattr(self, "global_frontier_enabled", False)):
+            return True
+        lifecycle_id = self._canonical_lifecycle_transaction_id()
+        if lifecycle_id <= 0:
+            self.publish_goal_arbitration(
+                "canonical_identity_rejected",
+                reason="missing_lifecycle_transaction_id",
+                source=str(source or "unknown"),
+            )
+            return False
+        if source == "global_slam_frontier":
+            fields = (
+                ("route_id", getattr(self, "global_frontier_route_id", 0)),
+                (
+                    "graph_transaction_id",
+                    getattr(self, "global_frontier_graph_transaction_id", 0),
+                ),
+                ("map_epoch", self._canonical_map_epoch()),
+            )
+            for name, value in fields:
+                try:
+                    valid = int(value or 0) > 0
+                except (TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    self.publish_goal_arbitration(
+                        "canonical_identity_rejected",
+                        reason="missing_%s" % name,
+                        source=source,
+                    )
+                    return False
+        elif self._canonical_map_epoch() <= 0:
+            # Target routes are a higher-priority semantic owner, but still
+            # execute against the last map snapshot issued by Global Frontier.
+            self.publish_goal_arbitration(
+                "canonical_identity_rejected",
+                reason="missing_map_epoch",
+                source=str(source or "unknown"),
+            )
+            return False
+        elif (
+            int(getattr(self, "global_frontier_route_id", 0) or 0) <= 0
+            or int(getattr(self, "global_frontier_graph_transaction_id", 0) or 0)
+            <= 0
+        ):
+            self.publish_goal_arbitration(
+                "canonical_identity_rejected",
+                reason="missing_inherited_route_identity",
+                source=str(source or "unknown"),
+            )
+            return False
+        return True
+
     @staticmethod
     def _frame_name(frame: str) -> str:
         return (frame or "odom").strip().lstrip("/") or "odom"
@@ -98,9 +170,9 @@ class GoalManagerGoalOutputMixin:
             > 0
         ):
             return False
-        lifecycle = getattr(self, "lifecycle_manager", None)
-        if lifecycle is not None:
-            lifecycle.begin_transaction(State.DISPATCHED)
+        if not self._canonical_goal_identity_ready("target_terminal_observation"):
+            return False
+        lifecycle_id = self._canonical_lifecycle_transaction_id()
         self.goal_command_id += 1
         mission_context = default_goal_context(
             getattr(self, "exploration_method", "legacy"),
@@ -116,8 +188,14 @@ class GoalManagerGoalOutputMixin:
             "priority": 2,
             "route_kind": "direct_goal",
             "mission_route_kind": "direct_goal",
-            "map_epoch": max(
-                1, int(getattr(self, "navigation_map_epoch", 1) or 1)
+            "route_id": int(getattr(self, "global_frontier_route_id", 0) or 0),
+            "graph_transaction_id": int(
+                getattr(self, "global_frontier_graph_transaction_id", 0) or 0
+            ),
+            "map_epoch": (
+                self._canonical_map_epoch()
+                if getattr(self, "global_frontier_enabled", False)
+                else max(1, int(getattr(self, "navigation_map_epoch", 1) or 1))
             ),
             "task_id": str(getattr(self, "current_task_id", "")),
             "mission_id": str(getattr(self, "current_mission_id", "")),
@@ -131,14 +209,7 @@ class GoalManagerGoalOutputMixin:
                 getattr(self, "target_viewpoint_attempt_id", "") or ""
             ),
             "goal_context": mission_context,
-            "lifecycle_transaction_id": int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
-                or 0
-            ),
+            "lifecycle_transaction_id": lifecycle_id,
             "reason": str(reason or "target_terminal_observation"),
         }
         self.pub_goal_command.publish(
@@ -310,6 +381,8 @@ class GoalManagerGoalOutputMixin:
             and not frontier_context_changed
         ):
             return False
+        if not self._canonical_goal_identity_ready(self.goal_source):
+            return False
         self.last_goal = goal
         self.last_goal_source = self.goal_source
         self._consume_target_terminal_observation_handoff()
@@ -323,16 +396,7 @@ class GoalManagerGoalOutputMixin:
             self.target_execution_state = "TARGET_EXECUTING"
         if self.goal_source == "global_slam_frontier":
             self.frontier_goal_sent_at = rospy.Time.now().to_sec()
-        lifecycle = getattr(self, "lifecycle_manager", None)
-        preserve_external_route = bool(
-            lifecycle is not None
-            and getattr(self, "_lifecycle_event_transaction_id", None)
-            and self.goal_source == "global_slam_frontier"
-            and getattr(self, "_lifecycle_event_transaction_id", None)
-            == lifecycle.current_transaction_id
-        )
-        if lifecycle is not None and not preserve_external_route:
-            lifecycle.begin_transaction(State.DISPATCHED)
+        lifecycle_id = self._canonical_lifecycle_transaction_id()
         # Publish the mission decision before the pose.  The bridge can then
         # classify the following PoseStamped before it considers dispatching an
         # action, avoiding a race between a target takeover and a frontier
@@ -349,14 +413,11 @@ class GoalManagerGoalOutputMixin:
         intent = {
             "source": self.goal_source,
             "priority": self.goal_intent_priority(self.goal_source),
-            "lifecycle_transaction_id": int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
-                or 0
-            ),
+            # GoalManager owns ``transaction_id`` below.  Keep the graph
+            # planner's identity separate so a mission update cannot make a
+            # stale graph route appear current.
+            "graph_transaction_id": 0,
+            "lifecycle_transaction_id": lifecycle_id,
             # These fields identify the long-lived semantic mission.  The
             # PoseStamped below remains only the short-lived executable point.
             "task_id": str(getattr(self, "current_task_id", "")),
@@ -394,12 +455,25 @@ class GoalManagerGoalOutputMixin:
             intent["graph_obligation_kind"] = str(
                 getattr(self, "global_frontier_graph_obligation_kind", "") or ""
             )
+            intent["graph_transaction_id"] = int(
+                getattr(self, "global_frontier_graph_transaction_id", 0) or 0
+            )
         if self.goal_source.startswith("target_"):
             intent["target_epoch"] = int(self.target_observation_epoch)
             intent["route_kind"] = "direct_goal"
             intent["mission_route_kind"] = "direct_goal"
-            intent["map_epoch"] = max(
-                1, int(getattr(self, "navigation_map_epoch", 1) or 1)
+            # A target segment inherits the current Global Frontier route
+            # identity. GoalManager does not create a parallel route namespace.
+            intent["route_id"] = int(
+                getattr(self, "global_frontier_route_id", 0) or 0
+            )
+            intent["graph_transaction_id"] = int(
+                getattr(self, "global_frontier_graph_transaction_id", 0) or 0
+            )
+            intent["map_epoch"] = (
+                self._canonical_map_epoch()
+                if getattr(self, "global_frontier_enabled", False)
+                else max(1, int(getattr(self, "navigation_map_epoch", 1) or 1))
             )
             intent["target_approach_epoch"] = int(
                 getattr(
@@ -437,14 +511,7 @@ class GoalManagerGoalOutputMixin:
                 1.0 - 2.0 * (q.y * q.y + q.z * q.z),
             ), 4),
             "stamp": rospy.Time.now().to_sec(),
-            "lifecycle_transaction_id": int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
-                or 0
-            ),
+            "lifecycle_transaction_id": lifecycle_id,
         })
         self.pub_goal_command.publish(String(data=json.dumps(command, sort_keys=True)))
         self.pub_goal_intent.publish(String(data=json.dumps(intent, sort_keys=True)))

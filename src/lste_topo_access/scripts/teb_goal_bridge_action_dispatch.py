@@ -22,6 +22,20 @@ class TebGoalBridgeActionDispatchMixin(
         """Dispatch the latest intent after common lifecycle admission checks."""
         if self.latest_goal is None or not self._is_active_mode():
             return
+        # Prepare has revoked the old action generation and requested a
+        # controller release. Until Global Frontier's exact ACK arrives, a
+        # timer wake must not resurrect the same semantic route as a new
+        # MoveBase action.
+        pending_prepare = getattr(self, "pending_terminal_prepare", None)
+        if isinstance(pending_prepare, dict):
+            rospy.loginfo_throttle(
+                2.0,
+                "TEB goal bridge holds dispatch during terminal release "
+                "route_id=%s reason=%s",
+                pending_prepare.get("old_contract", {}).get("route_id", 0),
+                reason,
+            )
+            return
         if (
             not force
             and self.frontier_portal_wait

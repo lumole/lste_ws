@@ -18,6 +18,19 @@ from collections import deque
 
 FAILURE_SCHEMA_VERSION = 1
 _CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
+_TEB_FEEDBACK_BOUNDARY_REASONS = frozenset(
+    {
+        "new_action_dispatch",
+        "route_owner_changed",
+        "persistent_endpoint_terminal",
+        "execution_terminal",
+        "controller_lease_released",
+        "action_lease_cleared",
+        "bridge_inactive",
+        "hard_reset",
+        "task_done",
+    }
+)
 
 
 def _as_float(value, default=None):
@@ -142,12 +155,16 @@ def _controller_output_gap(sample, goal_tolerance):
 
     TEB can publish a valid band with a tiny negative linear sample while it
     is close to an obstacle.  The mux intentionally removes that reverse
-    component on the production base.  When the base is still outside TEB's
-    XY success envelope, this is an execution gap rather than a successful
-    terminal turn.  The predicate is intentionally tied to the explicit mux
-    filter reason, not to a guessed velocity threshold.
+    component on the production base.  A non-zero angular output is still an
+    effective actuator command: the base may be deliberately reorienting before
+    TEB resumes forward motion.  Only classify this as an execution gap when
+    the mux has removed the reverse component and has also left no meaningful
+    angular command.  The predicate is intentionally tied to the explicit mux
+    filter reason and the command contract, not to a guessed timer.
     """
     if not isinstance(sample, dict):
+        return False
+    if sample.get("teb_feedback_valid") is False:
         return False
     mux = sample.get("cmd_vel_mux")
     mux = mux if isinstance(mux, dict) else {}
@@ -164,6 +181,13 @@ def _controller_output_gap(sample, goal_tolerance):
     if planner[0] >= -0.002 or selected[0] > 0.02:
         return False
     if abs(output[0]) > 0.02:
+        return False
+    # The forward-only clamp removes only linear reverse motion.  If the mux
+    # still forwards TEB's meaningful angular command, the robot is executing
+    # a bounded route reorientation rather than receiving no controller output.
+    # Keep this threshold aligned with the existing telemetry definition of a
+    # native TEB reorientation in navigation_metrics_command_events.py.
+    if abs(output[1]) >= 0.10 and abs(selected[1]) >= 0.10:
         return False
     turn = sample.get("teb_turn_supervisor")
     turn = turn if isinstance(turn, dict) else {}
@@ -216,6 +240,8 @@ _ROUTE_ID_KEYS = ("route_id", "active_route_id", "released_route_id")
 _ROUTE_FIELD_KEYS = (
     "route_id", "active_route_id", "released_route_id", "route_kind",
     "active_route_kind", "released_route_kind", "mission_route_kind",
+    "graph_transaction_id", "active_graph_transaction_id",
+    "latest_graph_transaction_id",
     "goal", "command_goal", "mission_goal", "distance", "elapsed",
     "path_distance", "best_path_distance", "best_goal_distance",
     "last_progress_signal", "odom_detour_distance", "odom_novel_cells",
@@ -311,6 +337,7 @@ _GRAPH_ROUTE_FIELDS = (
     "obligation_kind", "portal_path", "first_portal_id", "portal_probe_phase",
     "reason", "status", "source_place_id", "destination_place_id",
     "place_id", "work_item_id", "route_id", "route_kind",
+    "graph_transaction_id",
 )
 
 
@@ -384,6 +411,8 @@ _FAILURE_DETAIL_SCALARS = frozenset(
         "failure_reason", "route_invalidation_reason", "route_id",
         "active_route_id", "released_route_id", "route_kind",
         "active_route_kind", "released_route_kind", "mission_route_kind",
+        "graph_transaction_id", "active_graph_transaction_id",
+        "latest_graph_transaction_id",
         "goal", "goal_frame", "command_goal", "mission_goal", "distance", "elapsed",
         "path_distance", "best_path_distance", "best_goal_distance",
         "last_progress_signal", "odom_detour_distance", "odom_novel_cells",
@@ -446,7 +475,9 @@ def _compact_failure_details(value):
                 {"graph_route_action_transaction": item}
             )
             if isinstance(item, dict):
-                for field in ("transaction_id", "phase", "map_epoch"):
+                for field in (
+                    "transaction_id", "graph_transaction_id", "phase", "map_epoch"
+                ):
                     if item.get(field) is not None:
                         compact[field] = _json_safe(item[field])
         elif key == "event_graph":
@@ -505,7 +536,8 @@ def _compact_failure_details(value):
             }
         elif key == "released_controller_route":
             fields = (
-                "route_id", "route_kind", "controller_pending",
+                "route_id", "route_kind", "graph_transaction_id",
+                "controller_pending",
                 "terminal_received",
             )
             compact = {
@@ -602,6 +634,27 @@ def _explicit_route_failure(trigger, details):
     """Map a route-level terminal reason to its owning layer."""
     trigger = str(trigger or "").strip().lower()
     details = details if isinstance(details, dict) else {}
+    if trigger == "no_active_controller_route":
+        return (
+            "no_active_controller_route",
+            "goal_manager/teb_goal_bridge",
+            "high",
+            "the experiment boundary has no executable controller route",
+        )
+    if trigger == "handoff_timeout":
+        return (
+            "handoff_timeout",
+            "teb_goal_bridge/global_frontier",
+            "high",
+            "the route handoff lease expired before a matching successor was acknowledged",
+        )
+    if trigger == "controller_stall":
+        return (
+            "controller_stall",
+            "teb_goal_bridge/cmd_vel_mux",
+            "high",
+            "the active route remained executable but produced no effective motion",
+        )
     if trigger == "controller_output_gap":
         return "controller_output_gap", "teb_planner/cmd_vel_mux", "high", (
             "TEB selected a reverse-only terminal sample and the forward-only "
@@ -717,7 +770,10 @@ def diagnose_failure_sample(sample, details=None):
         or details.get("event"),
         details,
     )
-    if explicit_failure is not None and not terminal_wait:
+    if explicit_failure is not None and (
+        not terminal_wait
+        or explicit_failure[0] in {"handoff_timeout", "no_active_controller_route"}
+    ):
         cause, layer, confidence, explanation = explicit_failure
     elif terminal_wait:
         cause = "planner_materialization_stall"
@@ -727,6 +783,7 @@ def diagnose_failure_sample(sample, details=None):
     elif (
         selected[0] > 0.05
         and planner[0] <= 0.05
+        and sample.get("teb_feedback_valid", True)
         and sample.get("teb_status") == "trajectory_valid"
     ):
         cause = "stale_teb_feedback"
@@ -977,6 +1034,28 @@ _FRONTIER_RECOVERY_EVENTS = frozenset(
         "move_base_recovery",
         "graph_recovery_requested",
         "controller_lease_released",
+    )
+)
+# A materialization watchdog can fire while the executive is between two
+# controller leases.  Keep this class recoverable until the post window proves
+# that no successor route was installed.  Explicit terminal failures and hard
+# reset boundaries are never eligible for this recovery path.
+_RECOVERABLE_MATERIALIZATION_TRIGGERS = frozenset(
+    (
+        "frontier_route_stall",
+        "planner_materialization_stall",
+        "zero_velocity_stall",
+    )
+)
+_RECOVERY_ROUTE_EVENTS = frozenset(
+    (
+        "route_command",
+        "frontier_action_selected",
+        "graph_route_edge_materialized",
+        "dispatch",
+        "persistent_mission_path_adopted",
+        "active",
+        "lifecycle_transition",
     )
 )
 _FRONTIER_UNAVAILABLE_REASON_ALIASES = {
@@ -1337,7 +1416,7 @@ class NavigationMetricsFailureEvidenceMixin:
             2.0, self._failure_float_param("failure_evidence_pre_window", 12.0)
         )
         self.failure_post_window = max(
-            1.0, self._failure_float_param("failure_evidence_post_window", 5.0)
+            1.0, self._failure_float_param("failure_evidence_post_window", 12.0)
         )
         self.failure_zero_velocity_limit = max(
             1.0, self._failure_float_param("failure_evidence_zero_velocity_seconds", 5.0)
@@ -1407,6 +1486,451 @@ class NavigationMetricsFailureEvidenceMixin:
         # the append-only evidence log.  The artifact makes one failure
         # inspectable without parsing a potentially very large JSON log line.
         self.failure_artifact_paths = deque(maxlen=64)
+        # Warm slices use the same metrics process.  Keep the reset identity
+        # so a repeated latched/request retry cannot close and clear the same
+        # evidence twice.
+        self.failure_last_reset_id = ""
+        self.failure_reset_count = 0
+        self.failure_last_boundary = None
+
+    def _failure_boundary_has_route_expectation_locked(self, sample):
+        """Return whether a route was actually requested before this boundary.
+
+        An idle startup and a temporary graph/candidate wait both legitimately
+        have no controller route.  A boundary may only promote
+        ``no_active_controller_route`` after a positive route/goal identity or
+        a producer event proves that dispatch was expected.
+        """
+        sample = sample if isinstance(sample, dict) else {}
+        if bool(sample.get("bridge_active")):
+            return True
+
+        route = _sample_route(sample)
+        released = route.get("released_controller_route")
+        released = released if isinstance(released, dict) else {}
+        if (
+            _positive_route_id(released) is not None
+            and not bool(released.get("terminal_received"))
+        ):
+            return True
+
+        expected_events = {
+            "route_command", "frontier_action_selected",
+            "graph_route_edge_materialized", "dispatch", "active",
+            "handoff_requested", "mission_goal", "target_route_accepted",
+            "target_segment_committed", "target_route_held",
+        }
+        normal_terminal_events = {
+            "succeeded", "terminal_prefetch_promoted",
+            "persistent_execution_terminal", "persistent_frontier_endpoint_terminal",
+            "endpoint_action_terminal", "target_approach_terminal",
+        }
+        failure_terminal_events = {
+            "execution_terminal_failure", "frontier_route_failed",
+            "portal_hypothesis_failed", "portal_execution_failure_observed",
+            "route_invalidated_stall", "route_invalidated_timeout",
+            "route_invalidated_controller_failure",
+        }
+        expected = False
+        for item in list(getattr(self, "failure_event_history", ()))[-64:]:
+            if not isinstance(item, dict):
+                continue
+            payload = item.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            event = str(item.get("event", "")).strip().lower()
+            if event in normal_terminal_events or event in failure_terminal_events:
+                expected = False
+                continue
+            if event == "terminal":
+                status = payload.get("status", payload.get("result_status"))
+                try:
+                    status = int(status)
+                except (TypeError, ValueError):
+                    status = None
+                if status in (3, 4, 5, 8, 9):
+                    expected = False
+                    continue
+            if event == "route_invalidated":
+                reason = str(payload.get("reason", "")).strip().lower()
+                if reason in {
+                    "frontier_observed_at_standoff", "completed", "succeeded",
+                    "goal_reached", "observation_complete",
+                }:
+                    expected = False
+                    continue
+            if event not in expected_events:
+                continue
+            route_payload = _nested_route_fields(payload)
+            has_route_id = _positive_route_id(route_payload) is not None
+            has_goal_transaction = any(
+                (_as_float(payload.get(key), 0.0) or 0.0) > 0.0
+                for key in (
+                    "transaction_id", "goal_transaction_id",
+                    "active_goal_transaction_id", "latest_goal_transaction_id",
+                )
+            )
+            if has_route_id or has_goal_transaction:
+                expected = True
+        return expected
+
+    def _failure_boundary_has_sustained_stall_locked(self):
+        """Require watchdog-duration evidence before closing a stall at reset."""
+        now = time.monotonic()
+        checks = (
+            ("failure_zero_start_wall", "failure_zero_velocity_limit"),
+            ("failure_no_progress_start_wall", "failure_no_progress_limit"),
+        )
+        for start_name, limit_name in checks:
+            started = getattr(self, start_name, None)
+            if started is None:
+                continue
+            try:
+                limit = float(getattr(self, limit_name))
+                if limit > 0.0 and now - float(started) >= limit:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        for item in reversed(list(getattr(self, "failure_event_history", ()))[-32:]):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("event", "")).strip().lower() in {
+                "controller_stall", "zero_velocity_stall", "no_progress_stall",
+                "route_invalidated_stall", "route_invalidated_timeout",
+                "route_invalidated_controller_failure",
+            }:
+                return True
+        return False
+
+    def _failure_boundary_trigger_locked(self, sample, boundary):
+        """Choose a terminal failure only from explicit boundary evidence.
+
+        A planning wait is not a failure while the run is alive.  At a
+        declared slice/trial boundary, however, an unresolved controller
+        lease must be classified if the retained evidence proves it lasted
+        past the route handoff watchdog.  This keeps ordinary candidate
+        misses out of the failure stream while eliminating ambiguous timeout
+        records.
+        """
+        sample = sample if isinstance(sample, dict) else {}
+        boundary = boundary if isinstance(boundary, dict) else {}
+        if bool(sample.get("task_done")):
+            return None
+        forced_trigger = str(
+            boundary.get("failure_trigger", "") or ""
+        ).strip().lower()
+        if bool(boundary.get("force_failure")) and forced_trigger in {
+            "no_active_controller_route",
+        }:
+            # The runner's trial-end diagnostic is read from a bounded log
+            # tail and can lag the live ROS callbacks.  The metrics sample
+            # captured while handling the reset is authoritative; never close
+            # a no-route episode when that sample still owns a live route.
+            current_route = _sample_route(sample)
+            if bool(sample.get("bridge_active")) or (
+                _positive_route_id(current_route) is not None
+            ):
+                self._write(
+                    "INFO",
+                    "failure_boundary_trigger_suppressed",
+                    reason="live_controller_route_present",
+                    requested_trigger=forced_trigger,
+                    route_id=_positive_route_id(current_route),
+                )
+                return None
+            forced_details = boundary.get("failure_details", {})
+            forced_details = (
+                dict(forced_details)
+                if isinstance(forced_details, dict)
+                else {}
+            )
+            forced_details.setdefault("event", "trial_boundary")
+            forced_details.setdefault("reason", forced_trigger)
+            forced_details["boundary"] = boundary
+            return forced_trigger, forced_details
+        # A warm reset is an intentional ownership boundary. Its topic may be
+        # delivered to metrics after bridge/frontier have already published
+        # reset acknowledgements and replayed latched route state, so those
+        # post-reset observations cannot prove a new no-route failure.
+        if str(boundary.get("event", "")).strip().lower() == "hard_reset_boundary":
+            return None
+
+        route = _sample_route(sample)
+        released = route.get("released_controller_route")
+        released = released if isinstance(released, dict) else {}
+        recent = list(getattr(self, "failure_event_history", ()))
+        handoff_timeout = False
+        handoff_evidence = []
+        for item in reversed(recent[-32:]):
+            if not isinstance(item, dict):
+                continue
+            event = str(item.get("event", "")).strip().lower()
+            payload = item.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            if event in {
+                "route_lease_watchdog_expired",
+                "handoff_timeout",
+            }:
+                handoff_timeout = True
+                handoff_evidence.append(event)
+                break
+            if event in {
+                "handoff_requested",
+                "frontier_continuous_prefetch_handoff_requested",
+                "frontier_continuous_prefetch_handoff_fallback",
+            }:
+                for key in ("waited_seconds", "handoff_wait_seconds", "duration_seconds"):
+                    try:
+                        if float(payload.get(key, 0.0) or 0.0) >= 10.0:
+                            handoff_timeout = True
+                            handoff_evidence.append(
+                                "%s:%s" % (event, key)
+                            )
+                            break
+                    except (TypeError, ValueError):
+                        continue
+                if handoff_timeout:
+                    break
+
+        if (
+            bool(released.get("controller_pending"))
+            and bool(released.get("terminal_received"))
+            and handoff_timeout
+        ):
+            return "handoff_timeout", {
+                "boundary": boundary,
+                "handoff_evidence": handoff_evidence,
+                "released_controller_route": released,
+            }
+        if handoff_timeout:
+            return "handoff_timeout", {
+                "boundary": boundary,
+                "handoff_evidence": handoff_evidence,
+                "route": route,
+            }
+
+        command = _command_pair(sample.get("cmd_vel"))
+        zero_command = abs(command[0]) <= 0.05 and abs(command[1]) <= 0.03
+        forward_clearance = _as_float(
+            (sample.get("scan") or {}).get("forward_min")
+            if isinstance(sample.get("scan"), dict) else None
+        )
+        obstacle_limit = _as_float(
+            sample.get("obstacle_clearance_threshold"), 0.0
+        ) or 0.0
+        distance = _as_float(sample.get("distance_to_goal"))
+        active_route = bool(sample.get("bridge_active"))
+        if (
+            active_route
+            and zero_command
+            and forward_clearance is not None
+            and (obstacle_limit <= 0.0 or forward_clearance > obstacle_limit)
+            and (distance is None or distance > 0.80)
+            and self._failure_boundary_has_sustained_stall_locked()
+        ):
+            return "controller_stall", {
+                "boundary": boundary,
+                "duration_seconds": max(
+                    float(getattr(self, "failure_zero_velocity_limit", 0.0)),
+                    float(getattr(self, "failure_no_progress_limit", 0.0)),
+                ),
+                "route": route,
+            }
+
+        # A successful action can intentionally leave the bridge inactive for
+        # a short successor-selection boundary.  Do not call that a failure
+        # unless the retained context also shows that the controller lease
+        # was still pending.
+        status = str(sample.get("move_base_status", "")).strip().upper()
+        if status == "SUCCEEDED" and any(
+            str(item.get("event", "")).strip().lower()
+            in {"terminal", "endpoint_action_terminal", "persistent_execution_terminal"}
+            for item in recent[-16:]
+            if isinstance(item, dict)
+        ):
+            return None
+        if (
+            not active_route
+            and self._failure_boundary_has_route_expectation_locked(sample)
+        ):
+            return "no_active_controller_route", {
+                "boundary": boundary,
+                "route": route,
+                "last_bridge_event": getattr(self, "bridge_last_event", ""),
+                "last_goal_source": getattr(self, "goal_source", ""),
+            }
+        return None
+
+    def _close_boundary_failure_locked(self, boundary, sample=None, force=True):
+        """Promote one explicit trial/slice boundary into a closed episode."""
+        boundary = boundary if isinstance(boundary, dict) else {}
+        if sample is None:
+            sample = self._failure_append_sample_locked(time.monotonic())
+        selected = self._failure_boundary_trigger_locked(sample, boundary)
+        self.failure_last_boundary = _json_safe(boundary)
+        self._write(
+            "INFO",
+            "failure_boundary_observed",
+            boundary=_json_safe(boundary),
+            selected_trigger=None if selected is None else selected[0],
+        )
+        if selected is not None and self.active_failure is None:
+            trigger, details = selected
+            details = dict(details)
+            details["boundary_reason"] = str(
+                boundary.get("reason") or boundary.get("event") or "boundary"
+            )
+            self._begin_failure_episode_locked(
+                trigger,
+                "experiment_boundary",
+                details,
+                sample,
+            )
+        if self.active_failure is None:
+            return None
+        return self._finish_failure_episode_locked(
+            "boundary:%s" % str(
+                boundary.get("reason") or boundary.get("event") or "closed"
+            ),
+            force=bool(force),
+        )
+
+    def on_experiment_boundary(self, message):
+        """Close the current trial before the launcher tears down ROS."""
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        event = str(payload.get("event", "trial_boundary") or "").strip().lower()
+        if event not in {"trial_boundary", "experiment_boundary"}:
+            return
+        with self.lock:
+            now = time.monotonic()
+            self._failure_record_context_locked("experiment", event, payload)
+            self._close_boundary_failure_locked(
+                payload,
+                sample=self._failure_append_sample_locked(now),
+                force=True,
+            )
+
+    def on_hard_reset(self, message):
+        """Close the slice and discard context before a warm reset is applied."""
+        try:
+            from experiment_reset_contract import decode_reset_request
+            request = decode_reset_request(message)
+        except (ImportError, TypeError, ValueError, json.JSONDecodeError):
+            request = None
+        if request is None:
+            return
+        reset_id = str(request.get("reset_id", "") or "").strip()
+        if not reset_id:
+            return
+        with self.lock:
+            if reset_id == self.failure_last_reset_id:
+                return
+            had_active_action = bool(
+                getattr(self, "bridge_active", False)
+                or str(getattr(self, "last_move_base_status", "")).upper()
+                in {"ACTIVE", "PENDING", "PREEMPTING"}
+            )
+            now = time.monotonic()
+            boundary = dict(request)
+            boundary["event"] = "hard_reset_boundary"
+            self._failure_record_context_locked(
+                "experiment", "hard_reset_boundary", boundary
+            )
+            self._close_boundary_failure_locked(
+                boundary,
+                sample=self._failure_append_sample_locked(now),
+                force=True,
+            )
+            self.failure_last_reset_id = reset_id
+            self.failure_reset_count += 1
+            self._write(
+                "INFO",
+                "metrics_hard_reset",
+                reset_id=reset_id,
+                reset_transaction_id=int(request.get("transaction_id", 0) or 0),
+                slice_id=str(request.get("slice_id", "") or ""),
+                reason=str(request.get("reason", "slice_boundary")),
+                failure_reset_count=int(self.failure_reset_count),
+            )
+            self._reset_failure_context_locked()
+            arm_reset = getattr(
+                self, "_arm_hard_reset_preemption_locked", None
+            )
+            if callable(arm_reset):
+                arm_reset(had_active_action)
+
+    def _reset_failure_context_locked(self):
+        """Clear slice-local observer context while retaining run history."""
+        self.failure_evidence_ring.clear()
+        self.failure_event_history.clear()
+        self.failure_frontier_unavailable_since_wall = None
+        self.failure_frontier_unavailable_count = 0
+        self.failure_frontier_unavailable_key = None
+        self.failure_frontier_unavailable_latch = None
+        self.failure_frontier_unavailable_latest_reason = None
+        self.failure_last_positive_route = None
+        self.failure_zero_start_wall = None
+        self.failure_zero_triggered = False
+        self.failure_no_progress_start_wall = None
+        self.failure_no_progress_triggered = False
+        self.failure_controller_gap_start_wall = None
+        self.failure_controller_gap_triggered = False
+        self.failure_last_pose_xy = None
+        self.failure_last_pose_wall = None
+        self.last_bridge_context = None
+        self.last_frontier_context = None
+        self.last_goal_context = None
+        self.last_action_context = None
+        self.active_failure = None
+        self.last_failure_evidence_wall = 0.0
+        self.goal = None
+        self.goal_message = None
+        self.goal_source = "unknown"
+        self.goal_transaction_id = 0
+        self.bridge_active = False
+        self.bridge_last_event = "hard_reset"
+        self.task_done = False
+        self.navigation_hold = False
+        self.last_move_base_status = "UNKNOWN"
+        self.teb_status = "not_available"
+        self.move_base_feedback_state = None
+        self.teb_feedback_state = None
+        self.teb_feedback_wall = None
+        self.teb_feedback_valid = False
+        self.teb_feedback_invalid_reason = "hard_reset"
+        self.teb_feedback_requires_fresh_planner_command = True
+        self.teb_feedback_identity = None
+        self.teb_feedback_owner_identity = None
+        self.planner_contract_identity = None
+        self.planner_contract_state = None
+        self.planner_contract_validation = "hard_reset"
+        self.planner_contract_reason = "hard_reset"
+        self.planner_contract_sequence_by_producer = {}
+        self.pending_planner_contract = None
+        self.terminal_contract_identity = None
+        self.terminal_contract_validation = "hard_reset"
+        self.pending_terminal_contracts.clear()
+        self.bridge_dispatch_contracts.clear()
+        self.bridge_latest_dispatch_contract = None
+        self.bridge_active_contract = None
+        self.recovery_state = None
+        self.navfn_plan_stats = None
+        self.global_planner_plan_stats = None
+        self.teb_global_plan_stats = None
+        self.teb_local_plan_stats = None
+        for name in ("command", "teb_command", "teb_planner_command"):
+            command = getattr(self, name, None)
+            if command is None:
+                continue
+            try:
+                command.linear.x = 0.0
+                command.angular.z = 0.0
+            except AttributeError:
+                pass
 
     def on_teb_goal_failure(self, message):
         """Correlate the bridge's semantic target-route failure immediately."""
@@ -1619,6 +2143,7 @@ class NavigationMetricsFailureEvidenceMixin:
             "generation",
             "route_generation",
             "action_generation",
+            "graph_transaction_id",
         ):
             if payload.get(key) is not None:
                 return cls._failure_identity_value(payload.get(key))
@@ -1634,6 +2159,7 @@ class NavigationMetricsFailureEvidenceMixin:
                 "generation",
                 "route_generation",
                 "action_generation",
+                "graph_transaction_id",
             ):
                 if nested.get(key) is not None:
                     return cls._failure_identity_value(nested.get(key))
@@ -1956,9 +2482,12 @@ class NavigationMetricsFailureEvidenceMixin:
                 "portal_path", "first_portal_id", "target_place_id",
                 "released_controller_route", "controller_pending", "terminal_received",
                 "active_goal_transaction_id", "latest_goal_transaction_id",
+                "active_graph_transaction_id", "latest_graph_transaction_id",
                 "active_intent_priority", "latest_intent_priority",
                 "active_intent_source", "latest_intent_source",
-                "transaction_id", "goal_frame", "frame_id", "source",
+                "transaction_id", "graph_transaction_id",
+                "active_graph_transaction_id", "latest_graph_transaction_id",
+                "goal_frame", "frame_id", "source",
                 "status", "status_name", "failure_count",
                 "target_transaction_id",
                 "navfn_path_remaining", "navfn_path_endpoint", "navfn_plan_topic",
@@ -2062,7 +2591,9 @@ class NavigationMetricsFailureEvidenceMixin:
                 "route_id", "active_route_id", "route_kind", "active_route_kind",
                 "mission_route_kind", "place_id", "source_place_id",
                 "destination_place_id", "work_item_id", "attempt_id",
-                "transaction_id", "target_epoch", "target_track_id",
+                "transaction_id", "graph_transaction_id",
+                "active_graph_transaction_id", "latest_graph_transaction_id",
+                "target_epoch", "target_track_id",
                 "reason", "goal", "distance", "elapsed", "path_distance",
                 "best_path_distance", "best_goal_distance", "odom_detour_distance",
                 "odom_novel_cells", "generation", "proposal_generation",
@@ -2108,7 +2639,8 @@ class NavigationMetricsFailureEvidenceMixin:
             released_route = payload.get("released_controller_route")
             if isinstance(released_route, dict):
                 for key in (
-                    "route_id", "route_kind", "terminal_received",
+                    "route_id", "route_kind", "graph_transaction_id",
+                    "terminal_received",
                     "controller_pending",
                 ):
                     if released_route.get(key) is None:
@@ -2371,7 +2903,8 @@ class NavigationMetricsFailureEvidenceMixin:
                 age("last_navfn_plan_wall"),
             ),
             "teb_feedback": (
-                isinstance(sample.get("teb_feedback"), dict),
+                isinstance(sample.get("teb_feedback"), dict)
+                and bool(sample.get("teb_feedback_valid", True)),
                 "teb_feedback_topic",
                 age("teb_feedback_wall"),
             ),
@@ -2483,6 +3016,49 @@ class NavigationMetricsFailureEvidenceMixin:
             "teb_global_plan": _json_safe(getattr(self, "teb_global_plan_stats", None)),
             "teb_local_plan": _json_safe(getattr(self, "teb_local_plan_stats", None)),
             "teb_feedback": _json_safe(selected_feedback),
+            "teb_feedback_valid": bool(
+                getattr(self, "teb_feedback_valid", False)
+            ),
+            "teb_feedback_invalid_reason": str(
+                getattr(self, "teb_feedback_invalid_reason", "no_feedback")
+                or "no_feedback"
+            ),
+            "teb_feedback_requires_fresh_planner_command": bool(
+                getattr(
+                    self,
+                    "teb_feedback_requires_fresh_planner_command",
+                    True,
+                )
+            ),
+            "teb_feedback_identity": _json_safe(
+                getattr(self, "teb_feedback_identity", None)
+            ),
+            "teb_feedback_invalidation_count": int(
+                getattr(self, "teb_feedback_invalidation_count", 0) or 0
+            ),
+            "planner_command_contract": _json_safe({
+                "identity": getattr(self, "planner_contract_identity", None),
+                "state": getattr(self, "planner_contract_state", None),
+                "validation": getattr(
+                    self, "planner_contract_validation", "unobserved"
+                ),
+                "reason": getattr(self, "planner_contract_reason", "startup"),
+                "pending": bool(
+                    getattr(self, "pending_planner_contract", None) is not None
+                ),
+            }),
+            "frontier_execution_terminal_contract": _json_safe({
+                "identity": getattr(self, "terminal_contract_identity", None),
+                "validation": getattr(
+                    self, "terminal_contract_validation", "unobserved"
+                ),
+                "count": int(
+                    getattr(self, "terminal_contract_count", 0) or 0
+                ),
+                "pending": len(
+                    getattr(self, "pending_terminal_contracts", ())
+                ),
+            }),
             "teb_turn_supervisor": _json_safe(
                 getattr(self, "teb_turn_supervisor_status", None)
             ),
@@ -2740,7 +3316,20 @@ class NavigationMetricsFailureEvidenceMixin:
                 and sample["scan"]["forward_min"]
                 > float(sample["obstacle_clearance_threshold"] or 0.0)
             )
-            if active_route and zero_command and goal_far and clear_path:
+            feedback_boundary = (
+                not bool(sample.get("teb_feedback_valid", True))
+                and str(
+                    sample.get("teb_feedback_invalid_reason", "") or ""
+                ).strip().lower()
+                in _TEB_FEEDBACK_BOUNDARY_REASONS
+            )
+            if (
+                active_route
+                and zero_command
+                and goal_far
+                and clear_path
+                and not feedback_boundary
+            ):
                 if self.failure_zero_start_wall is None:
                     self.failure_zero_start_wall = now
                 zero_seconds = now - self.failure_zero_start_wall
@@ -2885,6 +3474,7 @@ class NavigationMetricsFailureEvidenceMixin:
                 sample.get("bridge_active")
                 and str(sample.get("move_base_status", "")).upper()
                 in {"ACTIVE", "PENDING", "PREEMPTING"}
+                and bool(sample.get("teb_feedback_valid", True))
                 and str(sample.get("teb_status", "")) == "trajectory_valid"
                 and (
                     controller_linear > 0.08
@@ -3177,6 +3767,157 @@ class NavigationMetricsFailureEvidenceMixin:
         )
         return failure_id
 
+    def _failure_recovery_from_post_window_locked(self, active, final_sample):
+        """Return successor-route evidence for a recoverable materialization wait.
+
+        ``frontier_route_stall`` and endpoint zero-velocity stalls can be
+        promoted while the executive is between two controller leases.  That
+        condition is not a terminal navigation failure when the executive
+        installs and activates a successor route during the evidence window.
+        The successor may itself reach its endpoint before the window closes,
+        so inspect the bounded ring for a healthy successor sample instead of
+        requiring the final sample to still own that route.
+        """
+        if not isinstance(active, dict) or not isinstance(final_sample, dict):
+            return None
+        trigger = str(active.get("trigger", "") or "").strip().lower()
+        if trigger not in _RECOVERABLE_MATERIALIZATION_TRIGGERS:
+            return None
+
+        causal_route = active.get("causal_route")
+        causal_route = causal_route if isinstance(causal_route, dict) else {}
+        failed_route_id = _positive_route_id(causal_route)
+        failed_graph_transaction = _as_float(
+            causal_route.get("graph_transaction_id")
+            or causal_route.get("active_graph_transaction_id")
+            or causal_route.get("latest_graph_transaction_id")
+        )
+        started_elapsed = _as_float(
+            active.get("started_wall_elapsed_seconds"), 0.0
+        )
+        recovery_event = None
+        for context in reversed(
+            list(getattr(self, "failure_event_history", ()))
+        ):
+            if not isinstance(context, dict):
+                continue
+            event = str(context.get("event", "") or "").strip().lower()
+            if event not in _RECOVERY_ROUTE_EVENTS:
+                continue
+            event_elapsed = _as_float(context.get("wall_elapsed_seconds"))
+            if event_elapsed is None or event_elapsed <= started_elapsed:
+                continue
+            payload = context.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            route = _nested_route_fields(payload)
+            route_id = _positive_route_id(route)
+            if route_id is None:
+                continue
+            graph_transaction = _as_float(
+                route.get("graph_transaction_id")
+                or route.get("active_graph_transaction_id")
+                or route.get("latest_graph_transaction_id")
+            )
+            identity_changed = (
+                failed_route_id is None
+                or route_id != failed_route_id
+                or (
+                    graph_transaction is not None
+                    and failed_graph_transaction is not None
+                    and graph_transaction != failed_graph_transaction
+                )
+            )
+            if not identity_changed:
+                continue
+            recovery_event = {
+                "event": event,
+                "event_sequence": context.get("event_sequence"),
+                "route_id": route_id,
+                "route_kind": route.get("route_kind")
+                or route.get("active_route_kind")
+                or route.get("mission_route_kind"),
+                "graph_transaction_id": graph_transaction,
+                "wall_elapsed_seconds": event_elapsed,
+            }
+            break
+        if recovery_event is None:
+            return None
+
+        recovery_sample = None
+        for candidate in reversed(list(self.failure_evidence_ring)):
+            if not isinstance(candidate, dict):
+                continue
+            candidate_elapsed = _as_float(
+                candidate.get("wall_elapsed_seconds")
+            )
+            if candidate_elapsed is None or candidate_elapsed <= started_elapsed:
+                continue
+            candidate_route = _sample_route(candidate)
+            candidate_route_id = _positive_route_id(candidate_route)
+            if candidate_route_id != recovery_event["route_id"]:
+                continue
+            if not bool(candidate.get("bridge_active")):
+                continue
+            if str(candidate.get("move_base_status", "") or "").upper() not in {
+                "ACTIVE", "PENDING", "PREEMPTING"
+            }:
+                continue
+            teb_status = str(
+                candidate.get("teb_status", "") or ""
+            ).strip().lower()
+            command = _command_pair(candidate.get("cmd_vel"))
+            healthy_feedback = teb_status == "trajectory_valid"
+            healthy_command = abs(command[0]) > 0.05 or abs(command[1]) > 0.03
+            if healthy_feedback or healthy_command:
+                recovery_sample = candidate
+                break
+        if recovery_sample is None:
+            return None
+        recovery_route = _sample_route(recovery_sample)
+        recovery_event["recovery_route_id"] = recovery_event["route_id"]
+        recovery_event["recovery_route_kind"] = (
+            recovery_route.get("route_kind")
+            or recovery_route.get("active_route_kind")
+        )
+        recovery_event["recovery_wall_elapsed_seconds"] = _as_float(
+            recovery_sample.get("wall_elapsed_seconds")
+        )
+        recovery_event["recovery_move_base_status"] = recovery_sample.get(
+            "move_base_status"
+        )
+        recovery_event["recovery_teb_status"] = recovery_sample.get(
+            "teb_status"
+        )
+        return recovery_event
+
+    def _discard_recovered_failure_locked(self, recovery, reason):
+        """Close a watchdog candidate as context without publishing a failure.
+
+        The candidate ID remains in the event history for replay, but no
+        ``failure_snapshot_ready`` event or JSON artifact is emitted.  The
+        experiment runner therefore keeps the live runtime when route recovery
+        is proven inside the bounded post window.
+        """
+        active = self.active_failure
+        if not isinstance(active, dict):
+            return None
+        failure_id = str(active.get("failure_id", "") or "")
+        payload = {
+            "failure_id": failure_id,
+            "trigger": active.get("trigger"),
+            "source": active.get("source"),
+            "reason": str(reason),
+            "recovery": _json_safe(recovery),
+        }
+        self._failure_append_episode_marker_locked(
+            "failure_episode_recovered", payload
+        )
+        self._write("INFO", "failure_episode_recovered", **payload)
+        self._write_failure_log("INFO", "failure_episode_recovered", **payload)
+        self._failure_release_frontier_latch_locked("episode_recovered")
+        self.active_failure = None
+        return payload
+
     def _finish_failure_episode_locked(self, reason, force=False):
         if self.active_failure is None:
             return None
@@ -3199,6 +3940,14 @@ class NavigationMetricsFailureEvidenceMixin:
             self.failure_evidence_ring[-1]
             if self.failure_evidence_ring else active["trigger_sample"]
         )
+        if not force:
+            recovery = self._failure_recovery_from_post_window_locked(
+                active, final_sample
+            )
+            if recovery is not None:
+                return self._discard_recovered_failure_locked(
+                    recovery, "successor_route_active"
+                )
         end_classification = classify_failure(
             active["trigger"],
             final_sample,
@@ -3319,4 +4068,9 @@ class NavigationMetricsFailureEvidenceMixin:
                 None if self.failure_log_path is None else str(self.failure_log_path)
             ),
             "failure_artifacts": list(self.failure_artifact_paths),
+            "reset_count": int(getattr(self, "failure_reset_count", 0) or 0),
+            "last_reset_id": getattr(self, "failure_last_reset_id", "") or None,
+            "last_boundary": _json_safe(
+                getattr(self, "failure_last_boundary", None)
+            ),
         }

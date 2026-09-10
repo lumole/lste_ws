@@ -86,6 +86,11 @@ _TOPIC_DEFAULTS = (
         "/move_base/TebLocalPlannerROS/teb_feedback",
     ),
     ("teb_planner_cmd_topic", "~teb_planner_cmd_topic", "/lste/cmd_vel/teb_planner"),
+    (
+        "planner_command_contract_topic",
+        "~planner_command_contract_topic",
+        "/lste/persistent_execution/planner_command_contract",
+    ),
     ("navfn_plan_topic", "~navfn_plan_topic", "/move_base/NavfnROS/plan"),
     (
         "local_costmap_topic",
@@ -149,6 +154,9 @@ def _configure_execution_mode(bridge, gp):
     bridge.active_mode = str(gp("~active_mode", "teb")).strip().lower()
     bridge.mode = str(gp("~initial_mode", "teb")).strip().lower()
     bridge.persistent_execution = bridge._as_bool(gp("~persistent_execution", False))
+    bridge.require_canonical_identity = bridge._as_bool(
+        gp("~require_canonical_identity", bridge.persistent_execution)
+    )
     bridge.allow_in_place_replacement = bridge._as_bool(
         gp("~allow_in_place_replacement", False)
     )

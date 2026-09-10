@@ -54,6 +54,9 @@ class TebGoalBridgeActionClientMixin:
                 or 0
             ),
             "route_id": int(getattr(self, "latest_route_id", 0) or 0),
+            "graph_transaction_id": int(
+                getattr(self, "latest_graph_transaction_id", 0) or 0
+            ),
             "epoch": self._effective_action_epoch_locked(),
             "map_epoch": map_epoch,
             "route_kind": str(
@@ -82,8 +85,18 @@ class TebGoalBridgeActionClientMixin:
         """Cancel once and let the terminal callback authorize the handoff."""
         if not self.action_active or self.handoff_requested:
             return
+        self._commit_termination(
+            "pending_goal_handoff",
+            source_goal=getattr(self, "last_dispatched_goal", None),
+            action_contract=getattr(self, "active_action_contract", None),
+            watchdog_reason="pending_goal_handoff",
+            publish_terminal=False,
+            arm_watchdog=False,
+        )
+        self.pending_terminal_prepare = None
+        self.pending_lease_release_contract = None
         self.handoff_requested = True
-        self.action_client.cancel_goal()
+        self.schedule_terminal_dispatch_locked()
         self.publish_bridge_status(
             "handoff_requested",
             reason=reason,
@@ -119,8 +132,19 @@ class TebGoalBridgeActionClientMixin:
         if callable(cancel_watchdog):
             cancel_watchdog("new_dispatch")
         self._clear_failed_route_lease_locked()
-        self.action_generation += 1
-        generation = self.action_generation
+        pending_generation = int(
+            getattr(self, "pending_dispatch_generation", 0) or 0
+        )
+        if pending_generation > 0:
+            generation = max(
+                pending_generation,
+                int(getattr(self, "action_generation", 0) or 0),
+            )
+            self.action_generation = generation
+            self.pending_dispatch_generation = 0
+        else:
+            self.action_generation += 1
+            generation = self.action_generation
         self.last_dispatched_goal = copy.deepcopy(source_goal)
         self._remember_last_dispatch_identity_locked()
         self.active_portal_source_goal = (
@@ -141,6 +165,9 @@ class TebGoalBridgeActionClientMixin:
         self.active_target_epoch = int(self.latest_target_epoch)
         self.active_route_map_epoch = getattr(
             self, "latest_route_map_epoch", None
+        )
+        self.active_graph_transaction_id = int(
+            getattr(self, "latest_graph_transaction_id", 0) or 0
         )
         self.active_graph_action = str(
             getattr(self, "latest_graph_action", "") or ""
@@ -208,6 +235,9 @@ class TebGoalBridgeActionClientMixin:
                 or 0
             ),
             "route_id": int(self.latest_route_id),
+            "graph_transaction_id": int(
+                getattr(self, "latest_graph_transaction_id", 0) or 0
+            ),
             "epoch": self._effective_action_epoch_locked(),
             "map_epoch": self.active_route_map_epoch,
             "route_kind": str(self.latest_route_kind or ""),
@@ -232,8 +262,24 @@ class TebGoalBridgeActionClientMixin:
             ),
             "goal_context": copy.deepcopy(dict(self.latest_goal_context)),
         })
+        invalidate_feedback = getattr(
+            self, "_invalidate_teb_feedback_locked", None
+        )
+        if callable(invalidate_feedback):
+            invalidate_feedback("new_action_dispatch", clear_planner=True)
         self.dispatch_count += 1
         return generation
+
+    def _reserve_persistent_dispatch_generation_locked(self):
+        """Reserve the generation before the planner receives a mission command."""
+        if self.action_active:
+            return int(self.action_generation)
+        pending = int(getattr(self, "pending_dispatch_generation", 0) or 0)
+        if pending > int(getattr(self, "action_generation", 0) or 0):
+            return pending
+        self.action_generation = int(getattr(self, "action_generation", 0) or 0) + 1
+        self.pending_dispatch_generation = int(self.action_generation)
+        return int(self.action_generation)
 
     def _action_contract_for_generation_locked(self, generation):
         """Return the immutable dispatch contract for one action callback."""
@@ -290,6 +336,9 @@ class TebGoalBridgeActionClientMixin:
                 or 0
             ),
             "route_id": int(self.active_route_id),
+            "graph_transaction_id": int(
+                getattr(self, "active_graph_transaction_id", 0) or 0
+            ),
             "mission_route_kind": self.active_mission_route_kind,
             "source_goal": [
                 round(source_goal.pose.position.x, 3),
@@ -314,6 +363,36 @@ class TebGoalBridgeActionClientMixin:
         }
         dispatch_fields.update(event_fields)
         self.publish_bridge_status("dispatch", **dispatch_fields)
+        predecessor_ack = getattr(self, "pending_successor_release_ack", None)
+        if (
+            isinstance(predecessor_ack, dict)
+            and self.active_intent_source == "global_slam_frontier"
+            and int(self.active_intent_priority) == 0
+            and int(self.active_route_id) > int(predecessor_ack.get("route_id", 0) or 0)
+        ):
+            self.publish_bridge_status(
+                "successor_dispatched",
+                predecessor_route_id=int(predecessor_ack["route_id"]),
+                predecessor_route_kind=str(
+                    predecessor_ack.get("route_kind", "") or ""
+                ),
+                predecessor_lifecycle_transaction_id=int(
+                    predecessor_ack.get("lifecycle_transaction_id", 0) or 0
+                ),
+                predecessor_action_generation=int(
+                    predecessor_ack.get("action_generation", 0) or 0
+                ),
+                predecessor_new_action_generation=int(
+                    predecessor_ack.get("new_action_generation", 0) or 0
+                ),
+                predecessor_graph_transaction_id=int(
+                    predecessor_ack.get("graph_transaction_id", 0) or 0
+                ),
+                predecessor_map_epoch=predecessor_ack.get("map_epoch"),
+                release_ack="exact",
+                **dispatch_fields
+            )
+            self.pending_successor_release_ack = None
         rospy.loginfo(
             "TEB goal bridge %s move_base action: reason=%s frame=%s "
             "target=(%.2f,%.2f) source_frame=%s source=(%.2f,%.2f)",
@@ -331,6 +410,13 @@ class TebGoalBridgeActionClientMixin:
     def on_active(self, generation):
         with self.lock:
             if generation != self.action_generation:
+                self.publish_bridge_status(
+                    "stale_action_callback_ignored",
+                    callback="active",
+                    callback_action_generation=int(generation),
+                    current_action_generation=int(self.action_generation),
+                    reason="generation_mismatch",
+                )
                 return
             self.action_active = True
             self.publish_bridge_status("active")

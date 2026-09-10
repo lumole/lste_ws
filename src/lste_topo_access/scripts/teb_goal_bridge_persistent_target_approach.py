@@ -59,7 +59,16 @@ class TebGoalBridgePersistentTargetApproachMixin:
                 latest_transaction_id=int(self.latest_goal_transaction_id),
             )
             return
-        terminal_goal = self._publish_execution_terminal_locked(self.latest_goal)
+        source_goal = self.latest_goal
+        termination = self._commit_termination(
+            "persistent_target_approach_terminal",
+            source_goal=source_goal,
+            action_contract=getattr(self, "active_action_contract", None),
+            watchdog_reason="persistent_target_approach_terminal",
+        )
+        if not termination.get("committed", False):
+            return
+        terminal_goal = getattr(self, "last_terminal_goal", None) or source_goal
         self.persistent_target_approach_reported_transaction = int(
             self.latest_goal_transaction_id
         )

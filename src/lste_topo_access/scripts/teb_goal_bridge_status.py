@@ -14,6 +14,7 @@ class TebGoalBridgeStatusMixin:
 
     def publish_bridge_status(self, event, **fields):
         now = now_for(self)
+        action_contract = getattr(self, "active_action_contract", None)
         payload = {
             "event": str(event),
             "lifecycle_transaction_id": int(
@@ -40,11 +41,32 @@ class TebGoalBridgeStatusMixin:
             "active_goal_transaction_id": int(
                 getattr(self, "active_goal_transaction_id", 0) or 0
             ),
+            "active_graph_transaction_id": int(
+                getattr(self, "active_graph_transaction_id", 0) or 0
+            ),
+            "latest_graph_transaction_id": int(
+                getattr(self, "latest_graph_transaction_id", 0) or 0
+            ),
             "latest_intent_source": self.latest_intent_source,
             "latest_intent_priority": int(self.latest_intent_priority),
             "require_intent": bool(self.require_intent),
             "intent_seen": bool(self.intent_seen),
             "use_goal_command": bool(self.use_goal_command),
+            "require_canonical_identity": bool(
+                getattr(self, "require_canonical_identity", False)
+            ),
+            "canonical_lifecycle_high_water": int(
+                getattr(self, "canonical_lifecycle_high_water", 0) or 0
+            ),
+            "canonical_route_high_water": int(
+                getattr(self, "canonical_route_high_water", 0) or 0
+            ),
+            "canonical_graph_high_water": int(
+                getattr(self, "canonical_graph_high_water", 0) or 0
+            ),
+            "canonical_map_epoch_high_water": int(
+                getattr(self, "canonical_map_epoch_high_water", 0) or 0
+            ),
             "goal_command_topic": self.goal_command_topic,
             "latest_goal_transaction_id": int(self.latest_goal_transaction_id),
             "last_dispatch_identity": _identity_snapshot(
@@ -81,6 +103,17 @@ class TebGoalBridgeStatusMixin:
             ),
             "active_route_id": int(self.active_route_id),
             "latest_route_id": int(self.latest_route_id),
+            "active_action_generation": int(
+                action_contract.get("generation", 0)
+                if action_contract is not None
+                else getattr(self, "action_generation", 0) or 0
+            ),
+            "active_route_map_epoch": getattr(
+                self, "active_route_map_epoch", None
+            ),
+            "latest_route_map_epoch": getattr(
+                self, "latest_route_map_epoch", None
+            ),
             "frontier_lease_released_route_id": int(
                 getattr(self, "frontier_lease_released_route_id", 0) or 0
             ),
@@ -118,6 +151,38 @@ class TebGoalBridgeStatusMixin:
                 now=now,
             ),
             "teb_planner_command": _planner_command_snapshot(self, now=now),
+            "teb_feedback_valid": bool(
+                getattr(self, "teb_feedback_valid", False)
+            ),
+            "teb_feedback_invalid_reason": str(
+                getattr(self, "teb_feedback_invalid_reason", "no_feedback")
+                or "no_feedback"
+            ),
+            "teb_feedback_requires_fresh_planner_command": bool(
+                getattr(
+                    self,
+                    "teb_feedback_requires_fresh_planner_command",
+                    True,
+                )
+            ),
+            "teb_feedback_generation": int(
+                getattr(self, "teb_feedback_generation", 0) or 0
+            ),
+            "teb_feedback_route_id": int(
+                getattr(self, "teb_feedback_route_id", 0) or 0
+            ),
+            "teb_feedback_transaction_id": int(
+                getattr(self, "teb_feedback_transaction_id", 0) or 0
+            ),
+            "teb_feedback_map_epoch": getattr(
+                self, "teb_feedback_map_epoch", None
+            ),
+            "teb_feedback_graph_transaction_id": int(
+                getattr(self, "teb_feedback_graph_transaction_id", 0) or 0
+            ),
+            "teb_feedback_invalidation_count": int(
+                getattr(self, "teb_feedback_invalidation_count", 0) or 0
+            ),
             "teb_reorientation": _reorientation_snapshot(self, now=now),
             "priority_handoffs": int(self.priority_handoff_count),
             "target_segment_handoffs": int(self.target_segment_handoff_count),
@@ -138,8 +203,6 @@ class TebGoalBridgeStatusMixin:
             "latest_target_epoch": int(self.latest_target_epoch),
             "active_map_epoch": getattr(self, "active_frontier_map_epoch", None),
             "latest_map_epoch": getattr(self, "latest_frontier_map_epoch", None),
-            "active_route_map_epoch": getattr(self, "active_route_map_epoch", None),
-            "latest_route_map_epoch": getattr(self, "latest_route_map_epoch", None),
             "active_epoch": int(getattr(self, "active_target_epoch", 0) or 0),
             "latest_epoch": int(getattr(self, "latest_target_epoch", 0) or 0),
             "active_target_track_id": self.active_target_track_id,
@@ -193,6 +256,9 @@ def _identity_snapshot(identity):
         "transaction_id": int(identity.get("transaction_id", 0) or 0),
         "lifecycle_transaction_id": int(
             identity.get("lifecycle_transaction_id", 0) or 0
+        ),
+        "graph_transaction_id": int(
+            identity.get("graph_transaction_id", 0) or 0
         ),
         "route_id": int(identity.get("route_id", 0) or 0),
         "epoch": identity.get("epoch", identity.get("target_epoch", 0)),

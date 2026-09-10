@@ -87,6 +87,7 @@
   <arg name="persistent_mission_command_topic" default="/lste/persistent_execution/mission_command"/>
   <arg name="persistent_target_command_topic" default="/lste/persistent_execution/target_command"/>
   <arg name="persistent_installed_target_command_topic" default="/lste/persistent_execution/installed_target_command"/>
+  <arg name="persistent_planner_command_contract_topic" default="/lste/persistent_execution/planner_command_contract"/>
   <arg name="base_global_planner" default="navfn/NavfnROS"/>
   <arg name="base_local_planner" default="teb_local_planner/TebLocalPlannerROS"/>
   <!-- Production keeps the historical respawn behavior. Focused diagnostic
@@ -221,6 +222,7 @@
     <param name="streaming_mission_command_topic" value="$(arg persistent_mission_command_topic)"/>
     <param name="streaming_target_command_topic" value="$(arg persistent_target_command_topic)"/>
     <param name="persistent_installed_target_command_topic" value="$(arg persistent_installed_target_command_topic)"/>
+    <param name="persistent_planner_command_contract_topic" value="$(arg persistent_planner_command_contract_topic)"/>
     <param name="streaming_goal_epsilon" value="0.05"/>
     <param name="streaming_replan_distance" value="0.50"/>
     <param name="streaming_max_replan_interval" value="2.0"/>
@@ -442,6 +444,7 @@
     <param name="global_frame" value="$(arg global_frame)"/>
     <param name="initial_mode" value="$(arg controller_mode)"/>
     <param name="persistent_execution" value="$(arg persistent_execution)"/>
+    <param name="require_canonical_identity" value="$(arg persistent_execution)"/>
     <param name="persistent_frontier_lookahead_handoff_enabled" value="$(arg persistent_frontier_lookahead_handoff_enabled)"/>
     <param name="persistent_frontier_lookahead_trigger_distance" value="$(arg persistent_frontier_lookahead_trigger_distance)"/>
     <param name="persistent_frontier_admission_horizon" value="$(arg persistent_frontier_admission_horizon)"/>
@@ -501,6 +504,8 @@
         name="lste_teb_turn_supervisor" output="screen">
     <param name="planner_cmd_topic" value="/lste/cmd_vel/teb_planner"/>
     <param name="command_contract_topic" value="/lste/cmd_vel/teb_contract"/>
+    <param name="planner_command_contract_topic" value="$(arg persistent_planner_command_contract_topic)"/>
+    <param name="require_planner_command_contract" value="$(arg persistent_execution)"/>
     <param name="navfn_plan_topic" value="$(arg navfn_plan_topic)"/>
     <param name="output_cmd_topic" value="/lste/cmd_vel/teb"/>
     <param name="goal_topic" value="$(arg goal_topic)"/>

@@ -20,6 +20,7 @@ from std_msgs.msg import String
 from std_srvs.srv import Empty
 
 from experiment_reset_contract import (
+    EXPERIMENT_BOUNDARY_TOPIC,
     HARD_RESET_ACK_TOPIC,
     HARD_RESET_RELEASE_TOPIC,
     HARD_RESET_TOPIC,
@@ -89,6 +90,16 @@ def main():
     parser.add_argument("--reset-id", required=True)
     parser.add_argument("--slice-id", default="")
     parser.add_argument("--reason", default="slice_boundary")
+    parser.add_argument(
+        "--failure-trigger",
+        default="",
+        help="explicit metrics failure trigger at this trial boundary",
+    )
+    parser.add_argument(
+        "--failure-details",
+        default="{}",
+        help="compact JSON details for an explicit failure trigger",
+    )
     parser.add_argument("--timeout", type=float, default=15.0)
     parser.add_argument(
         "--reset-world",
@@ -150,6 +161,15 @@ def main():
         HARD_RESET_ACK_TOPIC, String, on_ack, queue_size=50
     )
     publisher = rospy.Publisher(HARD_RESET_TOPIC, String, queue_size=5)
+    boundary_publisher = rospy.Publisher(
+        EXPERIMENT_BOUNDARY_TOPIC, String, queue_size=5
+    )
+    try:
+        failure_details = json.loads(args.failure_details or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        failure_details = {}
+    if not isinstance(failure_details, dict):
+        failure_details = {}
     request = {
         "event": "hard_reset",
         "reset_id": str(args.reset_id),
@@ -157,8 +177,36 @@ def main():
         "slice_id": str(args.slice_id or ""),
         "reason": str(args.reason or "slice_boundary"),
         "requested_wall_time": time.time(),
+        "failure_trigger": str(args.failure_trigger or "").strip(),
+        "failure_details": failure_details,
     }
     message = String(data=json.dumps(request, sort_keys=True))
+    boundary_request = {
+        "event": "trial_boundary",
+        "boundary_id": str(args.reset_id),
+        "reset_id": str(args.reset_id),
+        "transaction_id": int(reset_transaction_id),
+        "slice_id": str(args.slice_id or ""),
+        "reason": str(args.reason or "slice_boundary"),
+        "failure_trigger": str(args.failure_trigger or "").strip(),
+        "failure_details": failure_details,
+        "force_failure": bool(str(args.failure_trigger or "").strip()),
+        "requested_wall_time": time.time(),
+    }
+    boundary_message = String(
+        data=json.dumps(boundary_request, sort_keys=True)
+    )
+    # Metrics owns failure IDs and artifacts. Give its subscriber a bounded
+    # delivery window before the reset clears the slice-local evidence ring.
+    boundary_deadline = time.monotonic() + 1.0
+    while (
+        not rospy.is_shutdown()
+        and boundary_publisher.get_num_connections() == 0
+        and time.monotonic() < boundary_deadline
+    ):
+        time.sleep(0.05)
+    boundary_publisher.publish(boundary_message)
+    time.sleep(0.15)
     deadline = time.monotonic() + float(args.timeout)
     while not rospy.is_shutdown() and time.monotonic() < deadline:
         publisher.publish(message)

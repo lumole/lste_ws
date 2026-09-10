@@ -105,6 +105,7 @@ def default_goal_context(
     task_id="",
     mission_id="",
     task_version="",
+    graph_transaction_id=0,
 ):
     """Return the complete, JSON-safe context for a geometry-only action."""
     return {
@@ -117,6 +118,9 @@ def default_goal_context(
         "task_id": _stable_text(task_id),
         "mission_id": _stable_text(mission_id) or _stable_text(task_id),
         "task_version": _stable_text(task_version),
+        # Graph planning and mission command allocation are independent
+        # identity domains. Zero denotes a direct semantic route.
+        "graph_transaction_id": _positive_id(graph_transaction_id) or 0,
         "goal_role": "geometry_frontier",
         "owner_place_id": None,
         "source_place_id": None,
@@ -137,6 +141,7 @@ def normalize_goal_context(value):
         value.get("task_id", ""),
         value.get("mission_id", ""),
         value.get("task_version", ""),
+        value.get("graph_transaction_id", 0),
     )
     role = str(value.get("goal_role", "")).strip().lower()
     if role not in GOAL_CONTEXT_ROLES:
@@ -149,6 +154,9 @@ def normalize_goal_context(value):
         "portal_probe_id",
     ):
         context[key] = _positive_id(value.get(key))
+    context["graph_transaction_id"] = (
+        _positive_id(value.get("graph_transaction_id")) or 0
+    )
     context["portal_probe_phase"] = str(
         value.get("portal_probe_phase", "") or ""
     ).strip().lower()
@@ -170,6 +178,7 @@ def goal_context_identity(value):
         context["task_id"],
         context["mission_id"],
         context["task_version"],
+        context["graph_transaction_id"],
         context["goal_role"],
         context["owner_place_id"],
         context["source_place_id"],

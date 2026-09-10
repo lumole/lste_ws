@@ -3,6 +3,7 @@
 from actionlib_msgs.msg import GoalStatusArray
 from gazebo_msgs.msg import ContactsState, ModelStates
 from geometry_msgs.msg import Pose2D, PoseStamped, Twist
+from lste_topo_access.msg import FrontierExecutionTerminal, PlannerCommandContract
 from lste_msgs.msg import LsteDetections, LsteScores, LsteState
 from move_base_msgs.msg import MoveBaseActionFeedback, MoveBaseActionGoal, RecoveryStatus
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath
@@ -11,6 +12,8 @@ from std_msgs.msg import Bool, String
 from teb_local_planner.msg import FeedbackMsg
 
 import rospy
+
+from experiment_reset_contract import HARD_RESET_TOPIC
 
 
 class NavigationMetricsRosInterfacesMixin:
@@ -68,6 +71,8 @@ class NavigationMetricsRosInterfacesMixin:
                     if self.target_eval_enabled and self.target_eval_depth_enabled
                     else None
                 ),
+                "hard_reset": HARD_RESET_TOPIC,
+                "experiment_boundary": "/lste/experiment/trial_boundary",
             },
             resolved_params=resolved_params,
             experiment=run_context["experiment"],
@@ -147,6 +152,18 @@ class NavigationMetricsRosInterfacesMixin:
             queue_size=1,
         )
         rospy.Subscriber(
+            "/lste/persistent_execution/planner_command_contract",
+            PlannerCommandContract,
+            self.on_planner_command_contract,
+            queue_size=20,
+        )
+        rospy.Subscriber(
+            "/lste/teb_goal_terminal_contract",
+            FrontierExecutionTerminal,
+            self.on_frontier_execution_terminal,
+            queue_size=10,
+        )
+        rospy.Subscriber(
             "/lste/persistent_execution/plan_event",
             String,
             self.on_persistent_plan_event,
@@ -187,6 +204,15 @@ class NavigationMetricsRosInterfacesMixin:
         rospy.Subscriber("/lste/navigation_hold", Bool, self.on_navigation_hold, queue_size=1)
         rospy.Subscriber(
             "/lste/teb_goal_failure", String, self.on_teb_goal_failure, queue_size=20
+        )
+        rospy.Subscriber(
+            HARD_RESET_TOPIC, String, self.on_hard_reset, queue_size=20
+        )
+        rospy.Subscriber(
+            "/lste/experiment/trial_boundary",
+            String,
+            self.on_experiment_boundary,
+            queue_size=10,
         )
         rospy.Subscriber("/map", OccupancyGrid, self.on_map, queue_size=1)
         if self.benchmark_collision_truth_enabled:

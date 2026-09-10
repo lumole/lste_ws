@@ -27,6 +27,7 @@ class GlobalFrontierRouteStateMixin:
 
     def apply_costmap(self, message):
         self.costmap_msg = message
+        self._last_full_costmap = message
         self.costmap_message_count += 1
         self.costmap_last_receive_wall = now_for(self)
         self._costmap_explicitly_invalid = False
@@ -129,6 +130,48 @@ class GlobalFrontierRouteStateMixin:
 
     def invalidate_costmap(self):
         """Drop a partial delta reconstruction until a full grid arrives."""
+        fallback = getattr(self, "_rehydration_costmap_fallback", None)
+        if fallback is None:
+            fallback = getattr(self, "_last_full_costmap", None)
+        if (
+            fallback is not None
+        ):
+            # A resync marker after reset means delta history was coalesced;
+            # it does not invalidate the authoritative full snapshot captured
+            # at the lifecycle boundary. Reinstall that snapshot through the
+            # same state owner and wake the planner for the successor route.
+            self.costmap_msg = copy.deepcopy(fallback)
+            self.costmap_last_receive_wall = now_for(self)
+            self._costmap_explicitly_invalid = False
+            self._costmap_rehydrated_pose_grace = bool(
+                getattr(self, "_rehydration_costmap_fallback_active", False)
+            )
+            self.cached_costmap_validation = None
+            self.cached_costmap_validation_wall = 0.0
+            scheduler = getattr(self, "decision_wake_scheduler", None)
+            if scheduler is not None:
+                scheduler.observe_costmap(self.costmap_msg)
+            publish = getattr(self, "publish_status", None)
+            if callable(publish):
+                publish(
+                    "costmap_rehydration_fallback_restored",
+                    rehydration_transaction_id=int(
+                        getattr(self, "_rehydration_transaction_id", 0) or 0
+                    ),
+                    reason=(
+                        "coalesced_delta_resync"
+                        if getattr(
+                            self, "_rehydration_costmap_fallback_active", False
+                        )
+                        else "coalesced_delta_resync_last_full"
+                    ),
+                )
+            rospy.logwarn_throttle(
+                5.0,
+                "Global frontier restored hard-reset costmap after coalesced "
+                "delta resync",
+            )
+            return
         self.costmap_msg = None
         self.costmap_last_receive_wall = 0.0
         self._costmap_explicitly_invalid = True
@@ -168,7 +211,14 @@ class GlobalFrontierRouteStateMixin:
         elif moved:
             self.costmap_stationary_since = None
             self.costmap_stationary = False
-            if getattr(self, "costmap_msg", None) is not None:
+            if getattr(self, "_rehydration_costmap_fallback_active", False):
+                # The robot is held during hard reset. Keep the reset full
+                # grid usable while pose callbacks catch up; a coalesced delta
+                # may still request resync before the first successor route.
+                pass
+            elif getattr(self, "_costmap_rehydrated_pose_grace", False):
+                self._costmap_rehydrated_pose_grace = False
+            elif getattr(self, "costmap_msg", None) is not None:
                 self._costmap_explicitly_invalid = True
         else:
             if not getattr(self, "costmap_stationary", False):
@@ -324,7 +374,11 @@ class GlobalFrontierRouteStateMixin:
         self.prefetched_work_item_support_cells = 0
 
     def release_active_frontier(
-        self, discard_prefetch=False, preserve_place_departure=False,
+        self,
+        discard_prefetch=False,
+        preserve_place_departure=False,
+        queue_successor=True,
+        terminal_contract=None,
     ):
         """Release the current endpoint lease without changing place closure.
 
@@ -336,17 +390,120 @@ class GlobalFrontierRouteStateMixin:
         """
         released_route_kind = self.active_route_kind
         released_route_id = int(getattr(self, "active_route_id", 0) or 0)
+        terminal_received = bool(
+            getattr(self, "active_terminal_received", False)
+        )
+        contract = terminal_contract
+        if not isinstance(contract, dict):
+            contract = getattr(self, "active_terminal_contract", None)
+        contract = contract if isinstance(contract, dict) else {}
+
+        def identity_int(value, fallback=0):
+            try:
+                return int(value or fallback)
+            except (TypeError, ValueError):
+                return int(fallback)
+
+        release_lifecycle_id = identity_int(
+            contract.get(
+                "lifecycle_transaction_id",
+                getattr(
+                    getattr(self, "lifecycle_manager", None),
+                    "current_transaction_id",
+                    0,
+                ),
+            )
+        )
+        release_action_generation = identity_int(
+            contract.get("action_generation", 0)
+        )
+        release_graph_transaction_id = identity_int(
+            contract.get(
+                "graph_transaction_id",
+                getattr(
+                    getattr(self, "graph_route_action_transaction", None),
+                    "graph_transaction_id",
+                    0,
+                ),
+            )
+        )
+        release_map_epoch = contract.get(
+            "map_epoch", getattr(self, "active_route_map_epoch", None)
+        )
+        try:
+            release_map_epoch = (
+                None
+                if release_map_epoch is None
+                else int(release_map_epoch)
+            )
+        except (TypeError, ValueError):
+            release_map_epoch = None
+        release_route_kind = str(
+            contract.get("route_kind", released_route_kind) or released_route_kind
+        )
+        await_release_ack = bool(
+            not queue_successor and terminal_received and released_route_id > 0
+        )
         # In persistent mode this method ends the graph lease before the
         # action client necessarily reaches DONE. Preserve the identity and
         # whether the graph already accepted a terminal so a delayed failure
         # can be consumed as controller cleanup rather than mistaken for a
         # second portal attempt.
         self.last_released_route_id = released_route_id
-        self.last_released_route_kind = str(released_route_kind or "")
+        self.last_released_route_kind = str(release_route_kind or "")
         self.last_released_route_terminal_received = bool(
-            getattr(self, "active_terminal_received", False)
+            terminal_received
         )
         self.last_released_route_controller_pending = released_route_id > 0
+        self.last_released_route_lifecycle_transaction_id = release_lifecycle_id
+        self.last_released_route_action_generation = release_action_generation
+        self.last_released_route_graph_transaction_id = (
+            release_graph_transaction_id
+        )
+        self.last_released_route_map_epoch = release_map_epoch
+        self.pending_controller_lease_release = (
+            {
+                "route_id": released_route_id,
+                "route_kind": release_route_kind,
+                "lifecycle_transaction_id": release_lifecycle_id,
+                "action_generation": release_action_generation,
+                "graph_transaction_id": release_graph_transaction_id,
+                "map_epoch": release_map_epoch,
+            }
+            if await_release_ack
+            else None
+        )
+        self.awaiting_controller_lease_release_ack = await_release_ack
+        if released_route_id > 0:
+            # Publish the controller lease boundary while the released route
+            # identity is still available.  The bridge uses the explicit
+            # terminal bit to clear its transport/feedback state immediately;
+            # ordinary route failures remain on their existing invalidation
+            # path and are not cancelled twice.
+            self.publish_status(
+                "controller_lease_released",
+                route_id=released_route_id,
+                released_route_id=released_route_id,
+                released_route_kind=str(release_route_kind or ""),
+                terminal_received=bool(
+                    self.last_released_route_terminal_received
+                ),
+                controller_pending=bool(
+                    self.last_released_route_controller_pending
+                ),
+                release_reason="terminal_boundary"
+                if terminal_received
+                else "route_release",
+                release_phase=(
+                    "awaiting_transport_ack"
+                    if await_release_ack
+                    else "semantic_only"
+                ),
+                lifecycle_transaction_id=release_lifecycle_id,
+                action_generation=release_action_generation,
+                graph_transaction_id=release_graph_transaction_id,
+                map_epoch=release_map_epoch,
+            )
         decision_scheduler = getattr(self, "decision_wake_scheduler", None)
         if decision_scheduler is not None:
             # Route IDs remain monotonic in the explorer after release, so the
@@ -465,6 +622,7 @@ class GlobalFrontierRouteStateMixin:
         self.active_portal_retry = False
         self.active_local_egress_resumes_portal = False
         self.active_terminal_received = False
+        self.active_terminal_contract = None
         self.recovery_pending_route_id = 0
         self.recovery_pending_behavior = ""
         self.recovery_pending_reason = ""
@@ -476,6 +634,7 @@ class GlobalFrontierRouteStateMixin:
         self.active_unreachable_since = None
         if discard_prefetch:
             self.clear_prefetched_frontier()
+        return await_release_ack
 
     def active_endpoint_observed_from_map(
         self, message, known_free, unknown, row, col, robot_map, distance,

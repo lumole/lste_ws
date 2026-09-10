@@ -7,6 +7,222 @@ import rospy
 
 
 class TebGoalBridgeFrontierStatusMixin:
+    def _clear_frontier_intent_after_release_locked(self):
+        """Prevent the bridge timer from replaying a released frontier goal."""
+        self.latest_goal = None
+        self.last_dispatched_goal = None
+        self.last_dispatch_identity = None
+        self.last_terminal_goal = None
+        self.latest_intent_source = "waiting_global_slam_frontier"
+        self.latest_intent_priority = 0
+        self.latest_route_kind = ""
+        self.latest_mission_route_kind = ""
+        self.latest_graph_transaction_id = 0
+        self.latest_route_id = 0
+        self.latest_intent_goal = None
+
+    def _apply_controller_lease_release_locked(self, payload):
+        """Apply an identity-checked terminal release from GlobalFrontier."""
+        released = payload.get("released_controller_route")
+        released = released if isinstance(released, dict) else {}
+        if not bool(
+            payload.get("terminal_received")
+            or released.get("terminal_received")
+        ) or not bool(
+            payload.get("controller_pending")
+            or released.get("controller_pending")
+        ):
+            return False
+        try:
+            route_id = max(
+                0,
+                int(
+                    released.get(
+                        "route_id",
+                        payload.get(
+                            "released_route_id", payload.get("route_id", 0)
+                        ),
+                    )
+                    or 0
+                ),
+            )
+        except (TypeError, ValueError):
+            route_id = 0
+        if route_id <= 0:
+            return False
+        if int(getattr(self, "active_route_id", 0) or 0) != route_id:
+            # A newer route already owns the action. The monotonic route guard
+            # below is the final protection against cancelling that successor.
+            return False
+        if str(
+            getattr(self, "active_intent_source", "unknown") or "unknown"
+        ).strip().lower() != "global_slam_frontier":
+            return False
+        release = getattr(
+            self, "_release_frontier_controller_lease_locked", None
+        )
+        if not callable(release):
+            return False
+        pending_prepare = getattr(self, "pending_terminal_prepare", None)
+        expected_contract = {}
+        if isinstance(pending_prepare, dict):
+            expected_contract = dict(
+                pending_prepare.get("old_contract") or {}
+            )
+        if not expected_contract:
+            active_contract = getattr(self, "active_action_contract", None)
+            if isinstance(active_contract, dict):
+                expected_contract = dict(active_contract)
+        if not expected_contract:
+            last_dispatch = getattr(self, "last_dispatch_identity", None)
+            if isinstance(last_dispatch, dict):
+                expected_contract = dict(last_dispatch)
+
+        def contract_int(*values):
+            for value in values:
+                try:
+                    return int(value or 0)
+                except (TypeError, ValueError):
+                    continue
+            return 0
+
+        incoming_lifecycle = contract_int(
+            released.get("lifecycle_transaction_id"),
+            payload.get("lifecycle_transaction_id"),
+        )
+        incoming_generation = contract_int(
+            released.get("action_generation"),
+            payload.get("action_generation"),
+        )
+        incoming_graph = contract_int(
+            released.get("graph_transaction_id"),
+            payload.get("graph_transaction_id"),
+        )
+        incoming_map = released.get("map_epoch")
+        if incoming_map is None:
+            incoming_map = payload.get("map_epoch")
+        expected_generation = contract_int(
+            expected_contract.get(
+                "generation", expected_contract.get("action_generation", 0)
+            )
+        )
+        expected_lifecycle = contract_int(
+            expected_contract.get("lifecycle_transaction_id")
+        )
+        expected_graph = contract_int(expected_contract.get("graph_transaction_id"))
+        expected_map = expected_contract.get("map_epoch")
+        if expected_generation > 0 and incoming_generation != expected_generation:
+            self.publish_bridge_status(
+                "controller_lease_release_rejected",
+                reason="action_generation_mismatch",
+                route_id=route_id,
+                expected_action_generation=expected_generation,
+                received_action_generation=incoming_generation,
+            )
+            return False
+        if expected_lifecycle > 0 and incoming_lifecycle != expected_lifecycle:
+            self.publish_bridge_status(
+                "controller_lease_release_rejected",
+                reason="lifecycle_transaction_id_mismatch",
+                route_id=route_id,
+                expected_lifecycle_transaction_id=expected_lifecycle,
+                received_lifecycle_transaction_id=incoming_lifecycle,
+            )
+            return False
+        if expected_graph > 0 and incoming_graph != expected_graph:
+            self.publish_bridge_status(
+                "controller_lease_release_rejected",
+                reason="graph_transaction_id_mismatch",
+                route_id=route_id,
+                expected_graph_transaction_id=expected_graph,
+                received_graph_transaction_id=incoming_graph,
+            )
+            return False
+        if expected_map is not None:
+            try:
+                if int(incoming_map) != int(expected_map):
+                    raise ValueError
+            except (TypeError, ValueError):
+                self.publish_bridge_status(
+                    "controller_lease_release_rejected",
+                    reason="map_epoch_mismatch",
+                    route_id=route_id,
+                    expected_map_epoch=expected_map,
+                    received_map_epoch=incoming_map,
+                )
+                return False
+        released_route_kind = str(
+            released.get("route_kind")
+            or payload.get("released_route_kind")
+            or getattr(self, "active_route_kind", "")
+            or ""
+        )
+        release_reason = str(
+            payload.get("release_reason", "controller_lease_released")
+            or "controller_lease_released"
+        )
+        if (
+            release_reason != "terminal_boundary"
+            and not release_reason.startswith(
+                ("terminal_boundary_", "endpoint_terminal_")
+            )
+        ):
+            release_reason = "terminal_boundary_%s" % release_reason
+        if not release(route_id, release_reason):
+            return False
+        self._clear_frontier_intent_after_release_locked()
+        self.publish_bridge_status(
+            "controller_lease_release_applied",
+            released_route_id=route_id,
+            released_route_kind=released_route_kind,
+            terminal_received=True,
+            controller_lease="released",
+            next_owner="global_slam_frontier",
+            lifecycle_transaction_id=incoming_lifecycle,
+            action_generation=incoming_generation,
+            new_action_generation=int(
+                getattr(self, "action_generation", 0) or 0
+            ),
+            graph_transaction_id=incoming_graph,
+            map_epoch=incoming_map,
+        )
+        self.publish_bridge_status(
+            "lease_release_ack",
+            released_route_id=route_id,
+            released_route_kind=released_route_kind,
+            lifecycle_transaction_id=incoming_lifecycle,
+            action_generation=incoming_generation,
+            new_action_generation=int(
+                getattr(self, "action_generation", 0) or 0
+            ),
+            graph_transaction_id=incoming_graph,
+            map_epoch=incoming_map,
+            controller_lease="released",
+            released_controller_route={
+                "route_id": route_id,
+                "route_kind": released_route_kind,
+                "lifecycle_transaction_id": incoming_lifecycle,
+                "action_generation": incoming_generation,
+                "graph_transaction_id": incoming_graph,
+                "map_epoch": incoming_map,
+            },
+        )
+        # Keep the exact predecessor ACK local to the bridge.  The next
+        # dispatch may consume it only for a newer frontier route; a target or
+        # same-route replay must never be labeled as a successor.
+        self.pending_successor_release_ack = {
+            "route_id": route_id,
+            "route_kind": released_route_kind,
+            "lifecycle_transaction_id": incoming_lifecycle,
+            "action_generation": incoming_generation,
+            "new_action_generation": int(
+                getattr(self, "action_generation", 0) or 0
+            ),
+            "graph_transaction_id": incoming_graph,
+            "map_epoch": incoming_map,
+        }
+        return True
+
     def _remember_frontier_map_epoch_locked(self, payload):
         """Bind the newest frontier route to its graph snapshot epoch."""
         raw_route_id = payload.get("route_id")
@@ -24,11 +240,20 @@ class TebGoalBridgeFrontierStatusMixin:
         previous_route_id = int(
             getattr(self, "latest_frontier_map_route_id", 0) or 0
         )
+        try:
+            graph_transaction_id = max(
+                0, int(payload.get("graph_transaction_id", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            graph_transaction_id = 0
         if route_id > previous_route_id:
             self.latest_frontier_map_route_id = route_id
             self.latest_frontier_map_epoch = epoch
+            self.latest_frontier_graph_transaction_id = graph_transaction_id
         elif route_id == previous_route_id and epoch is not None:
             self.latest_frontier_map_epoch = epoch
+            if graph_transaction_id > 0:
+                self.latest_frontier_graph_transaction_id = graph_transaction_id
         if epoch is not None and (
             not bool(getattr(self, "intent_seen", False))
             or str(getattr(self, "latest_intent_source", "") or "").strip().lower()
@@ -36,6 +261,8 @@ class TebGoalBridgeFrontierStatusMixin:
             or route_id >= int(getattr(self, "latest_route_id", 0) or 0)
         ):
             self.latest_route_map_epoch = epoch
+            if graph_transaction_id > 0:
+                self.latest_graph_transaction_id = graph_transaction_id
 
     def _handle_frontier_route_unavailable_locked(self, payload):
         """Release an idle route, or defer while its controller still runs.
@@ -138,9 +365,13 @@ class TebGoalBridgeFrontierStatusMixin:
         release = getattr(
             self, "_release_frontier_controller_lease_locked", None
         )
-        release_reason = (
-            "endpoint_terminal_%s" % reason if terminal_boundary else reason
-        )
+        release_reason = reason
+        if terminal_boundary and release_reason == "terminal_boundary":
+            release_reason = "terminal_boundary"
+        elif terminal_boundary and not release_reason.startswith(
+            ("endpoint_terminal_", "terminal_boundary_")
+        ):
+            release_reason = "endpoint_terminal_%s" % release_reason
         if release is None or not release(route_id, release_reason):
             return
         self.prefetched_frontier_goal = None
@@ -155,6 +386,7 @@ class TebGoalBridgeFrontierStatusMixin:
         self.latest_intent_priority = 0
         self.latest_route_kind = ""
         self.latest_mission_route_kind = ""
+        self.latest_graph_transaction_id = 0
         self.latest_route_id = 0
         self.latest_intent_goal = None
         self.publish_bridge_status(
@@ -191,6 +423,9 @@ class TebGoalBridgeFrontierStatusMixin:
             )
             if callable(observe_watchdog):
                 observe_watchdog(payload)
+            if event == "controller_lease_released":
+                self._apply_controller_lease_release_locked(payload)
+                return
             if event == "frontier_route_unavailable":
                 self._handle_frontier_route_unavailable_locked(payload)
                 return
@@ -307,6 +542,7 @@ class TebGoalBridgeFrontierStatusMixin:
             self.latest_intent_source = "waiting_global_slam_frontier"
             self.latest_intent_priority = 0
             self.latest_route_kind = ""
+            self.latest_graph_transaction_id = 0
             self.latest_route_id = 0
             self.latest_intent_goal = None
             self.publish_bridge_status(

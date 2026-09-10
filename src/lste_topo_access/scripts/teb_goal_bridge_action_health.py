@@ -42,6 +42,9 @@ class TebGoalBridgeActionHealthMixin:
             transaction_id = self._watchdog_int(
                 contract.get("transaction_id", 0)
             )
+            graph_transaction_id = self._watchdog_int(
+                contract.get("graph_transaction_id", 0)
+            )
             lifecycle_transaction_id = self._watchdog_int(
                 contract.get("lifecycle_transaction_id", 0)
             )
@@ -68,6 +71,10 @@ class TebGoalBridgeActionHealthMixin:
             transaction_id = self._watchdog_int(
                 getattr(self, "active_goal_transaction_id", 0)
                 or getattr(self, "latest_goal_transaction_id", 0)
+            )
+            graph_transaction_id = self._watchdog_int(
+                getattr(self, "active_graph_transaction_id", 0)
+                or getattr(self, "latest_graph_transaction_id", 0)
             )
             lifecycle_transaction_id = self._watchdog_int(
                 getattr(
@@ -103,6 +110,7 @@ class TebGoalBridgeActionHealthMixin:
         return {
             "route_id": route_id,
             "transaction_id": transaction_id,
+            "graph_transaction_id": graph_transaction_id,
             "lifecycle_transaction_id": lifecycle_transaction_id,
             "action_generation": generation,
             "epoch": epoch,
@@ -156,6 +164,9 @@ class TebGoalBridgeActionHealthMixin:
         self.publish_bridge_status(
             "route_lease_watchdog_cancelled",
             route_id=self._watchdog_int(record.get("route_id")),
+            graph_transaction_id=self._watchdog_int(
+                record.get("graph_transaction_id")
+            ),
             transaction_id=self._watchdog_int(record.get("transaction_id")),
             action_generation=self._watchdog_int(
                 record.get("action_generation")
@@ -228,6 +239,7 @@ class TebGoalBridgeActionHealthMixin:
         self.publish_bridge_status(
             "route_lease_watchdog_armed",
             route_id=identity["route_id"],
+            graph_transaction_id=identity["graph_transaction_id"],
             transaction_id=identity["transaction_id"],
             action_generation=identity["action_generation"],
             lifecycle_transaction_id=identity["lifecycle_transaction_id"],
@@ -262,6 +274,9 @@ class TebGoalBridgeActionHealthMixin:
         captured_transaction = self._watchdog_int(
             record.get("transaction_id")
         )
+        captured_graph_transaction = self._watchdog_int(
+            record.get("graph_transaction_id")
+        )
         captured_generation = self._watchdog_int(
             record.get("action_generation")
         )
@@ -281,6 +296,15 @@ class TebGoalBridgeActionHealthMixin:
         if (
             latest_transaction > 0
             and latest_transaction > captured_transaction
+        ):
+            return True
+        latest_graph_transaction = self._watchdog_int(
+            getattr(self, "latest_graph_transaction_id", 0)
+        )
+        if (
+            captured_graph_transaction > 0
+            and latest_graph_transaction > 0
+            and latest_graph_transaction != captured_graph_transaction
         ):
             return True
         if getattr(self, "latest_goal", None) is None:
@@ -389,26 +413,23 @@ class TebGoalBridgeActionHealthMixin:
             record.get("action_generation")
         )
         epoch = record.get("epoch")
-        transport_cancelled = False
-        transport_error = None
-        cancel_goal = getattr(
-            getattr(self, "action_client", None), "cancel_goal", None
+        action_contract = dict(record)
+        if "generation" not in action_contract:
+            action_contract["generation"] = action_generation
+        termination = self._commit_termination(
+            "route_lease_watchdog_expired",
+            source_goal=getattr(self, "last_dispatched_goal", None),
+            action_contract=action_contract,
+            watchdog_reason="route_lease_watchdog_expired",
+            publish_terminal=False,
+            arm_watchdog=False,
         )
-        if callable(cancel_goal):
-            try:
-                cancel_goal()
-                transport_cancelled = True
-            except Exception as exc:  # pragma: no cover - actionlib edge
-                transport_error = str(exc)
-        else:
-            transport_error = "cancel_goal_unavailable"
-
-        # Invalidate any late actionlib callback before clearing its contract.
-        self.action_generation = max(
-            self._watchdog_int(getattr(self, "action_generation", 0)),
-            action_generation,
-        ) + 1
-        self.action_active = False
+        transport_cancelled = bool(
+            termination.get("transport_cancelled", False)
+        )
+        transport_error = termination.get("transport_error")
+        # The watchdog is now closed; keep only the callback tombstone and
+        # clear the retry record so a late result cannot arm it again.
         self.handoff_requested = False
         self.frontier_observation_completion_pending = None
         self.frontier_continuous_prefetch_handoff_pending = None
@@ -485,11 +506,16 @@ class TebGoalBridgeActionHealthMixin:
         self.active_target_viewpoint_attempt_id = ""
         self.active_goal_context = {}
         self.persistent_target_terminal_boundary_transaction = 0
+        self.pending_terminal_prepare = None
+        self.pending_lease_release_contract = None
         self.last_result_status = record.get("status")
         self.last_result_monotonic = current
         self.publish_bridge_status(
             "route_lease_watchdog_expired",
             route_id=route_id,
+            graph_transaction_id=self._watchdog_int(
+                record.get("graph_transaction_id")
+            ),
             transaction_id=transaction_id,
             action_generation=action_generation,
             lifecycle_transaction_id=self._watchdog_int(
@@ -615,18 +641,21 @@ class TebGoalBridgeActionHealthMixin:
 
         transport_cancelled = False
         # A persistent planner can report an unreachable target while the
-        # single MoveBase action is still ACTIVE.  Leaving that action alive
-        # keeps ``active_intent_priority=2`` and makes every frontier command
-        # look lower priority forever.  Invalidate the callback generation
-        # before cancelling so the late PREEMPTED result is diagnostic only.
+        # single MoveBase action is still ACTIVE.  Route the transport close
+        # through the generation barrier so the late PREEMPTED result is
+        # diagnostic only.
         if self.action_active:
-            self.action_generation += 1
-            cancel_goal = getattr(
-                getattr(self, "action_client", None), "cancel_goal", None
+            termination = self._commit_termination(
+                "target_controller_lease_release",
+                source_goal=getattr(self, "last_dispatched_goal", None),
+                action_contract=getattr(self, "active_action_contract", None),
+                watchdog_reason="target_controller_lease_release",
+                publish_terminal=False,
+                arm_watchdog=False,
             )
-            if callable(cancel_goal):
-                cancel_goal()
-                transport_cancelled = True
+            transport_cancelled = bool(
+                termination.get("transport_cancelled", False)
+            )
             self.action_active = False
             self.last_result_status = GoalStatus.PREEMPTED
             self.last_result_monotonic = now_for(self)
@@ -640,6 +669,8 @@ class TebGoalBridgeActionHealthMixin:
             self.persistent_target_pending_goal = None
             self.persistent_installed_target_goal = None
             self.persistent_installed_target_transaction = 0
+            self.pending_terminal_prepare = None
+            self.pending_lease_release_contract = None
         self.latest_goal = None
         self.last_dispatched_goal = None
         self.last_dispatch_identity = None
@@ -708,16 +739,22 @@ class TebGoalBridgeActionHealthMixin:
             route_id,
         )
         self.frontier_lease_released_reason = str(reason)
-        self.action_generation += 1
-        if was_active:
-            self.action_client.cancel_goal()
-        self.action_active = False
+        self._commit_termination(
+            "frontier_controller_release",
+            source_goal=getattr(self, "last_dispatched_goal", None),
+            action_contract=getattr(self, "active_action_contract", None),
+            watchdog_reason="frontier_controller_release",
+            publish_terminal=False,
+            arm_watchdog=False,
+        )
         self.handoff_requested = False
         self.frontier_observation_completion_pending = None
         self.frontier_continuous_prefetch_handoff_pending = None
         self._clear_target_failure_locked("frontier_route_unavailable")
         self._clear_action_health_locked()
         self._clear_failed_route_lease_locked()
+        self.pending_terminal_prepare = None
+        self.pending_lease_release_contract = None
         self.last_result_status = GoalStatus.PREEMPTED
         self.last_result_monotonic = now_for(self)
         self.publish_bridge_status(
@@ -745,11 +782,15 @@ class TebGoalBridgeActionHealthMixin:
         )
         if callable(cancel_watchdog):
             cancel_watchdog("cancel:%s" % reason)
-        self.action_generation += 1
         was_active = bool(self.action_active)
-        if was_active:
-            self.action_client.cancel_goal()
-        self.action_active = False
+        self._commit_termination(
+            "cancel:%s" % reason,
+            source_goal=getattr(self, "last_dispatched_goal", None),
+            action_contract=getattr(self, "active_action_contract", None),
+            watchdog_reason="cancel:%s" % reason,
+            publish_terminal=False,
+            arm_watchdog=False,
+        )
         self.handoff_requested = False
         self.persistent_target_terminal_boundary_transaction = 0
         self.frontier_observation_completion_pending = None
@@ -757,6 +798,8 @@ class TebGoalBridgeActionHealthMixin:
         self._clear_target_failure_locked("cancel:%s" % reason)
         self._clear_action_health_locked()
         self._clear_failed_route_lease_locked()
+        self.pending_terminal_prepare = None
+        self.pending_lease_release_contract = None
         self.last_result_status = GoalStatus.PREEMPTED
         self.last_result_monotonic = now_for(self)
         self.publish_bridge_status(
@@ -767,6 +810,26 @@ class TebGoalBridgeActionHealthMixin:
         rospy.loginfo("TEB goal bridge cancelled move_base action: reason=%s", reason)
 
     def _clear_action_health_locked(self):
+        invalidate_feedback = getattr(
+            self, "_invalidate_teb_feedback_locked", None
+        )
+        if callable(invalidate_feedback):
+            feedback_already_invalid = bool(
+                not getattr(self, "teb_feedback_valid", False)
+                and getattr(self, "teb_feedback_requires_fresh_planner_command", False)
+                and getattr(self, "latest_teb_selected_linear", None) is None
+            )
+            invalidation_reason = (
+                str(
+                    getattr(
+                        self, "teb_feedback_invalid_reason", "action_lease_cleared"
+                    )
+                    or "action_lease_cleared"
+                )
+                if feedback_already_invalid
+                else "action_lease_cleared"
+            )
+            invalidate_feedback(invalidation_reason, clear_planner=True)
         self.active_goal_global = None
         self.active_feedback_distance = None
         self.active_feedback_pose = None
@@ -792,6 +855,7 @@ class TebGoalBridgeActionHealthMixin:
         self.active_route_kind = ""
         self.active_route_id = 0
         self.active_route_map_epoch = None
+        self.active_graph_transaction_id = 0
         self.active_target_epoch = 0
         self.active_target_track_id = ""
 
@@ -1164,8 +1228,6 @@ class TebGoalBridgeActionHealthMixin:
             lifecycle="release_to_frontier",
             controller_lease="released" if released else "unchanged",
         )
-        if cancel_action and self.action_active:
-            self.action_client.cancel_goal()
         rospy.logwarn(
             "TEB goal bridge released failed target to mission layer: "
             "reason=%s status=%s goal=%s epoch=%d",

@@ -6,6 +6,8 @@
 
 uint32 route_id
 uint64 map_epoch
+# Graph planner transaction; independent from the GoalManager mission ID.
+uint64 graph_transaction_id
 # LifecycleManager uses a full UUID1 integer; keep it lossless across ROS.
 string lifecycle_transaction_id
 uint32 action_generation

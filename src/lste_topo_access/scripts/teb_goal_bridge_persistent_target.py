@@ -73,9 +73,13 @@ class TebGoalBridgePersistentTargetMixin:
         transaction_id,
         goal,
         *,
+        route_id=0,
+        lifecycle_transaction_id="",
+        action_generation=0,
         map_epoch=0,
         route_kind="",
         mission_route_kind="",
+        graph_transaction_id=0,
         graph_action="",
         graph_obligation_kind="",
     ):
@@ -83,13 +87,38 @@ class TebGoalBridgePersistentTargetMixin:
         command = PersistentGoalCommand()
         command.kind = int(kind)
         command.transaction_id = max(0, int(transaction_id))
+        command.route_id = max(0, int(route_id or 0))
+        command.lifecycle_transaction_id = str(lifecycle_transaction_id or "")
+        command.action_generation = max(0, int(action_generation or 0))
         command.map_epoch = max(0, int(map_epoch or 0))
+        command.graph_transaction_id = max(
+            0, int(graph_transaction_id or 0)
+        )
         command.route_kind = str(route_kind or "")
         command.mission_route_kind = str(mission_route_kind or "")
         command.graph_action = str(graph_action or "")
         command.graph_obligation_kind = str(graph_obligation_kind or "")
         command.goal = copy.deepcopy(goal)
         return command
+
+    def _persistent_command_identity_locked(self, reserve=False):
+        """Return the route identity shared by planner and bridge commands."""
+        generation = int(getattr(self, "action_generation", 0) or 0)
+        if reserve and not self.action_active:
+            generation = int(self._reserve_persistent_dispatch_generation_locked())
+        lifecycle_id = int(
+            getattr(
+                getattr(self, "lifecycle_manager", None),
+                "current_transaction_id",
+                0,
+            )
+            or 0
+        )
+        return {
+            "route_id": int(getattr(self, "latest_route_id", 0) or 0),
+            "lifecycle_transaction_id": str(lifecycle_id),
+            "action_generation": generation,
+        }
 
     def _request_persistent_target_locked(self, reason):
         """Request Navfn validation without promoting an unverified target."""
@@ -107,6 +136,7 @@ class TebGoalBridgePersistentTargetMixin:
                 PersistentGoalCommand.KIND_TARGET_REQUEST,
                 transaction_id,
                 target_request,
+                **self._persistent_command_identity_locked(reserve=True),
                 map_epoch=max(
                     1, int(getattr(self, "latest_route_map_epoch", 0) or 0)
                 ),
@@ -114,6 +144,9 @@ class TebGoalBridgePersistentTargetMixin:
                 mission_route_kind=str(
                     self.latest_mission_route_kind or self.latest_route_kind
                     or "direct_goal"
+                ),
+                graph_transaction_id=int(
+                    getattr(self, "latest_graph_transaction_id", 0) or 0
                 ),
                 graph_action=str(getattr(self, "latest_graph_action", "") or ""),
                 graph_obligation_kind=str(
@@ -169,6 +202,7 @@ class TebGoalBridgePersistentTargetMixin:
                 PersistentGoalCommand.KIND_CLEAR,
                 cleared_transaction,
                 tombstone,
+                **self._persistent_command_identity_locked(),
                 map_epoch=max(
                     1, int(getattr(self, "latest_route_map_epoch", 0) or 0)
                 ),
@@ -192,13 +226,19 @@ class TebGoalBridgePersistentTargetMixin:
         self.persistent_target_goal_pub.publish(tombstone)
         self.persistent_target_command_pub.publish(
             self._persistent_goal_command(
-                PersistentGoalCommand.KIND_CLEAR, 0, tombstone
+                PersistentGoalCommand.KIND_CLEAR,
+                0,
+                tombstone,
+                **self._persistent_command_identity_locked(),
             )
         )
         self.persistent_mission_goal_pub.publish(tombstone)
         self.persistent_mission_command_pub.publish(
             self._persistent_goal_command(
-                PersistentGoalCommand.KIND_CLEAR, 0, tombstone
+                PersistentGoalCommand.KIND_CLEAR,
+                0,
+                tombstone,
+                **self._persistent_command_identity_locked(),
             )
         )
         self.publish_bridge_status(
@@ -220,8 +260,12 @@ class TebGoalBridgePersistentTargetMixin:
                 PersistentGoalCommand.KIND_MISSION,
                 int(self.latest_goal_transaction_id),
                 approved,
+                **self._persistent_command_identity_locked(reserve=True),
                 map_epoch=max(
                     1, int(getattr(self, "latest_route_map_epoch", 0) or 0)
+                ),
+                graph_transaction_id=int(
+                    getattr(self, "latest_graph_transaction_id", 0) or 0
                 ),
                 route_kind=str(self.latest_route_kind or "direct_goal"),
                 mission_route_kind=str(

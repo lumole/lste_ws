@@ -13,12 +13,146 @@ from lifecycle_manager import EventType
 class GlobalFrontierTerminalReplanMixin:
     """Release completed work and request one fresh planning snapshot."""
 
+    @staticmethod
+    def _lease_release_ack_identity(payload):
+        """Decode the exact predecessor identity returned by the bridge."""
+        released = payload.get("released_controller_route")
+        released = released if isinstance(released, dict) else {}
+
+        def integer(*values):
+            for value in values:
+                try:
+                    return int(value or 0)
+                except (TypeError, ValueError):
+                    continue
+            return 0
+
+        return {
+            "route_id": integer(
+                released.get("route_id"),
+                payload.get("released_route_id"),
+                payload.get("route_id"),
+            ),
+            "route_kind": str(
+                released.get("route_kind")
+                or payload.get("released_route_kind")
+                or payload.get("route_kind")
+                or ""
+            ).strip().lower(),
+            "lifecycle_transaction_id": integer(
+                released.get("lifecycle_transaction_id"),
+                payload.get("lifecycle_transaction_id"),
+            ),
+            "action_generation": integer(
+                released.get("action_generation"),
+                payload.get("action_generation"),
+            ),
+            "graph_transaction_id": integer(
+                released.get("graph_transaction_id"),
+                payload.get("graph_transaction_id"),
+            ),
+            "map_epoch": (
+                released.get("map_epoch")
+                if released.get("map_epoch") is not None
+                else payload.get("map_epoch")
+            ),
+        }
+
+    def _accept_controller_lease_release_ack(self, payload):
+        """Open successor planning only after an exact transport ACK."""
+        pending = getattr(self, "pending_controller_lease_release", None)
+        identity = self._lease_release_ack_identity(payload)
+        if not isinstance(pending, dict):
+            self.publish_status(
+                "stale_lease_release_ack",
+                reason="no_pending_controller_release",
+                received_identity=identity,
+            )
+            return False
+        mismatch = None
+        for field in (
+            "route_id",
+            "route_kind",
+            "lifecycle_transaction_id",
+            "action_generation",
+            "graph_transaction_id",
+        ):
+            expected = pending.get(field, 0 if field != "route_kind" else "")
+            if identity[field] != expected:
+                mismatch = "lease_release_ack_%s_mismatch" % field
+                break
+        if mismatch is None and pending.get("map_epoch") is not None:
+            try:
+                received_epoch = int(identity.get("map_epoch"))
+                expected_epoch = int(pending["map_epoch"])
+            except (TypeError, ValueError):
+                mismatch = "lease_release_ack_map_epoch_invalid"
+            else:
+                if received_epoch != expected_epoch:
+                    mismatch = "lease_release_ack_map_epoch_mismatch"
+        if mismatch is not None:
+            self.publish_status(
+                "stale_lease_release_ack",
+                reason=mismatch,
+                expected_identity=pending,
+                received_identity=identity,
+            )
+            return False
+        if str(payload.get("controller_lease", "")).strip().lower() not in {
+            "released",
+            "transport_released",
+        }:
+            self.publish_status(
+                "stale_lease_release_ack",
+                reason="lease_release_ack_not_released",
+                expected_identity=pending,
+                received_identity=identity,
+            )
+            return False
+
+        self.pending_controller_lease_release = None
+        self.awaiting_controller_lease_release_ack = False
+        self.last_controller_lease_release_ack = dict(identity)
+        self.last_released_route_controller_pending = False
+        self.last_planning_wall = 0.0
+        self.publish_status(
+            "controller_lease_release_acknowledged",
+            **identity,
+            new_action_generation=int(
+                payload.get("new_action_generation", 0) or 0
+            ),
+            successor_planning="released",
+        )
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        wake_payload = {
+            "event": "terminal_replan_after_lease_ack",
+            "route_id": identity["route_id"],
+            "lifecycle_transaction_id": identity[
+                "lifecycle_transaction_id"
+            ],
+        }
+        if lifecycle is not None:
+            lifecycle.enqueue_type(EventType.REPLAN_REQUESTED, wake_payload)
+        elif self.immediate_plan_timer is None and not rospy.is_shutdown():
+            self.immediate_plan_timer = rospy.Timer(
+                rospy.Duration(0.01), self.on_immediate_plan, oneshot=True
+            )
+        return False
+
     def schedule_terminal_replan(self, completed, terminal_delta):
         """Release a finished lease and schedule normal successor selection."""
+        terminal_contract = getattr(self, "active_terminal_contract", None)
+        terminal_contract = (
+            dict(terminal_contract)
+            if isinstance(terminal_contract, dict)
+            else None
+        )
         # Do not let the next SLAM timer re-project a completed mission endpoint
         # onto a nearby grid cell and publish a synthetic follow-up action.
-        self.release_active_frontier(
+        awaiting_ack = self.release_active_frontier(
             preserve_place_departure=bool(self.place_departure.active),
+            queue_successor=False,
+            terminal_contract=terminal_contract,
         )
         self.active_progress_time = 0.0
         self.active_last_progress_signal = "terminal_replan"
@@ -30,11 +164,21 @@ class GlobalFrontierTerminalReplanMixin:
                     round(float(completed[3]), 3),
                 ]
             ),
+            awaiting_controller_lease_release_ack=bool(awaiting_ack),
         )
         # Bypass only the compute-throttle, never route validation. The next
         # fixed lifecycle tick consumes this fact; no callback-owned timer is
         # needed for the successor boundary.
         self.last_planning_wall = 0.0
+        if awaiting_ack:
+            rospy.loginfo(
+                "Global frontier holds successor planning until controller "
+                "lease ACK route_id=%d",
+                int(terminal_contract.get("route_id", 0) or 0)
+                if terminal_contract is not None
+                else 0,
+            )
+            return
         lifecycle = getattr(self, "lifecycle_manager", None)
         if lifecycle is not None:
             lifecycle.enqueue_type(

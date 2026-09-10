@@ -44,6 +44,9 @@ class GlobalFrontierLifecycleMixin:
         self._last_hard_reset_id = None
         self._last_hard_reset_transaction_id = 0
         self._hard_reset_count = 0
+        self._rehydration_transaction_id = 0
+        self._rehydration_pending_streams = set()
+        self._rehydration_applied_streams = set()
 
     def lifecycle_state(self):
         return self.lifecycle_manager.current_state
@@ -199,9 +202,27 @@ class GlobalFrontierLifecycleMixin:
         )
 
     def on_execution_terminal(self, message):
-        return self._enqueue_lifecycle_event(
+        # The terminal is a causal ownership boundary.  Mark the current
+        # planning snapshot obsolete before enqueueing so a slow candidate
+        # pass yields before the bridge's handoff watchdog can expire.  Route
+        # state remains exclusively owned by LifecycleManager.tick().
+        request_preempt = getattr(self, "request_planning_preempt", None)
+        if callable(request_preempt):
+            request_preempt("execution_terminal")
+        else:
+            self.planning_preempt_requested = True
+            self.planning_preempt_reason = "execution_terminal"
+        accepted = self._enqueue_lifecycle_event(
             EventType.EXECUTION_TERMINAL, deepcopy(message)
         )
+        if not accepted:
+            clear_preempt = getattr(self, "clear_planning_preempt", None)
+            if callable(clear_preempt):
+                clear_preempt()
+            else:
+                self.planning_preempt_requested = False
+                self.planning_preempt_reason = ""
+        return accepted
 
     def on_hard_reset(self, message):
         """Queue a slice reset; domain state changes stay inside ``tick``."""
@@ -231,6 +252,11 @@ class GlobalFrontierLifecycleMixin:
 
     def _handle_lifecycle_event(self, event):
         """Apply one gathered fact from inside ``LifecycleManager.tick``."""
+        expire_pending = getattr(
+            self, "_expire_terminals_waiting_for_dispatch", None
+        )
+        if callable(expire_pending):
+            expire_pending()
         if event.type == EventType.RESET:
             return self._apply_hard_reset(event)
         handlers = {
@@ -250,15 +276,31 @@ class GlobalFrontierLifecycleMixin:
         }
         if event.type == EventType.COSTMAP_UPDATED:
             kind, payload = event.payload
-            result = (
-                self._apply_costmap(payload)
-                if kind == "full"
-                else (
-                    self._apply_costmap_update(payload)
-                    if kind == "delta"
-                    else GlobalFrontierRouteStateMixin.invalidate_costmap(self)
+            rehydration_costmap = bool(
+                kind == "full"
+                and int(getattr(event, "transaction_id", 0) or 0)
+                == int(getattr(self, "_rehydration_transaction_id", 0) or 0)
+                and "costmap" in getattr(
+                    self, "_rehydration_pending_streams", set()
                 )
             )
+            self._applying_rehydration_costmap = rehydration_costmap
+            try:
+                result = (
+                    self._apply_costmap(payload)
+                    if kind == "full"
+                    else (
+                        self._apply_costmap_update(payload)
+                        if kind == "delta"
+                        else GlobalFrontierRouteStateMixin.invalidate_costmap(self)
+                    )
+                )
+            finally:
+                self._applying_rehydration_costmap = False
+            if kind == "full" and not rehydration_costmap:
+                self._rehydration_costmap_fallback = None
+                self._rehydration_costmap_fallback_active = False
+            self._record_rehydration_event_applied(event, "costmap")
             if (
                 kind != "resync"
                 and
@@ -280,6 +322,10 @@ class GlobalFrontierLifecycleMixin:
             ):
                 self._lifecycle_sync_seen.add("map")
         result = handler(event.payload)
+        if event.type == EventType.MAP_UPDATED:
+            self._record_rehydration_event_applied(event, "map")
+        elif event.type == EventType.POSE_UPDATED:
+            self._record_rehydration_event_applied(event, "pose")
         if result is not None:
             return result
         if (
@@ -291,6 +337,139 @@ class GlobalFrontierLifecycleMixin:
         if event.type == EventType.TASK_COMPLETED:
             return State.COMPLETED if bool(getattr(event.payload, "data", False)) else State.IDLE
         return None
+
+    def _record_rehydration_event_applied(self, event, stream):
+        """Publish an auditable marker when a reset snapshot is consumed."""
+        transaction_id = int(getattr(event, "transaction_id", 0) or 0)
+        if transaction_id != int(getattr(self, "_rehydration_transaction_id", 0) or 0):
+            return
+        pending = getattr(self, "_rehydration_pending_streams", set())
+        if stream not in pending:
+            return
+        pending.discard(stream)
+        applied = getattr(self, "_rehydration_applied_streams", set())
+        applied.add(stream)
+        self.publish_status(
+            "hard_reset_rehydration_applied",
+            rehydrated=True,
+            rehydrated_stream=str(stream),
+            rehydration_transaction_id=transaction_id,
+            rehydration_applied_streams=sorted(applied),
+        )
+        if pending:
+            return
+        self.publish_status(
+            "hard_reset_rehydration_complete",
+            rehydrated=True,
+            rehydration_transaction_id=transaction_id,
+            rehydration_applied_streams=sorted(applied),
+            planner_inputs_ready=all(
+                name in applied for name in ("map", "costmap", "pose")
+            ),
+        )
+
+    def _capture_hard_reset_snapshots(self):
+        """Capture the latest valid sensor projection before clearing state."""
+        map_message = getattr(self, "map_msg", None)
+        costmap_message = getattr(self, "costmap_msg", None)
+        costmap_snapshot_stale = False
+        if costmap_message is None:
+            # The delta stream may have invalidated the working projection
+            # after the last full grid. An explicit hard reset is a stopped
+            # actuator boundary, so retain that full grid as the next planner
+            # bootstrap instead of forcing the next slice to wait forever.
+            costmap_message = getattr(self, "_last_full_costmap", None)
+            costmap_snapshot_stale = costmap_message is not None
+        fresh_costmap = getattr(self, "fresh_costmap", None)
+        if costmap_message is not None and callable(fresh_costmap):
+            # Keep the same freshness contract used by planning while a route
+            # owns the robot. A stopped slice boundary may use the structural
+            # fallback below when the latched full-grid stream is quiet.
+            fresh = fresh_costmap()
+            if fresh is None:
+                # A slice boundary is also a controller stop boundary. When
+                # the route has already been released, retain a structurally
+                # valid full grid as a short-lived bootstrap baseline instead
+                # of making the next slice wait forever for a latched topic.
+                # Never do this while an active route still owns the robot.
+                active_route = int(getattr(self, "active_route_id", 0) or 0)
+                stationary = bool(getattr(self, "costmap_stationary", False))
+                valid_shape = False
+                try:
+                    expected = int(costmap_message.info.width) * int(
+                        costmap_message.info.height
+                    )
+                    valid_shape = bool(
+                        expected > 0
+                        and len(costmap_message.data) == expected
+                        and float(costmap_message.info.resolution) > 0.0
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    valid_shape = False
+                if valid_shape:
+                    costmap_snapshot_stale = True
+                else:
+                    costmap_message = None
+            else:
+                costmap_message = fresh
+        self._last_hard_reset_costmap_snapshot_stale = bool(
+            costmap_snapshot_stale
+        )
+        pose_message = getattr(self, "pose_odom", None)
+        return {
+            "map": None if map_message is None else deepcopy(map_message),
+            "costmap": (
+                None
+                if costmap_message is None
+                else deepcopy(costmap_message)
+            ),
+            "pose": None if pose_message is None else deepcopy(pose_message),
+        }
+
+    def _enqueue_hard_reset_rehydration(self, transaction_id, snapshots):
+        """Re-enter cached inputs through the normal lifecycle event queue."""
+        pending = set()
+        queued = {}
+        for stream, event_type, payload in (
+            ("map", EventType.MAP_UPDATED, snapshots.get("map")),
+            (
+                "costmap",
+                EventType.COSTMAP_UPDATED,
+                (
+                    "full",
+                    snapshots.get("costmap"),
+                ),
+            ),
+            ("pose", EventType.POSE_UPDATED, snapshots.get("pose")),
+        ):
+            if payload is None or (
+                stream == "costmap" and payload[1] is None
+            ):
+                queued[stream] = False
+                continue
+            accepted = self._enqueue_lifecycle_event(
+                event_type,
+                payload,
+                transaction_id=int(transaction_id),
+            )
+            queued[stream] = bool(accepted)
+            if accepted:
+                pending.add(stream)
+        self._rehydration_transaction_id = int(transaction_id)
+        self._rehydration_pending_streams = pending
+        self._rehydration_applied_streams = set()
+        fallback = snapshots.get("costmap")
+        self._rehydration_costmap_fallback = (
+            None if fallback is None else deepcopy(fallback)
+        )
+        self._last_full_costmap = (
+            None if fallback is None else deepcopy(fallback)
+        )
+        self._rehydration_costmap_fallback_active = bool(
+            queued.get("costmap") and self._rehydration_costmap_fallback is not None
+        )
+        self._costmap_rehydrated_pose_grace = bool(queued.get("costmap"))
+        return queued
 
     def _apply_hard_reset(self, event):
         """Clear the complete explorer projection for one warm slice."""
@@ -316,6 +495,7 @@ class GlobalFrontierLifecycleMixin:
             return None
 
         task = deepcopy(getattr(self, "latest_task", None))
+        snapshots = self._capture_hard_reset_snapshots()
         previous_route_id = int(getattr(self, "active_route_id", 0) or 0)
         previous_graph_transaction = bool(
             getattr(self, "graph_route_action_transaction", None)
@@ -331,6 +511,10 @@ class GlobalFrontierLifecycleMixin:
         self._initialize_runtime_state()
         if task is not None:
             GlobalFrontierEventCallbacksMixin.on_task(self, task)
+        rehydration = self._enqueue_hard_reset_rehydration(
+            new_transaction_id,
+            snapshots,
+        )
         self._last_hard_reset_id = reset_id
         self._last_hard_reset_transaction_id = int(new_transaction_id)
         self._hard_reset_count += 1
@@ -343,6 +527,14 @@ class GlobalFrontierLifecycleMixin:
             previous_graph_transaction_active=previous_graph_transaction,
             state=State.IDLE.value,
             hard_reset_count=int(self._hard_reset_count),
+            rehydration_transaction_id=int(new_transaction_id),
+            rehydration_queued=rehydration,
+            rehydration_missing_streams=sorted(
+                stream for stream, accepted in rehydration.items() if not accepted
+            ),
+            costmap_snapshot_stale=bool(
+                getattr(self, "_last_hard_reset_costmap_snapshot_stale", False)
+            ),
         )
         publish_reset_ack(
             self.hard_reset_ack_publisher,
@@ -584,18 +776,29 @@ class GlobalFrontierLifecycleMixin:
         return None
 
     def _apply_execution_terminal_event(self, message):
-        if isinstance(message, dict):
+        try:
+            if isinstance(message, dict):
+                return None
+            before_route = getattr(self, "active_route_id", 0)
+            GlobalFrontierTerminalReplanMixin._process_execution_terminal_locked(
+                self, message
+            )
+            if (
+                before_route > 0
+                and getattr(self, "active_terminal_received", False)
+            ):
+                return State.EXECUTION_DONE
             return None
-        before_route = getattr(self, "active_route_id", 0)
-        GlobalFrontierTerminalReplanMixin._process_execution_terminal_locked(
-            self, message
-        )
-        if (
-            before_route > 0
-            and getattr(self, "active_terminal_received", False)
-        ):
-            return State.EXECUTION_DONE
-        return None
+        finally:
+            # The queued terminal, including a stale/mismatched one, has now
+            # crossed the lifecycle boundary.  A later snapshot may compute
+            # again, but it must not inherit this event's invalidation.
+            clear_preempt = getattr(self, "clear_planning_preempt", None)
+            if callable(clear_preempt):
+                clear_preempt()
+            else:
+                self.planning_preempt_requested = False
+                self.planning_preempt_reason = ""
 
     def _apply_replan_request_event(self, message):
         if isinstance(message, dict):

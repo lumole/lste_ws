@@ -536,16 +536,29 @@ def _command_output_gap_evidence(records, goal_tolerance):
         try:
             distance = float(payload.get("distance_to_goal"))
             planner = payload.get("teb_planner_cmd") or [0.0, 0.0]
-            output = (mux.get("output") or {}).get("linear_x", 0.0)
+            output_command = mux.get("output") or {}
+            output = output_command.get("linear_x", 0.0)
+            output_angular = output_command.get("angular_z", 0.0)
             planner_linear = float(planner[0])
             output_linear = float(output)
+            output_angular = float(output_angular)
         except (TypeError, ValueError, IndexError):
             continue
         if distance <= goal_tolerance + 0.02:
             continue
+        feedback = payload.get("teb_feedback")
+        feedback = feedback if isinstance(feedback, dict) else {}
+        selected = feedback.get("selected_velocity")
+        selected = selected if isinstance(selected, dict) else {}
+        try:
+            selected_angular = float(selected.get("angular_z", 0.0))
+        except (TypeError, ValueError):
+            selected_angular = 0.0
         turn = payload.get("teb_turn_supervisor")
         turn = turn if isinstance(turn, dict) else {}
         if planner_linear < -0.002 and abs(output_linear) <= 0.02 \
+                and abs(output_angular) < 0.10 \
+                and abs(selected_angular) < 0.10 \
                 and str(turn.get("state") or "").upper() != "TURNING":
             candidates.append(payload)
     recent = candidates[-16:]
@@ -1393,7 +1406,14 @@ def _run_benchmark_start(trial, environment):
         raise subprocess.CalledProcessError(return_code, command)
 
 
-def _run_warm_slice_hard_reset(runtime, trial, slice_id, reason):
+def _run_warm_slice_hard_reset(
+    runtime,
+    trial,
+    slice_id,
+    reason,
+    failure_trigger="",
+    failure_details=None,
+):
     """Reset every stateful participant before another slice can start."""
     required = [
         "lste_goal_manager",
@@ -1425,6 +1445,17 @@ def _run_warm_slice_hard_reset(runtime, trial, slice_id, reason):
         "--timeout",
         "15",
     ]
+    failure_trigger = str(failure_trigger or "").strip()
+    if failure_trigger:
+        command.extend(("--failure-trigger", failure_trigger))
+        command.extend((
+            "--failure-details",
+            json.dumps(
+                failure_details if isinstance(failure_details, dict) else {},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ))
     for node in required:
         command.extend(("--require", node))
     # A warm target-entry slice is an independent local experiment. Keep the
@@ -1476,6 +1507,27 @@ def _run_warm_slice_hard_reset(runtime, trial, slice_id, reason):
             "warm slice hard reset failed: %s" % json.dumps(result, sort_keys=True)
         )
     return result
+
+
+def _warm_boundary_failure(diagnostic):
+    """Return an explicit metrics trigger for a closed no-route slice."""
+    if not isinstance(diagnostic, dict):
+        return "", {}
+    if str(diagnostic.get("reason", "") or "").strip().lower() != (
+        "no_active_controller_route"
+    ):
+        return "", {}
+    details = {
+        "event": "trial_boundary",
+        "state": diagnostic.get("state"),
+        "reason": diagnostic.get("reason"),
+        "classification": diagnostic.get("classification"),
+        "active_route_id": diagnostic.get("active_route_id"),
+        "active_route_kind": diagnostic.get("active_route_kind"),
+        "latest_sample": diagnostic.get("latest_sample"),
+        "progress": diagnostic.get("progress"),
+    }
+    return "no_active_controller_route", details
 
 
 def _launcher_start_metadata(run_dir: Path):
@@ -2378,6 +2430,9 @@ def _warm_slice_record(
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             diagnostic = None
+    boundary_failure_trigger, boundary_failure_details = _warm_boundary_failure(
+        diagnostic
+    )
     reset = None
     reset_error = None
     try:
@@ -2386,7 +2441,20 @@ def _warm_slice_record(
             trial,
             slice_id,
             "slice_interrupted" if interrupted else "slice_boundary",
+            failure_trigger=boundary_failure_trigger,
+            failure_details=boundary_failure_details,
         )
+        # The metrics node closes a boundary failure while processing the
+        # hard-reset request.  Read that artifact after the reset so the slice
+        # record points to the authoritative failure episode instead of only
+        # retaining the runner-owned trial-end diagnostic.
+        if failure_stop is None:
+            failure_stop = latest_failure_snapshot(
+                runtime.metrics_path,
+                exclude_failure_ids=known_failure_ids,
+            )
+            if failure_stop is not None:
+                outcome = "failure_snapshot"
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         reset_error = "%s:%s" % (type(exc).__name__, exc)
         _append_lifecycle_event(

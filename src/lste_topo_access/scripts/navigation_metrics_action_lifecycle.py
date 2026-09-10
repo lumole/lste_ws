@@ -94,6 +94,44 @@ class NavigationMetricsActionLifecycleMixin:
                 time.monotonic(), "move_base_simple_goal"
             )
 
+    def _consume_recent_persistent_terminal_preemption_locked(self):
+        """Correlate the PREEMPTED emitted by an intentional endpoint terminal."""
+        if not bool(getattr(self, "persistent_execution", False)):
+            return False
+        event_name = "persistent_execution_terminal"
+        terminal_wall = float(
+            getattr(self, "lifecycle_event_wall", {}).get(event_name, 0.0)
+            or 0.0
+        )
+        # The typed terminal and /move_base/status use independent ROS topic
+        # queues. A validated endpoint can therefore trigger the intentional
+        # cancel before the terminal topic callback is delivered. The bridge's
+        # endpoint_detected status is already identity-checked, so it is a
+        # safe predecessor for the same bounded PREEMPTED correlation window.
+        endpoint_wall = float(
+            getattr(self, "lifecycle_event_wall", {}).get(
+                "endpoint_detected", 0.0
+            )
+            or 0.0
+        )
+        if endpoint_wall > terminal_wall:
+            event_name = "endpoint_detected"
+            terminal_wall = endpoint_wall
+        if terminal_wall <= 0.0 or time.monotonic() - terminal_wall > 1.0:
+            return False
+        source = str(
+            getattr(self, "bridge_active_intent_source", "") or ""
+        ).strip().lower()
+        if source and source != "global_slam_frontier":
+            return False
+        self._write(
+            "INFO",
+            "frontier_observation_preemption",
+            reason=event_name,
+            correlation_window_seconds=1.0,
+        )
+        return True
+
     def on_status(self, message):
         with self.lock:
             for status in message.status_list:
@@ -119,7 +157,16 @@ class NavigationMetricsActionLifecycleMixin:
                 self.status_counts[name] = self.status_counts.get(name, 0) + 1
                 if code == 2:
                     self.preemptions += 1
-                    if self.pending_task_done_preemptions > 0:
+                    if self._consume_hard_reset_preemption_locked():
+                        self._write(
+                            "INFO",
+                            "hard_reset_preemption",
+                            goal_id=status.goal_id.id,
+                            reason="warm_slice_hard_reset",
+                        )
+                    elif self._consume_recent_persistent_terminal_preemption_locked():
+                        self.frontier_observation_preemptions += 1
+                    elif self.pending_task_done_preemptions > 0:
                         self.pending_task_done_preemptions -= 1
                         self.task_done_preemptions += 1
                     elif self.pending_target_terminal_observation_preemptions > 0:
@@ -162,6 +209,19 @@ class NavigationMetricsActionLifecycleMixin:
                             "route_recovery_preemption",
                             goal_id=status.goal_id.id,
                             reasons=dict(self.route_recovery_preemption_reasons),
+                        )
+                    elif (
+                        self._consume_recent_frontier_release_preemption_locked()
+                        is not None
+                    ):
+                        self.route_recovery_preemptions += 1
+                        self._write(
+                            "INFO",
+                            "route_recovery_preemption",
+                            goal_id=status.goal_id.id,
+                            reason=(
+                                "recent_frontier_release_context"
+                            ),
                         )
                     else:
                         self.unexpected_preemptions += 1

@@ -99,6 +99,7 @@ class GoalManagerFrontierMixin:
             # Keep the legacy lookup for external or old frontier publishers.
             self.global_frontier_route_id = 0 if route_id is None else int(route_id)
         self.global_frontier_goal_context = self.normalize_frontier_goal_context(None)
+        self.global_frontier_graph_transaction_id = 0
         # A terminal means the next fresh frontier message is actionable now.
         if self.teb_terminal_goal is not None:
             self.next_update_time = 0.0
@@ -126,6 +127,14 @@ class GoalManagerFrontierMixin:
             x, y = float(goal_xy[0]), float(goal_xy[1])
             route_id = max(0, int(payload.get("route_id", 0) or 0))
         except (TypeError, ValueError):
+            return
+        identity, identity_reason = self._canonical_route_identity(message)
+        if identity_reason:
+            self._record_canonical_rejection(identity_reason, identity)
+            return
+        stale_reason = self._canonical_route_stale_reason(identity)
+        if stale_reason:
+            self._record_canonical_rejection(stale_reason, identity)
             return
         frame = str(payload.get("frame_id", "map")).strip().lstrip("/") or "map"
         if frame not in ("odom", "map"):
@@ -156,6 +165,40 @@ class GoalManagerFrontierMixin:
         except (TypeError, ValueError):
             map_epoch = 0
         self.global_frontier_map_epoch = map_epoch if map_epoch > 0 else None
+        try:
+            graph_transaction_id = int(
+                payload.get("graph_transaction_id", 0) or 0
+            )
+        except (TypeError, ValueError):
+            graph_transaction_id = 0
+        if graph_transaction_id <= 0:
+            transaction_payload = payload.get("graph_route_action_transaction")
+            if isinstance(transaction_payload, dict):
+                try:
+                    graph_transaction_id = int(
+                        transaction_payload.get("graph_transaction_id", 0)
+                        or transaction_payload.get("transaction_id", 0)
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    graph_transaction_id = 0
+        self.global_frontier_graph_transaction_id = max(0, graph_transaction_id)
+        self.canonical_lifecycle_high_water = max(
+            int(getattr(self, "canonical_lifecycle_high_water", 0) or 0),
+            identity["lifecycle_transaction_id"],
+        )
+        self.canonical_route_high_water = max(
+            int(getattr(self, "canonical_route_high_water", 0) or 0),
+            identity["route_id"],
+        )
+        self.canonical_graph_high_water = max(
+            int(getattr(self, "canonical_graph_high_water", 0) or 0),
+            identity["graph_transaction_id"],
+        )
+        self.canonical_map_epoch_high_water = max(
+            int(getattr(self, "canonical_map_epoch_high_water", 0) or 0),
+            identity["map_epoch"],
+        )
         self.global_frontier_graph_action = str(
             payload.get("graph_action", "") or ""
         ).strip().lower()
@@ -283,29 +326,10 @@ class GoalManagerFrontierMixin:
             "local_egress",
             "portal_probe",
         ):
-            self.global_frontier_route_kind = route_kind
-            mission_route_kind = str(
-                payload.get("mission_route_kind", route_kind)
-            ).strip().lower()
-            if mission_route_kind in (
-                "frontier_endpoint",
-                "portal_transition",
-                "local_egress",
-                "portal_probe",
-            ):
-                self.global_frontier_mission_route_kind = mission_route_kind
-            try:
-                map_epoch = int(payload.get("map_epoch", 0) or 0)
-            except (TypeError, ValueError):
-                map_epoch = 0
-            if map_epoch > 0:
-                self.global_frontier_map_epoch = map_epoch
-            self.global_frontier_graph_action = str(
-                payload.get("graph_action", "") or ""
-            ).strip().lower()
-            self.global_frontier_graph_obligation_kind = str(
-                payload.get("graph_obligation_kind", "") or ""
-            ).strip().lower()
+            # The status topic mirrors route decisions for observability, but
+            # the atomic route-command topic is the only identity authority.
+            if self.global_frontier_command_enabled:
+                return
         route_id = int(payload.get("route_id", 0) or 0)
         command_goal = payload.get("command_goal")
         if (
@@ -358,6 +382,7 @@ class GoalManagerFrontierMixin:
         self.global_frontier_route_kind = "frontier_endpoint"
         self.global_frontier_mission_route_kind = "frontier_endpoint"
         self.global_frontier_route_id = 0
+        self.global_frontier_graph_transaction_id = 0
         self.teb_terminal_goal = None
         self.teb_frontier_goal_history = []
         self.frontier_goal_sent_at = None
@@ -384,9 +409,6 @@ class GoalManagerFrontierMixin:
             and not target_room_claim_release
         ):
             return self.frontier_replan_pending_id
-        lifecycle = getattr(self, "lifecycle_manager", None)
-        if lifecycle is not None:
-            lifecycle.begin_transaction(State.IDLE)
         self.frontier_replan_request_id += 1
         request_id = self.frontier_replan_request_id
         self.frontier_replan_pending_id = request_id

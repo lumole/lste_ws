@@ -245,6 +245,10 @@ class GlobalFrontierActivationMixin:
             self.last_released_route_kind = ""
             self.last_released_route_terminal_received = False
             self.last_released_route_controller_pending = False
+            self.last_released_route_lifecycle_transaction_id = 0
+            self.last_released_route_action_generation = 0
+            self.last_released_route_graph_transaction_id = 0
+            self.last_released_route_map_epoch = None
         self.active_transition_kind = "initial"
         self.active_predecessor_route_id = 0
         self.active_transition_distance = None
@@ -273,6 +277,7 @@ class GlobalFrontierActivationMixin:
         self.active_portal_probe_phase = ""
         self.active_portal_retry = False
         self.active_terminal_received = False
+        self.active_terminal_contract = None
         start_probe = getattr(self, "start_active_portal_probe", None)
         if start_probe is not None and probe_record is None:
             probe_record = start_probe(selection, now)

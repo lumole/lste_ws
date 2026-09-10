@@ -13,6 +13,7 @@ import time
 HARD_RESET_TOPIC = "/lste/experiment/hard_reset"
 HARD_RESET_ACK_TOPIC = "/lste/experiment/hard_reset_ack"
 HARD_RESET_RELEASE_TOPIC = "/lste/experiment/hard_reset_release"
+EXPERIMENT_BOUNDARY_TOPIC = "/lste/experiment/trial_boundary"
 
 
 def decode_reset_request(message):
@@ -33,12 +34,17 @@ def decode_reset_request(message):
     reset_id = str(payload.get("reset_id", "") or "").strip()
     if not reset_id:
         return None
+    failure_details = payload.get("failure_details", {})
+    if not isinstance(failure_details, dict):
+        failure_details = {}
     return {
         "event": "hard_reset",
         "reset_id": reset_id,
         "transaction_id": max(0, int(payload.get("transaction_id", 0) or 0)),
         "reason": str(payload.get("reason", "slice_boundary") or "slice_boundary"),
         "slice_id": str(payload.get("slice_id", "") or ""),
+        "failure_trigger": str(payload.get("failure_trigger", "") or "").strip(),
+        "failure_details": failure_details,
     }
 
 
@@ -78,6 +84,7 @@ __all__ = [
     "HARD_RESET_ACK_TOPIC",
     "HARD_RESET_RELEASE_TOPIC",
     "HARD_RESET_TOPIC",
+    "EXPERIMENT_BOUNDARY_TOPIC",
     "decode_reset_request",
     "publish_reset_ack",
     "reset_ack_payload",
