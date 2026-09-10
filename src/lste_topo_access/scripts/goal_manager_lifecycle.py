@@ -404,6 +404,13 @@ class GoalManagerLifecycleMixin:
             transaction_id=request.get("transaction_id"),
         )
         self._initialize_runtime_state(rospy.get_param)
+        # ``goal_command_id`` is the mission transaction sequence consumed by
+        # the persistent planner.  A warm reset clears semantic ownership, but
+        # the planner intentionally retains its transaction high-water mark
+        # to reject late commands from the previous slice.  Keep issuing
+        # strictly newer mission IDs across that reset instead of rewinding
+        # the distributed contract to zero.
+        self.goal_command_id = previous_goal_command_id
         if task is not None:
             GoalManagerInputCallbacksMixin.apply_task(self, task)
         # Both are latched safety gates. Publish explicitly even when the

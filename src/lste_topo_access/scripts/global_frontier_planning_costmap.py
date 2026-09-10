@@ -79,13 +79,29 @@ class GlobalFrontierPlanningCostmapMixin:
         )
         if age > self.costmap_max_age:
             if (
-                getattr(self, "costmap_stationary", False)
-                and not getattr(self, "_costmap_explicitly_invalid", False)
+                not getattr(self, "_costmap_explicitly_invalid", False)
+                and getattr(self, "costmap_stationary", False)
             ):
                 rospy.logwarn_throttle(
                     5.0,
                     "Global frontier retaining stationary costmap cache "
                     "age=%.2fs limit=%.2fs",
+                    age,
+                    self.costmap_max_age,
+                )
+                return message
+            # The benchmark global costmap is a static-map projection whose
+            # full grid may be published only once; its update stream can stay
+            # quiet while SLAM and the robot continue moving.  This grid is
+            # used only for structural candidate filtering.  Exact Navfn
+            # validation below remains the executability gate, so retaining a
+            # valid stale structure is safer than making exploration
+            # permanently costmap-blind after the first quiet interval.
+            if bool(getattr(self, "navfn_plan_validation", False)):
+                rospy.logwarn_throttle(
+                    5.0,
+                    "Global frontier retaining structural costmap cache "
+                    "age=%.2fs limit=%.2fs; Navfn remains authoritative",
                     age,
                     self.costmap_max_age,
                 )

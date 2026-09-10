@@ -94,6 +94,54 @@ class NavigationMetricsActionLifecycleMixin:
                 time.monotonic(), "move_base_simple_goal"
             )
 
+    def _consume_preterminal_persistent_endpoint_preemption_locked(self):
+        """Correlate action status that follows an explicit planner terminal hold.
+
+        The bridge cancels the action before the endpoint and terminal status
+        topics are necessarily delivered to this observer. The planner
+        contract is already an identity-checked terminal boundary at that
+        point, so use it as the local predecessor for the same action.
+        """
+        if not bool(getattr(self, "persistent_execution", False)):
+            return False
+        reason = str(
+            getattr(self, "teb_feedback_invalid_reason", "") or ""
+        ).strip().lower()
+        if reason not in {
+            "planner_contract_endpoint_reached",
+            "planner_contract_terminal_hold",
+            "planner_contract_persistent_frontier_endpoint_terminal",
+        }:
+            return False
+        if not bool(getattr(self, "bridge_active", False)):
+            return False
+        source = str(
+            getattr(self, "bridge_active_intent_source", "") or ""
+        ).strip().lower()
+        if source and source != "global_slam_frontier":
+            return False
+        route = {}
+        reader = getattr(self, "_failure_route_context_locked", None)
+        if callable(reader):
+            context = reader()
+            if isinstance(context, dict) and isinstance(context.get("route"), dict):
+                route = context["route"]
+        route_kind = str(
+            route.get("active_route_kind") or route.get("route_kind") or ""
+        ).strip().lower()
+        if route_kind not in {"frontier_endpoint", "portal_transition", "local_egress"}:
+            return False
+        self._write(
+            "INFO",
+            "frontier_observation_preemption",
+            reason="planner_contract_terminal_boundary",
+            planner_feedback_reason=reason,
+            route_id=route.get("active_route_id") or route.get("route_id"),
+            route_kind=route_kind,
+            correlation_window_seconds=0.0,
+        )
+        return True
+
     def _consume_recent_persistent_terminal_preemption_locked(self):
         """Correlate the PREEMPTED emitted by an intentional endpoint terminal."""
         if not bool(getattr(self, "persistent_execution", False)):
@@ -132,6 +180,18 @@ class NavigationMetricsActionLifecycleMixin:
         )
         return True
 
+    @staticmethod
+    def _is_expected_goal_replacement_status(status):
+        """Recognize actionlib cancellation caused by a successor goal."""
+        try:
+            code = int(status.status)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if code not in (8, 9):
+            return False
+        text = str(getattr(status, "text", "") or "").strip().lower()
+        return "another goal" in text and "simple action server" in text
+
     def on_status(self, message):
         with self.lock:
             for status in message.status_list:
@@ -164,6 +224,8 @@ class NavigationMetricsActionLifecycleMixin:
                             goal_id=status.goal_id.id,
                             reason="warm_slice_hard_reset",
                         )
+                    elif self._consume_preterminal_persistent_endpoint_preemption_locked():
+                        self.frontier_observation_preemptions += 1
                     elif self._consume_recent_persistent_terminal_preemption_locked():
                         self.frontier_observation_preemptions += 1
                     elif self.pending_task_done_preemptions > 0:
@@ -237,17 +299,27 @@ class NavigationMetricsActionLifecycleMixin:
                 elif code == 3:
                     self.successes += 1
                 elif code in (4, 5, 8, 9):
-                    self.aborts += 1
-                    self._begin_failure_episode_locked(
-                        "move_base_terminal_failure",
-                        "move_base",
-                        {
-                            "goal_id": status.goal_id.id,
-                            "status": code,
-                            "status_name": name,
-                            "status_text": status.text or "-",
-                        },
-                    )
+                    if self._is_expected_goal_replacement_status(status):
+                        self.route_recovery_preemptions += 1
+                        self._write(
+                            "INFO",
+                            "route_recovery_preemption",
+                            goal_id=status.goal_id.id,
+                            reason="move_base_successor_goal_replacement",
+                            status_name=name,
+                        )
+                    else:
+                        self.aborts += 1
+                        self._begin_failure_episode_locked(
+                            "move_base_terminal_failure",
+                            "move_base",
+                            {
+                                "goal_id": status.goal_id.id,
+                                "status": code,
+                                "status_name": name,
+                                "status_text": status.text or "-",
+                            },
+                        )
                 self._write(
                     "INFO" if code in (0, 1, 3) else "WARN",
                     "move_base_status",
