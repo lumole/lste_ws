@@ -128,6 +128,40 @@ class TebTurnSupervisorControlMixin:
             if active_map_epoch is not None
             else planner_map_epoch
         )
+        # An explicit turn is owned by this adapter, not by the last raw TEB
+        # sample. A route boundary normally leaves the planner contract in a
+        # ZERO/STALE state, but the turn itself still has to cross the mux as
+        # a current, authenticated command. Ordinary pass-through commands
+        # retain the planner-produced identity unchanged.
+        supervisor_owned_turn = decision in ("turn", "turn_settle") and (
+            abs(float(command.linear.x)) > 0.001
+            or abs(float(command.angular.z)) > 0.01
+        ) and bool(self.active_action)
+        effective_planner_transaction_id = int(
+            getattr(self, "planner_command_transaction_id", 0) or 0
+        )
+        effective_planner_route_id = int(
+            getattr(self, "planner_command_route_id", 0) or 0
+        )
+        effective_planner_graph_transaction_id = int(
+            getattr(self, "planner_command_graph_transaction_id", 0) or 0
+        )
+        effective_planner_action_generation = int(
+            getattr(self, "planner_command_action_generation", 0) or 0
+        )
+        effective_planner_map_epoch = planner_map_epoch
+        if supervisor_owned_turn:
+            effective_planner_transaction_id = int(transaction_id)
+            effective_planner_route_id = int(
+                getattr(self, "active_action_route_id", 0) or 0
+            )
+            effective_planner_graph_transaction_id = int(
+                getattr(self, "active_action_graph_transaction_id", 0) or 0
+            )
+            effective_planner_action_generation = int(
+                getattr(self, "active_action_generation", 0) or 0
+            )
+            effective_planner_map_epoch = active_map_epoch
         payload = {
             "event": "teb_command",
             "transaction_id": int(transaction_id),
@@ -139,7 +173,7 @@ class TebTurnSupervisorControlMixin:
                 getattr(self, "planner_contract_sequence", 0) or 0
             ),
             "planner_action_generation": int(
-                getattr(self, "planner_command_action_generation", 0) or 0
+                effective_planner_action_generation
             ),
             "active_action_generation": int(
                 getattr(self, "active_action_generation", 0) or 0
@@ -151,7 +185,7 @@ class TebTurnSupervisorControlMixin:
                 getattr(self, "planner_contract_valid", False)
             ),
             "planner_transaction_id": int(
-                getattr(self, "planner_command_transaction_id", 0) or 0
+                effective_planner_transaction_id
             ),
             "active_action_transaction_id": int(
                 getattr(self, "active_action_transaction_id", 0) or 0
@@ -160,20 +194,20 @@ class TebTurnSupervisorControlMixin:
                 getattr(self, "active_action_graph_transaction_id", 0) or 0
             ),
             "planner_graph_transaction_id": int(
-                getattr(self, "planner_command_graph_transaction_id", 0) or 0
+                effective_planner_graph_transaction_id
             ),
             "active_action_graph_transaction_id": int(
                 getattr(self, "active_action_graph_transaction_id", 0) or 0
             ),
             "route_id": int(getattr(self, "active_action_route_id", 0) or 0),
             "planner_route_id": int(
-                getattr(self, "planner_command_route_id", 0) or 0
+                effective_planner_route_id
             ),
             "active_action_route_id": int(
                 getattr(self, "active_action_route_id", 0) or 0
             ),
             "map_epoch": command_map_epoch,
-            "planner_map_epoch": planner_map_epoch,
+            "planner_map_epoch": effective_planner_map_epoch,
             "active_action_map_epoch": getattr(
                 self, "active_action_map_epoch", None
             ),
@@ -427,16 +461,6 @@ class TebTurnSupervisorControlMixin:
             command = Twist()
             decision = "inactive"
             if (
-                getattr(self, "require_planner_command_contract", False)
-                and (
-                    not bool(getattr(self, "planner_contract_valid", False))
-                    or int(getattr(self, "planner_contract_state", 0) or 0) != 1
-                )
-            ):
-                command = Twist()
-                decision = "planner_contract_boundary"
-                state = self.state
-            elif (
                 self.mode == self.active_mode
                 and not self.task_done
                 and not self.navigation_hold
@@ -457,6 +481,16 @@ class TebTurnSupervisorControlMixin:
                         1.0 / self.command_frequency
                     )
                     decision = "turn"
+                state = self.state
+            elif (
+                getattr(self, "require_planner_command_contract", False)
+                and (
+                    not bool(getattr(self, "planner_contract_valid", False))
+                    or int(getattr(self, "planner_contract_state", 0) or 0) != 1
+                )
+            ):
+                command = Twist()
+                decision = "planner_contract_boundary"
                 state = self.state
             elif (
                 self.mode == self.active_mode
