@@ -84,9 +84,9 @@ class GoalManagerTargetCompletionMixin:
         A terminal target segment remains the strongest form of approach
         evidence.  For the normal search task, however, a two-frame confirmed
         direct target that is already close in the camera is also sufficient
-        to begin the *three-frame* completion transaction.  The vehicle stays
-        at that safe viewpoint while the remaining frames arrive.  Context
-        labels are deliberately absent from this decision.
+        to begin the configured completion transaction.  The vehicle stays at
+        that safe viewpoint while the remaining frames arrive.  Context labels
+        are deliberately absent from this decision.
         """
         approach_terminal = bool(
             self.target_completed_segments >= 1

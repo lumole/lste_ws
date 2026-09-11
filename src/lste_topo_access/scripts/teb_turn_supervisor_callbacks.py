@@ -28,6 +28,53 @@ from teb_turn_supervisor_contract import (
 class TebTurnSupervisorCallbacksMixin:
     """Decode ROS callbacks into the supervisor's synchronized state."""
 
+    def _clear_recovery_execution_locked(self, reason):
+        """Drop the recovery-command bridge after a route/contract boundary."""
+        if not getattr(self, "recovery_active", False):
+            return
+        self.recovery_active = False
+        self.recovery_behavior = ""
+        self.recovery_identity = None
+        self.latest_recovery_command = Twist()
+        self.latest_recovery_command_wall = 0.0
+        self.publish_status_locked(
+            "recovery_command_bridge_cleared",
+            reason=str(reason),
+        )
+
+    def on_recovery_status(self, message):
+        """Bind move_base recovery output to the current action identity."""
+        try:
+            current = int(message.current_recovery_number)
+            total = int(message.total_number_of_recoveries)
+        except (AttributeError, TypeError, ValueError):
+            return
+        behavior = str(
+            getattr(message, "recovery_behavior_name", "") or ""
+        ).strip()
+        with self.lock:
+            active = bool(
+                behavior
+                and self.active_action
+                and current >= 0
+                and (total <= 0 or current < total)
+            )
+            if not active:
+                self._clear_recovery_execution_locked("recovery_status_inactive")
+                return
+            self.recovery_active = True
+            self.recovery_behavior = behavior
+            self.recovery_identity = self.active_action_identity
+            self.latest_recovery_command = Twist()
+            self.latest_recovery_command_wall = 0.0
+            self.publish_status_locked(
+                "recovery_command_bridge_armed",
+                behavior=behavior,
+                recovery_number=current,
+                recovery_total=total,
+                action_identity=self.active_action_identity,
+            )
+
     @staticmethod
     def _planner_contract_identity(message):
         """Decode a typed planner frame into scalar identity fields."""
@@ -269,13 +316,15 @@ class TebTurnSupervisorCallbacksMixin:
         command = self._planner_contract_command(message)
         reason = str(getattr(message, "reason", "") or "")
         with self.lock:
-            self._apply_planner_contract_locked(
+            accepted = self._apply_planner_contract_locked(
                 identity,
                 command,
                 identity["state"],
                 reason,
                 identity["producer"],
             )
+            if accepted and identity["state"] == PlannerCommandContract.STATE_ACTIVE:
+                self._clear_recovery_execution_locked("active_planner_contract")
 
     def _promote_pending_planner_contract_locked(self):
         pending = getattr(self, "planner_contract_pending", None)
@@ -634,6 +683,14 @@ class TebTurnSupervisorCallbacksMixin:
     def on_planner_command(self, message):
         if getattr(self, "require_planner_command_contract", False):
             with self.lock:
+                if (
+                    getattr(self, "recovery_active", False)
+                    and getattr(self, "recovery_identity", None)
+                    == getattr(self, "active_action_identity", None)
+                ):
+                    self.latest_recovery_command = copy.deepcopy(message)
+                    self.latest_recovery_command_wall = now_for(self)
+                    return
                 self.publish_status_locked(
                     "planner_raw_command_ignored",
                     reason="typed_planner_contract_required",

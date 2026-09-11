@@ -19,6 +19,16 @@ class GoalManagerTargetCompletionConfigMixin:
         self.target_done_min_fresh_hits = max(
             1, int(gp("~target_done_min_fresh_hits", 3))
         )
+        require_close = gp("~target_done_require_close_evidence", True)
+        self.target_done_require_close_evidence = str(
+            require_close
+        ).strip().lower() in ("1", "true", "yes", "on")
+        require_confirmed_track = gp(
+            "~target_done_require_confirmed_track", True
+        )
+        self.target_done_require_confirmed_track = str(
+            require_confirmed_track
+        ).strip().lower() in ("1", "true", "yes", "on")
         self.target_done_max_detection_age = max(
             0.0, float(gp("~target_done_max_detection_age", 0.75))
         )

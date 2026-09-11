@@ -255,6 +255,7 @@ class TebGoalBridgeMissionRuntimeMixin:
             return False
         source_goal = copy.deepcopy(self.last_dispatched_goal)
         feedback_distance = float(self.active_feedback_distance)
+        selected_linear_speed = getattr(self, "latest_teb_selected_linear", None)
         self.persistent_frontier_prefetch_promoted_pairs.add(route_pair)
         termination = self._commit_termination(
             "persistent_frontier_prefetch_progress",
@@ -291,7 +292,11 @@ class TebGoalBridgeMissionRuntimeMixin:
             lookahead_trigger_distance=round(
                 self.persistent_frontier_lookahead_trigger_distance, 3
             ),
-            selected_linear_speed=round(float(self.latest_teb_selected_linear), 3),
+            selected_linear_speed=(
+                None
+                if selected_linear_speed is None
+                else round(float(selected_linear_speed), 3)
+            ),
             completion_max_linear_speed=round(
                 float(self.frontier_observation_completion_max_linear_speed), 3
             ),

@@ -9,6 +9,7 @@ start_teb_navigation_windows() {
        terminal_topic:=$TEB_GOAL_TERMINAL_TOPIC target_failure_topic:=$TEB_GOAL_FAILURE_TOPIC \\
        intent_topic:=$GOAL_INTENT_TOPIC goal_command_topic:=$GOAL_COMMAND_TOPIC \\
        max_linear_speed:=$TEB_MAX_LINEAR_SPEED controller_mode:=$LSTE_CONTROLLER \\
+       teb_xy_goal_tolerance:=$TEB_XY_GOAL_TOLERANCE \\
        persistent_execution:=$TEB_PERSISTENT_EXECUTION \\
        base_global_planner:=$TEB_BASE_GLOBAL_PLANNER base_local_planner:=$TEB_BASE_LOCAL_PLANNER \\
        planner_frequency:=$TEB_PLANNER_FREQUENCY \\

@@ -182,7 +182,18 @@ def terminal_event_observed(
     """Read only the current bounded slice of the metrics log."""
     tail = _bounded_metrics_text(metrics_path, start_offset=start_offset)
     if terminal_event == "task_done":
-        return 'event=task_done ' in tail
+        # Completion may be represented by the dedicated task_done record,
+        # the preceding task_completed snapshot, or a post-completion sample.
+        # Large metrics records can push the short tail past the dedicated
+        # event before the polling loop observes it, so accept all three
+        # authoritative forms without treating ordinary route terminals as
+        # task completion.
+        return (
+            "event=task_done " in tail
+            or "event=task_completed " in tail
+            or '"task_done":true' in tail
+            or '"task_done": true' in tail
+        )
     if terminal_event == "frontier_exhausted":
         return 'frontier_event":"frontier_exhausted"' in tail
     raise ValueError("unsupported terminal event: %s" % terminal_event)

@@ -35,6 +35,9 @@ def configure_turn_supervisor_parameters(supervisor):
         "~planner_command_contract_topic",
         "/lste/persistent_execution/planner_command_contract",
     )
+    supervisor.recovery_status_topic = gp(
+        "~recovery_status_topic", "/move_base/recovery_status"
+    )
     supervisor.require_planner_command_contract = _as_bool(
         gp("~require_planner_command_contract", False)
     )
@@ -87,6 +90,9 @@ def configure_turn_supervisor_parameters(supervisor):
     )
     supervisor.planner_command_timeout = max(
         0.10, float(gp("~planner_command_timeout", 0.30))
+    )
+    supervisor.recovery_command_timeout = max(
+        0.10, float(gp("~recovery_command_timeout", 0.50))
     )
 
     supervisor.trajectory_continuity_enabled = _as_bool(

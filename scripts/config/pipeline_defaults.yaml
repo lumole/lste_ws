@@ -666,6 +666,10 @@ SAPPO_INTERMEDIATE_GOAL_TOLERANCE: 0.45
 # only when LSTE_CONTROLLER is teb. Keep this at or below the platform's safe
 # indoor speed; fixed-goal comparisons use their own test_config value.
 TEB_MAX_LINEAR_SPEED: 0.50
+# Keep Global Frontier's portal endpoint envelope identical to TEB's success
+# circle. Benchmark overlays may widen this only for a measured narrow-portal
+# geometry stall; production retains the conservative 0.50 m default.
+TEB_XY_GOAL_TOLERANCE: 0.50
 # Evaluate distinct local route topologies (for example, pass an obstacle on
 # its left or right) instead of optimizing only one elastic band inherited
 # from Navfn. It is retained for controlled experiments, but stays off by

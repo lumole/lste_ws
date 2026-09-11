@@ -20,6 +20,30 @@ from teb_turn_supervisor_contract import (
 class TebTurnSupervisorControlMixin:
     """Forward TEB commands, with narrowly bounded execution-phase handling."""
 
+    def _recovery_command_is_current_locked(self, now):
+        """Return true only for a fresh recovery command on this active route."""
+        if not (
+            getattr(self, "recovery_active", False)
+            and getattr(self, "active_action", False)
+            and getattr(self, "recovery_identity", None)
+            == getattr(self, "active_action_identity", None)
+        ):
+            return False
+        command_wall = float(
+            getattr(self, "latest_recovery_command_wall", 0.0) or 0.0
+        )
+        if command_wall <= 0.0 or now - command_wall > float(
+            getattr(self, "recovery_command_timeout", 0.50)
+        ):
+            return False
+        command = getattr(self, "latest_recovery_command", None)
+        if command is None:
+            return False
+        return (
+            abs(float(command.linear.x)) > 0.001
+            or abs(float(command.angular.z)) > 0.01
+        )
+
     def _trajectory_feedback_is_current_locked(self, action_identity=None):
         """Check feedback validity without breaking legacy lightweight fixtures."""
         if not hasattr(self, "trajectory_feedback_valid"):
@@ -133,7 +157,9 @@ class TebTurnSupervisorControlMixin:
         # ZERO/STALE state, but the turn itself still has to cross the mux as
         # a current, authenticated command. Ordinary pass-through commands
         # retain the planner-produced identity unchanged.
-        supervisor_owned_turn = decision in ("turn", "turn_settle") and (
+        supervisor_owned_turn = decision in (
+            "turn", "turn_settle", "move_base_recovery"
+        ) and (
             abs(float(command.linear.x)) > 0.001
             or abs(float(command.angular.z)) > 0.01
         ) and bool(self.active_action)
@@ -481,6 +507,12 @@ class TebTurnSupervisorControlMixin:
                         1.0 / self.command_frequency
                     )
                     decision = "turn"
+                state = self.state
+            elif (
+                self._recovery_command_is_current_locked(now)
+            ):
+                command = copy.deepcopy(self.latest_recovery_command)
+                decision = "move_base_recovery"
                 state = self.state
             elif (
                 getattr(self, "require_planner_command_contract", False)

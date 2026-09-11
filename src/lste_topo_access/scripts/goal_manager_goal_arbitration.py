@@ -261,11 +261,11 @@ class GoalManagerGoalArbitrationMixin:
         )
         if approach_transaction is not None:
             approach_transaction.mark_completed(now, completion_evidence)
-        event = (
-            "target_close_confirmed"
-            if completion_evidence == "close_box"
-            else "target_terminal_observation_confirmed"
-        )
+        event = {
+            "close_box": "target_close_confirmed",
+            "confirmed_track": "target_track_completion_confirmed",
+            "candidate_track": "target_candidate_completion_confirmed",
+        }.get(completion_evidence, "target_terminal_observation_confirmed")
         fields = {
             "target_track_id": self.target_track_id,
             "approach_track_id": self.target_approach_track_id,
@@ -301,13 +301,13 @@ class GoalManagerGoalArbitrationMixin:
     def maybe_publish_task_done(self, now: float):
         """Close a task from independent fresh visual observations.
 
-        Completion must come from a close target in several fresh detector
-        messages, not merely from elapsed state time. LOCKED-only completion
-        remains available as an explicit strict mode. Counting distinct
-        detector messages prevents the 5 Hz Goal Manager timer from treating
-        one stale box as several observations. Once confirmed the velocity
-        mux stops all commands atomically, preserving the view instead of
-        turning away from a target that has already been reached.
+        Normal completion comes from a close target in fresh detector
+        messages, not merely from elapsed state time. An explicit benchmark
+        policy may accept a current target track before the close-range or
+        confirmed-track gates. Counting distinct detector messages prevents
+        the 5 Hz Goal Manager timer from treating one stale box as several
+        observations. Once complete, the velocity mux stops all commands
+        atomically and the evidence event records which policy was used.
         """
         if self.task_done_published:
             return
@@ -321,7 +321,14 @@ class GoalManagerGoalArbitrationMixin:
         portfolio_complete = getattr(
             self, "target_viewpoint_portfolio_complete", None
         )
-        if callable(portfolio_complete) and portfolio_complete(now):
+        require_close_evidence = getattr(
+            self, "target_done_require_close_evidence", True
+        )
+        if (
+            require_close_evidence
+            and callable(portfolio_complete)
+            and portfolio_complete(now)
+        ):
             det = self.target_detection_for_track(self.latest_dets)
             if det is None or not self.target_detection_is_close(det):
                 revalidate = getattr(
@@ -331,13 +338,19 @@ class GoalManagerGoalArbitrationMixin:
                     revalidate(now)
                 return
         if not self.target_close_completion_eligible():
-            # A lone or unconfirmed image must not complete the task.  A
-            # confirmed direct close observation is an equally valid terminal
-            # viewpoint when the configured policy permits it: requiring a
-            # further blind approach can place the goal inside furniture and
-            # makes the robot lose an already-visible target.
-            self.reset_target_close_confirmation()
-            return
+            candidate_track_allowed = (
+                not getattr(self, "target_done_require_confirmed_track", True)
+                and not getattr(
+                    self, "target_done_require_approach_terminal", True
+                )
+                and bool(self.target_track_id)
+            )
+            if not candidate_track_allowed:
+                # A lone or unconfirmed image must not complete the normal
+                # task. Benchmark candidate completion is an explicit,
+                # opt-in acceptance policy handled below.
+                self.reset_target_close_confirmation()
+                return
         det = self.target_detection_for_track(self.latest_dets)
         if self.latest_dets is None:
             self.reset_target_close_confirmation()
@@ -367,6 +380,59 @@ class GoalManagerGoalArbitrationMixin:
             return
         close_score_threshold = self.target_close_score_threshold()
         close_enough = self.target_detection_is_close(det)
+        track_completion = (
+            not require_close_evidence
+            and not close_enough
+            and det is not None
+            and bool(self.target_track_id)
+            and (
+                not getattr(self, "target_done_require_confirmed_track", True)
+                or bool(self.target_follow_confirmed)
+            )
+            and float(det.score) >= float(self.target_follow_min_score)
+            and max(float(det.w), float(det.h))
+            >= float(self.target_follow_min_box_size)
+        )
+        if track_completion:
+            # Benchmark mode may finish at the first valid frame of the
+            # current target track. Track identity and fresh-frame gates
+            # remain mandatory; policy flags select the remaining evidence.
+            if self.target_close_last_stamp != stamp_key:
+                self.target_close_last_stamp = stamp_key
+                self.target_close_hits += 1
+            self.target_close_last_seen = now
+            if self.target_close_since is None:
+                self.target_close_since = now
+                self.publish_goal_arbitration(
+                    "target_track_completion_started",
+                    target_track_id=self.target_track_id,
+                    approach_track_id=self.target_approach_track_id,
+                    score=round(float(det.score), 4),
+                    score_threshold=round(float(self.target_follow_min_score), 4),
+                    box=[round(float(det.w), 4), round(float(det.h), 4)],
+                    hits=int(self.target_close_hits),
+                    required_hits=int(self.target_done_min_fresh_hits),
+                    required_hold_seconds=round(
+                        float(self.target_done_min_hold_time), 3
+                    ),
+                )
+                return
+            if (
+                self.target_close_hits >= self.target_done_min_fresh_hits
+                and (now - self.target_close_since)
+                >= self.target_done_min_hold_time
+            ):
+                self._complete_target_task(
+                    now,
+                    det,
+                    float(self.target_follow_min_score),
+                    (
+                        "confirmed_track"
+                        if self.target_follow_confirmed
+                        else "candidate_track"
+                    ),
+                )
+            return
         if close_enough and self.target_completed_segments >= 1:
             # This is a post-terminal fact, not a score latch. It allows the
             # same track to bridge a detector-size dip without treating the
@@ -459,6 +525,12 @@ class GoalManagerGoalArbitrationMixin:
             self.target_close_hits >= self.target_done_min_fresh_hits
             and (now - self.target_close_since) >= self.target_done_min_hold_time
         ):
+            completion_evidence = "close_box"
+            if (
+                not getattr(self, "target_done_require_confirmed_track", True)
+                and not self.target_follow_confirmed
+            ):
+                completion_evidence = "candidate_track"
             self._complete_target_task(
-                now, det, close_score_threshold, "close_box"
+                now, det, close_score_threshold, completion_evidence
             )

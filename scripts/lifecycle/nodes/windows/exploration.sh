@@ -33,6 +33,7 @@ start_exploration_windows() {
       frontier_approach_distance:=$GLOBAL_FRONTIER_APPROACH_DISTANCE \\
       min_path_distance:=$GLOBAL_FRONTIER_MIN_PATH_DISTANCE \\
       mission_endpoint_only:=$GLOBAL_FRONTIER_MISSION_ENDPOINT_ONLY \\
+      teb_xy_goal_tolerance:=$TEB_XY_GOAL_TOLERANCE \\
       persistent_execution:=$TEB_PERSISTENT_EXECUTION \\
       lookahead_distance:=$GLOBAL_FRONTIER_LOOKAHEAD_DISTANCE \\
       waypoint_release_radius:=$GLOBAL_FRONTIER_WAYPOINT_RELEASE_RADIUS \\

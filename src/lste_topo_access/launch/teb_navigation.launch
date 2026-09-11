@@ -6,6 +6,7 @@
   <arg name="odom_topic" default="/pro3/wheel_odom"/>
   <arg name="global_frame" default="map"/>
   <arg name="max_linear_speed" default="0.50"/>
+  <arg name="teb_xy_goal_tolerance" default="0.50"/>
   <arg name="controller_mode" default="teb"/>
   <arg name="goal_topic" default="/lste/final_goal"/>
   <arg name="intent_topic" default="/lste/goal_intent"/>
@@ -367,7 +368,7 @@
          that mission contract without an artificial cancel/PREEMPTED cycle.
          Confirmed visual targets still receive their own close-range evidence
          gate in GoalManager before task completion. -->
-    <param name="TebLocalPlannerROS/xy_goal_tolerance" value="0.50"/>
+    <param name="TebLocalPlannerROS/xy_goal_tolerance" value="$(arg teb_xy_goal_tolerance)"/>
     <!-- A frontier endpoint's yaw is a path tangent, not an arrival contract.
          Requiring a circular base to meet that yaw after it reaches the XY
          point creates a zero-speed terminal rotation, and the bridge can

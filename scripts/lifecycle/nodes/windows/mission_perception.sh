@@ -30,6 +30,8 @@ start_goal_manager_window() {
       _target_done_min_score:=$TARGET_DONE_MIN_SCORE \\
       _target_done_min_hold_time:=$TARGET_DONE_MIN_HOLD_TIME \\
       _target_done_min_fresh_hits:=$TARGET_DONE_MIN_FRESH_HITS \\
+      _target_done_require_close_evidence:=$TARGET_DONE_REQUIRE_CLOSE_EVIDENCE \\
+      _target_done_require_confirmed_track:=$TARGET_DONE_REQUIRE_CONFIRMED_TRACK \\
       _target_done_max_detection_age:=$TARGET_DONE_MAX_DETECTION_AGE \\
       _target_done_require_approach_terminal:=$TARGET_DONE_REQUIRE_APPROACH_TERMINAL \\
       _target_follow_min_score:=$TARGET_FOLLOW_MIN_SCORE \\

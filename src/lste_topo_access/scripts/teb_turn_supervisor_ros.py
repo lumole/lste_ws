@@ -3,6 +3,7 @@
 import rospy
 from geometry_msgs.msg import Pose2D, PoseStamped, Twist
 from lste_topo_access.msg import PlannerCommandContract
+from move_base_msgs.msg import RecoveryStatus
 from nav_msgs.msg import Path
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, String
@@ -34,6 +35,12 @@ def connect_turn_supervisor_ros(supervisor):
         PlannerCommandContract,
         supervisor.on_planner_command_contract,
         queue_size=20,
+    )
+    rospy.Subscriber(
+        supervisor.recovery_status_topic,
+        RecoveryStatus,
+        supervisor.on_recovery_status,
+        queue_size=10,
     )
     rospy.Subscriber(
         "/move_base/TebLocalPlannerROS/teb_feedback", FeedbackMsg,

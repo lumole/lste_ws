@@ -56,6 +56,14 @@ def initialize_turn_supervisor_state(supervisor):
     supervisor.planner_contract_wall = 0.0
     supervisor.planner_contract_awaiting_feedback = True
     supervisor.planner_contract_pending = None
+    # move_base recovery commands do not carry the planner contract message.
+    # Keep them admissible only while the recovery status and active route
+    # identity still match; the next active planner contract clears this latch.
+    supervisor.recovery_active = False
+    supervisor.recovery_behavior = ""
+    supervisor.recovery_identity = None
+    supervisor.latest_recovery_command = Twist()
+    supervisor.latest_recovery_command_wall = 0.0
     supervisor.output_sequence = 0
     supervisor.last_output_transaction_id = 0
     supervisor.last_output_decision = "startup"

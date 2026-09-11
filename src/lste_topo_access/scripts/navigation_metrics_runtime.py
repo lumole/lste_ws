@@ -145,6 +145,8 @@ class NavigationMetricsRuntimeMixin:
                 "done_min_box_height": param("target_done_min_box_height"),
                 "done_min_fresh_hits": param("target_done_min_fresh_hits"),
                 "done_min_hold_time": param("target_done_min_hold_time"),
+                "done_require_close_evidence": param("target_done_require_close_evidence"),
+                "done_require_confirmed_track": param("target_done_require_confirmed_track"),
                 "done_require_approach_terminal": param("target_done_require_approach_terminal"),
             },
         }

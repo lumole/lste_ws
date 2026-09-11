@@ -43,6 +43,8 @@ start_navigation_metrics_window() {
     "_target_done_min_box_height:=$TARGET_DONE_MIN_BOX_HEIGHT"
     "_target_done_min_fresh_hits:=$TARGET_DONE_MIN_FRESH_HITS"
     "_target_done_min_hold_time:=$TARGET_DONE_MIN_HOLD_TIME"
+    "_target_done_require_close_evidence:=$TARGET_DONE_REQUIRE_CLOSE_EVIDENCE"
+    "_target_done_require_confirmed_track:=$TARGET_DONE_REQUIRE_CONFIRMED_TRACK"
     "_target_done_require_approach_terminal:=$TARGET_DONE_REQUIRE_APPROACH_TERMINAL"
     "_target_eval_enabled:=$TARGET_EVAL_ENABLED"
     "_target_eval_gazebo_target_model:=$TARGET_EVAL_GAZEBO_TARGET_MODEL"

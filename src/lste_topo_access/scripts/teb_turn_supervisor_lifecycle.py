@@ -161,6 +161,7 @@ class TebTurnSupervisorLifecycleMixin:
             EventType.SCAN_UPDATED: TebTurnSupervisorCallbacksMixin.on_scan,
             EventType.BRIDGE_PLANNER_COMMAND: TebTurnSupervisorCallbacksMixin.on_planner_command,
             EventType.BRIDGE_PLANNER_COMMAND_CONTRACT: TebTurnSupervisorCallbacksMixin.on_planner_command_contract,
+            EventType.RECOVERY_OBSERVED: TebTurnSupervisorCallbacksMixin.on_recovery_status,
             EventType.BRIDGE_TEB_FEEDBACK: TebTurnSupervisorCallbacksMixin.on_teb_feedback,
             EventType.BRIDGE_MODE: TebTurnSupervisorControlMixin.on_mode,
             EventType.BRIDGE_TASK_DONE: TebTurnSupervisorControlMixin.on_task_done,
