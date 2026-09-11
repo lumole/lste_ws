@@ -10,8 +10,11 @@ from dataclasses import replace
 import rospy
 
 from global_frontier_graph_route_planner import (
+    ACTION_BOOTSTRAP,
     ACTION_CROSS_PORTAL,
+    ACTION_OBSERVE_LOCAL_WORK,
     ACTION_PROBE_PORTAL,
+    ACTION_RETRY_VIEWPOINT,
     PLAN_READY,
 )
 
@@ -360,6 +363,8 @@ class GlobalFrontierGraphRouteAdapterMixin:
         self.graph_route_action_transaction = None
         self.graph_route_portal_id = None
         self.graph_route_probe_id = None
+        self.graph_route_work_item_id = None
+        self.graph_route_work_item_filter = None
         self._clear_graph_route_plan_lease(
             "graph_route_materialization_expired"
         )
@@ -648,8 +653,34 @@ class GlobalFrontierGraphRouteAdapterMixin:
         """Install the selected identity without creating a new transaction."""
         self.graph_route_portal_id = None
         self.graph_route_probe_id = None
+        self.graph_route_work_item_id = None
+        self.graph_route_work_item_filter = None
         if plan is None or plan.status != PLAN_READY:
             return
+        if (
+            plan.action in {
+                ACTION_BOOTSTRAP,
+                ACTION_OBSERVE_LOCAL_WORK,
+                ACTION_RETRY_VIEWPOINT,
+            }
+            and plan.obligation_kind == "work_item"
+        ):
+            try:
+                work_item_id = int(plan.obligation_id)
+            except (TypeError, ValueError):
+                work_item_id = 0
+            if work_item_id > 0:
+                # The graph plan is the single durable owner. Candidate
+                # construction must materialize this identity only; building
+                # every local WorkItem candidate is both redundant and costly
+                # once a long-running map has accumulated many boundaries.
+                self.graph_route_work_item_id = work_item_id
+                self.graph_route_work_item_filter = "selected"
+                return
+        # A non-local graph plan (Portal/probe/target) does not need local
+        # WorkItem rehydration. Raw frontier and dedicated Portal collectors
+        # still run so explicit graph promotions can be materialized.
+        self.graph_route_work_item_filter = "none"
         first_id = plan.first_portal_id
         if first_id is None:
             return
@@ -697,11 +728,15 @@ class GlobalFrontierGraphRouteAdapterMixin:
             self.last_graph_route_plan = None
             self.graph_route_portal_id = None
             self.graph_route_probe_id = None
+            self.graph_route_work_item_id = None
+            self.graph_route_work_item_filter = None
             self.graph_route_action_transaction = None
             return None
         planner = getattr(self, "graph_route_planner", None)
         current_place_id = getattr(self, "current_physical_place_id", None)
         if planner is None or current_place_id is None:
+            self.graph_route_work_item_id = None
+            self.graph_route_work_item_filter = None
             return None
         work_ledger = getattr(self, "place_work_items", None)
         probe_ledger = getattr(self, "portal_probe_ledger", None)

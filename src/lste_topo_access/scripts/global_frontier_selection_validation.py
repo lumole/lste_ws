@@ -22,12 +22,24 @@ class GlobalFrontierSelectionValidationMixin:
         """Choose a score-best candidate with an executable Navfn route."""
         self.frontier_validation_budget_exhausted = False
         self.frontier_validation_pending = False
+        # A durable graph identity is checked against one immutable map
+        # snapshot.  If that projection misses, retrying the complete chooser
+        # in the remaining heading/tier slots cannot change the evidence; let
+        # the next planning wake observe a new snapshot instead.
+        self.graph_route_materialization_pending = False
         tiers = ["strict_clearance"]
         if allow_observation_recovery:
             tiers.append("navfn_observation_recovery")
         for selection_tier in tiers:
             heading_limit = max_heading_delta
             for _ in range(8):
+                miss_count_before = int(
+                    getattr(self, "graph_route_materialization_miss_count", 0)
+                    or 0
+                )
+                miss_signature_before = getattr(
+                    self, "graph_route_materialization_miss_signature", None
+                )
                 candidate = self.choose_frontier(
                     message,
                     steps,
@@ -53,6 +65,27 @@ class GlobalFrontierSelectionValidationMixin:
                     allow_portal_transitions=allow_portal_transitions,
                     graph_route_planning=graph_route_planning,
                 )
+                miss_count_after = int(
+                    getattr(self, "graph_route_materialization_miss_count", 0)
+                    or 0
+                )
+                miss_signature_after = getattr(
+                    self, "graph_route_materialization_miss_signature", None
+                )
+                graph_plan = getattr(self, "last_graph_route_plan", None)
+                materialization_miss_observed = (
+                    miss_count_after > miss_count_before
+                    or miss_signature_after != miss_signature_before
+                )
+                if (
+                    candidate is None
+                    and graph_route_planning
+                    and materialization_miss_observed
+                    and graph_plan is not None
+                    and getattr(graph_plan, "status", None) == "ready"
+                ):
+                    self.graph_route_materialization_pending = True
+                    return None
                 if (
                     candidate is None
                     and heading_limit is not None

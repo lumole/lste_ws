@@ -13,6 +13,31 @@ from global_frontier_graph_route_gate import (
 
 class GlobalFrontierPlanningSelectionMixin:
 
+    def _materialize_graph_successor_first(self, snapshot, snapshot_epoch):
+        """Materialize a leased Portal action before scanning raw frontiers."""
+        if not getattr(self, "graph_route_planner_enabled", False):
+            return None
+        if not getattr(self, "graph_route_plan_lease_active", False):
+            return None
+        plan = getattr(self, "last_graph_route_plan", None)
+        if plan is None or getattr(plan, "status", None) != PLAN_READY:
+            return None
+        if getattr(plan, "action", None) not in (
+            "cross_portal", "probe_portal",
+        ):
+            return None
+        prepare = getattr(self, "_prepare_graph_route_action", None)
+        if prepare is None:
+            return None
+        _plan, candidate = prepare(
+            snapshot,
+            reuse_existing_plan=True,
+            map_epoch=snapshot_epoch,
+        )
+        if candidate is None:
+            return None
+        return candidate, "graph_route_edge", False
+
     def terminal_prefetch_novelty_decision(self, snapshot):
         """Prefer a newly exposed place over a cached revisit at a terminal.
 
@@ -208,6 +233,11 @@ class GlobalFrontierPlanningSelectionMixin:
         # bypass that decision.  Baseline methods retain their historical
         # prefetch order below for a clean experiment contract.
         if getattr(self, "graph_route_planner_enabled", False):
+            graph_successor = self._materialize_graph_successor_first(
+                snapshot, snapshot_epoch,
+            )
+            if graph_successor is not None:
+                return graph_successor
             candidate = self._choose_frontier_for_new_action(
                 snapshot.message,
                 snapshot.route_graph,
@@ -314,6 +344,27 @@ class GlobalFrontierPlanningSelectionMixin:
             # graph materialization failed.  Do not release the controller
             # lease here: the Navfn worker schedules a planning wake when the
             # result arrives, and the same graph intent must be retried then.
+            if getattr(self, "graph_route_materialization_pending", False):
+                retain_lease = getattr(
+                    self, "_retain_graph_route_plan_lease", None
+                )
+                if retain_lease is not None and graph_plan is not None:
+                    retain_lease(
+                        graph_plan, "same_snapshot_materialization_miss"
+                    )
+                publish = getattr(self, "publish_status", None)
+                if publish is not None and graph_plan is not None:
+                    publish(
+                        "graph_route_materialization_wait",
+                        status=graph_plan.status,
+                        action=graph_plan.action,
+                        obligation_kind=graph_plan.obligation_kind,
+                        obligation_id=graph_plan.obligation_id,
+                        portal_path=list(graph_plan.portal_path),
+                        first_portal_id=graph_plan.first_portal_id,
+                        reason="same_snapshot_materialization_miss",
+                    )
+                return None, "graph_route_materialization_wait", True
             graph_plan = getattr(self, "last_graph_route_plan", None)
             if (
                 getattr(self, "frontier_validation_pending", False)

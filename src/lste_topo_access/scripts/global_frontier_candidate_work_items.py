@@ -96,6 +96,17 @@ class GlobalFrontierCandidateWorkItemMixin:
             return []
         snapshot = getattr(ledger, "snapshot", None)
         records = () if snapshot is None else snapshot()
+        work_item_filter = getattr(self, "graph_route_work_item_filter", None)
+        selected_work_item_id = getattr(self, "graph_route_work_item_id", None)
+        if work_item_filter == "none":
+            return []
+        if work_item_filter == "selected":
+            try:
+                selected_work_item_id = int(selected_work_item_id)
+            except (TypeError, ValueError):
+                return []
+            if selected_work_item_id <= 0:
+                return []
         probe_ledger = getattr(self, "portal_probe_ledger", None)
         probe_for_work = (
             None if probe_ledger is None
@@ -142,6 +153,11 @@ class GlobalFrontierCandidateWorkItemMixin:
             except (TypeError, ValueError):
                 continue
             if item_place != int(place_id):
+                continue
+            if (
+                work_item_filter == "selected"
+                and item_id != selected_work_item_id
+            ):
                 continue
             if str(item.get("state", "")).strip().lower() != "unresolved":
                 continue

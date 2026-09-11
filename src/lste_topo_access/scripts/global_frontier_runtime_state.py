@@ -444,6 +444,8 @@ class GlobalFrontierRuntimeStateMixin:
         self.graph_route_action_transaction = None
         self.graph_route_portal_id = None
         self.graph_route_probe_id = None
+        self.graph_route_work_item_id = None
+        self.graph_route_work_item_filter = None
         # De-duplicate the event for one unchanged blocked graph decision;
         # changing evidence or an action terminal clears it in the selector.
         self.last_graph_blocked_signature = None
@@ -466,6 +468,7 @@ class GlobalFrontierRuntimeStateMixin:
         self.graph_route_materialization_miss_count = 0
         self.graph_route_materialization_epochs = []
         self.graph_route_materialization_last_event = None
+        self.graph_route_materialization_pending = False
         self.graph_route_materialization_exclusions = {}
         self.last_graph_route_materialization_negative_evidence = None
         self.last_map_epoch = None

@@ -43,27 +43,32 @@ class GlobalFrontierExecutionActiveRouteMixin:
         """Cache a successor and return it only after a safe early handoff."""
         route_graph = snapshot.route_graph
         map_context = snapshot.map_context
-        self.prefetch_active_route_successor(
-            snapshot.message,
-            route_graph.strict_steps,
-            route_graph.strict_free,
-            route_graph.frontier,
-            route_graph.frontier_free,
-            map_context.unknown,
-            map_context.occupied,
-            map_context.components,
-            route_graph.validation,
-            route_graph.route_steps,
-            route_graph.seed,
-            snapshot.robot_map,
-            snapshot.robot_yaw_map,
-            snapshot.now,
-            row,
-            col,
-            x,
-            y,
-            observation.distance,
-        )
+        if not getattr(self, "graph_route_planner_enabled", False):
+            # The legacy selector owns successor prefetching. The durable graph
+            # method selects its next obligation at the terminal boundary;
+            # running both selectors here repeatedly scans the full frontier
+            # while the graph lifecycle correctly defers cross-Place handoff.
+            self.prefetch_active_route_successor(
+                snapshot.message,
+                route_graph.strict_steps,
+                route_graph.strict_free,
+                route_graph.frontier,
+                route_graph.frontier_free,
+                map_context.unknown,
+                map_context.occupied,
+                map_context.components,
+                route_graph.validation,
+                route_graph.route_steps,
+                route_graph.seed,
+                snapshot.robot_map,
+                snapshot.robot_yaw_map,
+                snapshot.now,
+                row,
+                col,
+                x,
+                y,
+                observation.distance,
+            )
         early_promoted = self.try_early_prefetch_promotion(
             snapshot.message,
             route_graph.route_steps,
