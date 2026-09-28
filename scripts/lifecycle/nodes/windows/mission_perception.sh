@@ -10,7 +10,7 @@ start_mission_and_perception_windows() {
      while true; do \\
        decision=\$(rosparam get /lste_prompt_node/needs_vllm 2>/dev/null || true); \\
        case \"\$decision\" in \\
-         true) echo \"Prompt cache miss; starting MiniCPM.\"; conda activate minicpm; exec bash start.sh ;; \\
+         true) echo \"Prompt cache miss; starting MiniCPM.\"; set +u; conda activate minicpm; set -u; exec bash start.sh ;; \\
          false) echo \"Prompt cache hit; MiniCPM was not started.\"; exit 0 ;; \\
        esac; \\
        sleep 0.5; \\
@@ -25,6 +25,14 @@ start_goal_manager_window() {
   tmux_new_window 3 "$WS" "goal" \
     "$WAIT_ROSCORE; rosrun lste_topo_access lste_goal_manager.py \\
       _follow_locked_done_time:=$FOLLOW_LOCKED_DONE_TIME _debug_goal_log:=$GOAL_DEBUG_LOG \\
+      _target_done_policy:=$TARGET_DONE_POLICY \\
+      _target_room_entry_min_x:=$TARGET_ROOM_ENTRY_MIN_X \\
+      _target_room_entry_min_y:=$TARGET_ROOM_ENTRY_MIN_Y \\
+      _target_room_entry_max_x:=$TARGET_ROOM_ENTRY_MAX_X \\
+      _target_room_entry_max_y:=$TARGET_ROOM_ENTRY_MAX_Y \\
+      _target_room_entry_margin:=$TARGET_ROOM_ENTRY_MARGIN \\
+      _target_room_entry_min_hold_time:=$TARGET_ROOM_ENTRY_MIN_HOLD_TIME \\
+      _target_room_entry_require_crossing:=$TARGET_ROOM_ENTRY_REQUIRE_CROSSING \\
       _target_done_min_box_width:=$TARGET_DONE_MIN_BOX_WIDTH \\
       _target_done_min_box_height:=$TARGET_DONE_MIN_BOX_HEIGHT \\
       _target_done_min_score:=$TARGET_DONE_MIN_SCORE \\
@@ -100,7 +108,7 @@ start_goal_manager_window() {
 
 start_prompt_and_detector_windows() {
   tmux_new_window 4 "$WS" "prompt" \
-    "$WAIT_ROSCORE; conda activate minicpm; \\
+    "$WAIT_ROSCORE; set +u; conda activate minicpm; set -u; \\
      rosparam set /lste_prompt_node/vllm_stop_command \"tmux kill-window -t =$SESSION:vllm\"; \\
      rosrun lste_core lste_prompt_node.py \\
        _vllm_base_url:=$VLLM_URL _vllm_model_name:=$VLLM_MODEL \\
@@ -110,7 +118,7 @@ start_prompt_and_detector_windows() {
   # Run the source through the activated detector interpreter. rosrun's relay
   # has the base-conda shebang and would otherwise load incompatible CUDA libs.
   tmux_new_window 5 "$WS" "detector" \
-    "$WAIT_ROSCORE; conda activate dino; export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7; \\
+    "$WAIT_ROSCORE; set +u; conda activate dino; set -u; export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7; \\
      export LD_LIBRARY_PATH=\"\$CONDA_PREFIX/lib/python3.9/site-packages/tensorrt_libs:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cudnn/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cublas/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cufft/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/curand/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cusolver/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cusparse/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cuda_runtime/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/cuda_nvrtc/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/nvidia/nvjitlink/lib:\$CONDA_PREFIX/lib/python3.9/site-packages/torch/lib:\${LD_LIBRARY_PATH:-}\"; \\
      python \"$WS/src/lste_core/scripts/$DETECTOR_NODE\" \\
        _min_inference_interval:=$DETECTOR_MIN_INTERVAL \\

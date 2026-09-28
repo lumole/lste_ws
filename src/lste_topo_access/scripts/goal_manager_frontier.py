@@ -41,9 +41,16 @@ class GoalManagerFrontierMixin:
         return value if value > 0 else None
 
     @classmethod
-    def normalize_frontier_goal_context(cls, value):
-        """Keep route identity explicit without trusting arbitrary JSON input."""
-        return normalize_goal_context(value)
+    def normalize_frontier_goal_context(cls, value, graph_transaction_id=None):
+        """Normalize context and bind it to the route command identity."""
+        context = normalize_goal_context(value)
+        if graph_transaction_id is not None:
+            try:
+                graph_transaction_id = max(0, int(graph_transaction_id or 0))
+            except (TypeError, ValueError):
+                graph_transaction_id = 0
+            context["graph_transaction_id"] = graph_transaction_id
+        return context
 
     def frontier_mission_goal_context(self):
         """Attach the LSTE task identity without changing physical ownership."""
@@ -55,12 +62,48 @@ class GoalManagerFrontierMixin:
         context["task_version"] = str(
             getattr(self, "current_task_version", "") or ""
         ).strip()
-        return normalize_goal_context(context)
+        graph_transaction_id = int(
+            getattr(self, "global_frontier_graph_transaction_id", 0) or 0
+        )
+        return self.normalize_frontier_goal_context(
+            context,
+            graph_transaction_id=(
+                graph_transaction_id if graph_transaction_id > 0 else None
+            ),
+        )
 
     def frontier_goal_context_changed(self):
         """Return whether a same-coordinate route has a different owner."""
         return goal_context_identity(self.frontier_mission_goal_context()) != (
             goal_context_identity(getattr(self, "last_frontier_goal_context", None))
+        )
+
+    def target_reinspection_route_active(self) -> bool:
+        """Return whether Global Frontier owns a target-room view route.
+
+        ``reinspect_target`` is a durable information action selected by the
+        frontier planner.  Once its complete route command has arrived, the
+        target-room claim is already represented by that route identity.  The
+        GoalManager must not clear the claim and issue the same replan again on
+        every timer tick while the route is being adopted or executed.
+        """
+        if not bool(getattr(self, "global_frontier_enabled", False)):
+            return False
+        if str(getattr(self, "global_frontier_graph_action", "") or "").strip().lower() != (
+            "reinspect_target"
+        ):
+            return False
+        if not bool(getattr(self, "target_reinspection_pending", False)):
+            return False
+        try:
+            route_id = int(getattr(self, "global_frontier_route_id", 0) or 0)
+            graph_id = int(
+                getattr(self, "global_frontier_graph_transaction_id", 0) or 0
+            )
+        except (TypeError, ValueError):
+            return False
+        return route_id > 0 and graph_id > 0 and (
+            getattr(self, "latest_global_frontier_goal", None) is not None
         )
 
     def gather_global_frontier(self, msg: PoseStamped):
@@ -100,6 +143,8 @@ class GoalManagerFrontierMixin:
             self.global_frontier_route_id = 0 if route_id is None else int(route_id)
         self.global_frontier_goal_context = self.normalize_frontier_goal_context(None)
         self.global_frontier_graph_transaction_id = 0
+        self.global_frontier_origin_epoch = None
+        self.global_frontier_projection_epoch = None
         # A terminal means the next fresh frontier message is actionable now.
         if self.teb_terminal_goal is not None:
             self.next_update_time = 0.0
@@ -160,11 +205,30 @@ class GoalManagerFrontierMixin:
         self.latest_global_frontier_goal = goal
         self.last_frontier_goal = goal
         self.global_frontier_route_id = route_id
+        self.global_frontier_lifecycle_transaction_id = int(
+            identity["lifecycle_transaction_id"]
+        )
         try:
             map_epoch = int(payload.get("map_epoch", 0) or 0)
         except (TypeError, ValueError):
             map_epoch = 0
         self.global_frontier_map_epoch = map_epoch if map_epoch > 0 else None
+        try:
+            origin_epoch = int(payload.get("origin_epoch", map_epoch) or 0)
+        except (TypeError, ValueError):
+            origin_epoch = 0
+        try:
+            projection_epoch = int(
+                payload.get("projection_epoch", map_epoch) or 0
+            )
+        except (TypeError, ValueError):
+            projection_epoch = 0
+        self.global_frontier_origin_epoch = (
+            origin_epoch if origin_epoch > 0 else None
+        )
+        self.global_frontier_projection_epoch = (
+            projection_epoch if projection_epoch > 0 else None
+        )
         try:
             graph_transaction_id = int(
                 payload.get("graph_transaction_id", 0) or 0
@@ -199,14 +263,61 @@ class GoalManagerFrontierMixin:
             int(getattr(self, "canonical_map_epoch_high_water", 0) or 0),
             identity["map_epoch"],
         )
+        self.canonical_origin_epoch_high_water = max(
+            int(getattr(self, "canonical_origin_epoch_high_water", 0) or 0),
+            identity["origin_epoch"],
+        )
+        self.canonical_projection_epoch_high_water = max(
+            int(
+                getattr(self, "canonical_projection_epoch_high_water", 0)
+                or 0
+            ),
+            identity["projection_epoch"],
+        )
         self.global_frontier_graph_action = str(
             payload.get("graph_action", "") or ""
         ).strip().lower()
         self.global_frontier_graph_obligation_kind = str(
             payload.get("graph_obligation_kind", "") or ""
         ).strip().lower()
+        raw_goal_context = payload.get("goal_context")
+        normalized_goal_context = self.normalize_frontier_goal_context(
+            raw_goal_context
+        )
+        canonical_graph_transaction_id = int(
+            self.global_frontier_graph_transaction_id or 0
+        )
+        received_graph_transaction_id = int(
+            normalized_goal_context.get("graph_transaction_id", 0) or 0
+        )
+        if (
+            canonical_graph_transaction_id > 0
+            and received_graph_transaction_id > 0
+            and received_graph_transaction_id != canonical_graph_transaction_id
+        ):
+            # The top-level route command is the sole graph owner. Preserve
+            # the semantic context, but never let a stale nested graph ID
+            # become the mission identity used downstream.
+            self.publish_goal_arbitration(
+                "frontier_goal_context_reconciled",
+                route_id=route_id,
+                received_graph_transaction_id=received_graph_transaction_id,
+                canonical_graph_transaction_id=canonical_graph_transaction_id,
+            )
+            rospy.logwarn(
+                "GoalManager reconciled stale nested graph identity: "
+                "route=%d received=%d canonical=%d",
+                route_id,
+                received_graph_transaction_id,
+                canonical_graph_transaction_id,
+            )
         self.global_frontier_goal_context = self.normalize_frontier_goal_context(
-            payload.get("goal_context")
+            normalized_goal_context,
+            graph_transaction_id=(
+                canonical_graph_transaction_id
+                if canonical_graph_transaction_id > 0
+                else None
+            ),
         )
         self.global_frontier_transition_kind = str(
             payload.get("transition_kind", "unknown")
@@ -217,6 +328,12 @@ class GoalManagerFrontierMixin:
             )
         except (TypeError, ValueError):
             self.global_frontier_predecessor_route_id = 0
+        predecessor_contract = payload.get("predecessor_contract")
+        self.global_frontier_predecessor_contract = (
+            dict(predecessor_contract)
+            if isinstance(predecessor_contract, dict)
+            else None
+        )
         try:
             transition_distance = payload.get(
                 "transition_distance_to_previous_endpoint"
@@ -246,6 +363,38 @@ class GoalManagerFrontierMixin:
             "portal_probe",
         ):
             self.global_frontier_mission_route_kind = mission_route_kind
+        # The route command is the atomic handoff carrying the complete
+        # successor identity.  Do not wait for a separate, high-rate status
+        # message to acknowledge the same replan: that status can be dropped
+        # while the lifecycle inbox is coalescing telemetry.  A newer command
+        # itself is sufficient evidence that the pending replan produced a
+        # usable route; Bridge still performs its own strict identity checks.
+        pending_replan_id = int(
+            getattr(self, "frontier_replan_pending_id", 0) or 0
+        )
+        last_published_route_id = int(
+            getattr(self, "last_published_frontier_route_id", 0) or 0
+        )
+        if (
+            pending_replan_id > 0
+            and route_id > last_published_route_id
+            and int(getattr(self, "frontier_replan_ready_id", 0) or 0)
+            != pending_replan_id
+        ):
+            self.frontier_replan_ready_id = pending_replan_id
+            self.publish_goal_arbitration(
+                "frontier_replan_ready_from_route_command",
+                replan_request_id=pending_replan_id,
+                route_id=route_id,
+                graph_transaction_id=canonical_graph_transaction_id,
+                lifecycle_transaction_id=identity["lifecycle_transaction_id"],
+                graph_action=self.global_frontier_graph_action,
+            )
+            rospy.loginfo(
+                "GoalManager: route command=%d completed pending replan id=%d",
+                route_id,
+                pending_replan_id,
+            )
         # A completed frontier segment can start the next map-connected one
         # immediately. A visual target owns its post-arrival observation
         # transaction, so that fast path must defer until it releases.
@@ -370,6 +519,18 @@ class GoalManagerFrontierMixin:
             "frontier_route_unavailable",
         ):
             return
+        if payload.get("controller_release_allowed") is False:
+            # A successor graph obligation can be excluded while the current
+            # persistent route is still moving.  Keep GoalManager's live goal
+            # ownership intact; only a route whose immutable graph contract
+            # owns the controller may trigger this release path.
+            self.publish_goal_arbitration(
+                "frontier_route_unavailable_deferred",
+                route_id=int(payload.get("route_id", 0) or 0),
+                reason=str(payload.get("reason", "graph_route_unavailable")),
+                active_route_retained=True,
+            )
+            return
         with_status_goal = payload.get("goal")
         rospy.logwarn(
             "GoalManager: releasing frontier ownership event=%s reason=%s goal=%s",
@@ -382,7 +543,10 @@ class GoalManagerFrontierMixin:
         self.global_frontier_route_kind = "frontier_endpoint"
         self.global_frontier_mission_route_kind = "frontier_endpoint"
         self.global_frontier_route_id = 0
+        self.last_published_frontier_route_id = 0
         self.global_frontier_graph_transaction_id = 0
+        self.global_frontier_origin_epoch = None
+        self.global_frontier_projection_epoch = None
         self.teb_terminal_goal = None
         self.teb_frontier_goal_history = []
         self.frontier_goal_sent_at = None
@@ -422,11 +586,7 @@ class GoalManagerFrontierMixin:
             "request_id": request_id,
             "reason": str(reason),
             "lifecycle_transaction_id": int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
+                self._canonical_lifecycle_transaction_id()
                 or 0
             ),
         }

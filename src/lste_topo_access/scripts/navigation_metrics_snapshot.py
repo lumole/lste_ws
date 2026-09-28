@@ -375,6 +375,12 @@ class NavigationMetricsSnapshotMixin:
             "legacy_state_locked_seconds": None if self.legacy_state_locked_ros is None else round(self.legacy_state_locked_ros - self.start_ros, 3),
             "target_lock_seconds": None if self.target_lock_ros is None else round(self.target_lock_ros - self.start_ros, 3),
             "task_done_seconds": None if self.task_done_ros is None else round(self.task_done_ros - self.start_ros, 3),
+            "task_done_completion_evidence": self.task_done_completion_evidence,
+            "task_done_policy": (
+                (self.run_context.get("target_thresholds") or {}).get("done_policy")
+                if isinstance(getattr(self, "run_context", None), dict)
+                else None
+            ),
             "target_lifecycle_sessions_observed": len(self.target_lifecycle_sessions),
             "target_lifecycle_completed_session": (
                 None

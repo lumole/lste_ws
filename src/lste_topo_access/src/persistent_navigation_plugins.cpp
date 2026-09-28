@@ -31,11 +31,15 @@ PersistentTebLocalPlanner::PersistentTebLocalPlanner()
       route_version_(0),
       route_geometry_hash_(0),
       installed_target_transaction_(0),
+      installed_target_origin_epoch_(0),
+      installed_target_projection_epoch_(0),
       latest_mission_transaction_(0),
       installed_mission_transaction_(0),
       latest_route_id_(0),
       latest_graph_transaction_id_(0),
       latest_map_epoch_(0),
+      latest_origin_epoch_(0),
+      latest_projection_epoch_(0),
       latest_lifecycle_transaction_id_(),
       latest_action_generation_(0),
       planner_command_sequence_(0) {}
@@ -230,6 +234,8 @@ void PersistentTebLocalPlanner::publishPlannerCommandContract(
     message.route_id = latest_route_id_;
     message.graph_transaction_id = latest_graph_transaction_id_;
     message.map_epoch = latest_map_epoch_;
+    message.origin_epoch = latest_origin_epoch_;
+    message.projection_epoch = latest_projection_epoch_;
     message.lifecycle_transaction_id = latest_lifecycle_transaction_id_;
     message.action_generation = latest_action_generation_;
   }
@@ -425,6 +431,13 @@ bool PersistentTebLocalPlanner::computeVelocityCommands(
         cmd_vel, PlannerCommandContract::STATE_ZERO, "endpoint_reached");
     return true;
   }
+  if (!command_available) {
+    // In persistent mode a transient TEB failure is input to the bridge's
+    // progress watchdog, not a MoveBase recovery request.  Keep the action
+    // server's control loop responsive so an explicit cancel can reach its
+    // terminal state and the successor gate can make progress.
+    cmd_vel = geometry_msgs::Twist();
+  }
   publishPlannerCommandContract(
       cmd_vel,
       (command_available &&
@@ -433,7 +446,7 @@ bool PersistentTebLocalPlanner::computeVelocityCommands(
           ? PlannerCommandContract::STATE_ACTIVE
           : PlannerCommandContract::STATE_ZERO,
       command_available ? "planner_command" : "planner_no_command");
-  return command_available;
+  return true;
 }
 
 bool PersistentTebLocalPlanner::isGoalReached() {
@@ -511,6 +524,8 @@ bool PersistentTebLocalPlanner::reportTargetApproachIfReady() {
   }
   geometry_msgs::PoseStamped approach;
   uint32_t transaction_id = 0;
+  uint64_t origin_epoch = 0;
+  uint64_t projection_epoch = 0;
   {
     std::lock_guard<std::mutex> lock(plan_mutex_);
     // The installed-target callback can race this control cycle. Recheck the
@@ -541,6 +556,8 @@ bool PersistentTebLocalPlanner::reportTargetApproachIfReady() {
     approach = installed_target_goal_;
     approach.header.stamp = ros::Time::now();
     transaction_id = installed_target_transaction_;
+    origin_epoch = installed_target_origin_epoch_;
+    projection_epoch = installed_target_projection_epoch_;
     terminal_hold_active_.store(true, std::memory_order_release);
     if (already_reported) {
       return true;
@@ -553,14 +570,17 @@ bool PersistentTebLocalPlanner::reportTargetApproachIfReady() {
             << transaction_id << ",\"frame_id\":\""
             << approach.header.frame_id << "\",\"goal\":["
             << approach.pose.position.x << "," << approach.pose.position.y
-            << "]}";
+            << "],\"origin_epoch\":" << origin_epoch
+            << ",\"projection_epoch\":" << projection_epoch << "}";
     std_msgs::String result;
     result.data = payload.str();
     target_approach_result_publisher_.publish(result);
   }
   ROS_INFO_STREAM("PersistentTebLocalPlanner reported target approach: endpoint=("
                   << approach.pose.position.x << "," << approach.pose.position.y
-                  << ") transaction=" << transaction_id);
+                  << ") transaction=" << transaction_id << " origin_epoch="
+                  << origin_epoch << " projection_epoch="
+                  << projection_epoch);
   return true;
 }
 
@@ -581,10 +601,14 @@ void PersistentTebLocalPlanner::onMissionCommand(
     has_reported_target_goal_ = false;
     has_reported_frontier_goal_ = false;
     installed_target_transaction_ = 0;
+    installed_target_origin_epoch_ = 0;
+    installed_target_projection_epoch_ = 0;
     reported_frontier_route_version_ = 0;
     latest_route_id_ = 0;
     latest_graph_transaction_id_ = 0;
     latest_map_epoch_ = 0;
+    latest_origin_epoch_ = 0;
+    latest_projection_epoch_ = 0;
     latest_lifecycle_transaction_id_.clear();
     latest_action_generation_ = 0;
     current_plan_goal_ = geometry_msgs::PoseStamped();
@@ -592,35 +616,61 @@ void PersistentTebLocalPlanner::onMissionCommand(
     terminal_hold_active_.store(true, std::memory_order_release);
     hard_reset_hold_.store(true, std::memory_order_release);
     publishPlanEvent("hard_reset_cleared", applied_plan_);
-    ROS_INFO("PersistentTebLocalPlanner cleared mission route for hard reset");
+    ROS_INFO_STREAM(
+        "PersistentTebLocalPlanner cleared mission route for hard reset "
+        << "origin_epoch=" << message->origin_epoch
+        << " projection_epoch=" << message->projection_epoch);
     return;
   }
   if (message->kind != PersistentGoalCommand::KIND_MISSION ||
       message->transaction_id == 0) {
     return;
   }
-  std::lock_guard<std::mutex> lock(plan_mutex_);
-  if (message->transaction_id == latest_mission_transaction_) {
-    return;
+  bool publish_mission_boundary = false;
+  {
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    const bool same_mission_identity =
+        message->transaction_id == latest_mission_transaction_ &&
+        message->route_id == latest_route_id_ &&
+        message->graph_transaction_id == latest_graph_transaction_id_ &&
+        message->map_epoch == latest_map_epoch_ &&
+        message->origin_epoch == latest_origin_epoch_ &&
+        message->projection_epoch == latest_projection_epoch_ &&
+        message->lifecycle_transaction_id == latest_lifecycle_transaction_id_ &&
+        message->action_generation == latest_action_generation_;
+    if (same_mission_identity) {
+      return;
+    }
+    if (message->transaction_id < latest_mission_transaction_) {
+      ROS_WARN_STREAM("PersistentTebLocalPlanner ignored stale mission "
+                      << "transaction=" << message->transaction_id << " < "
+                      << latest_mission_transaction_);
+      return;
+    }
+    // A new mission transaction may reuse the exact same Navfn geometry (for
+    // example, a second Portal probe at the same endpoint).  Path equivalence
+    // must not suppress that transaction's endpoint report.
+    latest_mission_transaction_ = message->transaction_id;
+    latest_route_id_ = message->route_id;
+    latest_graph_transaction_id_ = message->graph_transaction_id;
+    latest_map_epoch_ = message->map_epoch;
+    latest_lifecycle_transaction_id_ = message->lifecycle_transaction_id;
+    latest_action_generation_ = message->action_generation;
+    latest_origin_epoch_ = message->origin_epoch;
+    latest_projection_epoch_ = message->projection_epoch;
+    has_reported_frontier_goal_ = false;
+    reported_frontier_route_version_ = 0;
+    terminal_hold_active_.store(false, std::memory_order_release);
+    publish_mission_boundary = true;
   }
-  if (message->transaction_id < latest_mission_transaction_) {
-    ROS_WARN_STREAM("PersistentTebLocalPlanner ignored stale mission "
-                    << "transaction=" << message->transaction_id << " < "
-                    << latest_mission_transaction_);
-    return;
+  // Publish immediately after installing the new wire identity.  Waiting for
+  // the next move_base compute cycle leaves Supervisor holding the predecessor
+  // contract while the successor action is being adopted.
+  if (publish_mission_boundary) {
+    publishPlannerCommandContract(
+        geometry_msgs::Twist(), PlannerCommandContract::STATE_ZERO,
+        "mission_boundary");
   }
-  // A new mission transaction may reuse the exact same Navfn geometry (for
-  // example, a second Portal probe at the same endpoint).  Path equivalence
-  // must not suppress that transaction's endpoint report.
-  latest_mission_transaction_ = message->transaction_id;
-  latest_route_id_ = message->route_id;
-  latest_graph_transaction_id_ = message->graph_transaction_id;
-  latest_map_epoch_ = message->map_epoch;
-  latest_lifecycle_transaction_id_ = message->lifecycle_transaction_id;
-  latest_action_generation_ = message->action_generation;
-  has_reported_frontier_goal_ = false;
-  reported_frontier_route_version_ = 0;
-  terminal_hold_active_.store(false, std::memory_order_release);
 }
 
 void PersistentTebLocalPlanner::onInstalledTargetCommand(
@@ -640,6 +690,8 @@ void PersistentTebLocalPlanner::onInstalledTargetCommand(
     }
     has_installed_target_goal_ = false;
     installed_target_transaction_ = 0;
+    installed_target_origin_epoch_ = message->origin_epoch;
+    installed_target_projection_epoch_ = message->projection_epoch;
     has_reported_target_goal_ = false;
     if (sequence == 0) {
       current_plan_goal_ = geometry_msgs::PoseStamped();
@@ -651,7 +703,9 @@ void PersistentTebLocalPlanner::onInstalledTargetCommand(
       terminal_hold_active_.store(false, std::memory_order_release);
     }
     ROS_INFO_STREAM("PersistentTebLocalPlanner cleared installed target "
-                    << "transaction=" << sequence);
+                    << "transaction=" << sequence << " origin_epoch="
+                    << message->origin_epoch << " projection_epoch="
+                    << message->projection_epoch);
     return;
   }
   if (message->kind != PersistentGoalCommand::KIND_TARGET_INSTALLED ||
@@ -667,6 +721,8 @@ void PersistentTebLocalPlanner::onInstalledTargetCommand(
           target_goal_epsilon_;
   installed_target_goal_ = message->goal;
   installed_target_transaction_ = message->transaction_id;
+  installed_target_origin_epoch_ = message->origin_epoch;
+  installed_target_projection_epoch_ = message->projection_epoch;
   has_installed_target_goal_ = true;
   if (changed_target) {
     has_reported_target_goal_ = false;
@@ -701,11 +757,15 @@ StreamingNavfnPlanner::StreamingNavfnPlanner()
       replan_distance_(0.50),
       max_replan_interval_(2.0),
       latest_mission_sequence_(0),
+      latest_mission_origin_epoch_(0),
+      latest_mission_projection_epoch_(0),
       latest_target_sequence_(0),
       active_target_mission_sequence_(0),
       validated_target_sequence_(0),
       failed_target_sequence_(0),
       latest_target_map_epoch_(0),
+      latest_target_origin_epoch_(0),
+      latest_target_projection_epoch_(0),
       latest_target_graph_transaction_id_(0),
       latest_target_route_id_(0),
       latest_target_lifecycle_transaction_id_(),
@@ -793,6 +853,8 @@ void StreamingNavfnPlanner::publishTargetPlanResult(
   payload << "{\"event\":\"" << event << "\",\"transaction_id\":"
           << transaction_id << ",\"frame_id\":\"" << goal.header.frame_id
           << "\",\"map_epoch\":" << latest_target_map_epoch_
+          << ",\"origin_epoch\":" << latest_target_origin_epoch_
+          << ",\"projection_epoch\":" << latest_target_projection_epoch_
           << ",\"graph_transaction_id\":"
           << latest_target_graph_transaction_id_
           << ",\"route_kind\":\"" << latest_target_route_kind_
@@ -1000,6 +1062,8 @@ bool StreamingNavfnPlanner::makePlan(
         latest_target_lifecycle_transaction_id_;
     installed_command.action_generation = latest_target_action_generation_;
     installed_command.map_epoch = latest_target_map_epoch_;
+    installed_command.origin_epoch = latest_target_origin_epoch_;
+    installed_command.projection_epoch = latest_target_projection_epoch_;
     installed_command.graph_transaction_id = latest_target_graph_transaction_id_;
     installed_command.route_kind = latest_target_route_kind_;
     installed_command.mission_route_kind = latest_target_mission_route_kind_;
@@ -1011,7 +1075,9 @@ bool StreamingNavfnPlanner::makePlan(
                     << selected_target_sequence << " endpoint=("
                     << installed.pose.position.x << ","
                     << installed.pose.position.y << ") previous_route="
-                    << (retained_previous_route ? "retained" : "bootstrap"));
+                    << (retained_previous_route ? "retained" : "bootstrap")
+                    << " origin_epoch=" << latest_target_origin_epoch_
+                    << " projection_epoch=" << latest_target_projection_epoch_);
     publishTargetPlanResult("target_plan_installed", selected_target_sequence,
                             installed);
   }
@@ -1036,8 +1102,12 @@ void StreamingNavfnPlanner::onMissionCommand(
     cached_plan_.clear();
     validated_target_plan_.clear();
     latest_mission_sequence_ = 0;
+    latest_mission_origin_epoch_ = 0;
+    latest_mission_projection_epoch_ = 0;
     latest_target_sequence_ = 0;
     latest_target_map_epoch_ = 0;
+    latest_target_origin_epoch_ = 0;
+    latest_target_projection_epoch_ = 0;
     latest_target_graph_transaction_id_ = 0;
     latest_target_route_id_ = 0;
     latest_target_lifecycle_transaction_id_.clear();
@@ -1050,7 +1120,10 @@ void StreamingNavfnPlanner::onMissionCommand(
     validated_target_sequence_ = 0;
     failed_target_sequence_ = 0;
     ++mission_generation_;
-    ROS_INFO("StreamingNavfnPlanner cleared mission and target routes for hard reset");
+    ROS_INFO_STREAM(
+        "StreamingNavfnPlanner cleared mission and target routes for hard reset "
+        << "origin_epoch=" << message->origin_epoch
+        << " projection_epoch=" << message->projection_epoch);
     return;
   }
   if (message->kind != PersistentGoalCommand::KIND_MISSION ||
@@ -1067,6 +1140,8 @@ void StreamingNavfnPlanner::onMissionCommand(
   }
   mission_goal_ = message->goal;
   latest_mission_sequence_ = sequence;
+  latest_mission_origin_epoch_ = message->origin_epoch;
+  latest_mission_projection_epoch_ = message->projection_epoch;
   has_mission_goal_ = true;
   // A target is provisional only while it is strictly newer than the approved
   // mission. Once the bridge repeats its transaction here, consume the exact
@@ -1098,7 +1173,9 @@ void StreamingNavfnPlanner::onMissionCommand(
   ROS_INFO_STREAM("StreamingNavfnPlanner approved mission transaction="
                   << sequence << " endpoint=("
                   << message->goal.pose.position.x << ","
-                  << message->goal.pose.position.y << ")");
+                  << message->goal.pose.position.y << ") origin_epoch="
+                  << latest_mission_origin_epoch_ << " projection_epoch="
+                  << latest_mission_projection_epoch_);
 }
 
 void StreamingNavfnPlanner::onTargetCommand(
@@ -1125,8 +1202,12 @@ void StreamingNavfnPlanner::onTargetCommand(
       cached_plan_.clear();
       validated_target_plan_.clear();
       latest_mission_sequence_ = 0;
+      latest_mission_origin_epoch_ = 0;
+      latest_mission_projection_epoch_ = 0;
       latest_target_sequence_ = 0;
       latest_target_map_epoch_ = 0;
+      latest_target_origin_epoch_ = 0;
+      latest_target_projection_epoch_ = 0;
       latest_target_graph_transaction_id_ = 0;
       latest_target_route_id_ = 0;
       latest_target_lifecycle_transaction_id_.clear();
@@ -1148,6 +1229,8 @@ void StreamingNavfnPlanner::onTargetCommand(
           message->lifecycle_transaction_id;
       installed_clear.action_generation = message->action_generation;
       installed_clear.map_epoch = message->map_epoch;
+      installed_clear.origin_epoch = message->origin_epoch;
+      installed_clear.projection_epoch = message->projection_epoch;
       installed_clear.graph_transaction_id = message->graph_transaction_id;
       installed_clear.route_kind = message->route_kind;
       installed_clear.mission_route_kind = message->mission_route_kind;
@@ -1156,7 +1239,10 @@ void StreamingNavfnPlanner::onTargetCommand(
       installed_clear.goal = message->goal;
         installed_target_command_publisher_.publish(installed_clear);
       }
-      ROS_INFO("StreamingNavfnPlanner cleared all routes for hard reset");
+      ROS_INFO_STREAM(
+          "StreamingNavfnPlanner cleared all routes for hard reset "
+          << "origin_epoch=" << message->origin_epoch
+          << " projection_epoch=" << message->projection_epoch);
       return;
     }
     if (clear_sequence > 0 && latest_target_sequence_ > clear_sequence) {
@@ -1177,6 +1263,8 @@ void StreamingNavfnPlanner::onTargetCommand(
     // a hot restart, but it must not trigger another Navfn search.
     failed_target_sequence_ = std::max(failed_target_sequence_, clear_sequence);
     latest_target_sequence_ = std::max(latest_target_sequence_, clear_sequence);
+    latest_target_origin_epoch_ = message->origin_epoch;
+    latest_target_projection_epoch_ = message->projection_epoch;
     // Invalidation is terminal for this target identity. The bridge emits the
     // clear after any installed-target acknowledgement, so retaining the
     // candidate here would allow a delayed planner tick to reselect it before
@@ -1192,6 +1280,8 @@ void StreamingNavfnPlanner::onTargetCommand(
         message->lifecycle_transaction_id;
     installed_clear.action_generation = message->action_generation;
     installed_clear.map_epoch = message->map_epoch;
+    installed_clear.origin_epoch = message->origin_epoch;
+    installed_clear.projection_epoch = message->projection_epoch;
     installed_clear.graph_transaction_id = message->graph_transaction_id;
     installed_clear.route_kind = message->route_kind;
     installed_clear.mission_route_kind = message->mission_route_kind;
@@ -1201,7 +1291,9 @@ void StreamingNavfnPlanner::onTargetCommand(
       installed_target_command_publisher_.publish(installed_clear);
     }
     ROS_INFO_STREAM("StreamingNavfnPlanner cleared target request transaction="
-                    << clear_sequence);
+                    << clear_sequence << " origin_epoch="
+                    << message->origin_epoch << " projection_epoch="
+                    << message->projection_epoch);
     return;
   }
   if (message->kind != PersistentGoalCommand::KIND_TARGET_REQUEST ||
@@ -1213,7 +1305,9 @@ void StreamingNavfnPlanner::onTargetCommand(
                   << latest_mission_sequence_ << " latest_target="
                   << latest_target_sequence_ << " endpoint=("
                   << message->goal.pose.position.x << ","
-                  << message->goal.pose.position.y << ")");
+                  << message->goal.pose.position.y << ") origin_epoch="
+                  << message->origin_epoch << " projection_epoch="
+                  << message->projection_epoch);
   if (latest_mission_sequence_ > 0 && sequence <= latest_mission_sequence_) {
     ROS_WARN_STREAM("StreamingNavfnPlanner ignored stale target request "
                     << sequence << " <= approved mission "
@@ -1228,6 +1322,8 @@ void StreamingNavfnPlanner::onTargetCommand(
   target_goal_ = message->goal;
   latest_target_sequence_ = sequence;
   latest_target_map_epoch_ = message->map_epoch;
+  latest_target_origin_epoch_ = message->origin_epoch;
+  latest_target_projection_epoch_ = message->projection_epoch;
   latest_target_graph_transaction_id_ = message->graph_transaction_id;
   latest_target_route_id_ = message->route_id;
   latest_target_lifecycle_transaction_id_ = message->lifecycle_transaction_id;

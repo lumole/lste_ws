@@ -34,3 +34,4 @@ SAPPO_SPEED: 0.50
 # - rl_grid_guard: a lidar-only rolling occupancy grid plus A* local planner.
 #   It preserves the fixed global goal while selecting obstacle-free waypoints.
 CONTROLLER_MODE: rl_grid_guard
+LOG_MAX_BYTES: 1000000000

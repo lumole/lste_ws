@@ -122,6 +122,29 @@ def route_invalidation_failure_trigger(event, payload):
     return "route_invalidated_failure"
 
 
+def graph_materialization_failure_trigger(event, payload):
+    """Return the terminal failure trigger for a dropped graph obligation.
+
+    A materialization miss is normal planning context.  The graph adapter's
+    explicit invalidation, or its corresponding expired-unavailable event, is
+    the terminal boundary that must enter the metrics failure pipeline.
+    """
+    event = str(event or "").strip().lower()
+    payload = payload if isinstance(payload, dict) else {}
+    reason = str(payload.get("reason", "") or "").strip().lower()
+    if event in {
+        "graph_route_materialization_invalidated",
+        "graph_route_materialization_expired",
+    }:
+        return "graph_route_materialization_expired"
+    if event in {
+        "frontier_route_unavailable",
+        "graph_route_candidate_unavailable",
+    } and reason == "graph_route_materialization_expired":
+        return "graph_route_materialization_expired"
+    return None
+
+
 def recoverable_portal_route_failure(event, payload):
     """Return whether one Portal route failure should await successor replanning.
 
@@ -198,6 +221,16 @@ class NavigationMetricsExecutionEventsMixin:
                 if payload.get("map_epoch") is not None
                 else payload.get("active_route_map_epoch")
             ),
+            "origin_epoch": (
+                payload.get("origin_epoch")
+                if payload.get("origin_epoch") is not None
+                else payload.get("active_origin_epoch")
+            ),
+            "projection_epoch": (
+                payload.get("projection_epoch")
+                if payload.get("projection_epoch") is not None
+                else payload.get("active_projection_epoch")
+            ),
             "lifecycle_transaction_id": cls._metrics_int(
                 payload.get("lifecycle_transaction_id")
             ),
@@ -217,6 +250,13 @@ class NavigationMetricsExecutionEventsMixin:
         event = str(payload.get("event", "") or "").strip()
         if event not in {
             "dispatch",
+            "persistent_mission_goal_adopted",
+            # Persistent execution keeps one actionlib goal alive while the
+            # semantic route changes.  In that mode path adoption, rather
+            # than a new transport dispatch, is the authoritative contract
+            # boundary for the route that owns the next controller event.
+            "persistent_mission_path_adopted",
+            "persistent_frontier_successor_adopted",
             "dispatch_contract_reaffirmed",
             "successor_dispatched",
         }:
@@ -248,11 +288,14 @@ class NavigationMetricsExecutionEventsMixin:
             return "missing_lifecycle_transaction_id"
         if identity["action_generation"] <= 0:
             return "missing_action_generation"
+        if identity["route_id"] > 0 and identity["transaction_id"] <= 0:
+            return "missing_transaction_id"
         reference = self._terminal_contract_reference_locked(identity)
         if reference is None:
             return "pending_bridge_dispatch"
         for field in (
             "route_id",
+            "transaction_id",
             "lifecycle_transaction_id",
             "action_generation",
             "graph_transaction_id",
@@ -260,6 +303,15 @@ class NavigationMetricsExecutionEventsMixin:
             expected = self._metrics_int(reference.get(field))
             if expected > 0 and identity[field] != expected:
                 return "terminal_%s_mismatch" % field
+        for field in ("origin_epoch", "projection_epoch"):
+            expected_epoch = reference.get(field)
+            if expected_epoch is None:
+                continue
+            try:
+                if identity[field] != int(expected_epoch):
+                    return "terminal_%s_mismatch" % field
+            except (TypeError, ValueError):
+                return "terminal_%s_invalid" % field
         expected_map_epoch = reference.get("map_epoch")
         if expected_map_epoch is not None:
             try:
@@ -274,6 +326,48 @@ class NavigationMetricsExecutionEventsMixin:
                 return "terminal_%s_mismatch" % field
         return ""
 
+    def _validate_controller_stall_identity_locked(self, payload):
+        """Compare a controller-stall report with its dispatch contract."""
+        payload = payload if isinstance(payload, dict) else {}
+        route_id = self._metrics_int(payload.get("route_id"))
+        reference = self.bridge_dispatch_contracts.get(route_id)
+        if reference is None:
+            reference = self.bridge_latest_dispatch_contract
+        if reference is None:
+            return "dispatch_contract_missing"
+        mismatches = []
+        for field in (
+            "route_id",
+            "transaction_id",
+            "lifecycle_transaction_id",
+            "action_generation",
+            "graph_transaction_id",
+        ):
+            expected = self._metrics_int(reference.get(field))
+            actual = self._metrics_int(payload.get(field))
+            if expected > 0 and actual != expected:
+                mismatches.append(field)
+        for field in ("origin_epoch", "projection_epoch"):
+            expected_epoch = reference.get(field)
+            if expected_epoch is None:
+                continue
+            try:
+                if int(payload.get(field)) != int(expected_epoch):
+                    mismatches.append(field)
+            except (TypeError, ValueError):
+                mismatches.append(field)
+        expected_map_epoch = reference.get("map_epoch")
+        if expected_map_epoch is not None:
+            try:
+                if int(payload.get("map_epoch")) != int(expected_map_epoch):
+                    mismatches.append("map_epoch")
+            except (TypeError, ValueError):
+                mismatches.append("map_epoch")
+        return (
+            "mismatch:%s" % ",".join(mismatches)
+            if mismatches else "accepted"
+        )
+
     @staticmethod
     def _terminal_contract_identity(message):
         """Extract typed terminal identity without using endpoint geometry."""
@@ -285,7 +379,16 @@ class NavigationMetricsExecutionEventsMixin:
 
         return {
             "route_id": integer(getattr(message, "route_id", 0)),
+            "transaction_id": integer(
+                getattr(message, "transaction_id", 0)
+            ),
             "map_epoch": integer(getattr(message, "map_epoch", 0)),
+            "origin_epoch": integer(
+                getattr(message, "origin_epoch", 0)
+            ),
+            "projection_epoch": integer(
+                getattr(message, "projection_epoch", 0)
+            ),
             "graph_transaction_id": integer(
                 getattr(message, "graph_transaction_id", 0)
             ),
@@ -299,6 +402,9 @@ class NavigationMetricsExecutionEventsMixin:
             "mission_route_kind": str(
                 getattr(message, "mission_route_kind", "") or ""
             ),
+            "status": integer(getattr(message, "status", 3), default=3),
+            "failure": bool(getattr(message, "failure", False)),
+            "reason": str(getattr(message, "reason", "") or ""),
         }
 
     def _record_terminal_contract_locked(self, identity, reconciled=False):
@@ -641,6 +747,26 @@ class NavigationMetricsExecutionEventsMixin:
                     "teb_goal_bridge",
                     context_payload,
                 )
+            elif event == "controller_stall" and not self.task_done:
+                # The bridge has already made the identity-checked terminal
+                # transition. Enter the same metrics-owned episode path as
+                # other explicit failures so the bounded ring and artifact
+                # capture the state immediately before the lease is revoked.
+                failure_details = dict(context_payload)
+                failure_details.setdefault(
+                    "failure_reason",
+                    failure_details.get("reason", "controller_stall"),
+                )
+                failure_details["identity_validation"] = (
+                    self._validate_controller_stall_identity_locked(
+                        context_payload
+                    )
+                )
+                self._begin_failure_episode_locked(
+                    "controller_stall",
+                    "teb_goal_bridge",
+                    failure_details,
+                )
             elif event in (
                 "target_route_failed",
                 "persistent_target_plan_failed",
@@ -928,13 +1054,32 @@ class NavigationMetricsExecutionEventsMixin:
                     expected_preemption
                 )
             self._failure_record_context_locked("frontier", event, payload)
+            materialization_trigger = graph_materialization_failure_trigger(
+                event, payload
+            )
             deferred_portal_failure = recoverable_portal_route_failure(
                 event, payload
             )
             route_failure_trigger = route_invalidation_failure_trigger(
                 event, payload
             )
-            if not self.task_done and event in (
+            if not self.task_done and materialization_trigger is not None:
+                # ``graph_route_materialization_invalidated`` is the graph
+                # layer's explicit obligation-drop boundary. The companion
+                # unavailable event is accepted as a fallback when topic
+                # delivery races the invalidation status.
+                failure_details = dict(payload)
+                failure_details["materialization_event"] = event
+                failure_details.setdefault(
+                    "route_invalidation_reason",
+                    payload.get("reason", materialization_trigger),
+                )
+                self._begin_failure_episode_locked(
+                    materialization_trigger,
+                    "global_frontier",
+                    failure_details,
+                )
+            elif not self.task_done and event in (
                 "execution_terminal_failure",
                 "frontier_route_failed",
                 "portal_hypothesis_failed",

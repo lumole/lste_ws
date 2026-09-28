@@ -223,7 +223,5 @@ class TebGoalBridgeActionRetryPolicyMixin:
                 publish_terminal=False,
                 arm_watchdog=False,
             )
-            self.pending_terminal_prepare = None
-            self.pending_lease_release_contract = None
 
         self._send_goal_locked(self.latest_goal, reason=reason, replacement=False)

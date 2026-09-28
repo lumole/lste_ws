@@ -77,6 +77,8 @@ class TebGoalBridgePersistentTargetMixin:
         lifecycle_transaction_id="",
         action_generation=0,
         map_epoch=0,
+        origin_epoch=0,
+        projection_epoch=0,
         route_kind="",
         mission_route_kind="",
         graph_transaction_id=0,
@@ -91,6 +93,10 @@ class TebGoalBridgePersistentTargetMixin:
         command.lifecycle_transaction_id = str(lifecycle_transaction_id or "")
         command.action_generation = max(0, int(action_generation or 0))
         command.map_epoch = max(0, int(map_epoch or 0))
+        command.origin_epoch = max(0, int(origin_epoch or 0))
+        command.projection_epoch = max(
+            0, int(projection_epoch or 0)
+        )
         command.graph_transaction_id = max(
             0, int(graph_transaction_id or 0)
         )
@@ -106,8 +112,13 @@ class TebGoalBridgePersistentTargetMixin:
         generation = int(getattr(self, "action_generation", 0) or 0)
         if reserve and not self.action_active:
             generation = int(self._reserve_persistent_dispatch_generation_locked())
+        lifecycle_getter = getattr(
+            self, "_canonical_lifecycle_transaction_id", None
+        )
         lifecycle_id = int(
-            getattr(
+            lifecycle_getter()
+            if callable(lifecycle_getter)
+            else getattr(
                 getattr(self, "lifecycle_manager", None),
                 "current_transaction_id",
                 0,
@@ -118,6 +129,16 @@ class TebGoalBridgePersistentTargetMixin:
             "route_id": int(getattr(self, "latest_route_id", 0) or 0),
             "lifecycle_transaction_id": str(lifecycle_id),
             "action_generation": generation,
+            "origin_epoch": int(
+                getattr(self, "latest_origin_epoch", 0)
+                or getattr(self, "latest_route_map_epoch", 0)
+                or 0
+            ),
+            "projection_epoch": int(
+                getattr(self, "latest_projection_epoch", 0)
+                or getattr(self, "latest_route_map_epoch", 0)
+                or 0
+            ),
         }
 
     def _request_persistent_target_locked(self, reason):
@@ -278,10 +299,29 @@ class TebGoalBridgePersistentTargetMixin:
                 ),
             )
         )
+        identity = self._persistent_command_identity_locked()
         self.publish_bridge_status(
             "persistent_mission_goal_approved",
             reason=str(reason),
             transaction_id=int(self.latest_goal_transaction_id),
+            route_id=int(identity["route_id"]),
+            action_generation=int(identity["action_generation"]),
+            lifecycle_transaction_id=int(
+                identity["lifecycle_transaction_id"] or 0
+            ),
+            graph_transaction_id=int(
+                getattr(self, "latest_graph_transaction_id", 0) or 0
+            ),
+            map_epoch=max(
+                1, int(getattr(self, "latest_route_map_epoch", 0) or 0)
+            ),
+            origin_epoch=int(identity["origin_epoch"]),
+            projection_epoch=int(identity["projection_epoch"]),
+            route_kind=str(self.latest_route_kind or "direct_goal"),
+            mission_route_kind=str(
+                self.latest_mission_route_kind or self.latest_route_kind
+                or "direct_goal"
+            ),
             priority=int(self.latest_intent_priority),
             goal=[
                 round(float(approved.pose.position.x), 3),

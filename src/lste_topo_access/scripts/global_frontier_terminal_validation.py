@@ -25,7 +25,14 @@ class GlobalFrontierTerminalValidationMixin:
         raw_map_epoch = getattr(message, "map_epoch", 0)
         return {
             "route_id": integer(getattr(message, "route_id", 0)),
+            "transaction_id": integer(
+                getattr(message, "transaction_id", 0)
+            ),
             "map_epoch": integer(raw_map_epoch),
+            "origin_epoch": integer(getattr(message, "origin_epoch", 0)),
+            "projection_epoch": integer(
+                getattr(message, "projection_epoch", 0)
+            ),
             "graph_transaction_id": integer(
                 getattr(message, "graph_transaction_id", 0)
             ),
@@ -41,6 +48,9 @@ class GlobalFrontierTerminalValidationMixin:
             "mission_route_kind": str(
                 getattr(message, "mission_route_kind", "") or ""
             ).strip().lower(),
+            "status": integer(getattr(message, "status", 3), default=3),
+            "failure": bool(getattr(message, "failure", False)),
+            "reason": str(getattr(message, "reason", "") or ""),
         }
 
     def _reject_terminal(self, message, reason, **fields):
@@ -62,15 +72,144 @@ class GlobalFrontierTerminalValidationMixin:
         )
         return None
 
+    def consume_late_released_terminal(self, message):
+        """Replay controller release when a physical crossing won the race.
+
+        Continuous odometry can commit a Portal and release its semantic route
+        before the Bridge has published the dispatch/terminal callbacks for a
+        very short action.  The initial release then cannot be acknowledged by
+        the not-yet-adopted controller lease.  Accept only the later SUCCEEDED
+        terminal whose immutable dispatch identity matches the release
+        tombstone, and replay the release with that complete identity.
+        """
+        identity = self._terminal_identity(message)
+        if identity["failure"] or identity["status"] != 3:
+            return False
+        if getattr(self, "active_frontier", None) is not None:
+            return False
+        route_id = int(identity["route_id"] or 0)
+        if route_id <= 0 or route_id != int(
+            getattr(self, "last_released_route_id", 0) or 0
+        ):
+            return False
+        dispatch = getattr(self, "_bridge_dispatch_contracts", {}).get(route_id)
+        if not isinstance(dispatch, dict):
+            return False
+        released_kind = str(
+            getattr(self, "last_released_route_kind", "") or ""
+        ).strip().lower()
+        terminal_kind = str(identity["route_kind"] or "").strip().lower()
+        dispatch_kind = str(dispatch.get("route_kind", "") or "").strip().lower()
+        if terminal_kind and terminal_kind not in {released_kind, dispatch_kind}:
+            return False
+        for field in (
+            "action_generation",
+            "lifecycle_transaction_id",
+            "graph_transaction_id",
+            "map_epoch",
+            "origin_epoch",
+            "projection_epoch",
+        ):
+            try:
+                expected = int(dispatch.get(field, 0) or 0)
+                received = int(identity.get(field, 0) or 0)
+            except (TypeError, ValueError):
+                return False
+            if expected > 0 and received != expected:
+                return False
+        expected_transaction = int(dispatch.get("transaction_id", 0) or 0)
+        received_transaction = int(identity.get("transaction_id", 0) or 0)
+        if received_transaction <= 0 or received_transaction < expected_transaction:
+            return False
+
+        pending_lookup = getattr(
+            self, "_pending_controller_release_for_route", None
+        )
+        pending = (
+            pending_lookup(route_id) if callable(pending_lookup) else None
+        )
+        if (
+            getattr(self, "last_released_route_terminal_received", False)
+            and not isinstance(pending, dict)
+            and not getattr(
+                self, "last_released_route_controller_pending", False
+            )
+        ):
+            self.publish_status(
+                "released_route_terminal_duplicate",
+                route_id=route_id,
+                terminal_identity=identity,
+            )
+            return True
+
+        release_contract = {
+            "route_id": route_id,
+            "route_kind": terminal_kind or dispatch_kind or released_kind,
+            "transaction_id": received_transaction,
+            "lifecycle_transaction_id": int(
+                identity["lifecycle_transaction_id"]
+            ),
+            "action_generation": int(identity["action_generation"]),
+            "graph_transaction_id": int(identity["graph_transaction_id"]),
+            "map_epoch": int(identity["map_epoch"]),
+            "origin_epoch": int(identity["origin_epoch"]),
+            "projection_epoch": int(identity["projection_epoch"]),
+            "terminal_received": True,
+            "controller_pending": True,
+        }
+        remember_release = getattr(
+            self, "_remember_controller_release_contract", None
+        )
+        if not callable(remember_release):
+            return False
+        remember_release(release_contract)
+        self.last_released_route_kind = release_contract["route_kind"]
+        self.last_released_route_terminal_received = True
+        self.last_released_route_controller_pending = True
+        self.last_released_route_transaction_id = received_transaction
+        self.last_released_route_lifecycle_transaction_id = release_contract[
+            "lifecycle_transaction_id"
+        ]
+        self.last_released_route_action_generation = release_contract[
+            "action_generation"
+        ]
+        self.last_released_route_graph_transaction_id = release_contract[
+            "graph_transaction_id"
+        ]
+        self.last_released_route_map_epoch = release_contract["map_epoch"]
+        self.last_released_route_origin_epoch = release_contract["origin_epoch"]
+        self.last_released_route_projection_epoch = release_contract[
+            "projection_epoch"
+        ]
+        self.last_planning_wall = 0.0
+        self.publish_status(
+            "released_route_terminal_reconciled",
+            terminal_identity=identity,
+            release_reason="late_terminal_after_physical_crossing",
+            **release_contract
+        )
+        self.publish_status(
+            "controller_lease_released",
+            released_route_id=route_id,
+            released_route_kind=release_contract["route_kind"],
+            release_reason="late_terminal_after_physical_crossing",
+            release_phase="awaiting_transport_ack",
+            **release_contract
+        )
+        return True
+
     @staticmethod
     def _pending_terminal_key(identity):
         """Build a stable key for one terminal waiting on dispatch evidence."""
         return (
             int(identity.get("route_id", 0) or 0),
+            int(identity.get("transaction_id", 0) or 0),
             int(identity.get("action_generation", 0) or 0),
             int(identity.get("lifecycle_transaction_id", 0) or 0),
             int(identity.get("graph_transaction_id", 0) or 0),
             int(identity.get("map_epoch", 0) or 0),
+            int(identity.get("origin_epoch", 0) or 0),
+            int(identity.get("projection_epoch", 0) or 0),
             str(identity.get("route_kind", "") or ""),
             str(identity.get("mission_route_kind", "") or ""),
         )
@@ -147,6 +286,7 @@ class GlobalFrontierTerminalValidationMixin:
             matches = all(
                 identity[field] == dispatch.get(field)
                 for field in (
+                    "transaction_id",
                     "action_generation",
                     "route_kind",
                     "mission_route_kind",
@@ -157,6 +297,10 @@ class GlobalFrontierTerminalValidationMixin:
             dispatch_map_epoch = dispatch.get("map_epoch")
             if matches and dispatch_map_epoch is not None:
                 matches = identity["map_epoch"] == dispatch_map_epoch
+            for field in ("origin_epoch", "projection_epoch"):
+                expected_epoch = dispatch.get(field)
+                if matches and expected_epoch is not None:
+                    matches = identity[field] == int(expected_epoch)
             if not matches:
                 continue
             pending.pop(key, None)
@@ -190,7 +334,17 @@ class GlobalFrontierTerminalValidationMixin:
             return self._reject_terminal(message, "predecessor_not_current_owner")
         if getattr(self, "active_terminal_received", False):
             return self._reject_terminal(message, "duplicate_terminal")
-        if getattr(self, "awaiting_controller_lease_release_ack", False):
+        pending_release_for_route = getattr(
+            self, "_pending_controller_release_for_route", None
+        )
+        release_pending = bool(
+            getattr(self, "awaiting_controller_lease_release_ack", False)
+            and (
+                not callable(pending_release_for_route)
+                or pending_release_for_route(int(self.active_route_id)) is not None
+            )
+        )
+        if release_pending:
             return self._reject_terminal(
                 message, "predecessor_release_ack_pending"
             )
@@ -274,6 +428,8 @@ class GlobalFrontierTerminalValidationMixin:
             )
         if identity["action_generation"] <= 0:
             return self._reject_terminal(message, "action_generation_missing")
+        if identity["transaction_id"] <= 0:
+            return self._reject_terminal(message, "transaction_id_missing")
         for field in (
             "action_generation",
             "lifecycle_transaction_id",
@@ -281,6 +437,37 @@ class GlobalFrontierTerminalValidationMixin:
         ):
             expected = int(dispatch.get(field, 0) or 0)
             if expected > 0 and identity[field] != expected:
+                return self._reject_terminal(
+                    message,
+                    "dispatch_contract_%s_mismatch" % field,
+                    expected_identity=dispatch,
+                )
+        # A persistent route may receive a newer GoalManager semantic
+        # transaction after the same route/action was dispatched. Preserve the
+        # stronger route/action/graph/lifecycle checks above while accepting
+        # only a forward transaction update and rejecting replayed old goals.
+        expected_transaction_id = int(dispatch.get("transaction_id", 0) or 0)
+        received_transaction_id = int(identity["transaction_id"] or 0)
+        if (
+            expected_transaction_id > 0
+            and received_transaction_id < expected_transaction_id
+        ):
+            return self._reject_terminal(
+                message,
+                "dispatch_contract_transaction_id_mismatch",
+                expected_identity=dispatch,
+            )
+        if received_transaction_id > expected_transaction_id:
+            dispatch["transaction_id"] = received_transaction_id
+        for field in ("origin_epoch", "projection_epoch"):
+            expected_epoch = dispatch.get(field)
+            if expected_epoch is None:
+                continue
+            try:
+                matches = identity[field] == int(expected_epoch)
+            except (TypeError, ValueError):
+                matches = False
+            if not matches:
                 return self._reject_terminal(
                     message,
                     "dispatch_contract_%s_mismatch" % field,
@@ -358,6 +545,7 @@ class GlobalFrontierTerminalValidationMixin:
             )
         self.active_terminal_contract = {
             "route_id": terminal_route_id,
+            "transaction_id": identity["transaction_id"],
             "route_kind": terminal_route_kind or dispatch_route_kind,
             "lifecycle_transaction_id": identity[
                 "lifecycle_transaction_id"
@@ -365,5 +553,7 @@ class GlobalFrontierTerminalValidationMixin:
             "action_generation": identity["action_generation"],
             "graph_transaction_id": identity["graph_transaction_id"],
             "map_epoch": terminal_epoch,
+            "origin_epoch": identity["origin_epoch"],
+            "projection_epoch": identity["projection_epoch"],
         }
         return self.active_frontier, terminal_delta

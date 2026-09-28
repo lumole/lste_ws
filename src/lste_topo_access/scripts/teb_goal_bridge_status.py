@@ -2,6 +2,7 @@
 """Machine-readable status publishing for the TEB goal bridge."""
 
 import json
+import time
 
 import rospy
 from std_msgs.msg import String
@@ -15,19 +16,146 @@ class TebGoalBridgeStatusMixin:
     def publish_bridge_status(self, event, **fields):
         now = now_for(self)
         action_contract = getattr(self, "active_action_contract", None)
+        if not hasattr(action_contract, "get"):
+            pending = getattr(self, "pending_terminal_prepare", None)
+            if isinstance(pending, dict):
+                action_contract = pending.get("old_contract")
+        if not hasattr(action_contract, "get"):
+            action_contract = getattr(self, "last_dispatch_identity", None)
+
+        def identity_value(name, *fallbacks):
+            if name in fields and fields[name] is not None:
+                return fields[name]
+            if hasattr(action_contract, "get"):
+                value = action_contract.get(name)
+                if value is not None:
+                    return value
+                if name == "action_generation":
+                    value = action_contract.get("generation")
+                    if value is not None:
+                        return value
+            for value in fallbacks:
+                if value is not None:
+                    return value
+            return 0
+
+        def identity_int(value):
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        status_route_id = identity_int(
+            identity_value(
+                "route_id",
+                getattr(self, "active_route_id", 0),
+                getattr(self, "latest_route_id", 0),
+            )
+        )
+        status_action_generation = identity_int(
+            identity_value("action_generation", getattr(self, "action_generation", 0))
+        )
+        status_transaction_id = identity_int(
+            identity_value(
+                "transaction_id",
+                getattr(self, "active_goal_transaction_id", 0),
+                getattr(self, "latest_goal_transaction_id", 0),
+            )
+        )
+        status_lifecycle_transaction_id = identity_int(
+            identity_value(
+                "lifecycle_transaction_id",
+                self._canonical_lifecycle_transaction_id(),
+            )
+        )
+        active_action_lifecycle_transaction_id = identity_int(
+            action_contract.get("lifecycle_transaction_id", 0)
+            if hasattr(action_contract, "get")
+            else 0
+        )
+        if active_action_lifecycle_transaction_id <= 0:
+            active_action_lifecycle_transaction_id = status_lifecycle_transaction_id
+        status_graph_transaction_id = identity_int(
+            identity_value(
+                "graph_transaction_id",
+                getattr(self, "active_graph_transaction_id", 0),
+                getattr(self, "latest_graph_transaction_id", 0),
+            )
+        )
+        status_map_epoch = identity_value(
+            "map_epoch",
+            getattr(self, "active_route_map_epoch", None),
+            getattr(self, "latest_route_map_epoch", None),
+            getattr(self, "latest_frontier_map_epoch", None),
+        )
+        status_origin_epoch = identity_value(
+            "origin_epoch",
+            getattr(self, "active_origin_epoch", None),
+            getattr(self, "latest_origin_epoch", None),
+        )
+        status_projection_epoch = identity_value(
+            "projection_epoch",
+            getattr(self, "active_projection_epoch", None),
+            getattr(self, "latest_projection_epoch", None),
+        )
+        transport_pending = getattr(self, "transport_handoff_pending", None)
+        transport_pending_contract = (
+            transport_pending.get("old_contract", {})
+            if isinstance(transport_pending, dict)
+            else {}
+        )
         payload = {
             "event": str(event),
-            "lifecycle_transaction_id": int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
-                or 0
+            # These scalar fields are the canonical correlation surface. The
+            # active_* fields below remain useful for comparing old and new
+            # ownership during a terminal handoff.
+            "route_id": status_route_id,
+            "action_generation": status_action_generation,
+            "transaction_id": status_transaction_id,
+            "lifecycle_transaction_id": status_lifecycle_transaction_id,
+            # ``lifecycle_transaction_id`` describes this status event.  The
+            # explicit active-action field is the immutable identity that
+            # planner/turn callbacks must validate against while a newer
+            # semantic route is being adopted on the same persistent action.
+            "active_action_lifecycle_transaction_id": (
+                active_action_lifecycle_transaction_id
+            ),
+            "graph_transaction_id": status_graph_transaction_id,
+            "map_epoch": status_map_epoch,
+            "origin_epoch": status_origin_epoch,
+            "projection_epoch": status_projection_epoch,
+            "dedupe_key": (
+                [status_route_id, status_action_generation]
+                if status_action_generation > 0
+                else None
             ),
             "mode": self.mode,
             "persistent_execution": bool(self.persistent_execution),
             "active": bool(self.action_active),
+            "navigation_hold": bool(getattr(self, "navigation_hold", False)),
+            "navigation_hold_age_seconds": (
+                None
+                if float(
+                    getattr(self, "navigation_hold_started_monotonic", 0.0)
+                    or 0.0
+                )
+                <= 0.0
+                else round(
+                    max(
+                        0.0,
+                        now
+                        - float(
+                            getattr(
+                                self,
+                                "navigation_hold_started_monotonic",
+                                0.0,
+                            )
+                            or 0.0
+                        ),
+                    ),
+                    3,
+                )
+            ),
             "allow_in_place_replacement": bool(self.allow_in_place_replacement),
             "allow_route_continuation_replacement": bool(
                 self.allow_route_continuation_replacement
@@ -43,6 +171,22 @@ class TebGoalBridgeStatusMixin:
             ),
             "active_graph_transaction_id": int(
                 getattr(self, "active_graph_transaction_id", 0) or 0
+            ),
+            "origin_epoch": status_origin_epoch,
+            "projection_epoch": status_projection_epoch,
+            "active_origin_epoch": _epoch_value(
+                None if action_contract is None else action_contract.get("origin_epoch"),
+                getattr(self, "active_origin_epoch", None),
+            ),
+            "active_projection_epoch": _epoch_value(
+                None if action_contract is None else action_contract.get("projection_epoch"),
+                getattr(self, "active_projection_epoch", None),
+            ),
+            "latest_origin_epoch": _epoch_value(
+                getattr(self, "latest_origin_epoch", None)
+            ),
+            "latest_projection_epoch": _epoch_value(
+                getattr(self, "latest_projection_epoch", None)
             ),
             "latest_graph_transaction_id": int(
                 getattr(self, "latest_graph_transaction_id", 0) or 0
@@ -133,6 +277,73 @@ class TebGoalBridgeStatusMixin:
             "turn_supervisor_last_event": self.turn_supervisor_last_event,
             "turn_transition_ready": bool(self.turn_transition_ready),
             "move_base_terminal_pending": bool(self.move_base_terminal_pending),
+            "transport_handoff_pending": bool(
+                isinstance(transport_pending, dict)
+            ),
+            "transport_handoff_route_id": identity_int(
+                transport_pending_contract.get("route_id", 0)
+            ),
+            "transport_handoff_action_generation": identity_int(
+                transport_pending.get("old_generation", 0)
+                if isinstance(transport_pending, dict)
+                else 0
+            ),
+            "transport_handoff_status": (
+                transport_pending.get("status_before_cancel")
+                if isinstance(transport_pending, dict)
+                else None
+            ),
+            "transport_handoff_age_seconds": (
+                round(
+                    max(
+                        0.0,
+                        now
+                        - float(
+                            transport_pending.get("started_monotonic", now)
+                        ),
+                    ),
+                    3,
+                )
+                if isinstance(transport_pending, dict)
+                else None
+            ),
+            "transport_handoff_wall_age_seconds": (
+                round(
+                    max(
+                        0.0,
+                        time.monotonic()
+                        - float(
+                            transport_pending.get(
+                                "started_wall_monotonic",
+                                time.monotonic(),
+                            )
+                        ),
+                    ),
+                    3,
+                )
+                if isinstance(transport_pending, dict)
+                else None
+            ),
+            "transport_handoff_timeout_seconds": (
+                transport_pending.get("handoff_timeout_seconds")
+                if isinstance(transport_pending, dict)
+                else None
+            ),
+            "transport_handoff_controller_restart_requested": bool(
+                isinstance(transport_pending, dict)
+                and transport_pending.get("controller_restart_requested")
+            ),
+            "transport_handoff_controller_restart_attempts": int(
+                transport_pending.get("controller_restart_attempts", 0) or 0
+            )
+            if isinstance(transport_pending, dict)
+            else 0,
+            "transport_handoff_server_disconnect_observed": bool(
+                isinstance(transport_pending, dict)
+                and transport_pending.get(
+                    "controller_restart_server_disconnect_observed"
+                )
+            ),
             "active_feedback_frame": self.active_feedback_frame,
             "feedback_transform_failures": int(self.feedback_transform_failures),
             "navfn_plan_topic": self.navfn_plan_topic,
@@ -263,6 +474,8 @@ def _identity_snapshot(identity):
         "route_id": int(identity.get("route_id", 0) or 0),
         "epoch": identity.get("epoch", identity.get("target_epoch", 0)),
         "map_epoch": identity.get("map_epoch"),
+        "origin_epoch": identity.get("origin_epoch"),
+        "projection_epoch": identity.get("projection_epoch"),
         "route_kind": str(identity.get("route_kind", "") or ""),
         "mission_route_kind": str(
             identity.get("mission_route_kind", "") or ""
@@ -381,3 +594,17 @@ def _prefetch_pending_snapshot(bridge):
         "route_id": int(pending["route_id"]),
         "successor_route_id": int(pending["successor_route_id"]),
     }
+
+
+def _epoch_value(*values):
+    """Return the first non-negative epoch without inventing a lineage."""
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            return value
+    return None

@@ -68,6 +68,20 @@ phases:
     task_json: model/Data_exchange/vlm_prompt/lab/yellow_cup.json
     task_id: yellow_cup
     target_eval_enabled: true
+  level4_chunked:
+    # Phase 4.95 task-level validation. Each runner slice is bounded to 120 s;
+    # the runtime, map, graph state, and task lease are inherited between
+    # slices instead of being hard-reset at every diagnostic boundary.
+    formal: false
+    levels: [level_4]
+    seeds: [20260907]
+    startup_timeout_seconds: 180
+    startup_readiness_timeout_seconds: 45
+    timeout_seconds: 120
+    terminal_event: task_done
+    task_json: model/Data_exchange/vlm_prompt/lab/yellow_cup.json
+    task_id: yellow_cup
+    target_eval_enabled: true
 artifacts:
   require_summary: true
   require_topology_verification: true

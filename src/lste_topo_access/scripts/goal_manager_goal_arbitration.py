@@ -15,7 +15,7 @@ from tf.transformations import quaternion_from_euler, quaternion_matrix
 
 from goal_manager_route_validation import validate_target_route as validate_target_route_request
 from goal_manager_modes import STATE_LOCKED
-from goal_manager_target_utils import wrap_angle
+from goal_manager_target_utils import labels_compatible, wrap_angle
 
 class GoalManagerGoalArbitrationMixin:
     def publish_goal_arbitration(self, event: str, **fields):
@@ -26,6 +26,17 @@ class GoalManagerGoalArbitrationMixin:
         deferred, or rejected, so a stopped vehicle can be diagnosed without
         inferring policy decisions from velocity samples alone.
         """
+        try:
+            action_generation = int(
+                fields.get(
+                    "action_generation",
+                    0,
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            action_generation = 0
+        route_id = int(getattr(self, "global_frontier_route_id", 0) or 0)
         payload = {
             "event": str(event),
             "task_id": str(self.current_task_id),
@@ -35,6 +46,9 @@ class GoalManagerGoalArbitrationMixin:
             "mode": str(self.effective_mode),
             "controller_mode": str(self.controller_mode),
             "target_state": str(self.target_execution_state),
+            "target_done_policy": str(
+                getattr(self, "target_done_policy", "visual_target")
+            ),
             "target_epoch": int(self.target_observation_epoch),
             "target_blocked": bool(self.target_blocked),
             "target_failure_count": int(self.target_failure_count),
@@ -50,6 +64,36 @@ class GoalManagerGoalArbitrationMixin:
             ),
             "target_reinspection_pending": bool(
                 getattr(self, "target_reinspection_pending", False)
+            ),
+            # Keep the complete route lineage at the mission decision boundary
+            # so an arbitration event can be correlated without joining it to
+            # a later pose-only publication.
+            "route_id": route_id,
+            "action_generation": action_generation,
+            # GoalManager does not allocate transport generations. Keep the
+            # latest Bridge observation separately so a new semantic mission
+            # cannot inherit a stale generation during persistent handoff.
+            "bridge_action_generation": int(
+                getattr(self, "bridge_action_generation", 0) or 0
+            ),
+            "dedupe_key": (
+                [route_id, action_generation]
+                if action_generation > 0
+                else None
+            ),
+            "transaction_id": int(getattr(self, "goal_command_id", 0) or 0),
+            "lifecycle_transaction_id": int(
+                self._canonical_lifecycle_transaction_id()
+            ),
+            "graph_transaction_id": int(
+                getattr(self, "global_frontier_graph_transaction_id", 0) or 0
+            ),
+            "map_epoch": getattr(self, "global_frontier_map_epoch", None),
+            "origin_epoch": getattr(
+                self, "global_frontier_origin_epoch", None
+            ),
+            "projection_epoch": getattr(
+                self, "global_frontier_projection_epoch", None
             ),
         }
         payload.update(fields)
@@ -245,6 +289,27 @@ class GoalManagerGoalArbitrationMixin:
             return None
         if not self.global_frontier_enabled or self.latest_global_frontier_goal is None:
             return None
+        # TEB reports a terminal for the current frontier endpoint before the
+        # frontier executive has published its successor.  The cached goal is
+        # still present at this point, but reusing it would allocate a new
+        # GoalManager transaction for the same route and race the predecessor
+        # lease-release ACK.  Only a strictly newer route may clear this
+        # boundary.
+        if (
+            self.teb_terminal_goal is not None
+            and self.last_goal_source == "global_slam_frontier"
+            and int(getattr(self, "global_frontier_route_id", 0) or 0) > 0
+            and int(getattr(self, "last_published_frontier_route_id", 0) or 0) > 0
+            and int(getattr(self, "global_frontier_route_id", 0) or 0)
+            <= int(getattr(self, "last_published_frontier_route_id", 0) or 0)
+        ):
+            rospy.loginfo_throttle(
+                2.0,
+                "GoalManager: holds terminal frontier route=%d until a "
+                "strictly newer successor route arrives",
+                int(getattr(self, "global_frontier_route_id", 0) or 0),
+            )
+            return None
         stamp = self.latest_global_frontier_goal.header.stamp
         if self.global_frontier_max_age > 0.0 and stamp:
             age = now - stamp.to_sec()
@@ -298,18 +363,215 @@ class GoalManagerGoalArbitrationMixin:
         self.pub_task_done.publish(Bool(data=True))
         self.task_done_published = True
 
+    def reset_target_room_entry_state(self):
+        """Reset the one-way room-entry acceptance state for a new task."""
+        self.target_room_entry_seen_outside = False
+        self.target_room_entry_inside_since = None
+        self.target_room_entry_last_pose = None
+        self.target_room_entry_event_reported = False
+
+    def target_room_entry_completion_ready(self, now: float) -> bool:
+        """Return whether the robot has crossed the configured target doorway.
+
+        This is deliberately a benchmark acceptance policy, not a source of
+        navigation goals. The robot must first be observed outside the
+        physical doorway bounds; a later pose inside those bounds is enough
+        to prove doorway entry. The default visual-target policy never
+        evaluates this predicate.
+        """
+        if getattr(self, "target_done_policy", "visual_target") != "target_room_entry":
+            return False
+        if not str(getattr(self, "current_task_id", "") or "").strip():
+            return False
+        pose = getattr(self, "latest_pose", None)
+        if pose is None:
+            return False
+        try:
+            x = float(pose.x)
+            y = float(pose.y)
+            min_x = float(self.target_room_entry_min_x)
+            min_y = float(self.target_room_entry_min_y)
+            max_x = float(self.target_room_entry_max_x)
+            max_y = float(self.target_room_entry_max_y)
+            margin = float(self.target_room_entry_margin)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        values = (x, y, min_x, min_y, max_x, max_y, margin)
+        if not all(math.isfinite(value) for value in values):
+            return False
+        if min_x >= max_x or min_y >= max_y:
+            return False
+        self.target_room_entry_last_pose = [
+            round(x, 4), round(y, 4),
+            round(float(getattr(pose, "theta", 0.0)), 4),
+        ]
+        inside_gate = (
+            min_x <= x <= max_x
+            and min_y <= y <= max_y
+        )
+        if not inside_gate:
+            self.target_room_entry_seen_outside = True
+            self.target_room_entry_inside_since = None
+            self.target_room_entry_event_reported = False
+            return False
+        if (
+            getattr(self, "target_room_entry_require_crossing", True)
+            and not self.target_room_entry_seen_outside
+        ):
+            return False
+        if self.target_room_entry_inside_since is None:
+            self.target_room_entry_inside_since = float(now)
+            if not self.target_room_entry_event_reported:
+                self.publish_goal_arbitration(
+                    "target_room_entry_started",
+                    completion_evidence="target_room_entry",
+                    pose=list(self.target_room_entry_last_pose),
+                    door_id="target_room_corridor",
+                    source_region="main_corridor",
+                    target_region="target_room",
+                    door_bounds=[min_x, min_y, max_x, max_y],
+                    inset_margin=margin,
+                )
+                self.target_room_entry_event_reported = True
+        return (
+            float(now) - float(self.target_room_entry_inside_since)
+            >= float(getattr(self, "target_room_entry_min_hold_time", 0.0))
+        )
+
+    def _complete_target_room_entry(self, now: float):
+        """Publish task completion at the physical target-doorway boundary."""
+        pose = list(getattr(self, "target_room_entry_last_pose", None) or [])
+        fields = {
+            "completion_evidence": "target_room_entry",
+            "target_done_policy": "target_room_entry",
+            "pose": pose,
+            "door_id": "target_room_corridor",
+            "source_region": "main_corridor",
+            "target_region": "target_room",
+            "door_bounds": [
+                float(self.target_room_entry_min_x),
+                float(self.target_room_entry_min_y),
+                float(self.target_room_entry_max_x),
+                float(self.target_room_entry_max_y),
+            ],
+            "inset_margin": round(float(self.target_room_entry_margin), 3),
+            "hold_seconds": round(
+                max(
+                    0.0,
+                    float(now)
+                    - float(self.target_room_entry_inside_since or now),
+                ),
+                3,
+            ),
+        }
+        self.target_execution_state = "TARGET_ROOM_ENTRY_COMPLETED"
+        self.publish_goal_arbitration("target_room_entry_confirmed", **fields)
+        self.publish_goal_arbitration("target_task_completed", **fields)
+        rospy.loginfo(
+            "GoalManager: target doorway entry completed at pose=(%.2f, %.2f); "
+            "publish task_done",
+            float(pose[0]) if pose else 0.0,
+            float(pose[1]) if len(pose) > 1 else 0.0,
+        )
+        self.pub_task_done.publish(Bool(data=True))
+        self.task_done_published = True
+
+    def target_context_completion_evidence(self):
+        """Return one target plus two distinct configured context detections.
+
+        ``target_context`` is a short perception contract. Detector scores,
+        box dimensions, hold time, and navigation state are diagnostics only;
+        the detector's published presence is the gate. ``pick_ctx_pair``
+        already enforces that identical left/right terms cannot reuse one box.
+        """
+        task = getattr(self, "latest_task", None)
+        detections = getattr(self, "latest_dets", None)
+        if task is None or detections is None:
+            return None
+        task_id = str(getattr(task, "task_id", "") or "").strip()
+        current_task_id = str(getattr(self, "current_task_id", "") or "").strip()
+        target_name = str(getattr(task, "target_name", "") or "").strip()
+        if not task_id or task_id != current_task_id or not target_name:
+            return None
+        target_hits = [
+            detection
+            for detection in list(getattr(detections, "target_dets", []) or [])
+            if labels_compatible(target_name, getattr(detection, "label", ""))
+        ]
+        if not target_hits:
+            return None
+        left, right = self.pick_ctx_pair()
+        if left is None or right is None:
+            return None
+        target = max(target_hits, key=lambda detection: float(detection.score))
+        return {
+            "target": target,
+            "ctx_left": left,
+            "ctx_right": right,
+            "target_name": target_name,
+            "ctx_left_term": str(getattr(task, "ctx_left", "") or ""),
+            "ctx_right_term": str(getattr(task, "ctx_right", "") or ""),
+        }
+
+    def _complete_target_context(self, now: float, evidence):
+        """Publish perception-only completion without creating target motion."""
+        target = evidence["target"]
+        left = evidence["ctx_left"]
+        right = evidence["ctx_right"]
+        fields = {
+            "completion_evidence": "target_context",
+            "target_done_policy": "target_context",
+            "target_label": str(getattr(target, "label", "") or ""),
+            "target_score": round(float(getattr(target, "score", 0.0)), 4),
+            "context_labels": [
+                str(getattr(left, "label", "") or ""),
+                str(getattr(right, "label", "") or ""),
+            ],
+            "context_scores": [
+                round(float(getattr(left, "score", 0.0)), 4),
+                round(float(getattr(right, "score", 0.0)), 4),
+            ],
+            "target_name": evidence["target_name"],
+            "ctx_left_term": evidence["ctx_left_term"],
+            "ctx_right_term": evidence["ctx_right_term"],
+            "score_gate": "ignored",
+            "box_gate": "ignored",
+            "navigation_gate": "ignored",
+        }
+        self.target_execution_state = "TARGET_CONTEXT_COMPLETED"
+        self.publish_goal_arbitration("target_context_confirmed", **fields)
+        self.publish_goal_arbitration("target_task_completed", **fields)
+        rospy.loginfo(
+            "GoalManager: target context completed target=%s context=(%s,%s); "
+            "publish task_done",
+            fields["target_label"],
+            fields["context_labels"][0],
+            fields["context_labels"][1],
+        )
+        self.pub_task_done.publish(Bool(data=True))
+        self.task_done_published = True
+
     def maybe_publish_task_done(self, now: float):
-        """Close a task from independent fresh visual observations.
+        """Close a task from doorway or visual completion evidence.
 
         Normal completion comes from a close target in fresh detector
         messages, not merely from elapsed state time. An explicit benchmark
-        policy may accept a current target track before the close-range or
-        confirmed-track gates. Counting distinct detector messages prevents
+        policy may accept a doorway crossing before visual target evidence.
+        Counting distinct detector messages prevents
         the 5 Hz Goal Manager timer from treating one stale box as several
         observations. Once complete, the velocity mux stops all commands
         atomically and the evidence event records which policy was used.
         """
         if self.task_done_published:
+            return
+        if getattr(self, "target_done_policy", "visual_target") == "target_room_entry":
+            if self.target_room_entry_completion_ready(now):
+                self._complete_target_room_entry(now)
+            return
+        if getattr(self, "target_done_policy", "visual_target") == "target_context":
+            evidence = self.target_context_completion_evidence()
+            if evidence is not None:
+                self._complete_target_context(now, evidence)
             return
         if self.target_done_require_locked and self.current_state != STATE_LOCKED:
             self.reset_target_close_confirmation()

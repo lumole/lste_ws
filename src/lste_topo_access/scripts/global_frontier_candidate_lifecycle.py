@@ -193,9 +193,16 @@ class GlobalFrontierCandidateLifecycleMixin:
         if source_region is not None:
             # A certified zero-hop path is inside the source physical Place,
             # even if an office desk split its current structural component.
-            if source_region.get("state") == "dormant":
+            if (
+                source_region.get("state") == "dormant"
+                and not (is_portal_probe or is_work_item_rehydration)
+            ):
                 # The base can still leave this closed Place through a portal,
-                # but it must not reopen local observation work.
+                # but ordinary frontier geometry must not reopen local work.
+                # Explicit durable rehydration is the narrow exception: the
+                # current physical Place may still own a WorkItem or a
+                # source/destination PortalProbe discovered after it was
+                # marked dormant.
                 return None
             region_tier, region = "revisit", source_region
             ledger = (
@@ -302,7 +309,7 @@ class GlobalFrontierCandidateLifecycleMixin:
             self.last_ready_to_exit_reentry_skips += 1
             return None
         if (
-            not is_work_item_rehydration
+            not (is_work_item_rehydration or is_portal_probe)
             and self.region_memory.is_observed_region_reentry(
                 region,
                 context.source_component,

@@ -186,7 +186,13 @@ class GlobalFrontierCandidateScoringMixin(GlobalFrontierCandidateLifecycleMixin)
                 or request.selection_tier == "navfn_observation_recovery"
             ):
                 frontier_decision_candidates.append(decision_candidate)
-            if graph_obligation_candidates is not None:
+            if (
+                graph_obligation_candidates is not None
+                and (
+                    route_steps >= minimum_steps
+                    or request.selection_tier == "navfn_observation_recovery"
+                )
+            ):
                 graph_obligation_candidates.append(decision_candidate)
             record_scored_candidate(
                 pools,

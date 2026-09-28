@@ -38,6 +38,12 @@ def _initialize_action_state(bridge):
     bridge.last_result_monotonic = 0.0
     bridge.last_result_status = None
     bridge.task_done = False
+    # GoalManager may intentionally hold the actuator while collecting target
+    # evidence.  The bridge owns this sampled gate so its progress watchdog
+    # cannot turn an expected zero command into a route failure.
+    bridge.navigation_hold = False
+    bridge.navigation_hold_started_monotonic = 0.0
+    bridge.navigation_hold_last_change_monotonic = 0.0
     bridge.action_active = False
     bridge.action_server_seen = False
     bridge.deferred_goal_updates = 0
@@ -51,15 +57,30 @@ def _initialize_action_state(bridge):
     bridge.canonical_route_high_water = 0
     bridge.canonical_graph_high_water = 0
     bridge.canonical_map_epoch_high_water = 0
+    bridge.canonical_origin_epoch_high_water = 0
+    bridge.canonical_projection_epoch_high_water = 0
     # A prepared terminal revokes the old action generation immediately. The
     # old contract remains as a tombstone until Global Frontier acknowledges
     # the release, so a late callback cannot reopen the route.
     bridge.pending_terminal_prepare = None
     bridge.pending_lease_release_contract = None
+    # One bounded table is shared by stall, terminal, watchdog, and explicit
+    # cancel paths. Its key is (route_id, action_generation), not geometry.
+    bridge.terminal_action_tombstones = {}
+    bridge.released_action_tombstones = {}
     # A successor may be dispatched only after the graph's release ACK has
     # matched this exact predecessor transport contract.
     bridge.pending_successor_release_ack = None
+    # Global Frontier can publish a semantic release just before the matching
+    # mission command reaches this bridge. Retain that one bounded request and
+    # replay it after the route contract is adopted.
+    bridge.deferred_frontier_lease_release = None
     bridge.pending_dispatch_generation = 0
+    # Semantic ownership may be released before actionlib finishes cancelling
+    # the old MoveBase goal. Keep this transport gate until the old goal reaches
+    # a terminal state so a successor cannot be sent while it is PREEMPTING.
+    bridge.transport_handoff_pending = None
+    bridge.transport_handoff_last_report_monotonic = 0.0
     bridge.planner_contract_sequence = 0
     bridge.planner_contract_identity = None
     bridge.planner_contract_state = None
@@ -77,9 +98,13 @@ def _initialize_action_state(bridge):
     bridge.latest_frontier_map_route_id = 0
     bridge.latest_frontier_graph_transaction_id = 0
     bridge.latest_route_map_epoch = None
+    bridge.latest_origin_epoch = None
+    bridge.latest_projection_epoch = None
     bridge.latest_graph_transaction_id = 0
     bridge.active_frontier_map_epoch = None
     bridge.active_route_map_epoch = None
+    bridge.active_origin_epoch = None
+    bridge.active_projection_epoch = None
     bridge.active_graph_transaction_id = 0
     bridge.active_goal_global = None
     # A failed action releases controller-scoped health metrics but keeps the
@@ -126,7 +151,11 @@ def _initialize_frontier_state(bridge):
     bridge.frontier_continuous_prefetch_handoff_fallback_count = 0
     bridge.frontier_prefetch_requires_turn_pairs = set()
     bridge.persistent_frontier_prefetch_promoted_pairs = set()
-    bridge.persistent_frontier_endpoint_terminal_routes = set()
+    bridge.persistent_frontier_endpoint_terminal_keys = set()
+    # A persistent frontier endpoint has completed semantically while the
+    # single MoveBase action remains the transport lease.  The pending record
+    # is cleared only when a newer route is adopted or a forced release wins.
+    bridge.persistent_frontier_endpoint_pending = None
     bridge.frontier_observation_completion_pending = None
     bridge.frontier_continuous_prefetch_handoff_pending = None
     bridge.prefetched_frontier_goal = None
@@ -157,6 +186,10 @@ def _initialize_mission_state(bridge):
     bridge.target_lease_tombstone_track_id = ""
     bridge.latest_intent_source = "unknown"
     bridge.latest_intent_priority = 0
+    # The mission command is the canonical lifecycle source for every
+    # persistent planner command. Do not derive it from an unrelated local
+    # status event after a route has been released.
+    bridge.latest_lifecycle_transaction_id = 0
     bridge.latest_route_kind = ""
     bridge.latest_mission_route_kind = ""
     bridge.latest_graph_action = ""
@@ -168,6 +201,7 @@ def _initialize_mission_state(bridge):
     bridge.latest_target_viewpoint_candidate_id = ""
     bridge.latest_target_viewpoint_attempt_id = ""
     bridge.latest_goal_context = default_goal_context()
+    bridge.latest_predecessor_contract = None
     bridge.latest_goal_transaction_id = 0
     bridge.persistent_installed_target_goal = None
     bridge.persistent_installed_target_transaction = 0
@@ -200,6 +234,7 @@ def _initialize_mission_state(bridge):
     bridge.active_target_viewpoint_candidate_id = ""
     bridge.active_target_viewpoint_attempt_id = ""
     bridge.active_goal_context = default_goal_context()
+    bridge.active_predecessor_contract = None
     bridge.turn_supervisor_state = "UNKNOWN"
     bridge.turn_supervisor_last_event = "unknown"
     bridge.move_base_terminal_pending = False

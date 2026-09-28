@@ -465,8 +465,21 @@ def _channel_health_gaps(sample):
     gaps = []
     for name in required:
         state = health.get(name)
-        if not isinstance(state, dict) or not bool(state.get("available")):
+        if not isinstance(state, dict):
             gaps.append(name)
+            continue
+        if bool(state.get("available")):
+            continue
+        # Older metrics versions marked an invalidated TEB payload as
+        # unavailable even though the retained trajectory summary was
+        # serialized in the sample.  A captured invalid payload is useful
+        # causal evidence for a feedback-loss stall; only a genuinely absent
+        # payload is a channel gap.
+        if name == "teb_feedback" and isinstance(
+            sample.get("teb_feedback"), dict
+        ):
+            continue
+        gaps.append(name)
     return gaps
 
 

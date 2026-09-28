@@ -22,7 +22,13 @@ class GlobalFrontierExecutionObservationMixin:
             # Portal topology is advanced by continuous physical evidence, not
             # by an arbitrary controller terminal that may arrive late or not
             # at all after the base has already crossed the doorway.
-            self.observe_active_portal_crossing(now)
+            portal_destination = self.observe_active_portal_crossing(now)
+            if portal_destination is not None and self.active_frontier is None:
+                # Persistent portal crossing may release the old semantic
+                # route in the same serialized tick. Do not continue below
+                # with reset route fields or let the old watchdog process a
+                # route that has already been committed and released.
+                return None
         distance = math.hypot(x - robot_map[0], y - robot_map[1])
         if (
             portal_transition

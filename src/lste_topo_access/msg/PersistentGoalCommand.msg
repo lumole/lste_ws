@@ -14,6 +14,8 @@ uint32 route_id
 string lifecycle_transaction_id
 uint32 action_generation
 uint64 map_epoch
+uint64 origin_epoch
+uint64 projection_epoch
 # Graph planner transaction; zero for direct semantic target routes.
 uint64 graph_transaction_id
 string route_kind

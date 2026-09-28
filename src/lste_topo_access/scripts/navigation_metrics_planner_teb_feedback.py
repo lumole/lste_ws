@@ -26,6 +26,12 @@ class NavigationMetricsTebFeedbackMixin:
                 getattr(message, "graph_transaction_id", 0)
             ),
             "map_epoch": cls._contract_int(getattr(message, "map_epoch", 0)),
+            "origin_epoch": cls._contract_int(
+                getattr(message, "origin_epoch", 0)
+            ),
+            "projection_epoch": cls._contract_int(
+                getattr(message, "projection_epoch", 0)
+            ),
             "lifecycle_transaction_id": cls._contract_int(
                 getattr(message, "lifecycle_transaction_id", "")
             ),
@@ -63,6 +69,8 @@ class NavigationMetricsTebFeedbackMixin:
             "route_id",
             "lifecycle_transaction_id",
             "graph_transaction_id",
+            "origin_epoch",
+            "projection_epoch",
         ):
             expected_value = self._contract_int(expected.get(field))
             if expected_value > 0 and identity[field] != expected_value:
@@ -87,6 +95,32 @@ class NavigationMetricsTebFeedbackMixin:
     def _record_planner_contract_locked(self, message, reconciled=False):
         identity = self._planner_contract_identity(message)
         producer = identity["producer"] or "unknown"
+        previous_identity = getattr(self, "planner_contract_identity", None)
+        previous_state = self._contract_int(
+            getattr(self, "planner_contract_state", 0)
+        )
+        previous_validation = str(
+            getattr(self, "planner_contract_validation", "") or ""
+        )
+        identity_fields = (
+            "transaction_id",
+            "route_id",
+            "graph_transaction_id",
+            "map_epoch",
+            "origin_epoch",
+            "projection_epoch",
+            "lifecycle_transaction_id",
+            "action_generation",
+        )
+        identity_changed = not isinstance(previous_identity, dict) or any(
+            identity.get(field, 0) != previous_identity.get(field, 0)
+            for field in identity_fields
+        )
+        contract_boundary = bool(
+            identity_changed
+            or previous_state != 1
+            or previous_validation != "accepted"
+        )
         previous_sequence = self.planner_contract_sequence_by_producer.get(
             producer, 0
         )
@@ -130,9 +164,13 @@ class NavigationMetricsTebFeedbackMixin:
                 getattr(message, "reason", "") or ""
             )
             if state == 1:
-                self.teb_feedback_valid = False
+                if contract_boundary:
+                    # The typed contract is the only identity-bearing
+                    # boundary. A same-route contract sample must not erase a
+                    # valid identity-free FeedbackMsg on every planner tick.
+                    self.teb_feedback_valid = False
+                    self.teb_feedback_invalid_reason = "awaiting_teb_feedback"
                 self.teb_feedback_requires_fresh_planner_command = False
-                self.teb_feedback_invalid_reason = "awaiting_teb_feedback"
             else:
                 self.teb_planner_command.linear.x = 0.0
                 self.teb_planner_command.angular.z = 0.0

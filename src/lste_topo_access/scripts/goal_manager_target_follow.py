@@ -82,6 +82,15 @@ class GoalManagerTargetFollowMixin:
         latched merely because the scheduler has fallen back to geometric
         frontier mode before the candidate was confirmed.
         """
+        # A target-room reinspection route is already the successor requested
+        # by the candidate's durable claim.  Its command carries the new
+        # route/graph/lifecycle identity, so clearing the candidate here would
+        # immediately request another replan and erase that route before it
+        # can be adopted.  Let the matching route terminal or explicit loss
+        # event close this information transaction.
+        route_active = getattr(self, "target_reinspection_route_active", None)
+        if callable(route_active) and route_active():
+            return False
         # A parallax viewpoint is an active information action, not a passive
         # detector cache.  Its route can legitimately outlive the candidate
         # evidence timeout while Navfn/TEB is still moving the robot.  Letting

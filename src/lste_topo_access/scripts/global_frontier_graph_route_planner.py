@@ -123,6 +123,42 @@ class GraphRoutePlan:
             str(self.portal_probe_phase or ""),
         )
 
+    def durable_obligation_key(self):
+        """Return the topology identity that survives map re-projection.
+
+        ``signature`` deliberately describes one immutable plan and therefore
+        includes map/semantic details that may change on every snapshot.  A
+        materialization miss has a different lifetime: it belongs to the
+        durable WorkItem, PortalProbe, or Portal obligation.  Keep this key
+        free of map epochs and planner reasons so a moving SLAM projection
+        cannot reset the miss budget for the same topology obligation.
+        """
+        action = str(self.action or "")
+        obligation_kind = str(self.obligation_kind or "")
+        obligation_id = _positive_id(self.obligation_id)
+        if obligation_id is not None:
+            return ("obligation", obligation_kind or action, obligation_id)
+
+        portal_id = _positive_id(self.first_portal_id)
+        if portal_id is not None:
+            return ("portal", portal_id)
+
+        path = tuple(
+            value
+            for value in (_positive_id(item) for item in self.portal_path)
+            if value is not None
+        )
+        current_place = _positive_id(self.current_place_id)
+        target_place = _positive_id(self.target_place_id)
+        return (
+            "logical",
+            action,
+            obligation_kind,
+            current_place,
+            target_place,
+            path,
+        )
+
 
 def _records(value):
     """Read a ledger snapshot while keeping the planner side-effect free."""
@@ -248,8 +284,15 @@ def _available_probes(records, branch_coverage=None):
     return by_place
 
 
-def _available_structural_boundary_probes(records, branch_coverage=None):
+def _available_structural_boundary_probes(
+    records, branch_coverage=None, excluded_ids=()
+):
     """Return source probes compiled from known-free structural openings."""
+    excluded = {
+        probe_id
+        for probe_id in (_positive_id(value) for value in excluded_ids)
+        if probe_id is not None
+    }
     by_place = defaultdict(list)
     for probe in records:
         if str(probe.get("observation_source", "")).strip().lower() != (
@@ -259,6 +302,8 @@ def _available_structural_boundary_probes(records, branch_coverage=None):
         place_id = _positive_id(probe.get("source_place_id"))
         probe_id = _positive_id(probe.get("id"))
         if place_id is None or probe_id is None:
+            continue
+        if probe_id in excluded:
             continue
         state = str(probe.get("state", "")).strip().lower()
         if state not in _AVAILABLE_PROBE_STATES:
@@ -275,6 +320,7 @@ def _available_structural_boundary_probes(records, branch_coverage=None):
 
 def _bound_probe_for_portal(
     records, source_place_id, portal_id, branch_coverage=None,
+    excluded_ids=(),
 ):
     """Resolve a Portal hypothesis to its executable source-side probe.
 
@@ -289,11 +335,19 @@ def _bound_probe_for_portal(
     portal = _positive_id(portal_id)
     if source is None or portal is None:
         return None
+    excluded = {
+        probe_id
+        for probe_id in (_positive_id(value) for value in excluded_ids)
+        if probe_id is not None
+    }
     candidates = []
     for record in records:
         if _positive_id(record.get("source_place_id")) != source:
             continue
+        probe_id = _positive_id(record.get("id"))
         if _positive_id(record.get("portal_id")) != portal:
+            continue
+        if probe_id in excluded:
             continue
         state = str(record.get("state", "")).strip().lower()
         if state not in _AVAILABLE_PROBE_STATES:
@@ -334,13 +388,21 @@ def _portal_probe_state(records, source_place_id, portal_id):
     return str(record.get("state", "")).strip().lower()
 
 
-def _unresolved_probe_places(records, branch_coverage=None):
+def _unresolved_probe_places(records, branch_coverage=None, excluded_ids=()):
     """Keep active destination attempts visible to the completion decision."""
+    excluded = {
+        probe_id
+        for probe_id in (_positive_id(value) for value in excluded_ids)
+        if probe_id is not None
+    }
     by_place = defaultdict(list)
     terminal_states = {"observed", "rejected"}
     for probe in records:
         place_id = _positive_id(probe.get("source_place_id"))
+        probe_id = _positive_id(probe.get("id"))
         if place_id is None:
+            continue
+        if probe_id in excluded:
             continue
         if str(probe.get("state", "")).strip().lower() in terminal_states:
             continue
@@ -350,6 +412,56 @@ def _unresolved_probe_places(records, branch_coverage=None):
             continue
         by_place[place_id].append(probe)
     return by_place
+
+
+def _incoming_crossed_portal(
+    current_place_id, portal_records, excluded_portal_ids=()
+):
+    """Return the durable edge that brought the robot into this Place.
+
+    A covered Place can still own local frontier WorkItems after its entry
+    observation.  When no outward Portal evidence is executable, consuming all
+    of those transient viewpoints before returning to the graph corridor
+    serializes exploration room by room.  The reverse action must retain the
+    original crossed Portal identity so the adapter can materialize its durable
+    egress instead of minting a new edge.
+    """
+    current = _positive_id(current_place_id)
+    if current is None:
+        return None
+    excluded = {
+        portal_id
+        for portal_id in (
+            _positive_id(value) for value in excluded_portal_ids
+        )
+        if portal_id is not None
+    }
+    candidates = []
+    for portal in _records(portal_records):
+        if not isinstance(portal, dict):
+            continue
+        portal_id = _positive_id(portal.get("id"))
+        source = _positive_id(portal.get("source_place_id"))
+        destination = _positive_id(portal.get("destination_place_id"))
+        state = str(portal.get("state", "")).strip().lower()
+        if (
+            portal_id is None
+            or source is None
+            or destination != current
+            or source == current
+            or portal_id in excluded
+            or state not in _PORTAL_TRANSIT_STATES
+        ):
+            continue
+        try:
+            crossed_at = float(portal.get("last_crossed_at"))
+        except (TypeError, ValueError):
+            crossed_at = float("-inf")
+        candidates.append((-crossed_at, portal_id, source))
+    if not candidates:
+        return None
+    _order, portal_id, source = min(candidates)
+    return source, (portal_id,), "portal_edge", portal_id
 
 
 class GraphRoutePlanner:
@@ -372,9 +484,11 @@ class GraphRoutePlanner:
         probes=(),
         visible_work_item_ids=None,
         visible_probe_ids=None,
+        visible_portal_ids=None,
         branch_first=False,
         target_place_id=None,
         target_observation_pending=False,
+        resume_place_id=None,
         branch_coverage=None,
         structural_boundary_first=False,
         map_epoch=None,
@@ -383,6 +497,7 @@ class GraphRoutePlanner:
         excluded_probe_ids=(),
     ):
         current = _positive_id(current_place_id)
+        resume_place = _positive_id(resume_place_id)
         excluded_portals = {
             value for value in (_positive_id(item) for item in excluded_portal_ids)
             if value is not None
@@ -410,6 +525,17 @@ class GraphRoutePlanner:
             )
 
         probe_records = _records(probes)
+        # A source-side probe and its unbound Portal are two representations
+        # of one physical doorway.  Excluding only the probe would still let
+        # the Portal branch reintroduce that doorway after invalidation.
+        if excluded_probes:
+            for probe in probe_records:
+                probe_id = _positive_id(probe.get("id"))
+                if probe_id not in excluded_probes:
+                    continue
+                portal_id = _positive_id(probe.get("portal_id"))
+                if portal_id is not None:
+                    excluded_portals.add(portal_id)
         probe_by_place = _available_probes(probe_records, branch_coverage)
         if excluded_probes:
             for place_id, values in tuple(probe_by_place.items()):
@@ -419,15 +545,18 @@ class GraphRoutePlanner:
                     if _positive_id(item.get("id")) not in excluded_probes
                 ]
         structural_boundary_by_place = _available_structural_boundary_probes(
-            probe_records, branch_coverage,
+            probe_records, branch_coverage, excluded_ids=excluded_probes,
         )
         unresolved_probe_places = _unresolved_probe_places(
-            probe_records, branch_coverage,
+            probe_records, branch_coverage, excluded_ids=excluded_probes,
         )
         active_probe_by_place = defaultdict(list)
         for probe in probe_records:
             place_id = _positive_id(probe.get("source_place_id"))
+            probe_id = _positive_id(probe.get("id"))
             if place_id is None:
+                continue
+            if probe_id in excluded_probes:
                 continue
             if str(probe.get("state", "")).strip().lower() in {
                 "active",
@@ -438,6 +567,7 @@ class GraphRoutePlanner:
             probe.get("work_item_id")
             for probe in probe_records
             if probe.get("work_item_id") is not None
+            and _positive_id(probe.get("id")) not in excluded_probes
             and str(probe.get("state", "")).strip().lower()
             in {"pending", "active", "source_arrived", "destination_active"}
         }
@@ -466,36 +596,31 @@ class GraphRoutePlanner:
                 item for item in work.get(current, ())
                 if _positive_id(item.get("id")) in visible
             ]
-            if visible_current_work or not branch_first:
-                work[current] = visible_current_work
-            else:
-                if not visible:
-                    # Candidate collection may need to discover a Portal from
-                    # the same snapshot before its transient endpoint can be
-                    # added to the durable graph. Keep one current-place
-                    # WorkItem as the graph intent in that branch-first case;
-                    # the selector can then promote it explicitly through the
-                    # transaction boundary. This preserves the bootstrap
-                    # handoff when no candidate identity is known yet.
-                    work[current] = list(work.get(current, ()))[:1]
-                else:
-                    # A non-empty visible set is the result of candidate
-                    # collection. If it contains no current-place WorkItem,
-                    # every current local item is absent from this snapshot.
-                    # Do not resurrect the first durable ID merely because it
-                    # sorts first: leave it in ``unresolved_work`` while the
-                    # graph may use a certified transit edge to reach a
-                    # materialized remote obligation.
-                    work[current] = []
+            # An explicit set is the completed projection result, including
+            # the empty set. Never resurrect a durable local item merely
+            # because branch-first has no current candidate.
+            work[current] = visible_current_work
         if visible_probe_ids is not None:
-            # Probe visibility is a snapshot-local geometry fact.  Do not
-            # discard a durable probe merely because its frontier projection
-            # disappeared before this planning pass; the rehydration adapter
-            # is specifically responsible for rebuilding that viewpoint from
-            # the physical gate identity.  ``visible_probe_ids`` remains in
-            # the API for replay/compatibility and for callers that record the
-            # candidate set, but it is intentionally not an eligibility mask.
-            pass
+            # Probe visibility is a snapshot-local geometry fact. An explicit
+            # set, including an empty set, is the completed projection result
+            # for the current Place; remote probes remain durable obligations.
+            visible = {
+                probe_id
+                for probe_id in (_positive_id(value) for value in visible_probe_ids)
+                if probe_id is not None
+            }
+            probe_by_place[current] = [
+                probe for probe in probe_by_place.get(current, ())
+                if _positive_id(probe.get("id")) in visible
+            ]
+            # Apply the same snapshot boundary to structural probe records.
+            # Keeping a rejected/hidden pending record in this map made an
+            # otherwise executable bound-Portal egress wait forever even
+            # though no current-map structural probe could be dispatched.
+            structural_boundary_by_place[current] = [
+                probe for probe in structural_boundary_by_place.get(current, ())
+                if _positive_id(probe.get("id")) in visible
+            ]
         adjacency = defaultdict(list)
         unbound_by_place = defaultdict(list)
         portal_records = _records(portals)
@@ -549,12 +674,35 @@ class GraphRoutePlanner:
                 continue
             # Once crossed, a physical doorway is legal transit in either
             # direction.  Sorting makes the plan invariant to ledger order.
-                adjacency[source].append((destination, portal_id))
+            adjacency[source].append((destination, portal_id))
             adjacency[destination].append((source, portal_id))
         for values in adjacency.values():
             values.sort(key=lambda edge: (edge[1], edge[0]))
         for values in unbound_by_place.values():
             values.sort(key=lambda item: _positive_id(item.get("id")) or 0)
+        if visible_portal_ids is not None:
+            visible = {
+                portal_id
+                for portal_id in (
+                    _positive_id(value) for value in visible_portal_ids
+                )
+                if portal_id is not None
+            }
+            unbound_by_place[current] = [
+                portal for portal in unbound_by_place.get(current, ())
+                if (
+                    _positive_id(portal.get("id")) in visible
+                    # Once both sides of a physical doorway have been
+                    # observed, its crossing obligation is durable graph
+                    # evidence. Do not require the transient frontier arc to
+                    # remain visible before selecting the same Portal edge.
+                    or _portal_probe_state(
+                        probe_records,
+                        current,
+                        portal.get("id"),
+                    ) in {"observed", "certified"}
+                )
+            ]
 
         current_place = place_by_id[current]
         current_covered = _covered(current_place)
@@ -613,6 +761,32 @@ class GraphRoutePlanner:
         if target_observation_pending:
             return self._target(current, "target_observation_required")
 
+        # A branch-first Portal can turn out to be a second doorway into an
+        # already-known Place.  Preserve the source Place as a one-shot graph
+        # resume obligation so the destination's local work cannot steal the
+        # next decision and create a covered-room loop.  The adapter clears
+        # this marker when the source Place is reached; this planner remains
+        # pure and only follows certified adjacency.
+        if branch_first and resume_place is not None and resume_place != current:
+            resume_pending = bool(
+                work.get(resume_place)
+                or probe_by_place.get(resume_place)
+                or unbound_by_place.get(resume_place)
+            )
+            if resume_pending:
+                resume_path = self._path_to_place(
+                    current,
+                    resume_place,
+                    adjacency,
+                    excluded_portal_ids=excluded_portals,
+                )
+                if resume_path is not None:
+                    return self._cross(
+                        current,
+                        resume_path,
+                        "resume_source_after_covered_portal_arrival",
+                    )
+
         # A source-arrived Portal probe is an active evidence contract.  Its
         # destination view must be acquired before ordinary local WorkItems;
         # otherwise a fragmented frontier can keep the robot in the source
@@ -624,11 +798,18 @@ class GraphRoutePlanner:
             for probe in probes_at_place
         }
         evidence_probe_records = tuple(
-            probe for probe in probe_records
-            if _branch_coverage_state(branch_coverage, probe)
-            not in {"completed", "transit"}
-            and (
+                probe for probe in probe_records
+                if _branch_coverage_state(branch_coverage, probe)
+                not in {"completed", "transit"}
+                and _positive_id(probe.get("id")) not in excluded_probes
+                and (
+                # ``source_arrived`` is a durable phase boundary.  Its
+                # destination-view obligation must survive disappearance of
+                # the transient frontier arc; otherwise local WorkItems can
+                # starve the second half of the same Portal transaction.
                 str(probe.get("state", "")).strip().lower()
+                == "source_arrived"
+                or str(probe.get("state", "")).strip().lower()
                 not in _AVAILABLE_PROBE_STATES
                 or _positive_id(probe.get("id")) in available_probe_ids
             )
@@ -679,6 +860,27 @@ class GraphRoutePlanner:
                     "destination_view_promoted_to_portal",
                 )
 
+        # A durable unbound Portal with a registered source-side probe is an
+        # active branch obligation.  In branch-first mode, execute that probe
+        # before another local WorkItem can starve the doorway.  The probe
+        # identity is kept separate from the Portal identity so the source
+        # observation still follows the normal two-phase contract.
+        if branch_first and local_unbound:
+            for portal in local_unbound:
+                probe = _bound_probe_for_portal(
+                    probe_records,
+                    current,
+                    portal.get("id"),
+                    branch_coverage=branch_coverage,
+                    excluded_ids=excluded_probes,
+                )
+                if probe is not None:
+                    return self._probe(
+                        current,
+                        probe,
+                        "unbound_portal_source_probe_priority",
+                    )
+
         # A known-free structural opening is a first-class information
         # obligation in the full branch-first method.  It is deliberately
         # checked after target and destination-view obligations, but before
@@ -692,20 +894,98 @@ class GraphRoutePlanner:
                     "structural_boundary_requires_observation",
                 )
 
-        # Branch-first is allowed to bypass only local work that currently has
-        # no durable viewpoint geometry. A WorkItem with an unknown-side normal
-        # can be rehydrated from its physical anchor after SLAM changes, so it
-        # is a local place-closure obligation. Crossing first would leave that
-        # obligation behind and force a later return through an already visited
-        # Place. This is an evidence boundary, not a dwell/timeout heuristic.
+        # A covered Place reached through a crossed Portal is allowed to yield
+        # back to the graph corridor once it has no executable outward Portal
+        # evidence. Before taking the incoming edge, however, use any already
+        # certified path to an unobserved Place. Taking the reverse egress
+        # first makes a newly entered room immediately re-enter its source and
+        # can starve a different unexplored branch behind that source.
+        if (
+            branch_first
+            and not local_probe
+            and not local_unbound
+            and not structural_boundary_by_place.get(current)
+            # A destination Place may have no currently projected local
+            # WorkItems or Portal evidence while its durable obligation is
+            # still unresolved.  Use the unfiltered ledger here: returning
+            # through the incoming edge before re-materialization treats a
+            # newly entered Place as transit-only and sends it back to its
+            # source before its local work can be attempted.
+            and not unresolved_work.get(current)
+        ):
+            unobserved_path = self._best_path(
+                current,
+                place_by_id,
+                adjacency,
+                work,
+                probe_by_place,
+                unresolved_work,
+                unbound_by_place,
+                only_unobserved=True,
+                explicit_target=explicit_target,
+                excluded_portal_ids=excluded_portals,
+            )
+            if unobserved_path is not None:
+                return self._cross(
+                    current,
+                    unobserved_path,
+                    "branch_first_from_covered_place_to_unobserved_place",
+                )
+            egress_path = _incoming_crossed_portal(
+                current,
+                portal_records,
+                excluded_portal_ids=excluded_portals,
+            )
+            if egress_path is not None:
+                return self._cross(
+                    current,
+                    egress_path,
+                    "bound_portal_egress_required",
+                )
+
+        # Branch-first may suspend a local WorkItem once a certified edge leads
+        # to an unobserved Place. The WorkItem remains durable and resumable;
+        # requiring every rehydratable viewpoint to finish before crossing
+        # serializes the whole building into room-sized detours and defeats the
+        # graph policy's explicit branch-first contract.
         local_work_has_rehydratable_view = any(
             _work_item_has_direction(item)
             for item in unresolved_work.get(current, ())
         )
+        local_work_projection_missing = bool(
+            branch_first
+            and visible_work_item_ids is not None
+            and unresolved_work.get(current)
+            and not local_work
+        )
+        if local_work_projection_missing:
+            # An explicit empty visibility set is a completed snapshot result,
+            # not an instruction to wait forever.  Preserve the local durable
+            # WorkItems, but use a certified path to a genuinely unobserved
+            # Place when one exists.  This prevents a transient projection gap
+            # from pinning the robot in a covered room and still forbids a
+            # return to another already observed Place.
+            path = self._best_path(
+                current,
+                place_by_id,
+                adjacency,
+                work,
+                probe_by_place,
+                unresolved_work,
+                unbound_by_place,
+                only_unobserved=True,
+                explicit_target=explicit_target,
+                excluded_portal_ids=excluded_portals,
+            )
+            if path is not None:
+                return self._cross(
+                    current,
+                    path,
+                    "branch_first_after_local_projection_miss",
+                )
         if (
             branch_first
             and local_work
-            and not local_work_has_rehydratable_view
             and not self._target_work_pending(
                 explicit_target, current, local_work,
             )
@@ -746,6 +1026,7 @@ class GraphRoutePlanner:
                     current,
                     portal.get("id"),
                     branch_coverage=branch_coverage,
+                    excluded_ids=excluded_probes,
                 )
                 if probe is not None:
                     return self._probe(
@@ -816,6 +1097,37 @@ class GraphRoutePlanner:
             current_place_id=current,
             reason="all_durable_graph_obligations_settled",
         )
+
+    @staticmethod
+    def _path_to_place(
+        start, target, adjacency, excluded_portal_ids=()
+    ):
+        """Return a certified graph path to one explicitly resumed Place."""
+        start = _positive_id(start)
+        target = _positive_id(target)
+        if start is None or target is None or start == target:
+            return None
+        excluded = {
+            portal_id
+            for portal_id in (
+                _positive_id(value) for value in excluded_portal_ids
+            )
+            if portal_id is not None
+        }
+        queue = deque([start])
+        paths = {start: ()}
+        while queue:
+            place_id = queue.popleft()
+            for neighbour, portal_id in adjacency.get(place_id, ()):
+                portal_id = _positive_id(portal_id)
+                if portal_id in excluded or neighbour in paths:
+                    continue
+                paths[neighbour] = paths[place_id] + (portal_id,)
+                if neighbour == target:
+                    path = paths[neighbour]
+                    return target, path, "portal_edge", path[-1]
+                queue.append(neighbour)
+        return None
 
     @staticmethod
     def _target_work_pending(explicit_target, current, local_work):
@@ -986,7 +1298,23 @@ class GraphRoutePlanner:
             )
         if not candidates:
             return None
-        _distance, _priority, target, portal_path, kind, obligation_id = min(candidates)
+        # Semantic novelty is the primary graph objective.  Comparing path
+        # length first makes a nearby covered Place's WorkItem beat a slightly
+        # farther unobserved Place, which creates room re-entry and starves
+        # topology expansion.  Keep shortest certified transit as the tie-break
+        # within the same obligation class.
+        _priority, _distance, target, portal_path, kind, obligation_id = min(
+            (
+                priority,
+                distance,
+                place_id,
+                portal_path,
+                obligation_kind,
+                obligation_id,
+            )
+            for distance, priority, place_id, portal_path, obligation_kind,
+            obligation_id in candidates
+        )
         return target, portal_path, kind, obligation_id
 
 

@@ -537,6 +537,8 @@ class GlobalFrontierPlanningSnapshotMixin:
 
     def planning_pose_snapshot(self):
         """Resolve the current map-frame robot pose for one planning cycle."""
+        if not self._rehydration_inputs_ready_for_planning():
+            return None
         if self.task_done or self.map_msg is None or self.pose_odom is None:
             return None
         message = self.map_msg

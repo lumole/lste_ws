@@ -163,10 +163,28 @@ class NavigationMetricsGoalEventsMixin:
                 )
             except (TypeError, ValueError):
                 self.goal_transition_distance = None
+            goal_context = payload.get("goal_context")
+            goal_context = goal_context if isinstance(goal_context, dict) else {}
             self._write(
                 "INFO",
                 "mission_goal_transaction",
                 transaction_id=self.goal_transaction_id,
+                # GoalManager owns the semantic transaction; transport action
+                # generation is allocated by TEB Bridge and is zero until the
+                # command is adopted. Preserve the complete lineage so the
+                # short dispatch gate can match both boundaries explicitly.
+                action_generation=int(payload.get("action_generation", 0) or 0),
+                lifecycle_transaction_id=int(
+                    payload.get("lifecycle_transaction_id", 0) or 0
+                ),
+                graph_transaction_id=int(
+                    payload.get("graph_transaction_id", 0)
+                    or goal_context.get("graph_transaction_id", 0)
+                    or 0
+                ),
+                map_epoch=payload.get("map_epoch"),
+                origin_epoch=payload.get("origin_epoch"),
+                projection_epoch=payload.get("projection_epoch"),
                 source=self.goal_source,
                 priority=int(payload.get("priority", 0) or 0),
                 route_id=int(payload.get("route_id", 0) or 0),

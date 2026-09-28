@@ -51,6 +51,9 @@ def configure_turn_supervisor_parameters(supervisor):
     supervisor.navigation_hold_topic = gp(
         "~navigation_hold_topic", "/lste/navigation_hold"
     )
+    supervisor.mux_status_topic = gp(
+        "~mux_status_topic", "/lste/cmd_vel_mux/status"
+    )
     supervisor.status_topic = gp(
         "~status_topic", "/lste/teb_turn_supervisor/status"
     )

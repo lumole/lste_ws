@@ -92,7 +92,24 @@ class GlobalFrontierPlanningRuntimeMixin:
             if drain_terminals is not None:
                 drain_terminals()
             self._clear_planning_preempt_if_drained()
-            if getattr(self, "awaiting_controller_lease_release_ack", False):
+            pending_for_route = getattr(
+                self, "_pending_controller_release_for_route", None
+            )
+            try:
+                current_route_id = int(
+                    getattr(self, "active_route_id", 0) or 0
+                )
+            except (TypeError, ValueError):
+                current_route_id = 0
+            release_blocks_current_route = bool(
+                getattr(self, "awaiting_controller_lease_release_ack", False)
+                and (
+                    current_route_id <= 0
+                    or not callable(pending_for_route)
+                    or pending_for_route(current_route_id) is not None
+                )
+            )
+            if release_blocks_current_route:
                 now = time.monotonic()
                 last_report = float(
                     getattr(self, "last_controller_lease_wait_report_wall", 0.0)
@@ -102,6 +119,10 @@ class GlobalFrontierPlanningRuntimeMixin:
                     self.last_controller_lease_wait_report_wall = now
                     self.publish_status(
                         "controller_lease_release_wait",
+                        active_route_id=current_route_id,
+                        pending_controller_lease_releases=getattr(
+                            self, "pending_controller_lease_releases", None
+                        ),
                         pending_controller_lease_release=getattr(
                             self, "pending_controller_lease_release", None
                         ),

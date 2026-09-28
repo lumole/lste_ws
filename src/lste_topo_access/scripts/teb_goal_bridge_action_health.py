@@ -19,6 +19,7 @@ from clock_provider import now_for
 
 class TebGoalBridgeActionHealthMixin:
     _ROUTE_LEASE_WATCHDOG_SECONDS = 10.0
+    _ACTION_TOMBSTONE_LIMIT = 128
 
     @staticmethod
     def _watchdog_int(value, default=0):
@@ -26,6 +27,87 @@ class TebGoalBridgeActionHealthMixin:
             return int(value or 0)
         except (TypeError, ValueError):
             return int(default)
+
+    @staticmethod
+    def _action_identity_key(route_id, action_generation):
+        """Return the stable deduplication key for one transport action."""
+        try:
+            route_id = int(route_id or 0)
+            action_generation = int(action_generation or 0)
+        except (TypeError, ValueError):
+            return None
+        if action_generation <= 0:
+            return None
+        return route_id, action_generation
+
+    def _action_identity_key_locked(self, action_contract=None):
+        """Resolve one action key without synthesizing a new generation."""
+        contract = action_contract
+        if contract is None:
+            pending = getattr(self, "pending_terminal_prepare", None)
+            if isinstance(pending, dict):
+                contract = pending.get("old_contract")
+        if contract is None:
+            contract = getattr(self, "active_action_contract", None)
+        if contract is None:
+            contract = getattr(self, "last_dispatch_identity", None)
+        if hasattr(contract, "get"):
+            route_id = contract.get(
+                "route_id",
+                getattr(self, "active_route_id", 0)
+                or getattr(self, "latest_route_id", 0),
+            )
+            action_generation = contract.get(
+                "generation",
+                contract.get(
+                    "action_generation",
+                    getattr(self, "action_generation", 0),
+                ),
+            )
+        else:
+            route_id = getattr(self, "active_route_id", 0) or getattr(
+                self, "latest_route_id", 0
+            )
+            action_generation = getattr(self, "action_generation", 0)
+        return self._action_identity_key(route_id, action_generation)
+
+    def _terminal_tombstone_for_key_locked(self, key):
+        if key is None:
+            return None
+        records = getattr(self, "terminal_action_tombstones", None)
+        if not isinstance(records, dict):
+            return None
+        return records.get(key)
+
+    def _remember_terminal_tombstone_locked(self, key, record):
+        """Retain bounded termination state for duplicate callback suppression."""
+        if key is None or not isinstance(record, dict):
+            return
+        records = getattr(self, "terminal_action_tombstones", None)
+        if not isinstance(records, dict):
+            records = {}
+            self.terminal_action_tombstones = records
+        records[key] = record
+        while len(records) > self._ACTION_TOMBSTONE_LIMIT:
+            records.pop(next(iter(records)))
+
+    def _released_action_key_seen_locked(self, key):
+        if key is None:
+            return False
+        records = getattr(self, "released_action_tombstones", None)
+        return isinstance(records, dict) and key in records
+
+    def _remember_released_action_key_locked(self, key, reason):
+        """Retain the exact release key so repeated ACKs cannot release twice."""
+        if key is None:
+            return
+        records = getattr(self, "released_action_tombstones", None)
+        if not isinstance(records, dict):
+            records = {}
+            self.released_action_tombstones = records
+        records[key] = {"reason": str(reason or "")}
+        while len(records) > self._ACTION_TOMBSTONE_LIMIT:
+            records.pop(next(iter(records)))
 
     def _route_lease_watchdog_identity_locked(self, action_contract=None):
         """Build the immutable identity that a terminal route hands off."""
@@ -77,11 +159,7 @@ class TebGoalBridgeActionHealthMixin:
                 or getattr(self, "latest_graph_transaction_id", 0)
             )
             lifecycle_transaction_id = self._watchdog_int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
+                self._canonical_lifecycle_transaction_id()
             )
             route_id = self._watchdog_int(
                 getattr(self, "active_route_id", 0)
@@ -190,11 +268,36 @@ class TebGoalBridgeActionHealthMixin:
     ):
         """Arm one bounded handoff lease after a real MoveBase terminal."""
         identity = self._route_lease_watchdog_identity_locked(action_contract)
+        identity_key = self._action_identity_key(
+            identity.get("route_id"), identity.get("action_generation")
+        )
         if identity["action_generation"] <= 0 and getattr(
             self, "last_dispatched_goal", None
         ) is None:
             return False
-        if getattr(self, "route_lease_watchdog", None) is not None:
+        existing = getattr(self, "route_lease_watchdog", None)
+        if isinstance(existing, dict):
+            existing_key = self._action_identity_key(
+                existing.get("route_id"), existing.get("action_generation")
+            )
+            if existing_key == identity_key and identity_key is not None:
+                self.publish_bridge_status(
+                    "route_lease_watchdog_duplicate_ignored",
+                    route_id=identity["route_id"],
+                    transaction_id=identity["transaction_id"],
+                    lifecycle_transaction_id=identity[
+                        "lifecycle_transaction_id"
+                    ],
+                    action_generation=identity["action_generation"],
+                    graph_transaction_id=identity["graph_transaction_id"],
+                    map_epoch=identity.get("map_epoch"),
+                    origin_epoch=identity.get("origin_epoch"),
+                    projection_epoch=identity.get("projection_epoch"),
+                    reason=str(reason),
+                    dedupe_key=[int(identity_key[0]), int(identity_key[1])],
+                )
+                return True
+        if existing is not None:
             self._cancel_route_lease_watchdog_locked("rearmed")
 
         now = float(now_for(self))
@@ -209,6 +312,7 @@ class TebGoalBridgeActionHealthMixin:
         record = dict(identity)
         record.update(
             {
+                "identity_key": identity_key,
                 "armed_at": now,
                 "deadline": now + self._ROUTE_LEASE_WATCHDOG_SECONDS,
                 "status": status_code,
@@ -277,11 +381,6 @@ class TebGoalBridgeActionHealthMixin:
         captured_graph_transaction = self._watchdog_int(
             record.get("graph_transaction_id")
         )
-        captured_generation = self._watchdog_int(
-            record.get("action_generation")
-        )
-        if self._watchdog_int(getattr(self, "action_generation", 0)) > captured_generation:
-            return True
         latest_route = self._watchdog_int(
             getattr(self, "latest_route_id", 0)
         )
@@ -296,6 +395,18 @@ class TebGoalBridgeActionHealthMixin:
         if (
             latest_transaction > 0
             and latest_transaction > captured_transaction
+        ):
+            return True
+        latest_lifecycle = self._watchdog_int(
+            getattr(self, "latest_lifecycle_transaction_id", 0)
+        )
+        captured_lifecycle = self._watchdog_int(
+            record.get("lifecycle_transaction_id")
+        )
+        if (
+            captured_lifecycle > 0
+            and latest_lifecycle > 0
+            and latest_lifecycle != captured_lifecycle
         ):
             return True
         latest_graph_transaction = self._watchdog_int(
@@ -431,6 +542,7 @@ class TebGoalBridgeActionHealthMixin:
         # The watchdog is now closed; keep only the callback tombstone and
         # clear the retry record so a late result cannot arm it again.
         self.handoff_requested = False
+        self.persistent_frontier_endpoint_pending = None
         self.frontier_observation_completion_pending = None
         self.frontier_continuous_prefetch_handoff_pending = None
         clear_request = getattr(
@@ -461,6 +573,20 @@ class TebGoalBridgeActionHealthMixin:
             self.frontier_lease_released_reason = (
                 "route_lease_watchdog_expired"
             )
+            # The watchdog is the last owner of a terminal frontier route when
+            # no explicit release request arrived. Close the semantic lease
+            # with the immutable predecessor identity; otherwise Global
+            # Frontier waits forever for the ACK that would authorize a
+            # successor. The transport action has already gone through the
+            # generation barrier above, so this is idempotent ownership
+            # bookkeeping, not a second cancel.
+            self._publish_frontier_release_ack_locked(
+                route_id,
+                self._route_lease_watchdog_identity_locked(action_contract),
+                str(record.get("route_kind", "") or ""),
+                release_phase="route_lease_watchdog_expired",
+            )
+            self.pending_lease_release_contract = None
         if self._watchdog_int(record.get("priority")) >= 2:
             self.target_lease_tombstone_transaction_id = max(
                 self._watchdog_int(
@@ -506,8 +632,6 @@ class TebGoalBridgeActionHealthMixin:
         self.active_target_viewpoint_attempt_id = ""
         self.active_goal_context = {}
         self.persistent_target_terminal_boundary_transaction = 0
-        self.pending_terminal_prepare = None
-        self.pending_lease_release_contract = None
         self.last_result_status = record.get("status")
         self.last_result_monotonic = current
         self.publish_bridge_status(
@@ -669,8 +793,6 @@ class TebGoalBridgeActionHealthMixin:
             self.persistent_target_pending_goal = None
             self.persistent_installed_target_goal = None
             self.persistent_installed_target_transaction = 0
-            self.pending_terminal_prepare = None
-            self.pending_lease_release_contract = None
         self.latest_goal = None
         self.last_dispatched_goal = None
         self.last_dispatch_identity = None
@@ -705,7 +827,13 @@ class TebGoalBridgeActionHealthMixin:
         )
         return True
 
-    def _release_frontier_controller_lease_locked(self, route_id, reason):
+    def _release_frontier_controller_lease_locked(
+        self,
+        route_id,
+        reason,
+        publish_release_ack=False,
+        release_contract=None,
+    ):
         """Atomically release a stale frontier action by route identity.
 
         Global Frontier can finish its planning lease before the persistent
@@ -722,13 +850,82 @@ class TebGoalBridgeActionHealthMixin:
             return False
         active_route_id = int(getattr(self, "active_route_id", 0) or 0)
         latest_route_id = int(getattr(self, "latest_route_id", 0) or 0)
-        if route_id < max(active_route_id, latest_route_id):
+        explicit_contract = (
+            release_contract if hasattr(release_contract, "get") else None
+        )
+        explicit_route_id = self._watchdog_int(
+            None if explicit_contract is None
+            else explicit_contract.get("route_id")
+        )
+        if route_id < active_route_id:
+            return False
+        if (
+            route_id < latest_route_id
+            and explicit_route_id != route_id
+        ):
             return False
         active_source = str(
             getattr(self, "active_intent_source", "unknown") or "unknown"
         )
         active_kind = str(getattr(self, "active_route_kind", "") or "")
         was_active = bool(self.action_active)
+        if explicit_contract is not None:
+            release_contract = explicit_contract
+        else:
+            release_contract = getattr(self, "active_action_contract", None)
+        if release_contract is None:
+            pending = getattr(self, "pending_terminal_prepare", None)
+            if isinstance(pending, dict):
+                release_contract = pending.get("old_contract")
+        if release_contract is None:
+            release_contract = getattr(self, "last_dispatch_identity", None)
+        if release_contract is None:
+            release_contract = {
+                "route_id": route_id,
+                "generation": int(getattr(self, "action_generation", 0) or 0),
+            }
+        release_key = self._action_identity_key_locked(release_contract)
+        if release_key is not None and int(release_key[0]) not in (0, route_id):
+            self.publish_bridge_status(
+                "controller_lease_release_rejected",
+                route_id=route_id,
+                action_generation=int(release_key[1]),
+                reason="release_contract_route_mismatch",
+                contract_route_id=int(release_key[0]),
+            )
+            return False
+        if self._released_action_key_seen_locked(release_key):
+            if publish_release_ack:
+                release_identity = self._route_lease_watchdog_identity_locked(
+                    release_contract
+                )
+                self._publish_frontier_release_ack_locked(
+                    route_id,
+                    release_identity,
+                    str(
+                        release_identity.get("route_kind")
+                        or active_kind
+                        or ""
+                    ),
+                    release_phase="forced_controller_release_duplicate",
+                )
+            self.publish_bridge_status(
+                "controller_lease_release_duplicate_ignored",
+                route_id=route_id,
+                action_generation=(
+                    0 if release_key is None else int(release_key[1])
+                ),
+                reason="release_key_already_applied",
+                dedupe_key=(
+                    None
+                    if release_key is None
+                    else [int(release_key[0]), int(release_key[1])]
+                ),
+            )
+            return bool(publish_release_ack)
+        release_identity = self._route_lease_watchdog_identity_locked(
+            release_contract
+        )
         cancel_watchdog = getattr(
             self, "_cancel_route_lease_watchdog_locked", None
         )
@@ -742,21 +939,25 @@ class TebGoalBridgeActionHealthMixin:
         self._commit_termination(
             "frontier_controller_release",
             source_goal=getattr(self, "last_dispatched_goal", None),
-            action_contract=getattr(self, "active_action_contract", None),
+            action_contract=release_contract,
             watchdog_reason="frontier_controller_release",
             publish_terminal=False,
             arm_watchdog=False,
         )
+        # This method is the Bridge-side application of the upstream semantic
+        # release request. The transport prepare may remain pending until
+        # MoveBase reports terminal, but the separate semantic tombstone has
+        # already been consumed and must not block the successor indefinitely.
+        self.pending_lease_release_contract = None
         self.handoff_requested = False
         self.frontier_observation_completion_pending = None
         self.frontier_continuous_prefetch_handoff_pending = None
         self._clear_target_failure_locked("frontier_route_unavailable")
         self._clear_action_health_locked()
         self._clear_failed_route_lease_locked()
-        self.pending_terminal_prepare = None
-        self.pending_lease_release_contract = None
         self.last_result_status = GoalStatus.PREEMPTED
         self.last_result_monotonic = now_for(self)
+        self._remember_released_action_key_locked(release_key, reason)
         self.publish_bridge_status(
             "controller_lease_released",
             route_id=route_id,
@@ -768,13 +969,83 @@ class TebGoalBridgeActionHealthMixin:
             active_source=active_source,
             active_route_kind=active_kind,
             controller_lease="released",
+            transaction_id=release_identity["transaction_id"],
+            lifecycle_transaction_id=release_identity[
+                "lifecycle_transaction_id"
+            ],
+            action_generation=release_identity["action_generation"],
+            new_action_generation=int(
+                getattr(self, "action_generation", 0) or 0
+            ),
+            graph_transaction_id=release_identity["graph_transaction_id"],
+            map_epoch=release_identity.get("map_epoch"),
+            origin_epoch=release_identity.get("origin_epoch"),
+            projection_epoch=release_identity.get("projection_epoch"),
+            dedupe_key=(
+                None
+                if release_key is None
+                else [int(release_key[0]), int(release_key[1])]
+            ),
         )
+        if publish_release_ack:
+            self._publish_frontier_release_ack_locked(
+                route_id,
+                release_identity,
+                str(
+                    release_identity.get("route_kind") or active_kind or ""
+                ),
+                release_phase="forced_controller_release",
+            )
         rospy.logwarn(
             "TEB goal bridge released unavailable frontier route_id=%d: %s",
             route_id,
             reason,
         )
         return True
+
+    def _publish_frontier_release_ack_locked(
+        self, route_id, release_identity, released_route_kind, release_phase
+    ):
+        """Publish an idempotent ACK for a forced frontier release."""
+        released_controller_route = {
+            "route_id": int(route_id),
+            "route_kind": str(released_route_kind or ""),
+            "transaction_id": int(release_identity.get("transaction_id", 0) or 0),
+            "lifecycle_transaction_id": int(
+                release_identity.get("lifecycle_transaction_id", 0) or 0
+            ),
+            "action_generation": int(
+                release_identity.get("action_generation", 0) or 0
+            ),
+            "graph_transaction_id": int(
+                release_identity.get("graph_transaction_id", 0) or 0
+            ),
+            "map_epoch": release_identity.get("map_epoch"),
+            "origin_epoch": release_identity.get("origin_epoch"),
+            "projection_epoch": release_identity.get("projection_epoch"),
+        }
+        self.pending_successor_release_ack = dict(released_controller_route)
+        self.publish_bridge_status(
+            "lease_release_ack",
+            released_route_id=int(route_id),
+            released_route_kind=str(released_route_kind or ""),
+            route_id=int(route_id),
+            transaction_id=released_controller_route["transaction_id"],
+            lifecycle_transaction_id=released_controller_route[
+                "lifecycle_transaction_id"
+            ],
+            action_generation=released_controller_route["action_generation"],
+            new_action_generation=int(getattr(self, "action_generation", 0) or 0),
+            graph_transaction_id=released_controller_route[
+                "graph_transaction_id"
+            ],
+            map_epoch=released_controller_route["map_epoch"],
+            origin_epoch=released_controller_route["origin_epoch"],
+            projection_epoch=released_controller_route["projection_epoch"],
+            controller_lease="released",
+            release_phase=str(release_phase or "forced_controller_release"),
+            released_controller_route=released_controller_route,
+        )
 
     def cancel_locked(self, reason):
         cancel_watchdog = getattr(
@@ -792,14 +1063,13 @@ class TebGoalBridgeActionHealthMixin:
             arm_watchdog=False,
         )
         self.handoff_requested = False
+        self.persistent_frontier_endpoint_pending = None
         self.persistent_target_terminal_boundary_transaction = 0
         self.frontier_observation_completion_pending = None
         self.frontier_continuous_prefetch_handoff_pending = None
         self._clear_target_failure_locked("cancel:%s" % reason)
         self._clear_action_health_locked()
         self._clear_failed_route_lease_locked()
-        self.pending_terminal_prepare = None
-        self.pending_lease_release_contract = None
         self.last_result_status = GoalStatus.PREEMPTED
         self.last_result_monotonic = now_for(self)
         self.publish_bridge_status(

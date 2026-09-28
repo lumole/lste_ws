@@ -62,6 +62,16 @@ TARGET_LOCK_MIN_HITS: 8
 TARGET_LOCK_EXIT_TOTAL_MIN: 0.55
 TARGET_LOCK_EXIT_SCORE_MIN: 0.18
 TARGET_LOCK_EXIT_UNSTABLE_FRAMES: 15
+# Completion policy. ``visual_target`` is the production default. A benchmark
+# overlay may select ``target_room_entry`` for a short target-doorway gate.
+TARGET_DONE_POLICY: visual_target
+TARGET_ROOM_ENTRY_MIN_X: 0.0
+TARGET_ROOM_ENTRY_MIN_Y: 0.0
+TARGET_ROOM_ENTRY_MAX_X: 0.0
+TARGET_ROOM_ENTRY_MAX_Y: 0.0
+TARGET_ROOM_ENTRY_MARGIN: 0.30
+TARGET_ROOM_ENTRY_MIN_HOLD_TIME: 0.0
+TARGET_ROOM_ENTRY_REQUIRE_CROSSING: true
 # /lste/task_done fires when a target is visibly close (at least one normalized
 # box dimension reaches this size) in several distinct detector messages.
 # Completion itself commands the mux to stop immediately, so it must not wait

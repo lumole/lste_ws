@@ -181,13 +181,21 @@ class FrontierRegionPortalMixin:
         not prove that a frontier has been observed there.
         """
         normal_xy = self._portal_normal(entry_portal, component, (x, y))
-        portal_match = self._portal_entry_nearest(
-            entry_portal,
-            (x, y),
-            physical_gate_xy=physical_entry_portal,
-            physical_inside_xy=physical_xy,
-            normal_xy=normal_xy,
-        )
+        # A verified crossing with no bound destination is explicitly asking
+        # for a new Place identity.  Reusing an entry-portal match here can
+        # resolve the destination back to the source Place, which later turns
+        # a physical crossing into a rejected self-loop.  Bound reverse
+        # egresses use enter_bound_portal_destination and retain the normal
+        # portal matcher, so this bypass is limited to force_new arrivals.
+        portal_match = None
+        if not force_new:
+            portal_match = self._portal_entry_nearest(
+                entry_portal,
+                (x, y),
+                physical_gate_xy=physical_entry_portal,
+                physical_inside_xy=physical_xy,
+                normal_xy=normal_xy,
+            )
         if portal_match is not None:
             matched, association = portal_match
             covered = matched.get("state") != PLACE_OPEN

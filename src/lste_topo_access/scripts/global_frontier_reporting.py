@@ -42,7 +42,7 @@ class GlobalFrontierReportingMixin:
             return None
         return value if value > 0 else None
 
-    def active_goal_context(self, route_kind=None):
+    def active_goal_context(self, route_kind=None, graph_transaction_id=None):
         """Describe the durable owner of the active geometric command.
 
         ``/map`` may move a command point while a route is executing.  This
@@ -67,8 +67,12 @@ class GlobalFrontierReportingMixin:
         graph_transaction = getattr(
             self, "graph_route_action_transaction", None
         )
+        if graph_transaction_id is None:
+            graph_transaction_id = getattr(
+                graph_transaction, "graph_transaction_id", 0
+            )
         context["graph_transaction_id"] = int(
-            getattr(graph_transaction, "graph_transaction_id", 0) or 0
+            graph_transaction_id or 0
         )
         if not getattr(self, "place_memory_enabled", True):
             return context
@@ -471,6 +475,39 @@ class GlobalFrontierReportingMixin:
             if graph_transaction is not None
             else getattr(self, "last_map_epoch", None)
         )
+
+        def identity_integer(value, default=0):
+            try:
+                return int(value or default)
+            except (TypeError, ValueError):
+                return int(default)
+
+        released_route_id = identity_integer(
+            getattr(self, "last_released_route_id", 0)
+        )
+        active_route_id = identity_integer(
+            getattr(self, "active_route_id", 0)
+        )
+        action_generation = fields.get("action_generation")
+        if action_generation is None:
+            action_generation = identity_integer(
+                getattr(self, "active_action_generation", 0)
+            )
+        if (
+            identity_integer(action_generation) <= 0
+            and released_route_id > 0
+            and released_route_id == max(active_route_id, released_route_id)
+        ):
+            action_generation = identity_integer(
+                getattr(self, "last_released_route_action_generation", 0)
+            )
+        transaction_id = fields.get("transaction_id")
+        if transaction_id is None:
+            transaction_id = graph_transaction_id
+        if identity_integer(transaction_id) <= 0:
+            transaction_id = identity_integer(
+                getattr(self, "last_released_route_transaction_id", 0)
+            )
         payload = {
             "event": str(event),
             "active": self.active_frontier is not None,
@@ -484,6 +521,9 @@ class GlobalFrontierReportingMixin:
             "frontier_action_policy": str(
                 getattr(self, "frontier_action_policy", "legacy_scalar")
             ).strip().lower() or "legacy_scalar",
+            "target_done_policy": str(
+                getattr(self, "target_done_policy", "visual_target")
+            ).strip().lower() or "visual_target",
             "pending": self.prefetched_frontier is not None,
             # A prefetched point is lifecycle evidence, never an executable
             # goal.  It becomes a command only after route promotion.
@@ -507,12 +547,12 @@ class GlobalFrontierReportingMixin:
                 self, "turn_supervisor_target_yaw", None
             ),
             "route_id": int(self.active_route_id),
+            # Keep all graph and controller handoff events independently
+            # traceable, even when a caller has no extra event-specific fields.
+            "transaction_id": identity_integer(transaction_id),
+            "action_generation": identity_integer(action_generation),
             "lifecycle_transaction_id": int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
+                getattr(self, "route_lifecycle_transaction_id", self.lifecycle_transaction_id)()
                 or 0
             ),
             "active_region_id": active_region_id,
@@ -523,6 +563,10 @@ class GlobalFrontierReportingMixin:
                 ),
                 "route_kind": str(
                     getattr(self, "last_released_route_kind", "") or ""
+                ),
+                "transaction_id": int(
+                    getattr(self, "last_released_route_transaction_id", 0)
+                    or 0
                 ),
                 "terminal_received": bool(
                     getattr(
@@ -555,12 +599,24 @@ class GlobalFrontierReportingMixin:
                 "map_epoch": getattr(
                     self, "last_released_route_map_epoch", None
                 ),
+                "origin_epoch": getattr(
+                    self, "last_released_route_origin_epoch", None
+                ),
+                "projection_epoch": getattr(
+                    self, "last_released_route_projection_epoch", None
+                ),
             },
             "awaiting_controller_lease_release_ack": bool(
                 getattr(self, "awaiting_controller_lease_release_ack", False)
             ),
             "pending_controller_lease_release": getattr(
                 self, "pending_controller_lease_release", None
+            ),
+            "pending_controller_lease_releases": getattr(
+                self, "pending_controller_lease_releases", None
+            ),
+            "pending_controller_lease_release_count": len(
+                getattr(self, "pending_controller_lease_releases", {}) or {}
             ),
             "last_controller_lease_release_ack": getattr(
                 self, "last_controller_lease_release_ack", None
@@ -571,6 +627,13 @@ class GlobalFrontierReportingMixin:
             "place_entry_rehydration_pending": getattr(
                 self, "place_entry_rehydration_pending", None
             ),
+            "pending_graph_resume": {
+                "place_id": getattr(self, "pending_graph_resume_place_id", None),
+                "portal_id": getattr(self, "pending_graph_resume_portal_id", None),
+                "destination_place_id": getattr(
+                    self, "pending_graph_resume_destination_place_id", None
+                ),
+            },
             "portal_hypotheses": self.portal_hypothesis_report(),
             "portal_probes": self.portal_probe_report(),
             "work_items": self.work_item_report(),
@@ -581,6 +644,18 @@ class GlobalFrontierReportingMixin:
             "graph_route_action_transaction": graph_transaction_payload,
             "graph_transaction_id": graph_transaction_id,
             "map_epoch": map_epoch,
+            "origin_epoch": getattr(
+                graph_transaction,
+                "origin_epoch",
+                getattr(
+                    getattr(self, "last_graph_route_plan", None),
+                    "map_epoch",
+                    map_epoch,
+                ),
+            ) if graph_transaction is not None else map_epoch,
+            "projection_epoch": getattr(
+                self, "last_graph_snapshot_epoch", None
+            ) or map_epoch,
             "graph_route_fsm_state": str(
                 getattr(self, "graph_route_fsm_state", "SEARCHING")
             ),
@@ -588,8 +663,48 @@ class GlobalFrontierReportingMixin:
                 "miss_count": int(
                     getattr(self, "graph_route_materialization_miss_count", 0)
                 ),
+                "obligation_key": (
+                    list(getattr(
+                        self,
+                        "graph_route_materialization_obligation_key",
+                        (),
+                    ))
+                    if getattr(
+                        self,
+                        "graph_route_materialization_obligation_key",
+                        None,
+                    ) is not None
+                    else None
+                ),
                 "observed_epochs": list(
                     getattr(self, "graph_route_materialization_epochs", [])
+                ),
+                "first_epoch": getattr(
+                    self, "graph_route_materialization_first_epoch", None
+                ),
+                "last_epoch": getattr(
+                    self, "graph_route_materialization_last_epoch", None
+                ),
+                "last_observation": (
+                    list(getattr(
+                        self,
+                        "graph_route_materialization_last_observation",
+                        (),
+                    ))
+                    if getattr(
+                        self,
+                        "graph_route_materialization_last_observation",
+                        None,
+                    ) is not None
+                    else None
+                ),
+                "invalidated": bool(
+                    getattr(self, "graph_route_materialization_invalidated", False)
+                ),
+                "last_invalidation": getattr(
+                    self,
+                    "last_graph_route_materialization_invalidation",
+                    None,
                 ),
                 "negative_evidence": getattr(
                     self,
@@ -597,8 +712,50 @@ class GlobalFrontierReportingMixin:
                     None,
                 ),
             },
+            "graph_route_rehydration": {
+                "projection_complete": bool(
+                    getattr(
+                        self,
+                        "last_graph_snapshot_projection_complete",
+                        False,
+                    )
+                ),
+                "projection_epoch": getattr(
+                    self, "last_graph_snapshot_epoch", None
+                ),
+                "candidate_count": int(
+                    getattr(self, "last_graph_snapshot_candidate_count", 0)
+                ),
+                "visible_work_item_ids": list(
+                    getattr(
+                        self,
+                        "last_graph_snapshot_visible_work_item_ids",
+                        ()
+                    )
+                    or ()
+                ),
+                "visible_probe_ids": list(
+                    getattr(
+                        self,
+                        "last_graph_snapshot_visible_probe_ids",
+                        ()
+                    )
+                    or ()
+                ),
+                "visible_portal_ids": list(
+                    getattr(
+                        self,
+                        "last_graph_snapshot_visible_portal_ids",
+                        ()
+                    )
+                    or ()
+                ),
+            },
             "durable_portal_crossing_unavailable": getattr(
                 self, "last_durable_portal_crossing_unavailable", None
+            ),
+            "durable_portal_egress_unavailable": getattr(
+                self, "last_durable_portal_egress_unavailable", None
             ),
             # Planning is a slow evidence consumer.  Keep its ownership
             # boundary in the same replayable status stream as route events so
@@ -678,20 +835,55 @@ class GlobalFrontierReportingMixin:
             route_map_epoch = max(
                 1, int(getattr(self, "topology_component_epoch", 1) or 1)
             )
+        graph_transaction_id = int(
+            getattr(graph_transaction, "graph_transaction_id", 0) or 0
+        )
+        lifecycle_getter = getattr(self, "route_lifecycle_transaction_id", None)
+        lifecycle_transaction_id = int(
+            lifecycle_getter()
+            if callable(lifecycle_getter)
+            else getattr(self, "lifecycle_transaction_id", lambda: 0)()
+        )
+        route_transaction_id = int(
+            getattr(graph_transaction, "transaction_id", 0) or 0
+        )
+        if route_transaction_id <= 0:
+            # GoalManager allocates its mission transaction after this command
+            # crosses the ROS boundary.  Until then, the graph transaction is
+            # the only valid transaction identity for this handoff.
+            route_transaction_id = graph_transaction_id
+        action_generation = int(
+            getattr(self, "active_action_generation", 0) or 0
+        )
+        origin_epoch = (
+            getattr(graph_transaction, "origin_epoch", None)
+            if graph_transaction is not None
+            else route_map_epoch
+        )
+        if origin_epoch is None:
+            origin_epoch = route_map_epoch
+        projection_epoch = (
+            getattr(graph_transaction, "projection_epoch", None)
+            if graph_transaction is not None
+            else getattr(self, "last_graph_snapshot_epoch", None) or route_map_epoch
+        )
+        if projection_epoch is None:
+            projection_epoch = route_map_epoch
+        goal_context = self.active_goal_context(
+            route_kind, graph_transaction_id=graph_transaction_id
+        )
         payload = {
             "event": "route_command",
             "frame_id": str(frame_id or "map").strip().lstrip("/") or "map",
             "goal": [round(float(x), 4), round(float(y), 4)],
             "yaw": None if yaw is None else round(float(yaw), 4),
             "route_id": int(self.active_route_id),
-            "lifecycle_transaction_id": int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
-                or 0
-            ),
+            # The controller action generation is allocated downstream.  Keep
+            # the field explicit at zero here rather than borrowing the
+            # predecessor route's generation and creating a false identity.
+            "action_generation": action_generation,
+            "transaction_id": route_transaction_id,
+            "lifecycle_transaction_id": lifecycle_transaction_id,
             "route_kind": str(route_kind or "frontier_endpoint"),
             "mission_route_kind": str(
                 mission_route_kind
@@ -715,26 +907,36 @@ class GlobalFrontierReportingMixin:
             ),
             # This is the graph planner transaction, intentionally separate
             # from GoalManager's mission transaction_id allocated later.
-            "graph_transaction_id": int(
-                getattr(
-                    graph_transaction,
-                    "graph_transaction_id",
-                    0,
-                ) or 0
-            ),
+            "graph_transaction_id": graph_transaction_id,
+            "origin_epoch": origin_epoch,
+            "projection_epoch": projection_epoch,
             "portal_probe_phase": str(
                 getattr(self, "active_portal_probe_phase", "") or ""
             ),
             "transition_kind": str(self.active_transition_kind),
             "predecessor_route_id": int(self.active_predecessor_route_id),
+            "predecessor_contract": (
+                None
+                if not isinstance(
+                    getattr(self, "active_route_dispatch_contract", None), dict
+                )
+                else getattr(self, "active_route_dispatch_contract", {}).get(
+                    "predecessor_contract"
+                )
+            ),
             "transition_distance_to_previous_endpoint": (
                 None
                 if self.active_transition_distance is None
                 else round(float(self.active_transition_distance), 4)
             ),
-            "goal_context": self.active_goal_context(route_kind),
+            # Use the identity snapshot captured above. Reading the mutable
+            # graph transaction again here can pair transaction N with the
+            # nested context from transaction N-1 during a replan callback.
+            "goal_context": goal_context,
             "portal_transaction": self.portal_transaction_report(),
             "map_epoch": int(route_map_epoch),
+            "origin_epoch": origin_epoch,
+            "projection_epoch": projection_epoch,
             "stamp": rospy.Time.now().to_sec(),
         }
         decision_scheduler = getattr(self, "decision_wake_scheduler", None)

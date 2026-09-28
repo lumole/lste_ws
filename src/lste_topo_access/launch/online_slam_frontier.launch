@@ -102,6 +102,7 @@
        place_portal_workitem. The full method also consumes /lste/task and
        /lste/detections to choose task-conditioned topological expansion. -->
   <arg name="exploration_method" default="place_portal_workitem"/>
+  <arg name="target_done_policy" default="visual_target"/>
   <!-- Region memory sits above point-level frontier completion. The primary
        identity is a doorway-separated, high-clearance known-free component:
        it groups far endpoints in one room while a narrow door cuts the room
@@ -218,6 +219,7 @@
     <param name="rejected_timeout" value="$(arg rejected_timeout)"/>
     <param name="completed_radius" value="$(arg completed_radius)"/>
     <param name="exploration_method" value="$(arg exploration_method)"/>
+    <param name="target_done_policy" value="$(arg target_done_policy)"/>
     <param name="region_memory_radius" value="$(arg region_memory_radius)"/>
     <param name="region_information_delta" value="$(arg region_information_delta)"/>
     <param name="region_stagnation_timeout" value="$(arg region_stagnation_timeout)"/>

@@ -36,6 +36,8 @@ class TebGoalBridgeActionTerminalMixin:
                 "epoch", action_contract.get("target_epoch", 0)
             ),
             "map_epoch": action_contract.get("map_epoch"),
+            "origin_epoch": action_contract.get("origin_epoch"),
+            "projection_epoch": action_contract.get("projection_epoch"),
             "route_kind": str(action_contract.get("route_kind", "") or ""),
             "mission_route_kind": str(
                 action_contract.get("mission_route_kind", "") or ""
@@ -63,7 +65,12 @@ class TebGoalBridgeActionTerminalMixin:
         }
 
     def _publish_execution_terminal_locked(
-        self, source_goal, action_contract=None, invalidate_feedback=True
+        self,
+        source_goal,
+        action_contract=None,
+        invalidate_feedback=True,
+        status=None,
+        reason="",
     ):
         """Publish a terminal using an explicit action or semantic contract.
 
@@ -134,6 +141,11 @@ class TebGoalBridgeActionTerminalMixin:
             and route_id > 0
         )
         terminal.route_id = route_id if is_frontier else 0
+        terminal.transaction_id = (
+            int(action_contract.get("transaction_id", 0) or 0)
+            if action_contract is not None and is_frontier
+            else 0
+        )
         try:
             terminal.map_epoch = max(
                 0,
@@ -154,12 +166,7 @@ class TebGoalBridgeActionTerminalMixin:
             int(action_contract.get("lifecycle_transaction_id", 0) or 0)
             if action_contract is not None
             else int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
-                or 0
+                self._canonical_lifecycle_transaction_id()
             )
         )
         terminal.lifecycle_transaction_id = str(lifecycle_transaction_id)
@@ -187,6 +194,33 @@ class TebGoalBridgeActionTerminalMixin:
             or ""
         )
         terminal.goal = terminal_goal
+        terminal.status = int(
+            GoalStatus.SUCCEEDED if status is None else status
+        )
+        terminal.failure = bool(terminal.status != GoalStatus.SUCCEEDED)
+        terminal.reason = str(reason or "")
+        try:
+            terminal.origin_epoch = int(
+                (
+                    action_contract.get("origin_epoch", 0)
+                    if action_contract is not None
+                    else getattr(self, "active_origin_epoch", 0)
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            terminal.origin_epoch = 0
+        try:
+            terminal.projection_epoch = int(
+                (
+                    action_contract.get("projection_epoch", 0)
+                    if action_contract is not None
+                    else getattr(self, "active_projection_epoch", 0)
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            terminal.projection_epoch = 0
         self.terminal_contract_pub.publish(terminal)
         return terminal_goal
 
@@ -392,44 +426,76 @@ class TebGoalBridgeActionTerminalMixin:
         return True
 
     def _publish_failed_terminal_locked(
-        self, status, handoff_requested, action_contract=None
+        self,
+        status,
+        handoff_requested,
+        action_contract=None,
+        failure_reason=None,
     ):
         """Report a failure once, then leave route replacement to Frontier."""
-        self._commit_termination(
+        route_contract = action_contract
+        if route_contract is None:
+            route_contract = getattr(self, "active_action_contract", None)
+        source_goal = getattr(self, "last_dispatched_goal", None)
+        if hasattr(route_contract, "get") and route_contract.get("source_goal") is not None:
+            source_goal = route_contract.get("source_goal")
+        termination = self._commit_termination(
             "move_base_failed_terminal",
-            source_goal=getattr(self, "last_dispatched_goal", None),
-            action_contract=action_contract,
+            source_goal=source_goal,
+            action_contract=route_contract,
             terminal_status=status,
             watchdog_reason="move_base_failed_terminal",
-            publish_terminal=False,
+            terminal_reason=str(
+                failure_reason
+                or "move_base_%s" % GoalStatus.to_string(status).lower()
+            ),
+            publish_terminal=True,
         )
-        self.publish_bridge_status(
-            "terminal",
-            status=int(status),
-            status_text=GoalStatus.to_string(status),
-            **self._action_contract_status_fields(action_contract),
+        is_frontier_failure = bool(
+            hasattr(route_contract, "get")
+            and str(route_contract.get("source", "") or "").strip().lower()
+            == "global_slam_frontier"
+            and int(route_contract.get("priority", 0) or 0) == 0
+            and int(route_contract.get("route_id", 0) or 0) > 0
         )
+        if not is_frontier_failure:
+            self.publish_bridge_status(
+                "terminal",
+                status=int(status),
+                status_text=GoalStatus.to_string(status),
+                **self._action_contract_status_fields(route_contract),
+            )
+        else:
+            # Frontier failures are consumed from the typed terminal topic. Do
+            # not send a second identity-free terminal through the legacy
+            # status topic, where cross-topic ordering could release the route
+            # before Global Frontier validates the typed contract.
+            self.publish_bridge_status(
+                "typed_failure_terminal_published",
+                status=int(status),
+                status_text=GoalStatus.to_string(status),
+                reason=str(termination.get("reason", "move_base_failed_terminal")),
+                **self._action_contract_status_fields(route_contract),
+            )
         rospy.logwarn(
             "TEB move_base action finished without success: status=%s "
             "handoff=%s route_id=%s generation=%s transaction_id=%s epoch=%s",
             GoalStatus.to_string(status),
             handoff_requested,
             None
-            if action_contract is None
-            else action_contract.get("route_id"),
+            if route_contract is None
+            else route_contract.get("route_id"),
             None
-            if action_contract is None
-            else action_contract.get("generation"),
+            if route_contract is None
+            else route_contract.get("generation"),
             None
-            if action_contract is None
-            else action_contract.get("transaction_id"),
+            if route_contract is None
+            else route_contract.get("transaction_id"),
             None
-            if action_contract is None
-            else action_contract.get(
-                "epoch", action_contract.get("target_epoch", 0)
-            ),
+            if route_contract is None
+            else route_contract.get("epoch", route_contract.get("target_epoch", 0)),
         )
-        self._remember_failed_route_lease_locked(action_contract)
+        self._remember_failed_route_lease_locked(route_contract)
         self._clear_action_health_locked()
         # Only an explicit higher-priority cancellation owns a pending
         # successor.  A failed frontier route remains idle until Global
@@ -441,12 +507,16 @@ class TebGoalBridgeActionTerminalMixin:
         """Close one action; do not send actions from the actionlib callback."""
         with self.lock:
             if generation != self.action_generation:
+                transport_terminal_observed = self._observe_transport_terminal_locked(
+                    generation, status, "done_callback"
+                )
                 self.publish_bridge_status(
                     "stale_action_terminal_ignored",
                     callback_action_generation=int(generation),
                     current_action_generation=int(self.action_generation),
                     status=int(status),
                     reason="action_generation_mismatch",
+                    transport_terminal_observed=bool(transport_terminal_observed),
                 )
                 return
             action_contract = self._action_contract_for_generation_locked(generation)

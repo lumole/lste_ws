@@ -175,11 +175,34 @@ class GlobalFrontierCandidateWorkItemMixin:
                 continue
             anchor = self._work_item_map_anchor(request, item)
             normal = self._finite_normal(item.get("normal_xy"))
+            normal_source = "durable_unknown_side"
             if anchor is None:
                 audit["reason"] = "physical_anchor_projection_unavailable"
                 report["item_audit"].append(audit)
                 reject("physical_anchor_projection_unavailable")
                 continue
+            if normal is None:
+                # A one-cell or symmetric frontier arc can have a valid
+                # physical anchor but no unique unknown-side normal.  That is
+                # insufficient for a durable *identity* update, but it is
+                # still enough for this snapshot to choose the known-side
+                # approach from the robot toward the anchor.  Keep this
+                # fallback map-local; never persist it as the item's normal.
+                robot_anchor = self._finite_xy(
+                    getattr(request, "robot_map", None)
+                )
+                if robot_anchor is None:
+                    robot_anchor = self._finite_xy(
+                        getattr(request, "route_anchor_xy", None)
+                    )
+                if robot_anchor is not None:
+                    direction = (
+                        anchor[0] - robot_anchor[0],
+                        anchor[1] - robot_anchor[1],
+                    )
+                    normal = self._finite_normal(direction)
+                    if normal is not None:
+                        normal_source = "current_robot_approach"
             if normal is None:
                 audit["anchor_map"] = [round(float(value), 3) for value in anchor]
                 audit["reason"] = "unknown_side_normal_missing"
@@ -188,6 +211,7 @@ class GlobalFrontierCandidateWorkItemMixin:
                 continue
             audit["anchor_map"] = [round(float(value), 3) for value in anchor]
             audit["normal"] = [round(float(value), 3) for value in normal]
+            audit["normal_source"] = normal_source
             selected = None
             for strategy, desired in self._viewpoint_ladder(anchor, normal, depth):
                 view_audit = dict(audit)

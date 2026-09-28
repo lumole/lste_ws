@@ -398,6 +398,32 @@ class PortalHypothesisLedger:
             return None
         return min(matches, key=lambda value: value[:3])[3]
 
+    def crossed_gate_at_physical_gate(self, physical_gate_xy):
+        """Find any crossed edge sharing the same physical gate band.
+
+        Place IDs are semantic observations and can split when SLAM revisits a
+        doorway from the opposite side.  A crossed gate is nevertheless a
+        single undirected transit boundary.  This narrow physical lookup is
+        used only to suppress a duplicate structural hypothesis; it does not
+        bind a destination Place or authorize a crossing.
+        """
+        gate = _xy(physical_gate_xy)
+        if gate is None:
+            return None
+        matches = []
+        for record in self._records.values():
+            if str(record.get("state", "")).strip().lower() != "crossed":
+                continue
+            prior_gate = _xy(record.get("physical_gate"))
+            if prior_gate is None:
+                continue
+            distance = _distance(prior_gate, gate)
+            if distance <= self.match_radius:
+                matches.append((distance, int(record["id"]), record))
+        if not matches:
+            return None
+        return min(matches, key=lambda value: value[:2])[2]
+
     def incoming_for_place(self, destination_place_id, gate_xy=None):
         """Return forward hypotheses that arrived at one Place."""
         try:

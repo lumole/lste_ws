@@ -3,6 +3,7 @@
 """Periodic goal arbitration and state-to-mode scheduling for GoalManager."""
 
 import math
+import copy
 from typing import Optional
 
 import rospy
@@ -209,6 +210,12 @@ class GoalManagerSchedulingMixin:
         if self.navigation_hold_active:
             self.goal_source = "target_reobserving"
             return None
+        if getattr(self, "target_done_policy", "visual_target") == "target_room_entry":
+            # The doorway-entry policy measures whether exploration crosses the
+            # target-room doorway. Keep detector evidence from taking over
+            # control; otherwise a false target box can hold the robot at an
+            # unrelated viewpoint and prevent the doorway from being visited.
+            return self._compute_room_entry_goal(now)
         # A fresh target ray remains the only reason to suppress global map
         # coverage. Context-only states previously let a chair/monitor pair
         # keep the robot in one corridor indefinitely, even though the target
@@ -403,3 +410,119 @@ class GoalManagerSchedulingMixin:
         # 未知模式：保持现状
         rospy.logwarn_throttle(5.0, "GoalManager: unknown mode=%s", str(self.effective_mode))
         return None
+
+    def _compute_room_entry_goal(self, now: float) -> Optional[PoseStamped]:
+        """Promote a reachable target doorway to a task-owned route.
+
+        The doorway policy is a task-level handoff, not just a completion
+        mask. Until Navfn can prove the configured doorway inset is connected
+        to the current map, frontier exploration remains the owner. Once that
+        proof exists, retain the returned endpoint and let the normal target
+        route publication carry the current frontier lifecycle identity.
+        """
+        committed = getattr(self, "target_room_entry_goal", None)
+        if committed is not None:
+            self.goal_source = "target_room_entry"
+            return committed
+
+        if (
+            bool(getattr(self, "global_frontier_enabled", False))
+            and int(getattr(self, "frontier_terminal_count", 0) or 0) <= 0
+        ):
+            # Do not preempt the bootstrap WorkItem with a long semantic goal.
+            # The first frontier terminal is the proof that the Place has one
+            # valid observation and that the graph can safely own the next
+            # task-level handoff.
+            global_frontier = self.fresh_global_frontier_goal(now)
+            if global_frontier is not None:
+                self.goal_source = "global_slam_frontier"
+                return global_frontier
+            self.goal_source = "waiting_global_slam_frontier"
+            return None
+
+        if getattr(self, "target_room_entry_retry_blocked", False):
+            # A failed task route may have been accepted from an incomplete
+            # map. Wait for a real frontier terminal before asking Navfn to
+            # prove the doorway again; repeated validation of the same map is
+            # not new evidence.
+            global_frontier = self.fresh_global_frontier_goal(now)
+            if global_frontier is not None:
+                self.goal_source = "global_slam_frontier"
+                return global_frontier
+            self.goal_source = "waiting_global_slam_frontier"
+            return None
+
+        try:
+            min_x = float(self.target_room_entry_min_x)
+            min_y = float(self.target_room_entry_min_y)
+            max_x = float(self.target_room_entry_max_x)
+            max_y = float(self.target_room_entry_max_y)
+            margin = float(self.target_room_entry_margin)
+        except (AttributeError, TypeError, ValueError):
+            min_x = min_y = max_x = max_y = margin = float("nan")
+        inner_min_x = min_x + margin
+        inner_min_y = min_y + margin
+        inner_max_x = max_x - margin
+        inner_max_y = max_y - margin
+        if not all(
+            math.isfinite(value)
+            for value in (
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+                margin,
+                inner_min_x,
+                inner_min_y,
+                inner_max_x,
+                inner_max_y,
+            )
+        ) or inner_min_x >= inner_max_x or inner_min_y >= inner_max_y:
+            requested = None
+        else:
+            requested = PoseStamped()
+            requested.header.stamp = rospy.Time.now()
+            requested.header.frame_id = "map"
+            requested.pose.position.x = 0.5 * (inner_min_x + inner_max_x)
+            requested.pose.position.y = 0.5 * (inner_min_y + inner_max_y)
+            requested.pose.orientation.w = 1.0
+
+        if requested is not None:
+            route_status = self.validate_target_route(requested, now)
+            if route_status is True:
+                endpoint = getattr(
+                    self, "target_route_validation_last_endpoint", None
+                )
+                if endpoint is None:
+                    endpoint = requested
+                self.target_room_entry_goal = copy.deepcopy(endpoint)
+                self.goal_source = "target_room_entry"
+                self.publish_goal_arbitration(
+                    "target_room_entry_route_validated",
+                    requested_goal=[
+                        round(float(requested.pose.position.x), 3),
+                        round(float(requested.pose.position.y), 3),
+                    ],
+                    navfn_returned_goal=[
+                        round(float(endpoint.pose.position.x), 3),
+                        round(float(endpoint.pose.position.y), 3),
+                    ],
+                    goal_frame=(endpoint.header.frame_id or "map"),
+                    completion_evidence="target_room_entry",
+                )
+                rospy.loginfo(
+                    "GoalManager: target doorway became Navfn-reachable; "
+                    "adopting task route goal=(%.2f,%.2f)",
+                    float(endpoint.pose.position.x),
+                    float(endpoint.pose.position.y),
+                )
+                return self.target_room_entry_goal
+
+        global_frontier = self.fresh_global_frontier_goal(now)
+        if global_frontier is not None:
+            self.goal_source = "global_slam_frontier"
+            return global_frontier
+        if self.global_frontier_enabled:
+            self.goal_source = "waiting_global_slam_frontier"
+            return None
+        return self.goal_from_frontiers_prior()

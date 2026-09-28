@@ -311,6 +311,69 @@ class GlobalFrontierPortalArrivalCommitMixin:
                 evidence_source=str(evidence_source),
             )
             return None
+        # If an unbound branch lands in an already-known Place, the source
+        # Place may still own suspended local obligations. Evaluate this only
+        # after rematerialization and self-loop rejection so a discarded or
+        # repaired destination cannot leave a stale resume marker behind.
+        source_resume_id = None
+        source_resume_work = 0
+        source_resume_portals = 0
+        try:
+            hypothesis_source_id = int(
+                hypothesis.get("source_place_id")
+            ) if isinstance(hypothesis, dict) else None
+            destination_id = int(region.get("id"))
+        except (TypeError, ValueError, AttributeError):
+            hypothesis_source_id = None
+            destination_id = None
+        if (
+            isinstance(hypothesis, dict)
+            and hypothesis.get("destination_place_id") is None
+            and hypothesis_source_id is not None
+            and destination_id is not None
+            and hypothesis_source_id != destination_id
+            and str(tier) == "covered_arrival"
+        ):
+            work_items = getattr(self, "place_work_items", None)
+            if work_items is not None:
+                count = getattr(work_items, "unresolved_observation_count", None)
+                if callable(count):
+                    try:
+                        source_resume_work = int(
+                            count(
+                                hypothesis_source_id,
+                                portal_probe_ledger=getattr(
+                                    self, "portal_probe_ledger", None
+                                ),
+                            )
+                        )
+                    except TypeError:
+                        source_resume_work = int(count(hypothesis_source_id))
+                else:
+                    count = getattr(work_items, "unresolved_count", None)
+                    if callable(count):
+                        source_resume_work = int(count(hypothesis_source_id))
+            probe_ledger = getattr(self, "portal_probe_ledger", None)
+            count = (
+                None if probe_ledger is None
+                else getattr(probe_ledger, "unresolved_count", None)
+            )
+            if callable(count):
+                source_resume_portals = int(count(hypothesis_source_id))
+            if source_resume_work > 0 or source_resume_portals > 0:
+                source_resume_id = hypothesis_source_id
+                self.pending_graph_resume_place_id = source_resume_id
+                self.pending_graph_resume_portal_id = portal_id
+                self.pending_graph_resume_destination_place_id = destination_id
+                self.publish_status(
+                    "graph_place_resume_pending",
+                    source_place_id=source_resume_id,
+                    destination_place_id=destination_id,
+                    portal_id=portal_id,
+                    unresolved_work_items=source_resume_work,
+                    unresolved_portals=source_resume_portals,
+                    reason="covered_arrival_from_unbound_branch",
+                )
         # The crossing route terminates inside the destination component and
         # its lidar has already produced a destination-side scan.  Record that
         # first local view separately from the Portal crossing itself.  Any

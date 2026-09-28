@@ -9,9 +9,11 @@ publishes a command and never changes the navigation state machine.
 """
 
 import datetime
+import fcntl
 import json
 import math
 import os
+import re
 import time
 from collections import deque
 
@@ -230,6 +232,59 @@ def _sample_route(sample):
     return normalized
 
 
+def _failure_causal_identity(route=None, sample=None, details=None):
+    """Expose one flat identity tuple for compact failure records."""
+    sources = []
+    # The producer's terminal contract is authoritative.  A later ring sample
+    # may already belong to a newer projection epoch while the failure episode
+    # is still waiting for its post-window to close.
+    for value in (details, route, _sample_route(sample)):
+        if isinstance(value, dict):
+            sources.append(value)
+            for nested_key in (
+                "released_controller_route",
+                "route_context",
+                "route_identity",
+                "frontier_execution_terminal_contract",
+            ):
+                nested = value.get(nested_key)
+                if isinstance(nested, dict):
+                    sources.append(nested)
+
+    def first(*keys):
+        for source in sources:
+            for key in keys:
+                value = source.get(key)
+                if value is None or value == "":
+                    continue
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    return number
+        return None
+
+    identity = {}
+    for name, keys in (
+        ("route_id", ("route_id", "active_route_id", "released_route_id")),
+        ("action_generation", ("action_generation", "active_action_generation")),
+        ("transaction_id", ("transaction_id", "active_goal_transaction_id")),
+        ("lifecycle_transaction_id", ("lifecycle_transaction_id",)),
+        (
+            "graph_transaction_id",
+            ("graph_transaction_id", "active_graph_transaction_id"),
+        ),
+        ("map_epoch", ("map_epoch", "active_route_map_epoch", "active_map_epoch")),
+        ("origin_epoch", ("origin_epoch",)),
+        ("projection_epoch", ("projection_epoch",)),
+    ):
+        value = first(*keys)
+        if value is not None:
+            identity[name] = value
+    return identity
+
+
 # Route status payloads are not uniform across the ROS boundary.  A live
 # command carries ``route_id`` at the top level, while an invalidation often
 # carries only the route state in an event history entry and clears the bridge
@@ -240,6 +295,9 @@ _ROUTE_ID_KEYS = ("route_id", "active_route_id", "released_route_id")
 _ROUTE_FIELD_KEYS = (
     "route_id", "active_route_id", "released_route_id", "route_kind",
     "active_route_kind", "released_route_kind", "mission_route_kind",
+    "transaction_id", "lifecycle_transaction_id", "action_generation",
+    "origin_epoch", "projection_epoch",
+    "active_action_generation", "map_epoch", "active_route_map_epoch",
     "graph_transaction_id", "active_graph_transaction_id",
     "latest_graph_transaction_id",
     "goal", "command_goal", "mission_goal", "distance", "elapsed",
@@ -420,6 +478,9 @@ _FAILURE_DETAIL_SCALARS = frozenset(
         "region_id", "region_state", "work_item_id", "attempt_id",
         "place_id", "source_place_id", "destination_place_id",
         "active_goal_transaction_id", "latest_goal_transaction_id",
+        "lifecycle_transaction_id", "action_generation",
+        "origin_epoch", "projection_epoch",
+        "active_action_generation", "active_route_map_epoch",
         "active_intent_priority", "latest_intent_priority",
         "active_intent_source", "latest_intent_source", "target_epoch",
         "target_transaction_id",
@@ -428,7 +489,8 @@ _FAILURE_DETAIL_SCALARS = frozenset(
         "target_lease_tombstone_transaction_id", "target_lease_tombstone_epoch",
         "target_lease_tombstone_track_id",
         "transaction_id", "frame_id", "source", "failure_count",
-        "controller_lease", "target_viewpoint_candidate_id",
+        "controller_lease", "identity_validation",
+        "target_viewpoint_candidate_id",
         "target_viewpoint_attempt_id",
         "duration_seconds", "unavailable_count", "identity_reason",
         "generation", "replacement", "next_owner", "lifecycle",
@@ -654,6 +716,16 @@ def _explicit_route_failure(trigger, details):
             "teb_goal_bridge/cmd_vel_mux",
             "high",
             "the active route remained executable but produced no effective motion",
+        )
+    if trigger in {
+        "graph_route_materialization_expired",
+        "graph_route_materialization_invalidated",
+    }:
+        return (
+            "planner_materialization_stall",
+            "global_frontier",
+            "high",
+            "the durable graph obligation was dropped after it could not be materialized from the current frontier snapshot",
         )
     if trigger == "controller_output_gap":
         return "controller_output_gap", "teb_planner/cmd_vel_mux", "high", (
@@ -1007,6 +1079,7 @@ _FRONTIER_NEW_ROUTE_EVENTS = frozenset(
         "frontier_action_selected",
         "graph_route_edge_materialized",
         "dispatch",
+        "persistent_mission_goal_adopted",
     )
 )
 _FRONTIER_TERMINAL_EVENTS = frozenset(
@@ -1026,6 +1099,9 @@ _FRONTIER_TERMINAL_EVENTS = frozenset(
         "aborted",
         "rejected",
         "preempted",
+        "controller_stall",
+        "graph_route_materialization_invalidated",
+        "graph_route_materialization_expired",
     )
 )
 _FRONTIER_RECOVERY_EVENTS = frozenset(
@@ -1053,6 +1129,7 @@ _RECOVERY_ROUTE_EVENTS = frozenset(
         "frontier_action_selected",
         "graph_route_edge_materialized",
         "dispatch",
+        "persistent_mission_goal_adopted",
         "persistent_mission_path_adopted",
         "active",
         "lifecycle_transition",
@@ -1080,6 +1157,22 @@ def classify_failure(trigger, sample, details=None, recent_events=()):
     sample = sample if isinstance(sample, dict) else {}
     details = details if isinstance(details, dict) else {}
     trigger = str(trigger or "unknown")
+    if bool(sample.get("navigation_hold")) and trigger in {
+        "controller_stall",
+        "zero_velocity_stall",
+        "no_progress_stall",
+        "controller_output_gap",
+    }:
+        return {
+            "label": "intentional_navigation_hold",
+            "confidence": "high",
+            "candidates": [{
+                "label": "intentional_navigation_hold",
+                "confidence": "high",
+                "reason": "navigation hold intentionally suppresses controller output",
+            }],
+            "evidence": {"navigation_hold": True},
+        }
     text = _event_text(
         details,
         recent_events,
@@ -1482,6 +1575,8 @@ class NavigationMetricsFailureEvidenceMixin:
         self.failure_last_positive_route = None
         self.failure_stream = None
         self.failure_log_path = None
+        self.failure_sequence_path = None
+        self.failure_sequence_lock_path = None
         # Full episode payloads are written as individual artifacts as well as
         # the append-only evidence log.  The artifact makes one failure
         # inspectable without parsing a potentially very large JSON log line.
@@ -1530,6 +1625,9 @@ class NavigationMetricsFailureEvidenceMixin:
             "portal_hypothesis_failed", "portal_execution_failure_observed",
             "route_invalidated_stall", "route_invalidated_timeout",
             "route_invalidated_controller_failure",
+            "controller_stall",
+            "graph_route_materialization_invalidated",
+            "graph_route_materialization_expired",
         }
         expected = False
         for item in list(getattr(self, "failure_event_history", ()))[-64:]:
@@ -1752,6 +1850,23 @@ class NavigationMetricsFailureEvidenceMixin:
             not active_route
             and self._failure_boundary_has_route_expectation_locked(sample)
         ):
+            boundary_reason = str(
+                boundary.get("reason") or boundary.get("event") or ""
+            ).strip().lower()
+            if boundary_reason == "warm_slice_boundary":
+                # A warm boundary intentionally cuts between two lifecycle
+                # owners.  The bridge can be inactive for the short interval
+                # between predecessor release and successor adoption; the
+                # runner's dispatch/adoption gate owns that bounded wait.
+                # Keep it as context unless the earlier handoff-timeout path
+                # above already proved a sustained lease failure.
+                self._write(
+                    "INFO",
+                    "failure_boundary_trigger_suppressed",
+                    reason="warm_slice_successor_handoff_context",
+                    requested_trigger="no_active_controller_route",
+                )
+                return None
             return "no_active_controller_route", {
                 "boundary": boundary,
                 "route": route,
@@ -1964,12 +2079,134 @@ class NavigationMetricsFailureEvidenceMixin:
         except Exception:
             return float(default)
 
+    def _failure_existing_sequence(self, run_timestamp=None):
+        """Read the highest failure sequence already reserved for this run."""
+        log_path = getattr(self, "failure_log_path", None)
+        if log_path is None:
+            return 0
+        run_timestamp = str(
+            run_timestamp or getattr(self, "run_timestamp", "run")
+        )
+        sequence = 0
+        for artifact in log_path.parent.glob(
+            run_timestamp + "_failure_[0-9][0-9][0-9][0-9].json"
+        ):
+            try:
+                sequence = max(sequence, int(artifact.stem.rsplit("_", 1)[-1]))
+            except (IndexError, ValueError):
+                continue
+        sequence_path = getattr(self, "failure_sequence_path", None)
+        persisted_sequence = None
+        if sequence_path is not None:
+            try:
+                persisted_sequence = int(
+                    sequence_path.read_text(encoding="utf-8").strip()
+                )
+                sequence = max(sequence, persisted_sequence)
+            except (OSError, TypeError, ValueError):
+                pass
+        # Existing runs may predate the reservation file. Recover their last
+        # ID once so a metrics restart cannot reuse an old episode number.
+        if persisted_sequence is None:
+            try:
+                pattern = re.compile(
+                    re.escape(run_timestamp) + r"-F([0-9]+)\b"
+                )
+                with log_path.open(
+                    "r", encoding="utf-8", errors="replace"
+                ) as stream:
+                    for line in stream:
+                        for match in pattern.finditer(line):
+                            sequence = max(sequence, int(match.group(1)))
+            except (OSError, TypeError, ValueError):
+                pass
+        return sequence
+
+    def _allocate_failure_sequence_locked(self):
+        """Reserve one run-unique failure sequence across process restarts."""
+        lock_path = getattr(self, "failure_sequence_lock_path", None)
+        sequence_path = getattr(self, "failure_sequence_path", None)
+        if lock_path is None or sequence_path is None:
+            return None
+        lock_fd = None
+        temporary = None
+        try:
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            sequence = max(
+                int(getattr(self, "failure_sequence", 0) or 0),
+                self._failure_existing_sequence(),
+            ) + 1
+            run_timestamp = str(getattr(self, "run_timestamp", "run"))
+            while (
+                self.failure_log_path.parent
+                / ("%s_failure_%04d.json" % (run_timestamp, sequence))
+            ).exists():
+                sequence += 1
+            temporary = sequence_path.with_name(
+                sequence_path.name + ".tmp"
+            )
+            temporary.write_text("%d\n" % sequence, encoding="utf-8")
+            os.replace(str(temporary), str(sequence_path))
+            self.failure_sequence = sequence
+            return sequence
+        except (OSError, TypeError, ValueError):
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return None
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+
     def _open_failure_evidence_log(self):
         if not self.failure_evidence_enabled or self.failure_log_path is None:
             return
         try:
+            run_timestamp = str(getattr(self, "run_timestamp", "run"))
+            existing_artifacts = sorted(
+                self.failure_log_path.parent.glob(
+                    run_timestamp + "_failure_[0-9][0-9][0-9][0-9].json"
+                )
+            )
+            existing_sequences = []
+            for artifact in existing_artifacts:
+                try:
+                    existing_sequences.append(
+                        int(artifact.stem.rsplit("_", 1)[-1])
+                    )
+                except (IndexError, ValueError):
+                    continue
+            self.failure_sequence_path = self.failure_log_path.parent / (
+                run_timestamp + "_failure_sequence.state"
+            )
+            self.failure_sequence_lock_path = self.failure_log_path.parent / (
+                run_timestamp + "_failure_sequence.lock"
+            )
+            if existing_sequences:
+                self.failure_sequence = max(
+                    int(getattr(self, "failure_sequence", 0) or 0),
+                    max(existing_sequences),
+                )
+                self.failure_artifact_paths.extend(
+                    str(path) for path in existing_artifacts
+                )
+            self.failure_sequence = max(
+                int(getattr(self, "failure_sequence", 0) or 0),
+                self._failure_existing_sequence(run_timestamp),
+            )
+            log_mode = "a" if self.failure_log_path.exists() else "w"
             self.failure_stream = self.failure_log_path.open(
-                "w", encoding="utf-8", buffering=1
+                log_mode, encoding="utf-8", buffering=1
             )
         except (OSError, AttributeError):
             self.failure_stream = None
@@ -2040,6 +2277,14 @@ class NavigationMetricsFailureEvidenceMixin:
             artifact = log_path.parent / (
                 "%s_failure_%04d.json" % (run_timestamp, sequence)
             )
+            if artifact.exists():
+                self._write_failure_log(
+                    "ERROR",
+                    "failure_artifact_sequence_collision",
+                    failure_id=snapshot.get("failure_id"),
+                    artifact_path=str(artifact),
+                )
+                return None
             temporary = artifact.with_name(artifact.name + ".tmp")
             payload = self._failure_snapshot_storage_payload(snapshot)
             payload["artifact_path"] = str(artifact)
@@ -2482,13 +2727,18 @@ class NavigationMetricsFailureEvidenceMixin:
                 "portal_path", "first_portal_id", "target_place_id",
                 "released_controller_route", "controller_pending", "terminal_received",
                 "active_goal_transaction_id", "latest_goal_transaction_id",
+                "lifecycle_transaction_id", "action_generation",
+                "origin_epoch", "projection_epoch",
+                "active_action_generation", "active_route_map_epoch",
                 "active_graph_transaction_id", "latest_graph_transaction_id",
                 "active_intent_priority", "latest_intent_priority",
                 "active_intent_source", "latest_intent_source",
                 "transaction_id", "graph_transaction_id",
+                "origin_epoch", "projection_epoch",
                 "active_graph_transaction_id", "latest_graph_transaction_id",
                 "goal_frame", "frame_id", "source",
                 "status", "status_name", "failure_count",
+                "identity_validation",
                 "target_transaction_id",
                 "navfn_path_remaining", "navfn_path_endpoint", "navfn_plan_topic",
                 "navfn_path_progress_age", "physical_motion_progress_age",
@@ -2592,6 +2842,9 @@ class NavigationMetricsFailureEvidenceMixin:
                 "mission_route_kind", "place_id", "source_place_id",
                 "destination_place_id", "work_item_id", "attempt_id",
                 "transaction_id", "graph_transaction_id",
+                "lifecycle_transaction_id", "action_generation",
+                "origin_epoch", "projection_epoch",
+                "active_action_generation", "active_route_map_epoch",
                 "active_graph_transaction_id", "latest_graph_transaction_id",
                 "target_epoch", "target_track_id",
                 "reason", "goal", "distance", "elapsed", "path_distance",
@@ -2872,6 +3125,11 @@ class NavigationMetricsFailureEvidenceMixin:
             except (TypeError, ValueError):
                 return None
 
+        teb_feedback = sample.get("teb_feedback")
+        teb_feedback_captured = isinstance(teb_feedback, dict)
+        teb_feedback_valid = bool(
+            sample.get("teb_feedback_valid", True)
+        ) if teb_feedback_captured else False
         channels = {
             "pose": (
                 sample.get("pose") is not None,
@@ -2903,8 +3161,7 @@ class NavigationMetricsFailureEvidenceMixin:
                 age("last_navfn_plan_wall"),
             ),
             "teb_feedback": (
-                isinstance(sample.get("teb_feedback"), dict)
-                and bool(sample.get("teb_feedback_valid", True)),
+                teb_feedback_captured,
                 "teb_feedback_topic",
                 age("teb_feedback_wall"),
             ),
@@ -2930,7 +3187,7 @@ class NavigationMetricsFailureEvidenceMixin:
                 None,
             ),
         }
-        return {
+        health = {
             name: {
                 "available": bool(available),
                 "status": "present" if available else "missing",
@@ -2943,6 +3200,22 @@ class NavigationMetricsFailureEvidenceMixin:
             }
             for name, (available, source, age_seconds) in channels.items()
         }
+        # A controller-stall boundary intentionally invalidates the latest
+        # identity-free FeedbackMsg.  The retained trajectory summary is still
+        # causal evidence, so distinguish "captured but invalid" from a topic
+        # that never supplied a value instead of reporting a false channel gap.
+        teb_health = health["teb_feedback"]
+        teb_health["valid"] = bool(teb_feedback_valid)
+        if teb_feedback_captured and not teb_feedback_valid:
+            teb_health["status"] = "present_invalid"
+            teb_health["reason"] = "invalid_at_boundary"
+            teb_health["invalid_reason"] = str(
+                sample.get("teb_feedback_invalid_reason", "invalid_feedback")
+                or "invalid_feedback"
+            )
+        elif not teb_feedback_captured:
+            teb_health["valid"] = False
+        return health
 
     def _failure_sample_locked(self, now=None):
         now = time.monotonic() if now is None else float(now)
@@ -3305,6 +3578,12 @@ class NavigationMetricsFailureEvidenceMixin:
                 return
             sample = self._failure_append_sample_locked(now)
             command = sample["cmd_vel"]
+            navigation_hold = bool(sample.get("navigation_hold"))
+            if navigation_hold:
+                sample["failure_watchdog_suppressed"] = {
+                    "reason": "navigation_hold",
+                    "detail": "intentional observation hold",
+                }
             zero_command = abs(command[0]) <= 0.05 and abs(command[1]) <= 0.03
             active_route = bool(sample["bridge_active"]) and not sample["task_done"]
             goal_far = (
@@ -3329,6 +3608,7 @@ class NavigationMetricsFailureEvidenceMixin:
                 and goal_far
                 and clear_path
                 and not feedback_boundary
+                and not navigation_hold
             ):
                 if self.failure_zero_start_wall is None:
                     self.failure_zero_start_wall = now
@@ -3362,6 +3642,7 @@ class NavigationMetricsFailureEvidenceMixin:
                     getattr(self, "failure_goal_tolerance", 0.50),
                 )
                 and clear_path
+                and not navigation_hold
             )
             if controller_gap:
                 if self.failure_controller_gap_start_wall is None:
@@ -3405,7 +3686,11 @@ class NavigationMetricsFailureEvidenceMixin:
                     pose_xy[0] - self.failure_last_pose_xy[0],
                     pose_xy[1] - self.failure_last_pose_xy[1],
                 )
-                expected_motion = active_route and abs(command[0]) > 0.08
+                expected_motion = (
+                    active_route
+                    and abs(command[0]) > 0.08
+                    and not navigation_hold
+                )
                 if moved >= 0.04:
                     self.failure_last_pose_xy = pose_xy
                     self.failure_last_pose_wall = now
@@ -3667,9 +3952,22 @@ class NavigationMetricsFailureEvidenceMixin:
         trigger_sample = self._failure_trigger_sample_locked(
             sample, source, trigger, details
         )
-        self.failure_sequence += 1
+        causal_identity = _failure_causal_identity(
+            causal_route,
+            sample=trigger_sample,
+            details=details,
+        )
+        sequence = self._allocate_failure_sequence_locked()
+        if sequence is None:
+            self._write_failure_log(
+                "ERROR",
+                "failure_sequence_reservation_failed",
+                trigger=str(trigger),
+                source=str(source),
+            )
+            return None
         failure_id = "%s-F%04d" % (
-            getattr(self, "run_timestamp", "run"), self.failure_sequence
+            getattr(self, "run_timestamp", "run"), sequence
         )
         boundary = trigger_sample.get("failure_boundary")
         if isinstance(boundary, dict):
@@ -3686,6 +3984,13 @@ class NavigationMetricsFailureEvidenceMixin:
         causal_route = _normalize_failure_route_identity(
             causal_route, trigger, details
         )
+        causal_identity = _failure_causal_identity(
+            causal_route,
+            sample=trigger_sample,
+            details=details,
+        )
+        for key, value in causal_identity.items():
+            causal_route[key] = value
         # Preserve the route identity that existed when the trigger was
         # classified.  A route-invalidated callback can clear the active lease
         # before the next metrics sample, so the later post-window sample is
@@ -3718,6 +4023,7 @@ class NavigationMetricsFailureEvidenceMixin:
             "post_deadline_wall": now + self.failure_post_window,
             "classification_initial": classification,
             "causal_route": _json_safe(causal_route),
+            "causal_identity": _json_safe(causal_identity),
             "trigger_sample": trigger_sample,
             "related_events": [],
         }
@@ -3751,6 +4057,8 @@ class NavigationMetricsFailureEvidenceMixin:
             started_ros_time=active["started_ros_time"],
             pre_window_seconds=self.failure_pre_window,
             post_window_seconds=self.failure_post_window,
+            causal_identity=_json_safe(causal_identity),
+            **causal_identity,
         )
         self._write_failure_log(
             "WARN",
@@ -3764,6 +4072,8 @@ class NavigationMetricsFailureEvidenceMixin:
             started_ros_time=active["started_ros_time"],
             pre_window_seconds=self.failure_pre_window,
             post_window_seconds=self.failure_post_window,
+            causal_identity=_json_safe(causal_identity),
+            **causal_identity,
         )
         return failure_id
 
@@ -3968,6 +4278,11 @@ class NavigationMetricsFailureEvidenceMixin:
         diagnosis_at_end = diagnose_failure_sample(
             final_sample, details=diagnosis_details
         )
+        causal_identity = _failure_causal_identity(
+            active.get("causal_route"),
+            sample=active.get("trigger_sample"),
+            details=active.get("details"),
+        )
         snapshot = {
             "schema_version": FAILURE_SCHEMA_VERSION,
             "failure_id": active["failure_id"],
@@ -3979,6 +4294,7 @@ class NavigationMetricsFailureEvidenceMixin:
             "classification_at_end": end_classification,
             "details": active["details"],
             "causal_route": _json_safe(active.get("causal_route")),
+            "causal_identity": _json_safe(causal_identity),
             "started_wall_elapsed_seconds": active["started_wall_elapsed_seconds"],
             "ended_wall_elapsed_seconds": round(max(0.0, now - self.start_wall), 3),
             "started_ros_time": active["started_ros_time"],
@@ -4006,6 +4322,7 @@ class NavigationMetricsFailureEvidenceMixin:
             "sample_count": len(samples),
             "samples": samples,
         }
+        snapshot.update(causal_identity)
         run_context = getattr(self, "run_context", None)
         if isinstance(run_context, dict):
             # Keep the immutable startup contract in the append-only event as
@@ -4038,13 +4355,19 @@ class NavigationMetricsFailureEvidenceMixin:
             "artifact_path": artifact_path,
             "route_id": diagnosis_at_trigger.get("route_id"),
             "route_kind": diagnosis_at_trigger.get("route_kind"),
+            "causal_identity": _json_safe(causal_identity),
             "trigger_pose": diagnosis_at_trigger.get("spatial", {}).get("pose"),
             "trigger_goal": diagnosis_at_trigger.get("spatial", {}).get("goal"),
             "command_chain": diagnosis_at_trigger.get("command_chain"),
         }
+        summary.update(causal_identity)
         self.failure_history.append(summary)
         self.last_failure_summary = summary
         self._write_failure_log("ERROR", "failure_snapshot", **snapshot)
+        # Keep the artifact pointer in the bounded failure stream too. This
+        # lets an investigator open the episode directly from the dedicated
+        # evidence log without parsing the high-volume metrics stream.
+        self._write_failure_log("ERROR", "failure_snapshot_ready", **summary)
         self._write("ERROR", "failure_snapshot_ready", **summary)
         self.active_failure = None
         return summary

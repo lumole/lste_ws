@@ -6,6 +6,35 @@ class GoalManagerTargetCompletionConfigMixin:
 
     def _load_target_completion_parameters(self, gp):
         """Configure close-range completion and multi-frame confirmation."""
+        policy = str(gp("~target_done_policy", "visual_target")).strip().lower()
+        if policy not in ("visual_target", "target_room_entry", "target_context"):
+            policy = "visual_target"
+        self.target_done_policy = policy
+        # ``target_room_entry`` is a benchmark/diagnostic acceptance policy.
+        # The coordinates are supplied by the benchmark overlay; production
+        # runs keep the default visual-target policy and never use this mask.
+        self.target_room_entry_min_x = float(
+            gp("~target_room_entry_min_x", 0.0)
+        )
+        self.target_room_entry_min_y = float(
+            gp("~target_room_entry_min_y", 0.0)
+        )
+        self.target_room_entry_max_x = float(
+            gp("~target_room_entry_max_x", 0.0)
+        )
+        self.target_room_entry_max_y = float(
+            gp("~target_room_entry_max_y", 0.0)
+        )
+        self.target_room_entry_margin = max(
+            0.0, float(gp("~target_room_entry_margin", 0.30))
+        )
+        self.target_room_entry_min_hold_time = max(
+            0.0, float(gp("~target_room_entry_min_hold_time", 0.0))
+        )
+        require_crossing = gp("~target_room_entry_require_crossing", True)
+        self.target_room_entry_require_crossing = str(
+            require_crossing
+        ).strip().lower() in ("1", "true", "yes", "on")
         self.target_done_min_box_width = float(
             gp("~target_done_min_box_width", 0.06)
         )

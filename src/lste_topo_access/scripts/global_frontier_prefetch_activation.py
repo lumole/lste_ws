@@ -4,6 +4,7 @@ import math
 
 import rospy
 
+from lifecycle_manager import State
 from global_frontier_topology import copy_component_evidence
 
 
@@ -87,6 +88,93 @@ class GlobalFrontierPrefetchActivationMixin:
         self.active_best_detour_odom_distance = 0.0
         self._reset_active_odom_coverage()
         self.active_unreachable_since = None
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        if not preserve_route_id and lifecycle is not None:
+            # Prefetched successors bypass initialize_active_frontier_route.
+            # They are still a new route owner, so they must open a fresh
+            # lifecycle transaction before the route command crosses ROS.
+            lifecycle.begin_transaction(State.DISPATCHED, now=now)
+            latest = getattr(lifecycle, "latest_transaction_id", None)
+            self.active_route_lifecycle_transaction_id = int(
+                latest() if callable(latest) else lifecycle.current_transaction_id
+            )
+        elif preserve_route_id:
+            # A prefix continuation deliberately keeps the predecessor route
+            # identity.  If a compatibility composition did not initialize
+            # it, use the current lifecycle only as a defensive fallback.
+            active_lifecycle = int(
+                getattr(self, "active_route_lifecycle_transaction_id", 0) or 0
+            )
+            if active_lifecycle <= 0 and lifecycle is not None:
+                latest = getattr(lifecycle, "latest_transaction_id", None)
+                self.active_route_lifecycle_transaction_id = int(
+                    latest()
+                    if callable(latest)
+                    else lifecycle.current_transaction_id
+                )
+
+        graph_transaction = getattr(
+            self, "graph_route_action_transaction", None
+        )
+        route_epoch = (
+            getattr(graph_transaction, "map_epoch", None)
+            if graph_transaction is not None
+            else getattr(self, "last_map_epoch", None)
+        )
+        try:
+            self.active_route_map_epoch = max(1, int(route_epoch or 0))
+        except (TypeError, ValueError):
+            self.active_route_map_epoch = max(
+                1, int(getattr(self, "topology_component_epoch", 1) or 1)
+            )
+        route_origin_epoch = getattr(graph_transaction, "origin_epoch", None)
+        route_projection_epoch = getattr(
+            graph_transaction, "projection_epoch", None
+        )
+        if route_origin_epoch is None:
+            route_origin_epoch = self.active_route_map_epoch
+        if route_projection_epoch is None:
+            route_projection_epoch = self.active_route_map_epoch
+        # Keep the successor's immutable predecessor contract aligned with the
+        # lifecycle identity used by publish_route_command().  Without this
+        # record, release handling can fall back to the previous route's
+        # contract after a prefetched route takes ownership.
+        self.active_route_dispatch_contract = {
+            "route_id": int(self.active_route_id),
+            "transaction_id": 0,
+            "lifecycle_transaction_id": int(
+                getattr(self, "active_route_lifecycle_transaction_id", 0) or 0
+            ),
+            "action_generation": int(
+                getattr(self, "active_action_generation", 0) or 0
+            ),
+            "graph_transaction_id": int(
+                getattr(graph_transaction, "graph_transaction_id", 0) or 0
+            ),
+            "map_epoch": self.active_route_map_epoch,
+            "origin_epoch": route_origin_epoch,
+            "projection_epoch": route_projection_epoch,
+            "route_kind": "frontier_endpoint",
+            "mission_route_kind": "frontier_endpoint",
+            "source": "global_slam_frontier",
+            "priority": 0,
+        }
+        if not preserve_route_id:
+            self.publish_status(
+                "frontier_successor_lifecycle_started",
+                route_id=int(self.active_route_id),
+                predecessor_route_id=int(predecessor_route_id),
+                lifecycle_transaction_id=int(
+                    self.active_route_lifecycle_transaction_id
+                ),
+                graph_transaction_id=int(
+                    getattr(graph_transaction, "graph_transaction_id", 0) or 0
+                ),
+                map_epoch=self.active_route_map_epoch,
+                origin_epoch=route_origin_epoch,
+                projection_epoch=route_projection_epoch,
+                reason="prefetched_successor_adopted",
+            )
         # The promoted endpoint is a mission commitment. Reset command cache
         # so a distant branch begins with a connected waypoint, not one jump.
         self.active_last_waypoint_map = None

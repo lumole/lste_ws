@@ -13,6 +13,24 @@ from global_frontier_graph_route_gate import (
 
 class GlobalFrontierPlanningSelectionMixin:
 
+    def _current_graph_snapshot_prepare_kwargs(self, snapshot_epoch):
+        """Return the completed current-snapshot identity projection."""
+        ready = getattr(
+            self, "_graph_snapshot_projection_is_current", None
+        )
+        if not callable(ready) or not ready(snapshot_epoch):
+            return None
+        get_ids = getattr(self, "_graph_snapshot_projection_ids", None)
+        if not callable(get_ids):
+            return None
+        visible_work_item_ids, visible_probe_ids, visible_portal_ids = get_ids()
+        return {
+            "visible_work_item_ids": visible_work_item_ids,
+            "visible_probe_ids": visible_probe_ids,
+            "visible_portal_ids": visible_portal_ids,
+            "map_epoch": snapshot_epoch,
+        }
+
     def _materialize_graph_successor_first(self, snapshot, snapshot_epoch):
         """Materialize a leased Portal action before scanning raw frontiers."""
         if not getattr(self, "graph_route_planner_enabled", False):
@@ -29,10 +47,15 @@ class GlobalFrontierPlanningSelectionMixin:
         prepare = getattr(self, "_prepare_graph_route_action", None)
         if prepare is None:
             return None
+        projection_kwargs = self._current_graph_snapshot_prepare_kwargs(
+            snapshot_epoch
+        )
+        if projection_kwargs is None:
+            return None
         _plan, candidate = prepare(
             snapshot,
             reuse_existing_plan=True,
-            map_epoch=snapshot_epoch,
+            **projection_kwargs,
         )
         if candidate is None:
             return None
@@ -186,6 +209,68 @@ class GlobalFrontierPlanningSelectionMixin:
             "local_egress",
         ), "local_egress_recovery", False
 
+    def _select_durable_portal_probe_fallback(self, snapshot):
+        """Materialize a current-place probe without repeating full selection.
+
+        A blocked graph plan can mean that its preferred crossing has no
+        endpoint in this map projection.  A pending source/destination probe
+        is the same durable evidence chain and is therefore a valid immediate
+        successor.  The old path reached this code only after rerunning the
+        full frontier chooser, which left a multi-second no-goal gap.
+        """
+        durable_probe = getattr(self, "select_durable_portal_probe", None)
+        if not callable(durable_probe):
+            return None, None, False
+        candidate = durable_probe(snapshot)
+        if candidate is None:
+            return None, None, False
+        probe = candidate[15] if len(candidate) > 15 else None
+        try:
+            probe_id = int(getattr(probe, "probe_id", 0) or 0)
+        except (TypeError, ValueError):
+            probe_id = 0
+        graph_prepare = getattr(self, "_set_graph_route_preference", None)
+        commit = getattr(self, "_commit_graph_route_candidate", None)
+        if probe_id > 0 and callable(graph_prepare):
+            snapshot_epoch = getattr(
+                getattr(getattr(snapshot, "map_context", None), "components", None),
+                "epoch",
+                None,
+            )
+            graph_plan = graph_prepare(
+                map_epoch=snapshot_epoch,
+                visible_work_item_ids=(),
+                visible_probe_ids=(probe_id,),
+                visible_portal_ids=(),
+            )
+            if (
+                graph_plan is None
+                or getattr(graph_plan, "status", None) != PLAN_READY
+                or not callable(commit)
+                or not commit(
+                    graph_plan,
+                    candidate,
+                    source="durable_portal_probe_fallback",
+                )
+            ):
+                self.publish_status(
+                    "graph_route_materialization_wait",
+                    action=(
+                        None if graph_plan is None else graph_plan.action
+                    ),
+                    obligation_kind=(
+                        None
+                        if graph_plan is None else graph_plan.obligation_kind
+                    ),
+                    obligation_id=(
+                        None if graph_plan is None else graph_plan.obligation_id
+                    ),
+                    reason="durable_probe_fallback_plan_not_committed",
+                )
+                return None, "graph_route_materialization_wait", True
+        self.graph_route_probe_id = None
+        return candidate, "durable_portal_probe", False
+
     def select_next_active_frontier(self, snapshot):
         """Choose a terminal successor after resolving cache and claim policy."""
         snapshot_epoch = getattr(
@@ -216,6 +301,7 @@ class GlobalFrontierPlanningSelectionMixin:
                 reason="portal_transaction_owned",
             )
             return None, "portal_transaction_wait", True
+        durable_probe_checked = False
         candidate, selection_mode, wait_for_validation = (
             self.select_pending_local_egress(snapshot)
         )
@@ -229,15 +315,9 @@ class GlobalFrontierPlanningSelectionMixin:
 
         # The full graph method is a two-stage planner: the current map first
         # rehydrates WorkItems/Probes, then the durable graph owns the next
-        # action.  Do not let a terminal prefetch or an unrelated frontier
-        # bypass that decision.  Baseline methods retain their historical
-        # prefetch order below for a clean experiment contract.
+        # action.  The call below is deliberately the first graph entry point
+        # for this snapshot; no prior successor may bypass projection.
         if getattr(self, "graph_route_planner_enabled", False):
-            graph_successor = self._materialize_graph_successor_first(
-                snapshot, snapshot_epoch,
-            )
-            if graph_successor is not None:
-                return graph_successor
             candidate = self._choose_frontier_for_new_action(
                 snapshot.message,
                 snapshot.route_graph,
@@ -256,8 +336,19 @@ class GlobalFrontierPlanningSelectionMixin:
                         self, "_prepare_graph_route_action", None
                     )
                     if graph_prepare is not None:
+                        projection_kwargs = (
+                            self._current_graph_snapshot_prepare_kwargs(
+                                snapshot_epoch
+                            )
+                        )
+                        if projection_kwargs is None:
+                            return (
+                                None,
+                                "graph_route_rehydration_wait",
+                                True,
+                            )
                         graph_plan, _unused_graph_candidate = graph_prepare(
-                            None, map_epoch=snapshot_epoch
+                            None, **projection_kwargs
                         )
                 commit = getattr(self, "_commit_graph_route_candidate", None)
                 if graph_plan is None or commit is None:
@@ -295,14 +386,10 @@ class GlobalFrontierPlanningSelectionMixin:
                             first_portal_id=graph_plan.first_portal_id,
                             reason="candidate_does_not_refine_graph_plan",
                         )
-                    publish_unavailable = getattr(
-                        self, "_publish_graph_route_unavailable", None
-                    )
-                    if publish_unavailable is not None:
-                        publish_unavailable(
-                            graph_plan,
-                            "candidate_does_not_refine_graph_plan",
-                        )
+                    # This is a snapshot-local candidate mismatch, not a
+                    # controller failure.  Keep the durable plan leased and
+                    # let a later projection or the bounded miss tracker
+                    # decide whether the route is actually unavailable.
                     return None, "graph_route_materialization_wait", True
                 if commit(graph_plan, graph_candidate, source="frontier_selector"):
                     return candidate, self.last_frontier_selection_mode, False
@@ -311,10 +398,19 @@ class GlobalFrontierPlanningSelectionMixin:
                 # letting a second selector branch replace it.
                 return None, "graph_route_materialization_wait", True
 
+            # A leased Portal action must get one real current-snapshot
+            # materialization attempt before the post-arrival rehydration gate
+            # can turn an absent frontier projection into a generic wait. The
+            # helper preserves the graph identity and routes misses through
+            # the common negative-evidence/invalidation tracker.
+            graph_successor = self._materialize_graph_successor_first(
+                snapshot, snapshot_epoch
+            )
+            if graph_successor is not None:
+                return graph_successor
+
             # If the context pass could not run (for example a transient
-            # missing frontier projection), keep the entry barrier intact.  A
-            # direct graph fallback here would again see an empty ledger and
-            # select the reverse Portal before the next map can rehydrate it.
+            # missing frontier projection), keep the entry barrier intact.
             if getattr(self, "place_entry_rehydration_pending", None) is not None:
                 self.publish_status(
                     "place_entry_rehydration_wait",
@@ -327,6 +423,16 @@ class GlobalFrontierPlanningSelectionMixin:
             # the graph adapter first chance to materialize its successor;
             # otherwise the ordinary validation wait can strand the released
             # route until the materialization watchdog fires.
+            projection_kwargs = self._current_graph_snapshot_prepare_kwargs(
+                snapshot_epoch
+            )
+            if projection_kwargs is None:
+                self.publish_status(
+                    "graph_route_rehydration_wait",
+                    map_epoch=snapshot_epoch,
+                    reason="snapshot_projection_pending",
+                )
+                return None, "graph_route_rehydration_wait", True
             graph_prepare = getattr(self, "_prepare_graph_route_action", None)
             if graph_prepare is None:
                 graph_plan, graph_candidate = None, None
@@ -334,7 +440,7 @@ class GlobalFrontierPlanningSelectionMixin:
                 graph_plan, graph_candidate = graph_prepare(
                     snapshot,
                     reuse_existing_plan=True,
-                    map_epoch=snapshot_epoch,
+                    **projection_kwargs,
                 )
             if graph_candidate is not None:
                 return graph_candidate, "graph_route_edge", False
@@ -365,6 +471,7 @@ class GlobalFrontierPlanningSelectionMixin:
                         reason="same_snapshot_materialization_miss",
                     )
                 return None, "graph_route_materialization_wait", True
+
             graph_plan = getattr(self, "last_graph_route_plan", None)
             if (
                 getattr(self, "frontier_validation_pending", False)
@@ -431,19 +538,46 @@ class GlobalFrontierPlanningSelectionMixin:
                         first_portal_id=graph_plan.first_portal_id,
                         reason="selected_graph_obligation_not_executable_in_snapshot",
                     )
-                publish_unavailable = getattr(
-                    self, "_publish_graph_route_unavailable", None
-                )
-                if publish_unavailable is not None:
-                    publish_unavailable(
-                        graph_plan,
-                        "selected_graph_obligation_not_executable_in_snapshot",
-                    )
+                # Do not publish ``frontier_route_unavailable`` here.  The
+                # miss is still retryable; that event is a controller
+                # ownership boundary and is emitted only by the exhausted
+                # invalidation path with an explicit release decision.
                 return None, "graph_route_materialization_wait", True
-            # A blocked/complete plan is handed back to the normal completion
-            # gate. It may become executable after the next map or evidence
-            # event, but it must not be replaced by an unrelated route here.
-            return None, self.last_frontier_selection_mode, False
+            # A blocked current-place plan may still have a durable ledger
+            # fallback.  The graph planner has already excluded the exhausted
+            # identity; let the dedicated Portal probe/egress materializers
+            # find a different durable identity before reporting a hard hold.
+            # Generic score candidates remain blocked, so this does not bypass
+            # the graph contract with an unrelated frontier endpoint.
+            if (
+                graph_plan is not None
+                and getattr(graph_plan, "status", None) == "blocked"
+                and str(getattr(graph_plan, "reason", "") or "") in {
+                    "current_place_obligation_not_materialized",
+                    "durable_obligation_has_no_certified_graph_path",
+                }
+            ):
+                signature = graph_plan.signature()
+                if signature != getattr(
+                    self, "last_graph_blocked_fallback_signature", None
+                ):
+                    self.last_graph_blocked_fallback_signature = signature
+                    self.publish_status(
+                        "graph_route_blocked_fallback_to_durable_ledger",
+                        action=str(graph_plan.action),
+                        reason=str(graph_plan.reason),
+                        current_place_id=graph_plan.current_place_id,
+                    )
+                candidate, selection_mode, wait_for_validation = (
+                    self._select_durable_portal_probe_fallback(snapshot)
+                )
+                durable_probe_checked = True
+                if candidate is not None or wait_for_validation:
+                    return candidate, selection_mode, wait_for_validation
+            else:
+                # A complete plan, or a blocked plan caused by an unrelated
+                # invariant, remains a hard barrier for this selector pass.
+                return None, self.last_frontier_selection_mode, False
 
         candidate, selection_mode, wait_for_validation = (
             self.terminal_prefetch_novelty_decision(snapshot)
@@ -480,11 +614,62 @@ class GlobalFrontierPlanningSelectionMixin:
             candidate is None
             and not self.frontier_validation_budget_exhausted
             and not self.frontier_validation_pending
+            and not durable_probe_checked
         ):
             durable_probe = getattr(self, "select_durable_portal_probe", None)
             if durable_probe is not None:
                 candidate = durable_probe(snapshot)
                 if candidate is not None:
+                    probe = candidate[15] if len(candidate) > 15 else None
+                    try:
+                        probe_id = int(getattr(probe, "probe_id", 0) or 0)
+                    except (TypeError, ValueError):
+                        probe_id = 0
+                    graph_prepare = getattr(
+                        self, "_set_graph_route_preference", None
+                    )
+                    commit = getattr(
+                        self, "_commit_graph_route_candidate", None
+                    )
+                    if probe_id > 0 and callable(graph_prepare):
+                        graph_plan = graph_prepare(
+                            map_epoch=snapshot_epoch,
+                            visible_work_item_ids=(),
+                            visible_probe_ids=(probe_id,),
+                            visible_portal_ids=(),
+                        )
+                        if (
+                            graph_plan is None
+                            or getattr(graph_plan, "status", None) != PLAN_READY
+                            or not callable(commit)
+                            or not commit(
+                                graph_plan,
+                                candidate,
+                                source="durable_portal_probe_fallback",
+                            )
+                        ):
+                            self.publish_status(
+                                "graph_route_materialization_wait",
+                                action=(
+                                    None
+                                    if graph_plan is None
+                                    else graph_plan.action
+                                ),
+                                obligation_kind=(
+                                    None
+                                    if graph_plan is None
+                                    else graph_plan.obligation_kind
+                                ),
+                                obligation_id=(
+                                    None
+                                    if graph_plan is None
+                                    else graph_plan.obligation_id
+                                ),
+                                reason=(
+                                    "durable_probe_fallback_plan_not_committed"
+                                ),
+                            )
+                            return None, "graph_route_materialization_wait", True
                     self.graph_route_probe_id = None
                     return candidate, (
                         "durable_portal_probe"

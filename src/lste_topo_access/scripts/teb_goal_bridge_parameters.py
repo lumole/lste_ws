@@ -29,6 +29,7 @@ _TOPIC_DEFAULTS = (
     ("frontier_status_topic", "~frontier_status_topic", "/lste/global_frontier/status"),
     ("controller_topic", "~controller_topic", "/lste/controller_mode"),
     ("task_done_topic", "~task_done_topic", "/lste/task_done"),
+    ("navigation_hold_topic", "~navigation_hold_topic", "/lste/navigation_hold"),
     (
         "persistent_target_goal_topic",
         "~persistent_target_goal_topic",

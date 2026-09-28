@@ -416,15 +416,39 @@ class PortalProbeLedger:
             source_place_id = int(source_place_id)
         except (TypeError, ValueError):
             return []
-        records = [
-            self.view(record)
-            for record in sorted(self._records.values(), key=lambda item: int(item["id"]))
-            if int(record.get("source_place_id", -1)) == source_place_id
-            and record.get("state") in (
+        records = []
+        for record in sorted(
+            self._records.values(), key=lambda item: int(item["id"])
+        ):
+            if int(record.get("source_place_id", -1)) != source_place_id:
+                continue
+            if record.get("state") == PROBE_AWAITING_PROJECTION:
+                # A newer map is the explicit retry boundary for a parked
+                # physical probe.  Reopen the same durable record here so the
+                # graph adapter can retry it without creating a new identity.
+                blocked_epoch = _epoch(
+                    record.get("projection_blocked_map_epoch")
+                )
+                requested_epoch = _epoch(map_epoch)
+                if (
+                    blocked_epoch is None
+                    or (
+                        requested_epoch is not None
+                        and requested_epoch > blocked_epoch
+                    )
+                ):
+                    record["state"] = record.pop(
+                        "projection_resume_state", PROBE_PENDING
+                    ) or PROBE_PENDING
+                    record["projection_resume_state"] = None
+                    record["projection_blocked_map_epoch"] = None
+                    record["projection_blocked_reason"] = ""
+            allowed_states = (
                 (PROBE_PENDING, PROBE_SOURCE_ARRIVED)
                 if include_source_arrived else (PROBE_PENDING,)
             )
-        ]
+            if record.get("state") in allowed_states:
+                records.append(self.view(record))
         if not include_source_arrived:
             return records
         return [

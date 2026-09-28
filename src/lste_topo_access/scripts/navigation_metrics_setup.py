@@ -78,7 +78,11 @@ class NavigationMetricsSetupMixin:
         else:
             self.run_timestamp, self.log_dir = self._create_run_dir()
         self.log_path = self.log_dir / (self.run_timestamp + "_navigation_metrics.log")
-        self.stream = self.log_path.open("w", encoding="utf-8", buffering=1)
+        # A targeted application-node restart may reuse the same warm run
+        # directory. Preserve the existing evidence in that case; a newly
+        # allocated directory is still initialized as a fresh log.
+        log_mode = "a" if self.log_path.exists() else "w"
+        self.stream = self.log_path.open(log_mode, encoding="utf-8", buffering=1)
         # This parameter is written by the benchmark stop boundary.  Remove a
         # value left by an older process so a normal/manual shutdown cannot be
         # mistaken for the next trial's timeout.

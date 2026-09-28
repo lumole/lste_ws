@@ -43,6 +43,15 @@ _MAP_EPOCH_REJECTION_REASONS = frozenset(
 )
 
 
+def _positive_id(value):
+    """Normalize an optional durable ledger identity."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 class GlobalFrontierPortalEgressMixin:
     """Build a reverse portal route from durable Place entry evidence."""
 
@@ -151,8 +160,34 @@ class GlobalFrontierPortalEgressMixin:
         except (TypeError, ValueError):
             pass
         self._durable_portal_crossing_map_epoch = map_epoch
-        # The adapter consumes this marker to invalidate the graph lease and
-        # perform one immediate replan on the same snapshot.
+        rejected_epoch = record.get("rejected_map_epoch")
+        try:
+            rejected_for_epoch = (
+                map_epoch is not None
+                and rejected_epoch is not None
+                and int(rejected_epoch) == int(map_epoch)
+            )
+        except (TypeError, ValueError):
+            rejected_for_epoch = (
+                map_epoch is not None
+                and str(rejected_epoch).strip() == str(map_epoch).strip()
+            )
+        if rejected_for_epoch:
+            # The current snapshot already produced negative evidence for this
+            # Portal. Do not recompute the same geometry until a new epoch
+            # arrives; the adapter will account for the retained obligation.
+            self.last_durable_portal_crossing_unavailable = {
+                "portal_id": portal_id,
+                "map_epoch": map_epoch,
+                "reason": str(
+                    record.get("last_rejection_reason")
+                    or "portal_materialization_unavailable"
+                ),
+            }
+            return None
+        # The graph adapter consumes this marker as epoch-scoped negative
+        # evidence. It keeps the durable lease until the miss budget decides
+        # whether to retry on a newer map or invalidate the obligation.
         self.last_durable_portal_crossing_unavailable = None
         map_frame = getattr(getattr(message, "header", None), "frame_id", "map") or "map"
         projector_factory = getattr(self, "planar_xy_projector", None)
@@ -301,6 +336,16 @@ class GlobalFrontierPortalEgressMixin:
         report = {"portal_id": int(portal_id), "reason": str(reason)}
         if map_epoch is not None:
             report["map_epoch"] = map_epoch
+        identity_builder = getattr(
+            self, "_graph_route_materialization_identity", None
+        )
+        if callable(identity_builder):
+            identity = identity_builder(
+                plan=getattr(self, "last_graph_route_plan", None),
+                map_epoch=map_epoch,
+            )
+            identity.update(report)
+            report = identity
         # Keep the full reason even when the status publication is
         # de-duplicated. The graph adapter needs an explicit lifecycle marker,
         # not another timer tick, to release the stale route lease.
@@ -313,15 +358,76 @@ class GlobalFrontierPortalEgressMixin:
             mark_rejected = getattr(ledger, "mark_unbound_rejected", None)
             if callable(mark_rejected):
                 mark_rejected(int(portal_id), map_epoch, str(reason))
-            clear_lease = getattr(self, "_clear_graph_route_plan_lease", None)
-            if callable(clear_lease):
-                clear_lease("portal_%s" % str(reason))
+            # The graph adapter owns the durable miss budget.  Keep its lease
+            # alive across this epoch-local rejection so the same Portal edge
+            # can be retried on a newer map and eventually invalidated by the
+            # graph boundary instead of being replaced after one miss.
         if report == getattr(self, "last_durable_portal_crossing_report", None):
             return
         self.last_durable_portal_crossing_report = report
         publish = getattr(self, "publish_status", None)
         if callable(publish):
             publish("durable_portal_crossing_unavailable", **report)
+
+    def _report_durable_portal_egress_unavailable(
+        self, snapshot, portal_id, reason, **fields
+    ):
+        """Publish one snapshot-scoped failure for a bound reverse edge.
+
+        Forward crossing already exposes this marker to the graph adapter. A
+        reverse egress used to return ``None`` without an equivalent marker,
+        so a bound Portal could remain leased forever after its destination
+        side became unexecutable. The graph adapter consumes this marker and
+        owns the bounded miss/invalidation/release transition.
+        """
+        try:
+            portal_id = int(portal_id)
+        except (TypeError, ValueError):
+            return
+        if portal_id <= 0:
+            return
+        components = getattr(
+            getattr(snapshot, "map_context", None), "components", None
+        )
+        map_epoch = getattr(components, "epoch", None)
+        try:
+            map_epoch = None if map_epoch is None else int(map_epoch)
+        except (TypeError, ValueError):
+            map_epoch = None
+        report = {
+            "portal_id": portal_id,
+            "reason": str(reason or "portal_egress_unavailable"),
+        }
+        if map_epoch is not None:
+            report["map_epoch"] = map_epoch
+        source_place_id = getattr(self, "current_physical_place_id", None)
+        if source_place_id is not None:
+            try:
+                report["source_place_id"] = int(source_place_id)
+            except (TypeError, ValueError):
+                pass
+        report.update(fields)
+        identity_builder = getattr(
+            self, "_graph_route_materialization_identity", None
+        )
+        if callable(identity_builder):
+            identity = identity_builder(
+                plan=getattr(self, "last_graph_route_plan", None),
+                map_epoch=map_epoch,
+                transaction=getattr(
+                    self, "graph_route_action_transaction", None
+                ),
+            )
+            report = {**identity, **report}
+        self.last_durable_portal_egress_unavailable = dict(report)
+        if report == getattr(
+            self, "last_durable_portal_egress_report", None
+        ):
+            return
+        self.last_durable_portal_egress_report = dict(report)
+        publish = getattr(self, "publish_status", None)
+        if callable(publish):
+            publish("durable_portal_egress_unavailable", **report)
 
     def _covered_portal_transit_is_allowed(self, source_region, destination_region):
         """Permit covered transit only when the durable graph has progress."""
@@ -543,6 +649,7 @@ class GlobalFrontierPortalEgressMixin:
 
     def select_durable_portal_egress(self, snapshot):
         """Return one remembered reverse egress candidate, if executable."""
+        self.last_durable_portal_egress_unavailable = None
         if getattr(self, "target_region_claim_active", False):
             return None
         place_id = getattr(self, "current_physical_place_id", None)
@@ -551,13 +658,39 @@ class GlobalFrontierPortalEgressMixin:
         region = self.region_memory.by_id(place_id)
         if region is None:
             return None
+        excluded_portal_ids = set()
+        exclusion_reader = getattr(
+            self, "_graph_route_materialization_exclusions", None
+        )
+        if callable(exclusion_reader):
+            excluded_portal_ids = {
+                value for value in (
+                    _positive_id(item)
+                    for item in exclusion_reader(
+                        getattr(
+                            getattr(getattr(snapshot, "map_context", None),
+                                    "components", None),
+                            "epoch", None,
+                        )
+                    )[0]
+                ) if value is not None
+            }
         entries = [
             entry for entry in region.get("entry_portals", [])
             if isinstance(entry, dict)
             and self._entry_xy(entry, "gate") is not None
             and self._entry_xy(entry, "inside") is not None
         ]
+        preferred_portal_id = _positive_id(
+            getattr(self, "graph_route_portal_id", None)
+        )
         if not entries:
+            if preferred_portal_id is not None:
+                self._report_durable_portal_egress_unavailable(
+                    snapshot,
+                    preferred_portal_id,
+                    "reverse_entry_missing",
+                )
             return None
 
         # Prefer the physically closest remembered entrance. This is a graph
@@ -570,8 +703,22 @@ class GlobalFrontierPortalEgressMixin:
                 self._entry_xy(entry, "inside")[1] - robot[1],
             )
         )
+        last_unavailable_reason = None
+        last_unavailable_fields = {}
         for entry in entries:
+            entry_portal_id = next(
+                (
+                    _positive_id(entry.get(key))
+                    for key in ("portal_id", "id", "hypothesis_id")
+                    if _positive_id(entry.get(key)) is not None
+                ),
+                None,
+            )
+            if entry_portal_id in excluded_portal_ids:
+                continue
             if not self._entry_matches_graph_portal(entry):
+                last_unavailable_reason = "portal_entry_identity_mismatch"
+                last_unavailable_fields = {}
                 continue
             gate_xy = self._entry_xy(entry, "gate")
             inside_xy = self._entry_xy(entry, "inside")
@@ -582,6 +729,8 @@ class GlobalFrontierPortalEgressMixin:
                 inside_xy,
             )
             if endpoint is None:
+                last_unavailable_reason = "destination_side_not_reachable"
+                last_unavailable_fields = {}
                 continue
             row, col, goal_xy = endpoint
             physical_source, physical_gate, physical_goal = (
@@ -601,6 +750,8 @@ class GlobalFrontierPortalEgressMixin:
                 physical_destination_xy=physical_goal,
             )
             if reverse_exit is None:
+                last_unavailable_reason = "reverse_entry_not_found"
+                last_unavailable_fields = {}
                 continue
             destination_region = reverse_exit[0]
             if not self._covered_portal_transit_is_allowed(
@@ -619,6 +770,14 @@ class GlobalFrontierPortalEgressMixin:
                     ),
                     reason="covered_to_covered_without_graph_progress",
                 )
+                last_unavailable_reason = "covered_to_covered_without_graph_progress"
+                last_unavailable_fields = {
+                    "destination_place_id": (
+                        None
+                        if not isinstance(destination_region, dict)
+                        else destination_region.get("id")
+                    ),
+                }
                 continue
             costmap_distance = self.candidate_costmap_distance(
                 snapshot.route_graph.validation,
@@ -629,6 +788,10 @@ class GlobalFrontierPortalEgressMixin:
                 snapshot.route_graph.validation is not None
                 and costmap_distance is None
             ):
+                last_unavailable_reason = "costmap_route_unreachable"
+                last_unavailable_fields = {
+                    "destination_place_id": int(destination_region["id"]),
+                }
                 continue
             path_distance = (
                 float(costmap_distance)
@@ -646,7 +809,12 @@ class GlobalFrontierPortalEgressMixin:
                 destination_place_id=reverse_exit[0]["id"],
             )
             if hypothesis is None:
+                last_unavailable_reason = "portal_identity_unavailable"
+                last_unavailable_fields = {
+                    "destination_place_id": int(destination_region["id"]),
+                }
                 continue
+            self.last_durable_portal_egress_unavailable = None
             self.publish_status(
                 "durable_portal_egress_selected",
                 place_id=int(place_id),
@@ -677,6 +845,13 @@ class GlobalFrontierPortalEgressMixin:
                 "cross_portal",
                 "durable_portal_egress",
                 int(hypothesis["id"]),
+            )
+        if preferred_portal_id is not None and last_unavailable_reason:
+            self._report_durable_portal_egress_unavailable(
+                snapshot,
+                preferred_portal_id,
+                last_unavailable_reason,
+                **last_unavailable_fields
             )
         return None
 
@@ -722,6 +897,23 @@ class GlobalFrontierPortalEgressMixin:
                 )
             except TypeError:
                 records = pending_for_source(place_id)
+        excluded_probe_ids = set()
+        exclusion_reader = getattr(
+            self, "_graph_route_materialization_exclusions", None
+        )
+        if callable(exclusion_reader):
+            excluded_probe_ids = {
+                value for value in (
+                    _positive_id(item)
+                    for item in exclusion_reader(map_epoch)[2]
+                ) if value is not None
+            }
+            if preferred_probe_id in excluded_probe_ids:
+                preferred_probe_id = None
+            records = [
+                record for record in records
+                if _positive_id(record.get("id")) not in excluded_probe_ids
+            ]
         # A graph-owned source-arrived probe is an immediate two-phase
         # transaction: the source observation has just completed, so its
         # destination view must remain materializable even when a
@@ -1150,6 +1342,16 @@ class GlobalFrontierPortalEgressMixin:
 
     def _publish_durable_portal_probe_report(self, report):
         """Publish one deduplicated audit for a non-materialized probe."""
+        identity_builder = getattr(
+            self, "_graph_route_materialization_identity", None
+        )
+        if callable(identity_builder):
+            identity = identity_builder(
+                plan=getattr(self, "last_graph_route_plan", None),
+                map_epoch=report.get("map_epoch"),
+            )
+            identity.update(report)
+            report = identity
         if report == getattr(self, "last_durable_portal_probe_report", None):
             return
         self.last_durable_portal_probe_report = report

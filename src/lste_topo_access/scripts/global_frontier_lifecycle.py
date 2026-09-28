@@ -47,12 +47,35 @@ class GlobalFrontierLifecycleMixin:
         self._rehydration_transaction_id = 0
         self._rehydration_pending_streams = set()
         self._rehydration_applied_streams = set()
+        self._rehydration_ready_for_planning = True
+        self._rehydration_wait_signature = None
 
     def lifecycle_state(self):
         return self.lifecycle_manager.current_state
 
     def lifecycle_transaction_id(self):
-        return self.lifecycle_manager.current_transaction_id
+        manager = getattr(self, "lifecycle_manager", None)
+        if manager is None:
+            return 0
+        latest = getattr(manager, "latest_transaction_id", None)
+        if callable(latest):
+            return int(latest() or 0)
+        return int(getattr(manager, "current_transaction_id", 0) or 0)
+
+    def route_lifecycle_transaction_id(self):
+        """Return the identity belonging to the current route lease.
+
+        The lifecycle manager can advance while a released controller route is
+        still draining.  Keep that predecessor's wire identity stable, while
+        allowing a newly activated route to capture the newest identity.
+        """
+        active_route_id = int(getattr(self, "active_route_id", 0) or 0)
+        active_identity = int(
+            getattr(self, "active_route_lifecycle_transaction_id", 0) or 0
+        )
+        if active_route_id > 0 and active_identity > 0:
+            return active_identity
+        return self.lifecycle_transaction_id()
 
     def lifecycle_active(self):
         return self.lifecycle_manager.is_in(
@@ -187,9 +210,23 @@ class GlobalFrontierLifecycleMixin:
         )
 
     def on_bridge_status(self, message):
-        return self._enqueue_lifecycle_event(
-            EventType.NAV_FAILED, deepcopy(message)
-        )
+        # Lease ACKs are causal evidence for a predecessor route. They may be
+        # delivered after this owner has already adopted a newer route
+        # transaction, so keep them FIFO but rebind them to the transaction
+        # current when the lifecycle tick consumes them. Other bridge status
+        # events retain the normal stale-transaction filtering.
+        event_type = EventType.NAV_FAILED
+        try:
+            payload = json.loads(message.data)
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        if (
+            isinstance(payload, dict)
+            and str(payload.get("event", "") or "").strip()
+            == "lease_release_ack"
+        ):
+            event_type = EventType.CONTROLLER_LEASE_RELEASE_ACK
+        return self._enqueue_lifecycle_event(event_type, deepcopy(message))
 
     def on_replan_request(self, message):
         return self._enqueue_lifecycle_event(
@@ -270,6 +307,7 @@ class GlobalFrontierLifecycleMixin:
             EventType.RECOVERY_OBSERVED: self._apply_move_base_recovery,
             EventType.EXECUTION_TERMINAL: self._apply_execution_terminal_event,
             EventType.NAV_FAILED: self._apply_bridge_status,
+            EventType.CONTROLLER_LEASE_RELEASE_ACK: self._apply_bridge_status,
             EventType.REPLAN_REQUESTED: self._apply_replan_request_event,
             EventType.TURN_STATUS: self._apply_turn_status,
             EventType.NAVFN_RESULT: self._apply_navfn_result,
@@ -300,7 +338,12 @@ class GlobalFrontierLifecycleMixin:
             if kind == "full" and not rehydration_costmap:
                 self._rehydration_costmap_fallback = None
                 self._rehydration_costmap_fallback_active = False
-            self._record_rehydration_event_applied(event, "costmap")
+            # Only a complete full grid satisfies the reset planning input
+            # barrier. A delta/resync is an update to an already accepted
+            # projection and must not make a partially rebuilt snapshot look
+            # ready for graph materialization.
+            if kind == "full":
+                self._record_rehydration_event_applied(event, "costmap")
             if (
                 kind != "resync"
                 and
@@ -358,6 +401,10 @@ class GlobalFrontierLifecycleMixin:
         )
         if pending:
             return
+        self._rehydration_ready_for_planning = bool(
+            all(name in applied for name in ("map", "costmap", "pose"))
+        )
+        self._rehydration_wait_signature = None
         self.publish_status(
             "hard_reset_rehydration_complete",
             rehydrated=True,
@@ -367,6 +414,36 @@ class GlobalFrontierLifecycleMixin:
                 name in applied for name in ("map", "costmap", "pose")
             ),
         )
+
+    def _rehydration_inputs_ready_for_planning(self):
+        """Prevent graph planning until the current reset inputs are applied."""
+        transaction_id = int(
+            getattr(self, "_rehydration_transaction_id", 0) or 0
+        )
+        if transaction_id <= 0:
+            return True
+        pending = tuple(
+            sorted(getattr(self, "_rehydration_pending_streams", set()))
+        )
+        ready = bool(
+            getattr(self, "_rehydration_ready_for_planning", False)
+            and not pending
+        )
+        if ready:
+            return True
+        signature = (transaction_id, pending)
+        if signature != getattr(self, "_rehydration_wait_signature", None):
+            self._rehydration_wait_signature = signature
+            publish = getattr(self, "publish_status", None)
+            if callable(publish):
+                publish(
+                    "hard_reset_rehydration_wait",
+                    rehydrated=False,
+                    rehydration_transaction_id=transaction_id,
+                    pending_streams=list(pending),
+                    reason="planner_inputs_not_ready",
+                )
+        return False
 
     def _capture_hard_reset_snapshots(self):
         """Capture the latest valid sensor projection before clearing state."""
@@ -428,6 +505,15 @@ class GlobalFrontierLifecycleMixin:
 
     def _enqueue_hard_reset_rehydration(self, transaction_id, snapshots):
         """Re-enter cached inputs through the normal lifecycle event queue."""
+        # Keep all required streams pending, including a stream for which the
+        # reset had no cached sample. A live callback in the new transaction
+        # may satisfy that stream; planning remains closed until all three
+        # inputs have crossed this boundary.
+        self._rehydration_transaction_id = int(transaction_id)
+        self._rehydration_pending_streams = {"map", "costmap", "pose"}
+        self._rehydration_applied_streams = set()
+        self._rehydration_ready_for_planning = False
+        self._rehydration_wait_signature = None
         pending = set()
         queued = {}
         for stream, event_type, payload in (
@@ -455,9 +541,6 @@ class GlobalFrontierLifecycleMixin:
             queued[stream] = bool(accepted)
             if accepted:
                 pending.add(stream)
-        self._rehydration_transaction_id = int(transaction_id)
-        self._rehydration_pending_streams = pending
-        self._rehydration_applied_streams = set()
         fallback = snapshots.get("costmap")
         self._rehydration_costmap_fallback = (
             None if fallback is None else deepcopy(fallback)
@@ -573,8 +656,31 @@ class GlobalFrontierLifecycleMixin:
             )
             active_frontier = getattr(self, "active_frontier", None)
             release = getattr(self, "release_active_frontier", None)
+            active_route_id = int(getattr(self, "active_route_id", 0) or 0)
+            dispatch_contract = getattr(self, "_bridge_dispatch_contracts", {}).get(
+                active_route_id
+            )
+            terminal_contract = getattr(self, "active_terminal_contract", None)
+            controller_release_pending = bool(
+                active_frontier is not None
+                and getattr(self, "controller_owned_route_failure", False)
+                and active_route_id > 0
+                and (
+                    isinstance(dispatch_contract, dict)
+                    or isinstance(terminal_contract, dict)
+                )
+            )
             if active_frontier is not None and callable(release):
-                release(discard_prefetch=True)
+                release(
+                    discard_prefetch=True,
+                    queue_successor=not controller_release_pending,
+                    await_controller_release_ack=controller_release_pending,
+                    terminal_contract=(
+                        dict(terminal_contract)
+                        if isinstance(terminal_contract, dict)
+                        else None
+                    ),
+                )
             else:
                 clear_prefetch = getattr(self, "clear_prefetched_frontier", None)
                 if callable(clear_prefetch):
@@ -585,6 +691,7 @@ class GlobalFrontierLifecycleMixin:
                     "lifecycle_failure_cleanup",
                     transaction_id=int(self.lifecycle_transaction_id()),
                     released_route=active_frontier is not None,
+                    controller_release_pending=controller_release_pending,
                 )
         elif current == State.EXECUTION_DONE:
             self._lifecycle_sync_seen.clear()

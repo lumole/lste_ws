@@ -95,6 +95,8 @@ class PersistentTebLocalPlanner : public nav_core::BaseLocalPlanner {
   std::atomic<uint64_t> route_version_;
   std::atomic<uint64_t> route_geometry_hash_;
   uint32_t installed_target_transaction_;
+  uint64_t installed_target_origin_epoch_;
+  uint64_t installed_target_projection_epoch_;
   std::atomic<uint32_t> latest_mission_transaction_;
   // The persistent bridge can change route semantics without changing the
   // Navfn cell endpoint (for example, frontier observation -> Portal
@@ -113,6 +115,8 @@ class PersistentTebLocalPlanner : public nav_core::BaseLocalPlanner {
   uint32_t latest_route_id_;
   uint64_t latest_graph_transaction_id_;
   uint64_t latest_map_epoch_;
+  uint64_t latest_origin_epoch_;
+  uint64_t latest_projection_epoch_;
   std::string latest_lifecycle_transaction_id_;
   uint32_t latest_action_generation_;
   std::atomic<uint64_t> planner_command_sequence_;
@@ -173,11 +177,15 @@ class StreamingNavfnPlanner : public nav_core::BaseGlobalPlanner {
   // delayed latched delivery must never let an older mission or speculative
   // target overwrite a newer approved route.
   uint32_t latest_mission_sequence_;
+  uint64_t latest_mission_origin_epoch_;
+  uint64_t latest_mission_projection_epoch_;
   uint32_t latest_target_sequence_;
   uint32_t active_target_mission_sequence_;
   uint32_t validated_target_sequence_;
   uint32_t failed_target_sequence_;
   uint64_t latest_target_map_epoch_;
+  uint64_t latest_target_origin_epoch_;
+  uint64_t latest_target_projection_epoch_;
   uint64_t latest_target_graph_transaction_id_;
   uint32_t latest_target_route_id_;
   std::string latest_target_lifecycle_transaction_id_;

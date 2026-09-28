@@ -76,10 +76,11 @@ class GoalManager(
         self._setup_ros_interfaces()
         rospy.loginfo(
             "Goal Manager started: source=%s publishes /lste/final_goal "
-            "target_route_validation=%s service=%s",
+            "target_route_validation=%s service=%s target_done_policy=%s",
             self.global_goal_source,
             self.target_route_validation,
             self.target_route_validation_service,
+            self.target_done_policy,
         )
         if self.global_goal_source == "fixed":
             rospy.loginfo(

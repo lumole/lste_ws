@@ -66,6 +66,10 @@ def connect_turn_supervisor_ros(supervisor):
         queue_size=1,
     )
     rospy.Subscriber(
+        supervisor.mux_status_topic, String, supervisor.on_cmd_vel_mux_status,
+        queue_size=10,
+    )
+    rospy.Subscriber(
         HARD_RESET_TOPIC, String, supervisor.on_hard_reset, queue_size=5
     )
     supervisor.timer = rospy.Timer(

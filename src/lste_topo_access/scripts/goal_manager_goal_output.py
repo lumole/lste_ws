@@ -18,15 +18,23 @@ from goal_context import default_goal_context
 class GoalManagerGoalOutputMixin:
     # -------------------- Helpers --------------------
     def _canonical_lifecycle_transaction_id(self) -> int:
-        """Return the lifecycle identity inherited from Global Frontier."""
-        return int(
-            getattr(
-                getattr(self, "lifecycle_manager", None),
-                "current_transaction_id",
-                0,
-            )
+        """Return the exact lifecycle identity of the current route."""
+        inherited = int(
+            getattr(self, "global_frontier_lifecycle_transaction_id", 0)
             or 0
         )
+        if inherited > 0:
+            # Global Frontier owns the route lifecycle.  A later local event
+            # may already be queued, but it must not relabel this route's
+            # mission goal, dispatch, or terminal as that future identity.
+            return inherited
+        manager = getattr(self, "lifecycle_manager", None)
+        latest = getattr(manager, "latest_transaction_id", None)
+        if callable(latest):
+            current = int(latest() or 0)
+        else:
+            current = int(getattr(manager, "current_transaction_id", 0) or 0)
+        return current
 
     def _canonical_map_epoch(self) -> int:
         """Return a map epoch previously issued by Global Frontier."""
@@ -55,6 +63,14 @@ class GoalManagerGoalOutputMixin:
                     getattr(self, "global_frontier_graph_transaction_id", 0),
                 ),
                 ("map_epoch", self._canonical_map_epoch()),
+                (
+                    "origin_epoch",
+                    getattr(self, "global_frontier_origin_epoch", 0),
+                ),
+                (
+                    "projection_epoch",
+                    getattr(self, "global_frontier_projection_epoch", 0),
+                ),
             )
             for name, value in fields:
                 try:
@@ -196,6 +212,22 @@ class GoalManagerGoalOutputMixin:
                 self._canonical_map_epoch()
                 if getattr(self, "global_frontier_enabled", False)
                 else max(1, int(getattr(self, "navigation_map_epoch", 1) or 1))
+            ),
+            "origin_epoch": max(
+                1,
+                int(
+                    getattr(self, "global_frontier_origin_epoch", None)
+                    or self._canonical_map_epoch()
+                    or 1
+                ),
+            ),
+            "projection_epoch": max(
+                1,
+                int(
+                    getattr(self, "global_frontier_projection_epoch", None)
+                    or self._canonical_map_epoch()
+                    or 1
+                ),
             ),
             "task_id": str(getattr(self, "current_task_id", "")),
             "mission_id": str(getattr(self, "current_mission_id", "")),
@@ -388,6 +420,9 @@ class GoalManagerGoalOutputMixin:
         self._consume_target_terminal_observation_handoff()
         if self.goal_source == "global_slam_frontier":
             self.last_frontier_goal_context = frontier_context
+            self.last_published_frontier_route_id = int(
+                getattr(self, "global_frontier_route_id", 0) or 0
+            )
             self.teb_frontier_goal_history.append(copy.deepcopy(goal))
             # Keep enough history for coalesced route updates and native
             # in-place segment replacements without retaining a full mission.
@@ -437,6 +472,11 @@ class GoalManagerGoalOutputMixin:
             intent["predecessor_route_id"] = int(
                 self.global_frontier_predecessor_route_id
             )
+            predecessor_contract = getattr(
+                self, "global_frontier_predecessor_contract", None
+            )
+            if isinstance(predecessor_contract, dict):
+                intent["predecessor_contract"] = dict(predecessor_contract)
             intent["transition_distance_to_previous_endpoint"] = (
                 self.global_frontier_transition_distance
             )
@@ -446,6 +486,22 @@ class GoalManagerGoalOutputMixin:
                 int(
                     getattr(self, "global_frontier_map_epoch", None)
                     or getattr(self, "navigation_map_epoch", 1)
+                    or 1
+                ),
+            )
+            intent["origin_epoch"] = max(
+                1,
+                int(
+                    getattr(self, "global_frontier_origin_epoch", None)
+                    or intent["map_epoch"]
+                    or 1
+                ),
+            )
+            intent["projection_epoch"] = max(
+                1,
+                int(
+                    getattr(self, "global_frontier_projection_epoch", None)
+                    or intent["map_epoch"]
                     or 1
                 ),
             )
@@ -464,9 +520,16 @@ class GoalManagerGoalOutputMixin:
             intent["mission_route_kind"] = "direct_goal"
             # A target segment inherits the current Global Frontier route
             # identity. GoalManager does not create a parallel route namespace.
-            intent["route_id"] = int(
+            target_route_id = int(
                 getattr(self, "global_frontier_route_id", 0) or 0
             )
+            if target_route_id <= 0:
+                # A direct-target isolation profile has no Global Frontier
+                # route namespace. Reuse the next semantic command number as
+                # its local route identity; online target routes continue to
+                # inherit the canonical frontier route above.
+                target_route_id = max(1, int(self.goal_command_id) + 1)
+            intent["route_id"] = target_route_id
             intent["graph_transaction_id"] = int(
                 getattr(self, "global_frontier_graph_transaction_id", 0) or 0
             )
@@ -474,6 +537,22 @@ class GoalManagerGoalOutputMixin:
                 self._canonical_map_epoch()
                 if getattr(self, "global_frontier_enabled", False)
                 else max(1, int(getattr(self, "navigation_map_epoch", 1) or 1))
+            )
+            intent["origin_epoch"] = max(
+                1,
+                int(
+                    getattr(self, "global_frontier_origin_epoch", None)
+                    or intent["map_epoch"]
+                    or 1
+                ),
+            )
+            intent["projection_epoch"] = max(
+                1,
+                int(
+                    getattr(self, "global_frontier_projection_epoch", None)
+                    or intent["map_epoch"]
+                    or 1
+                ),
             )
             intent["target_approach_epoch"] = int(
                 getattr(
@@ -491,6 +570,19 @@ class GoalManagerGoalOutputMixin:
             intent["target_viewpoint_attempt_id"] = str(
                 getattr(self, "target_viewpoint_attempt_id", "") or ""
             )
+        # The graph identity is present at the top level for both frontier and
+        # target routes. Keep the nested context derived from that same
+        # identity so Bridge adoption cannot observe two route contracts.
+        if int(intent.get("graph_transaction_id", 0) or 0) > 0:
+            context = (
+                dict(frontier_context)
+                if frontier_context is not None
+                else dict(mission_context)
+            )
+            context["graph_transaction_id"] = int(
+                intent["graph_transaction_id"]
+            )
+            intent["goal_context"] = context
         # This is the execution boundary. Publishing pose and ownership in
         # one latched message prevents a freshly restarted bridge from first
         # receiving an obsolete final_goal and only later its replacement

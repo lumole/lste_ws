@@ -12,6 +12,11 @@ from lifecycle_manager import EventType
 class TebGoalBridgeMissionRuntimeMixin:
     def on_timer(self, _event):
         with self.lock:
+            poll_transport = getattr(
+                self, "_poll_transport_handoff_locked", None
+            )
+            if callable(poll_transport):
+                poll_transport()
             tick_watchdog = getattr(
                 self, "_tick_route_lease_watchdog_locked", None
             )
@@ -19,7 +24,13 @@ class TebGoalBridgeMissionRuntimeMixin:
                 tick_watchdog()
             if self._is_active_mode():
                 if self.persistent_execution:
-                    self._promote_persistent_frontier_prefetch_locked()
+                    # Persistent execution has one long-lived action client,
+                    # so it must still run the same health FSM as endpoint
+                    # execution. Otherwise an invalidated TEB feedback stream
+                    # can leave an active route emitting zero forever.
+                    self.maybe_handoff_locked()
+                    if self.action_active:
+                        self._promote_persistent_frontier_prefetch_locked()
                 else:
                     self.maybe_handoff_locked()
                 self.dispatch_locked(force=False, reason="coalesced_global_goal")
@@ -41,12 +52,7 @@ class TebGoalBridgeMissionRuntimeMixin:
             {
                 "transaction_id": int(self.latest_goal_transaction_id),
                 "lifecycle_transaction_id": int(
-                    getattr(
-                        getattr(self, "lifecycle_manager", None),
-                        "current_transaction_id",
-                        0,
-                    )
-                    or 0
+                    self._canonical_lifecycle_transaction_id()
                 ),
                 "route_id": int(self.latest_route_id),
                 "graph_transaction_id": int(
@@ -54,6 +60,8 @@ class TebGoalBridgeMissionRuntimeMixin:
                 ),
                 "epoch": self._effective_action_epoch_locked(),
                 "map_epoch": self.active_route_map_epoch,
+                "origin_epoch": self.active_origin_epoch,
+                "projection_epoch": self.active_projection_epoch,
                 "route_kind": str(self.latest_route_kind or ""),
                 "mission_route_kind": str(
                     self.latest_mission_route_kind or ""
@@ -109,6 +117,25 @@ class TebGoalBridgeMissionRuntimeMixin:
             getattr(self, "active_mission_route_kind", "") or ""
         ).strip().lower()
         previous_map_epoch = getattr(self, "active_route_map_epoch", None)
+        previous_origin_epoch = getattr(self, "active_origin_epoch", None)
+        previous_projection_epoch = getattr(
+            self, "active_projection_epoch", None
+        )
+        previous_action_contract = getattr(
+            self, "active_action_contract", None
+        )
+        try:
+            previous_lifecycle_transaction_id = int(
+                (previous_action_contract or {}).get(
+                    "lifecycle_transaction_id", 0
+                )
+                or 0
+            )
+        except (AttributeError, TypeError, ValueError):
+            previous_lifecycle_transaction_id = 0
+        current_lifecycle_transaction_id = int(
+            self._canonical_lifecycle_transaction_id()
+        )
         previous_target_track_id = str(
             getattr(self, "active_target_track_id", "") or ""
         )
@@ -125,10 +152,28 @@ class TebGoalBridgeMissionRuntimeMixin:
             or previous_mission_route_kind
             != str(self.latest_mission_route_kind or "").strip().lower()
             or previous_map_epoch != getattr(self, "latest_route_map_epoch", None)
+            or previous_origin_epoch
+            != getattr(self, "latest_origin_epoch", None)
+            or previous_projection_epoch
+            != getattr(self, "latest_projection_epoch", None)
+            or previous_lifecycle_transaction_id
+            != current_lifecycle_transaction_id
             or previous_target_track_id
             != str(self.latest_target_track_id or "")
         )
+        predecessor_endpoint_pending = getattr(
+            self, "persistent_frontier_endpoint_pending", None
+        )
+        if not (
+            isinstance(predecessor_endpoint_pending, dict)
+            and int(predecessor_endpoint_pending.get("route_id", 0) or 0)
+            == previous_route_id
+            and int(self.latest_route_id) > previous_route_id
+        ):
+            predecessor_endpoint_pending = None
         if route_changed:
+            if predecessor_endpoint_pending is not None:
+                self.persistent_frontier_endpoint_pending = None
             invalidate_feedback = getattr(
                 self, "_invalidate_teb_feedback_locked", None
             )
@@ -173,6 +218,16 @@ class TebGoalBridgeMissionRuntimeMixin:
         self.active_route_map_epoch = getattr(
             self, "latest_route_map_epoch", None
         )
+        # A persistent action keeps its transport generation, but the planner
+        # contract still belongs to the newly adopted map snapshot. Refresh
+        # these epochs together with the semantic route before the next
+        # identity-bearing planner frame is admitted.
+        self.active_origin_epoch = getattr(
+            self, "latest_origin_epoch", None
+        )
+        self.active_projection_epoch = getattr(
+            self, "latest_projection_epoch", None
+        )
         self.active_frontier_map_epoch = getattr(
             self, "latest_frontier_map_epoch", None
         ) if self.active_intent_source == "global_slam_frontier" else None
@@ -184,6 +239,11 @@ class TebGoalBridgeMissionRuntimeMixin:
             getattr(self, "latest_target_viewpoint_attempt_id", "") or ""
         )
         self.active_goal_context = dict(self.latest_goal_context)
+        self.active_predecessor_contract = (
+            None
+            if getattr(self, "latest_predecessor_contract", None) is None
+            else dict(self.latest_predecessor_contract)
+        )
         self._refresh_persistent_action_contract_locked(semantic_goal)
         self.active_best_distance = None
         self.active_progress_monotonic = now_for(self)
@@ -201,8 +261,25 @@ class TebGoalBridgeMissionRuntimeMixin:
             priority=int(self.active_intent_priority),
             source=self.active_intent_source,
             transaction_id=int(self.latest_goal_transaction_id),
+            lifecycle_transaction_id=int(
+                self._canonical_lifecycle_transaction_id()
+            ),
             graph_transaction_id=int(self.active_graph_transaction_id),
             epoch=int(self.latest_target_epoch),
+            map_epoch=self.active_route_map_epoch,
+            origin_epoch=self.active_origin_epoch,
+            projection_epoch=self.active_projection_epoch,
+            route_kind=str(self.active_route_kind or ""),
+            mission_route_kind=str(self.active_mission_route_kind or ""),
+            graph_action=str(getattr(self, "active_graph_action", "") or ""),
+            graph_obligation_kind=str(
+                getattr(self, "active_graph_obligation_kind", "") or ""
+            ),
+            predecessor_contract=(
+                None
+                if self.active_predecessor_contract is None
+                else dict(self.active_predecessor_contract)
+            ),
             target_track_id=self.active_target_track_id,
             goal_context=self.active_goal_context,
             goal=[
@@ -210,6 +287,37 @@ class TebGoalBridgeMissionRuntimeMixin:
                 round(float(semantic_goal.pose.position.y), 3),
             ],
         )
+        if predecessor_endpoint_pending is not None:
+            self.publish_bridge_status(
+                "persistent_frontier_successor_adopted",
+                predecessor_route_id=previous_route_id,
+                predecessor_action_generation=int(
+                    predecessor_endpoint_pending.get("action_generation", 0)
+                    or 0
+                ),
+                predecessor_transaction_id=int(
+                    predecessor_endpoint_pending.get("transaction_id", 0)
+                    or 0
+                ),
+                predecessor_lifecycle_transaction_id=int(
+                    predecessor_endpoint_pending.get(
+                        "lifecycle_transaction_id", 0
+                    )
+                    or 0
+                ),
+                route_id=int(self.active_route_id),
+                action_generation=int(self.action_generation),
+                transaction_id=int(self.latest_goal_transaction_id),
+                lifecycle_transaction_id=int(
+                    self._canonical_lifecycle_transaction_id()
+                ),
+                graph_transaction_id=int(self.active_graph_transaction_id),
+                map_epoch=self.active_route_map_epoch,
+                origin_epoch=self.active_origin_epoch,
+                projection_epoch=self.active_projection_epoch,
+                controller_lease="held",
+                semantic_only=True,
+            )
 
     def _promote_persistent_frontier_prefetch_locked(self):
         """Release one pre-admitted successor before a route-end stop."""

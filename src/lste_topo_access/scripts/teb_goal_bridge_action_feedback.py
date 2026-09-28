@@ -41,15 +41,25 @@ class TebGoalBridgeActionFeedbackMixin:
             )
             self.active_feedback_frame = base_pose.header.frame_id
             self.last_feedback_pose_global = copy.deepcopy(base_pose)
-            if self.active_motion_reference is None:
-                self.active_motion_reference = (float(base.x), float(base.y))
-                self.active_motion_progress_monotonic = now
-            elif math.hypot(
-                base.x - self.active_motion_reference[0],
-                base.y - self.active_motion_reference[1],
-            ) >= self.progress_epsilon:
-                self.active_motion_reference = (float(base.x), float(base.y))
-                self.active_motion_progress_monotonic = now
+            # ``MoveBaseFeedback.base_position`` can jump while a planner is
+            # oscillating or while actionlib is settling a predecessor.  The
+            # bridge must not treat that jump as physical progress.  The
+            # odometry callback owns the normal motion clock; retain this
+            # feedback fallback only for launch configurations without a pose
+            # sample after the current dispatch.
+            odom_sample_after_dispatch = float(
+                getattr(self, "odom_pose_monotonic", 0.0) or 0.0
+            ) > float(getattr(self, "last_dispatch_monotonic", 0.0) or 0.0)
+            if not odom_sample_after_dispatch:
+                if self.active_motion_reference is None:
+                    self.active_motion_reference = (float(base.x), float(base.y))
+                    self.active_motion_progress_monotonic = now
+                elif math.hypot(
+                    base.x - self.active_motion_reference[0],
+                    base.y - self.active_motion_reference[1],
+                ) >= self.progress_epsilon:
+                    self.active_motion_reference = (float(base.x), float(base.y))
+                    self.active_motion_progress_monotonic = now
             self._update_navfn_path_progress_locked(now)
             if (
                 self.active_best_distance is None

@@ -53,6 +53,8 @@ class GraphRouteActionTransaction:
     transaction_id: int
     plan: GraphRoutePlan
     map_epoch: object = None
+    origin_epoch: object = None
+    projection_epoch: object = None
     phase: str = "prepared"
     materialization: GraphRouteMaterialization = None
 
@@ -79,6 +81,8 @@ class GraphRouteActionTransaction:
             "transaction_id": int(self.transaction_id),
             "graph_transaction_id": int(self.graph_transaction_id),
             "map_epoch": self.map_epoch,
+            "origin_epoch": self.origin_epoch,
+            "projection_epoch": self.projection_epoch,
             "phase": str(self.phase),
             "plan": self.plan.as_dict(),
             "materialized": (
@@ -553,6 +557,13 @@ def materialize_graph_route_action(plan, candidate, *, branch_first=False):
                 accepted=False,
                 plan=plan,
                 reason="portal_crossing_intent_replaced",
+                **common,
+            )
+        if not _candidate_has_portal_proof(candidate):
+            return GraphRouteMaterialization(
+                accepted=False,
+                plan=plan,
+                reason="portal_crossing_requires_physical_portal_route",
                 **common,
             )
         expected_portal = _positive_id(plan.first_portal_id)

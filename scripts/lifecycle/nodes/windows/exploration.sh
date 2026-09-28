@@ -43,6 +43,7 @@ start_exploration_windows() {
       unreachable_grace:=$GLOBAL_FRONTIER_UNREACHABLE_GRACE rejected_timeout:=$GLOBAL_FRONTIER_REJECTED_TIMEOUT \\
       completed_radius:=$GLOBAL_FRONTIER_COMPLETED_RADIUS \\
       exploration_method:=$GLOBAL_FRONTIER_METHOD \\
+      target_done_policy:=$TARGET_DONE_POLICY \\
       region_memory_radius:=$GLOBAL_FRONTIER_REGION_MEMORY_RADIUS \\
       region_information_delta:=$GLOBAL_FRONTIER_REGION_INFORMATION_DELTA \\
       region_stagnation_timeout:=$GLOBAL_FRONTIER_REGION_STAGNATION_TIMEOUT \\

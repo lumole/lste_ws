@@ -27,6 +27,7 @@ class GlobalFrontierSelectionValidationMixin:
         # in the remaining heading/tier slots cannot change the evidence; let
         # the next planning wake observe a new snapshot instead.
         self.graph_route_materialization_pending = False
+        self.graph_route_materialization_invalidated = False
         tiers = ["strict_clearance"]
         if allow_observation_recovery:
             tiers.append("navfn_observation_recovery")
@@ -65,6 +66,14 @@ class GlobalFrontierSelectionValidationMixin:
                     allow_portal_transitions=allow_portal_transitions,
                     graph_route_planning=graph_route_planning,
                 )
+                if getattr(
+                    self, "graph_route_materialization_invalidated", False
+                ):
+                    # The adapter has already discarded the exhausted
+                    # durable obligation.  Do not fall through to heading or
+                    # score fallbacks with the stale local candidate.
+                    self.graph_route_materialization_invalidated = False
+                    return None
                 miss_count_after = int(
                     getattr(self, "graph_route_materialization_miss_count", 0)
                     or 0

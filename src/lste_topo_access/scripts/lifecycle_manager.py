@@ -53,6 +53,7 @@ class EventType(Enum):
     NAV_DISPATCHED = "NAV_DISPATCHED"
     NAV_REACHED = "NAV_REACHED"
     NAV_FAILED = "NAV_FAILED"
+    CONTROLLER_LEASE_RELEASE_ACK = "CONTROLLER_LEASE_RELEASE_ACK"
     EXECUTION_TERMINAL = "EXECUTION_TERMINAL"
     SYNC_REQUESTED = "SYNC_REQUESTED"
     SYNC_DONE = "SYNC_DONE"
@@ -84,6 +85,7 @@ class EventType(Enum):
     BRIDGE_FRONTIER_ENDPOINT = "BRIDGE_FRONTIER_ENDPOINT"
     TEB_BRIDGE_STATUS = "TEB_BRIDGE_STATUS"
     BRIDGE_NAVIGATION_HOLD = "BRIDGE_NAVIGATION_HOLD"
+    BRIDGE_MUX_STATUS = "BRIDGE_MUX_STATUS"
     ACTION_FEEDBACK = "ACTION_FEEDBACK"
     ACTION_DONE = "ACTION_DONE"
     BRIDGE_WAKE = "BRIDGE_WAKE"
@@ -186,10 +188,25 @@ class LifecycleManager:
     # first safe route.
     _TRANSACTION_INDEPENDENT_EVENT_TYPES = frozenset({
         EventType.BRIDGE_NAVIGATION_HOLD,
+        EventType.BRIDGE_MUX_STATUS,
         EventType.MAP_UPDATED,
         EventType.COSTMAP_UPDATED,
         EventType.POSE_UPDATED,
         EventType.SCAN_UPDATED,
+    })
+    # Frontier status carries causal release/terminal observations for a
+    # predecessor route and may arrive after the bridge has adopted a
+    # successor lifecycle transaction. Rebind it to the transaction current at
+    # tick time without coalescing it or weakening the route identity checks in
+    # the domain handler. This prevents a valid release request from being
+    # discarded solely because its ingress callback ran before mission_goal.
+    _TRANSACTION_REBOUND_EVENT_TYPES = frozenset({
+        EventType.CONTROLLER_LEASE_RELEASE_ACK,
+        EventType.BRIDGE_FRONTIER_STATUS,
+        # A planner contract is downstream observation.  It carries the
+        # producer's route identity for validation, but must not advance this
+        # node's lifecycle before the canonical mission/adoption event.
+        EventType.BRIDGE_PLANNER_COMMAND_CONTRACT,
     })
     _TRANSACTION_UNIQUE_BITS = 64
     _TRANSACTION_ID_LOCK = threading.Lock()
@@ -350,6 +367,16 @@ class LifecycleManager:
             queued = int(self._highest_accepted_transaction_id or 0)
         return max(current, queued)
 
+    def latest_transaction_id(self) -> int:
+        """Return the newest lifecycle identity available to an output.
+
+        A route may be published from the timer while a newer canonical event
+        is already queued.  Outputs must use that high-water identity instead
+        of re-emitting the last applied transaction and creating a stale
+        downstream contract.
+        """
+        return self.transaction_high_water_mark()
+
     def is_stale_transaction(self, transaction_id: int) -> bool:
         """Return whether a positive wire transaction is below the high water."""
         try:
@@ -434,22 +461,37 @@ class LifecycleManager:
             raise RuntimeError("hard resets are owned by tick()")
         reset_time = self._time_fn() if now is None else float(now)
         requested = 0 if transaction_id is None else int(transaction_id)
+        if transaction_id is None and event is not None:
+            reset_identity = self._reset_identity(event)
+            if reset_identity is not None:
+                requested = int(reset_identity[1])
         with self._state_lock:
             previous = self.current_state
             current = int(self.current_transaction_id or 0)
+            # A new reset identity is an explicit distributed barrier. Its
+            # request can arrive after a concurrent route message has already
+            # advanced this local high-water mark, but that message belongs to
+            # the pre-reset queue and will be discarded below. Old reset
+            # identities are rejected by ``enqueue`` before reaching here.
+            canonical_reset = bool(
+                event is not None
+                and event.type == EventType.RESET
+                and self._reset_identity(event) is not None
+            )
             if not self.allow_local_transactions and (
-                requested <= 0 or requested <= current
+                requested <= 0 or (requested <= current and not canonical_reset)
             ):
                 raise RuntimeError(
                     "hard reset requires a newer canonical wire transaction"
                 )
             candidate = requested if requested > 0 else self._new_transaction_id()
             if candidate <= self.current_transaction_id:
-                if not self.allow_local_transactions:
+                if not self.allow_local_transactions and not canonical_reset:
                     raise RuntimeError(
                         "hard reset cannot derive a local transaction"
                     )
-                candidate = self.current_transaction_id + 1
+                if self.allow_local_transactions:
+                    candidate = self.current_transaction_id + 1
             self.current_transaction_id = candidate
             self._next_transaction_id = candidate
             self.current_state = State.IDLE
@@ -816,6 +858,17 @@ class LifecycleManager:
                     self.discarded_stale_events += 1
                     stale += 1
                     continue
+                transaction_rebound = (
+                    event.type in self._TRANSACTION_REBOUND_EVENT_TYPES
+                )
+                if transaction_rebound:
+                    event = Event(
+                        event.type,
+                        self.current_transaction_id,
+                        event.payload,
+                        event.created_at,
+                        event.generation,
+                    )
                 if event.type in self._TRANSACTION_INDEPENDENT_EVENT_TYPES:
                     # Apply the latest sampled state to whichever mission
                     # transaction is current when the timer owns the tick.
@@ -830,17 +883,24 @@ class LifecycleManager:
                         self._highest_accepted_transaction_id
                     )
                 if (
-                    event.transaction_id < highest_queued_transaction
+                    not transaction_rebound
+                    and event.transaction_id < highest_queued_transaction
                     and highest_queued_transaction > self.current_transaction_id
                 ):
                     self.discarded_stale_events += 1
                     stale += 1
                     continue
-                if event.transaction_id < self.current_transaction_id:
+                if (
+                    not transaction_rebound
+                    and event.transaction_id < self.current_transaction_id
+                ):
                     self.discarded_stale_events += 1
                     stale += 1
                     continue
-                if event.transaction_id != self.current_transaction_id:
+                if (
+                    not transaction_rebound
+                    and event.transaction_id != self.current_transaction_id
+                ):
                     # A message carrying a newer lifecycle identity is the
                     # first observation of a new distributed transaction.
                     # Adopt it before dispatching the fact; dropping it here

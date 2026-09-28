@@ -727,7 +727,15 @@ class CmdVelMuxNode:
                 reason = "active_action_generation_missing"
             elif nonzero and active_transaction_id not in (0, transaction_id):
                 reason = "active_transaction_mismatch"
-            elif nonzero and route_id > 0 and graph_transaction_id <= 0:
+            elif (
+                nonzero
+                and route_id > 0
+                and graph_transaction_id <= 0
+                and (
+                    planner_graph_transaction_id > 0
+                    or active_graph_transaction_id > 0
+                )
+            ):
                 reason = "missing_graph_transaction_id"
             elif nonzero and graph_transaction_id != planner_graph_transaction_id:
                 reason = "graph_transaction_mismatch"

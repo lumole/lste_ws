@@ -68,9 +68,25 @@ class TebGoalBridgeLifecycleMixin:
         return value if value > 0 else None
 
     def _local_lifecycle_transaction_id(self):
-        return int(
-            getattr(self.lifecycle_manager, "current_transaction_id", 0) or 0
+        return self._canonical_lifecycle_transaction_id()
+
+    def _canonical_lifecycle_transaction_id(self):
+        """Return the exact lifecycle identity of the latest mission route."""
+        inherited = int(
+            getattr(self, "latest_lifecycle_transaction_id", 0) or 0
         )
+        if inherited > 0:
+            # The mission command is the canonical owner.  A bridge-local
+            # lifecycle high-water may advance while this route is draining;
+            # it must not rewrite the action's identity.
+            return inherited
+        manager = getattr(self, "lifecycle_manager", None)
+        latest = getattr(manager, "latest_transaction_id", None)
+        if callable(latest):
+            current = int(latest() or 0)
+        else:
+            current = int(getattr(manager, "current_transaction_id", 0) or 0)
+        return current
 
     @staticmethod
     def _canonical_instruction_identity(payload):
@@ -86,6 +102,12 @@ class TebGoalBridgeLifecycleMixin:
             route_id = int(value.get("route_id", 0) or 0)
             graph_id = int(value.get("graph_transaction_id", 0) or 0)
             map_epoch = int(value.get("map_epoch", 0) or 0)
+            origin_epoch = int(
+                value.get("origin_epoch", map_epoch) or 0
+            )
+            projection_epoch = int(
+                value.get("projection_epoch", map_epoch) or 0
+            )
             priority = int(value.get("priority", 0) or 0)
         except (TypeError, ValueError):
             return None, "invalid_canonical_identity"
@@ -100,6 +122,8 @@ class TebGoalBridgeLifecycleMixin:
             "route_id": route_id,
             "graph_transaction_id": graph_id,
             "map_epoch": map_epoch,
+            "origin_epoch": origin_epoch,
+            "projection_epoch": projection_epoch,
             "transaction_id": semantic_transaction_id,
             "priority": priority,
             "source": str(value.get("source", "") or "").strip().lower(),
@@ -109,6 +133,10 @@ class TebGoalBridgeLifecycleMixin:
             return identity, "missing_lifecycle_transaction_id"
         if map_epoch <= 0:
             return identity, "missing_map_epoch"
+        if origin_epoch <= 0:
+            return identity, "missing_origin_epoch"
+        if projection_epoch <= 0:
+            return identity, "missing_projection_epoch"
         if identity["event"] in ("mission_goal", "target_terminal_observation") and (
             identity["transaction_id"] <= 0
         ):
@@ -122,7 +150,25 @@ class TebGoalBridgeLifecycleMixin:
                     return identity, "invalid_goal"
             except (TypeError, ValueError):
                 return identity, "invalid_goal"
-        if route_id <= 0 or graph_id <= 0:
+        direct_target_mission = (
+            identity["event"] == "mission_goal"
+            and identity["source"].startswith("target_")
+        )
+        # ``target_terminal_observation`` is an ownership-boundary command,
+        # not an executable route.  It intentionally has route=0/graph=0
+        # while it asks the bridge to release the predecessor target lease.
+        # Keep the lifecycle/map identity checks above strict, but do not
+        # confuse this boundary with a malformed mission route.
+        target_terminal_boundary = (
+            identity["event"] == "target_terminal_observation"
+        )
+        if route_id <= 0 and not target_terminal_boundary:
+            return identity, "missing_route_identity"
+        if (
+            graph_id <= 0
+            and not direct_target_mission
+            and not target_terminal_boundary
+        ):
             return identity, "missing_route_identity"
         return identity, ""
 
@@ -136,6 +182,8 @@ class TebGoalBridgeLifecycleMixin:
             ("route_id", "canonical_route_high_water"),
             ("graph_transaction_id", "canonical_graph_high_water"),
             ("map_epoch", "canonical_map_epoch_high_water"),
+            ("origin_epoch", "canonical_origin_epoch_high_water"),
+            ("projection_epoch", "canonical_projection_epoch_high_water"),
         ):
             incoming = int(identity.get(field, 0) or 0)
             high_water = int(getattr(self, attribute, 0) or 0)
@@ -163,6 +211,17 @@ class TebGoalBridgeLifecycleMixin:
             int(getattr(self, "canonical_map_epoch_high_water", 0) or 0),
             int(identity.get("map_epoch", 0) or 0),
         )
+        self.canonical_origin_epoch_high_water = max(
+            int(getattr(self, "canonical_origin_epoch_high_water", 0) or 0),
+            int(identity.get("origin_epoch", 0) or 0),
+        )
+        self.canonical_projection_epoch_high_water = max(
+            int(
+                getattr(self, "canonical_projection_epoch_high_water", 0)
+                or 0
+            ),
+            int(identity.get("projection_epoch", 0) or 0),
+        )
 
     def _record_canonical_rejection(self, reason, identity=None):
         """Log a dropped downstream instruction without mutating route state."""
@@ -184,6 +243,12 @@ class TebGoalBridgeLifecycleMixin:
                 identity.get("graph_transaction_id", 0) or 0
             ),
             received_map_epoch=int(identity.get("map_epoch", 0) or 0),
+            received_origin_epoch=int(
+                identity.get("origin_epoch", 0) or 0
+            ),
+            received_projection_epoch=int(
+                identity.get("projection_epoch", 0) or 0
+            ),
         )
         rospy.logwarn(
             "TEB goal bridge discarded instruction: event=%s reason=%s "
@@ -276,7 +341,7 @@ class TebGoalBridgeLifecycleMixin:
         # UUID advance this bridge past a GoalManager transaction that is still
         # waiting at the warm-slice boundary.
         current_transaction_id = int(
-            getattr(self.lifecycle_manager, "current_transaction_id", 0) or 0
+            self._canonical_lifecycle_transaction_id()
         )
         return self._enqueue_bridge_event(
             EventType.BRIDGE_TURN_STATUS,
@@ -317,6 +382,14 @@ class TebGoalBridgeLifecycleMixin:
     def on_task_done(self, message):
         return self._enqueue_bridge_event(EventType.BRIDGE_TASK_DONE, message)
 
+    def on_navigation_hold(self, message):
+        """Queue the mission-level intentional zero-velocity gate."""
+        return self._enqueue_bridge_event(
+            EventType.BRIDGE_NAVIGATION_HOLD,
+            message,
+            transaction_id=0,
+        )
+
     def on_persistent_target_plan_result(self, message):
         # ``transaction_id`` in the C++ result is the semantic target command
         # identity, not this bridge's distributed lifecycle transaction. Keep
@@ -327,8 +400,7 @@ class TebGoalBridgeLifecycleMixin:
             EventType.BRIDGE_TARGET_RESULT,
             message,
             transaction_id=int(
-                getattr(self.lifecycle_manager, "current_transaction_id", 0)
-                or 0
+                self._canonical_lifecycle_transaction_id()
             ),
         )
 
@@ -439,6 +511,7 @@ class TebGoalBridgeLifecycleMixin:
             EventType.BRIDGE_POSE: TebGoalBridgeTebRuntimeMixin.on_pose,
             EventType.BRIDGE_MODE: TebGoalBridgeMissionControlMixin.on_mode,
             EventType.BRIDGE_TASK_DONE: TebGoalBridgeMissionControlMixin.on_task_done,
+            EventType.BRIDGE_NAVIGATION_HOLD: TebGoalBridgeMissionControlMixin.on_navigation_hold,
             EventType.BRIDGE_TARGET_RESULT: TebGoalBridgePersistentTargetResultMixin.on_persistent_target_plan_result,
             EventType.BRIDGE_FRONTIER_ENDPOINT: TebGoalBridgePersistentFrontierEndpointMixin.on_persistent_frontier_endpoint_reached,
         }
@@ -513,6 +586,12 @@ class TebGoalBridgeLifecycleMixin:
         previous_route_id = int(getattr(self, "active_route_id", 0) or 0)
         previous_intent = bool(getattr(self, "intent_seen", False))
         previous_action_active = bool(getattr(self, "action_active", False))
+        # A hard reset may be the boundary that issued cancel_goal. Preserve
+        # the old client's transport gate across state reinitialization; a new
+        # SimpleActionClient cannot observe the goal that is still settling.
+        transport_handoff_pending = getattr(
+            self, "transport_handoff_pending", None
+        )
         if callable(getattr(self, "cancel_locked", None)):
             self.cancel_locked("experiment_hard_reset")
         clear_persistent = getattr(
@@ -532,6 +611,9 @@ class TebGoalBridgeLifecycleMixin:
         # MoveBase goal after the reset.
         initialize_bridge_state(self)
         self.action_generation = max(1, previous_generation + 1)
+        if isinstance(transport_handoff_pending, dict):
+            self.transport_handoff_pending = transport_handoff_pending
+            self.transport_handoff_last_report_monotonic = 0.0
         self._last_hard_reset_id = reset_id
         self._last_hard_reset_transaction_id = int(new_transaction_id)
         self._hard_reset_count += 1
@@ -586,7 +668,7 @@ class TebGoalBridgeLifecycleMixin:
                 publish(
                     "lifecycle_failure_cleanup",
                     lifecycle_transaction_id=int(
-                        self.lifecycle_manager.current_transaction_id
+                        self._canonical_lifecycle_transaction_id()
                     ),
                 )
 

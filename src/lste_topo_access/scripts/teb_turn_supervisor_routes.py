@@ -175,6 +175,8 @@ class TebTurnSupervisorRoutesMixin:
             self.active_action_source,
             int(getattr(self, "active_action_route_id", 0) or 0),
             getattr(self, "active_action_map_epoch", None),
+            getattr(self, "active_action_origin_epoch", None),
+            getattr(self, "active_action_projection_epoch", None),
             int(
                 getattr(self, "active_action_graph_transaction_id", 0) or 0
             ),

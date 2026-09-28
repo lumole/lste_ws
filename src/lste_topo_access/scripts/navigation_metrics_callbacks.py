@@ -62,6 +62,10 @@ class NavigationMetricsCallbacksMixin:
             event = str(payload.get("event", "unknown"))
             self._failure_record_context_locked("goal", event, payload)
             self._record_target_lifecycle_locked(event, payload)
+            if event in ("target_room_entry_confirmed", "target_task_completed"):
+                evidence = str(payload.get("completion_evidence", "") or "").strip()
+                if evidence:
+                    self.task_done_completion_evidence = evidence
             if event == "target_follow_confirmed":
                 if self.target_follow_confirmed_ros is None:
                     self.target_follow_confirmed_ros = rospy.Time.now().to_sec()
@@ -181,6 +185,14 @@ class NavigationMetricsCallbacksMixin:
                         "INFO",
                         "task_completed",
                         latency_seconds=round(self.task_done_ros - self.start_ros, 3),
+                        completion_evidence=self.task_done_completion_evidence,
+                        task_done_policy=(
+                            (self.run_context.get("target_thresholds") or {}).get(
+                                "done_policy"
+                            )
+                            if isinstance(getattr(self, "run_context", None), dict)
+                            else None
+                        ),
                         target_acquired_latency=(
                             None if self.target_first_seen_ros is None else
                             round(self.target_first_seen_ros - self.start_ros, 3)
@@ -191,7 +203,12 @@ class NavigationMetricsCallbacksMixin:
                         ),
                         completion_snapshot=completion_snapshot,
                     )
-                self._write("INFO", "task_done", value=done)
+                self._write(
+                    "INFO",
+                    "task_done",
+                    value=done,
+                    completion_evidence=self.task_done_completion_evidence,
+                )
 
     def on_navigation_hold(self, message):
         with self.lock:

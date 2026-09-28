@@ -50,10 +50,21 @@ class TebTurnSupervisorLifecycleMixin:
             return None
         return value if value > 0 else None
 
-    def _enqueue_turn_event(self, event_type, payload=None, transaction_id=None):
-        if transaction_id is None:
+    def _enqueue_turn_event(
+        self, event_type, payload=None, transaction_id=None,
+        transaction_independent=False,
+    ):
+        if transaction_independent:
+            # Telemetry may describe a newer bridge route before the bridge's
+            # adoption status reaches this node.  Keep its wire identity for
+            # handler-side validation, but bind queue ordering to the local
+            # lifecycle at tick time rather than advancing high-water here.
+            transaction_id = 0
+        elif transaction_id is None:
             transaction_id = self._transaction_id_from_message(payload)
         if (
+            not transaction_independent
+            and
             transaction_id is not None
             and self.lifecycle_manager.is_stale_transaction(transaction_id)
         ):
@@ -77,7 +88,11 @@ class TebTurnSupervisorLifecycleMixin:
         )
 
     def on_bridge_status(self, message):
-        return self._enqueue_turn_event(EventType.BRIDGE_FRONTIER_STATUS, message)
+        return self._enqueue_turn_event(
+            EventType.BRIDGE_FRONTIER_STATUS,
+            message,
+            transaction_independent=True,
+        )
 
     def on_goal(self, message):
         return self._enqueue_turn_event(EventType.BRIDGE_GOAL, message)
@@ -95,14 +110,10 @@ class TebTurnSupervisorLifecycleMixin:
         return self._enqueue_turn_event(EventType.BRIDGE_PLANNER_COMMAND, message)
 
     def on_planner_command_contract(self, message):
-        try:
-            transaction_id = int(message.lifecycle_transaction_id or 0)
-        except (AttributeError, TypeError, ValueError):
-            transaction_id = None
         return self._enqueue_turn_event(
             EventType.BRIDGE_PLANNER_COMMAND_CONTRACT,
             message,
-            transaction_id if transaction_id and transaction_id > 0 else None,
+            transaction_independent=True,
         )
 
     def on_teb_feedback(self, message):
@@ -122,6 +133,14 @@ class TebTurnSupervisorLifecycleMixin:
         self.latest_navigation_hold_sample = bool(message.data)
         return self._enqueue_turn_event(
             EventType.BRIDGE_NAVIGATION_HOLD, message
+        )
+
+    def on_cmd_vel_mux_status(self, message):
+        """Queue the actuator-boundary result for the serialized controller FSM."""
+        return self._enqueue_turn_event(
+            EventType.BRIDGE_MUX_STATUS,
+            message,
+            transaction_independent=True,
         )
 
     def on_hard_reset(self, message):
@@ -166,6 +185,7 @@ class TebTurnSupervisorLifecycleMixin:
             EventType.BRIDGE_MODE: TebTurnSupervisorControlMixin.on_mode,
             EventType.BRIDGE_TASK_DONE: TebTurnSupervisorControlMixin.on_task_done,
             EventType.BRIDGE_NAVIGATION_HOLD: TebTurnSupervisorControlMixin.on_navigation_hold,
+            EventType.BRIDGE_MUX_STATUS: TebTurnSupervisorCallbacksMixin.on_cmd_vel_mux_status,
         }
         handler = handlers.get(event.type)
         if handler is None:

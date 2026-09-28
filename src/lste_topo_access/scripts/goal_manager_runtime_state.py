@@ -58,6 +58,13 @@ class GoalManagerRuntimeStateMixin:
         self.canonical_route_high_water = 0
         self.canonical_graph_high_water = 0
         self.canonical_map_epoch_high_water = 0
+        self.canonical_origin_epoch_high_water = 0
+        self.canonical_projection_epoch_high_water = 0
+        # ``action_generation`` is allocated by TEB Bridge, not GoalManager.
+        # Keep the last observed transport identity for arbitration logs; zero
+        # means that the current semantic decision has not been dispatched.
+        self.bridge_action_generation = 0
+        self.bridge_action_identity = None
         # The frontier planner labels whether the current goal is a validated
         # route connector or the final approach point.  This semantic is
         # forwarded with the goal intent so the TEB bridge can perform an
@@ -70,7 +77,13 @@ class GoalManagerRuntimeStateMixin:
         # coordinate alone cannot tell the TEB bridge whether a map update is
         # a continuous path extension or an unrelated branch.
         self.global_frontier_route_id = 0
+        # Lifecycle identity received with the current Global Frontier route.
+        # Keep it explicit so downstream mission publication does not infer a
+        # route's identity from an unrelated local callback.
+        self.global_frontier_lifecycle_transaction_id = 0
         self.global_frontier_map_epoch = None
+        self.global_frontier_origin_epoch = None
+        self.global_frontier_projection_epoch = None
         # Identity of the graph planner transaction.  This is deliberately
         # separate from GoalManager's mission transaction_id.
         self.global_frontier_graph_transaction_id = 0
@@ -78,6 +91,7 @@ class GoalManagerRuntimeStateMixin:
         self.global_frontier_graph_obligation_kind = ""
         self.global_frontier_transition_kind = "initial"
         self.global_frontier_predecessor_route_id = 0
+        self.global_frontier_predecessor_contract = None
         self.global_frontier_transition_distance = None
         # A map-frame coordinate is only a short-lived execution point.  The
         # companion context identifies its durable Place/WorkItem or portal
@@ -92,6 +106,11 @@ class GoalManagerRuntimeStateMixin:
         # release cleanly after handoff instead of leaving the controller
         # stopped on an obsolete target pose.
         self.last_frontier_goal: Optional[PoseStamped] = None
+        # A frontier terminal is a one-way boundary.  The cached endpoint
+        # remains useful for diagnostics, but it must not be republished as a
+        # new mission transaction until Global Frontier supplies a higher
+        # route ID.
+        self.last_published_frontier_route_id = 0
         # Set only when TEB reports a terminal event for the current frontier
         # pose. It is consumed by the next successful publish, so one finished
         # action can release exactly one held waypoint.
@@ -253,6 +272,13 @@ class GoalManagerRuntimeStateMixin:
         # TEB remain the execution authorities after the goal is committed.
         self.target_route_validation_last_plan: List[PoseStamped] = []
         self.target_route_validation_last_start_heading: Optional[float] = None
+        # In doorway-entry mode, this is the one Navfn-proven task route to
+        # the doorway. It remains owned by the task until task_done or an
+        # explicit controller failure releases it.
+        self.target_room_entry_goal: Optional[PoseStamped] = None
+        self.target_room_entry_retry_blocked = False
+        self.target_room_entry_blocked_route_id = 0
+        self.frontier_terminal_count = 0
         self.target_route_continuity_deferred = False
         self.target_route_continuity_deferred_goal: Optional[PoseStamped] = None
         self.target_route_hold_last_emit = 0.0
@@ -290,6 +316,13 @@ class GoalManagerRuntimeStateMixin:
         # candidate must never inherit a previous track's arrival terminal.
         self.target_approach_track_id = ""
         self.task_done_published = False
+        # One-way benchmark acceptance state. It is reset on process/hard-task
+        # boundaries, not on visual-track loss, so entering the target room
+        # remains a valid terminal fact even if perception is unavailable.
+        self.target_room_entry_seen_outside = False
+        self.target_room_entry_inside_since = None
+        self.target_room_entry_last_pose = None
+        self.target_room_entry_event_reported = False
         # Monotonic within this GoalManager process. It is diagnostic identity
         # for one execution transaction, not a frontier route id.
         self.goal_command_id = 0

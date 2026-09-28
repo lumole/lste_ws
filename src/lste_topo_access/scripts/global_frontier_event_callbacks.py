@@ -19,6 +19,46 @@ from clock_provider import now_for
 
 
 class GlobalFrontierEventCallbacksMixin:
+    def _target_visual_control_suppressed(self):
+        """Return whether room-entry completion owns the mission boundary."""
+        return str(
+            getattr(self, "target_done_policy", "visual_target") or ""
+        ).strip().lower() == "target_room_entry"
+
+    def _apply_target_done_policy(self, policy):
+        """Apply the shared completion policy at the graph ownership boundary."""
+        policy = str(policy or "").strip().lower()
+        if policy not in (
+            "visual_target",
+            "target_room_entry",
+            "target_context",
+        ):
+            return False
+        previous = str(
+            getattr(self, "target_done_policy", "visual_target") or ""
+        ).strip().lower()
+        self.target_done_policy = policy
+        if policy == "target_room_entry" and previous != policy:
+            # A room-entry benchmark measures topology, so any detector-driven
+            # target obligation already queued before the policy arrived must
+            # be discarded at the same ownership boundary. Generic environment
+            # labels remain valid exploration evidence.
+            target_belief = getattr(self, "target_belief", None)
+            if target_belief is not None:
+                target_belief.reset(getattr(self, "current_task_version", ""))
+            target_work = getattr(self, "target_observation_work", None)
+            if target_work is not None:
+                target_work.reset(getattr(self, "current_task_version", ""))
+            self.pending_target_belief_observations = []
+            self.pending_target_track_ids = []
+            self.target_reinspection_pending = False
+            self.publish_status(
+                "target_visual_control_suppressed",
+                target_done_policy=policy,
+                reason="target_room_entry_completion_owns_mission",
+            )
+        return True
+
     @staticmethod
     def _enqueue_or_apply(owner, event_type, message, apply):
         enqueue = getattr(owner, "_enqueue_lifecycle_event", None)
@@ -58,6 +98,11 @@ class GlobalFrontierEventCallbacksMixin:
         target_observation_work = getattr(self, "target_observation_work", None)
         if target_observation_work is not None:
             target_observation_work.reset(task_version)
+        reopen_target_observation = getattr(
+            self, "_clear_target_observation_materialization_deferred", None
+        )
+        if callable(reopen_target_observation):
+            reopen_target_observation(None, reason="new_task")
         self.pending_semantic_observations = []
         self.pending_target_belief_observations = []
         self.pending_target_track_ids = []
@@ -157,6 +202,13 @@ class GlobalFrontierEventCallbacksMixin:
         if target_belief is None or place_id is None:
             return
         if target_labels:
+            reopen_target_observation = getattr(
+                self, "_clear_target_observation_materialization_deferred", None
+            )
+            if callable(reopen_target_observation):
+                reopen_target_observation(
+                    place_id, reason="new_target_detection_evidence"
+                )
             evidence = target_belief.observe_target(
                 self.current_task_version,
                 place_id,
@@ -238,6 +290,10 @@ class GlobalFrontierEventCallbacksMixin:
         labels, target_labels = self._detection_labels(message)
         if not labels:
             return
+        if self._target_visual_control_suppressed():
+            # Keep detector labels available for generic room/context evidence,
+            # but do not let target labels create a durable target route.
+            target_labels = []
         stamp = self._semantic_stamp(message)
         place_id = getattr(self, "current_physical_place_id", None)
         if place_id is None:
@@ -272,7 +328,13 @@ class GlobalFrontierEventCallbacksMixin:
             getattr(self, "current_task_version", "")
         ):
             return
+        self._apply_target_done_policy(payload.get("target_done_policy"))
         event = str(payload.get("event", "")).strip()
+        if self._target_visual_control_suppressed() and event.startswith("target_"):
+            # Room-entry completion is intentionally independent of visual
+            # target tracking. Ignore late target-track/segment events so they
+            # cannot recreate target observation work after suppression.
+            return
         place_id = getattr(self, "current_physical_place_id", None)
         if event == "target_track_started":
             track_id = str(payload.get("target_track_id", "")).strip()
@@ -355,7 +417,11 @@ class GlobalFrontierEventCallbacksMixin:
     ):
         """Expose the finite-state semantic policy to the planner."""
         evidence = self.semantic_place_belief.evidence(place_id)
-        target_belief = getattr(self, "target_belief", None)
+        target_belief = (
+            None
+            if self._target_visual_control_suppressed()
+            else getattr(self, "target_belief", None)
+        )
         target_evidence = (
             None if target_belief is None else target_belief.evidence(place_id)
         )
@@ -603,6 +669,16 @@ class GlobalFrontierEventCallbacksMixin:
                 payload.get("active_route_map_epoch"),
                 identity.get("map_epoch"),
             ),
+            "origin_epoch": optional_int(
+                payload.get("origin_epoch"),
+                payload.get("active_origin_epoch"),
+                identity.get("origin_epoch"),
+            ),
+            "projection_epoch": optional_int(
+                payload.get("projection_epoch"),
+                payload.get("active_projection_epoch"),
+                identity.get("projection_epoch"),
+            ),
         }
 
     def _remember_bridge_dispatch_contract(self, payload):
@@ -610,6 +686,7 @@ class GlobalFrontierEventCallbacksMixin:
         event = str(payload.get("event", "")).strip()
         if event not in {
             "dispatch",
+            "persistent_mission_goal_adopted",
             "persistent_mission_path_adopted",
             "dispatch_contract_reaffirmed",
         }:
@@ -631,6 +708,20 @@ class GlobalFrontierEventCallbacksMixin:
         previous = contracts.get(contract["route_id"])
         if previous is None or contract["action_generation"] >= previous["action_generation"]:
             contracts[contract["route_id"]] = contract
+        if int(getattr(self, "active_route_id", 0) or 0) == contract["route_id"]:
+            # Complete the activation-time predecessor record with the
+            # mission transaction and action generation assigned downstream.
+            # Keep the route/lifecycle/epoch fields captured at activation if
+            # an out-of-order status carries a zero compatibility sentinel.
+            active_contract = getattr(
+                self, "active_route_dispatch_contract", None
+            )
+            merged = dict(active_contract) if isinstance(active_contract, dict) else {}
+            for field, value in contract.items():
+                if value not in (None, "", 0):
+                    merged[field] = value
+            if merged:
+                self.active_route_dispatch_contract = merged
         # Route IDs are monotonic. Keep the evidence lookup bounded during a
         # long exploration run.
         for route_id in sorted(contracts)[:-64]:
@@ -659,17 +750,33 @@ class GlobalFrontierEventCallbacksMixin:
         ):
             if contract[field] != expected[field]:
                 return False, "dispatch_contract_%s_mismatch" % field
+        # Persistent execution can advance the GoalManager semantic transaction
+        # while retaining one route/action lease.  Route, action generation,
+        # graph, and lifecycle identities above remain the hard boundary; the
+        # semantic transaction may only move forward, never backward.
+        expected_transaction_id = int(expected.get("transaction_id", 0) or 0)
+        received_transaction_id = int(contract.get("transaction_id", 0) or 0)
+        if (
+            expected_transaction_id > 0
+            and received_transaction_id < expected_transaction_id
+        ):
+            return False, "dispatch_contract_transaction_id_mismatch"
+        if received_transaction_id > expected_transaction_id:
+            expected["transaction_id"] = received_transaction_id
         if (
             expected.get("map_epoch") is not None
             and contract.get("map_epoch") != expected.get("map_epoch")
         ):
             return False, "dispatch_contract_map_epoch_mismatch"
-        if (
-            contract["transaction_id"] > 0
-            and expected["transaction_id"] > 0
-            and contract["transaction_id"] != expected["transaction_id"]
-        ):
-            return False, "dispatch_contract_transaction_mismatch"
+        for field in ("origin_epoch", "projection_epoch"):
+            expected_epoch = expected.get(field)
+            received_epoch = contract.get(field)
+            if (
+                expected_epoch is not None
+                and received_epoch is not None
+                and int(received_epoch) != int(expected_epoch)
+            ):
+                return False, "dispatch_contract_%s_mismatch" % field
         return True, "matched"
 
     def on_bridge_status(self, message):
@@ -996,6 +1103,14 @@ class GlobalFrontierEventCallbacksMixin:
             # This event-level obligation survives the asynchronous binding of
             # TargetObservationWork to a Place.  It is cleared only by an
             # accepted explicit release or task completion.
+            reopen_target_observation = getattr(
+                self, "_clear_target_observation_materialization_deferred", None
+            )
+            if callable(reopen_target_observation):
+                reopen_target_observation(
+                    getattr(self, "current_physical_place_id", None),
+                    reason="explicit_target_reinspection",
+                )
             self.target_reinspection_pending = True
         elif target_release_accepted:
             self.target_reinspection_pending = False

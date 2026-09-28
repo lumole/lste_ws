@@ -53,3 +53,4 @@ ROS_PORT: 11312
 GAZEBO_PORT: 11346
 # Number of days to retain timestamped log directories.
 LOG_RETENTION_DAYS: 15
+LOG_MAX_BYTES: 1000000000

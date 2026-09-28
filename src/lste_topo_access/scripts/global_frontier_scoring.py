@@ -7,7 +7,7 @@ tested without navigating the ROS callback code.
 
 import math
 
-from global_frontier_action_policy import unique_action_tiers
+from global_frontier_action_policy import KNOWN_ACTION_TIERS, unique_action_tiers
 from global_frontier_topology import frontier_score_bucket_prefixes
 
 
@@ -28,10 +28,16 @@ def make_score_pool():
 def initialise_score_pools(action_tiers):
     """Keep new/revisit decisions independent for every action tier.
 
-    ``probe`` is part of the action contract even when a context tuple was
-    built before candidate classification discovered a wall-bounded opening.
+    Candidate rehydration happens after the context is built, so a valid
+    candidate can carry a canonical action class that was absent from the
+    context's initial order.  Build a total pool map for the action contract;
+    callers still decide priority by the explicit order they pass to the
+    selector.
     """
-    action_tiers = unique_action_tiers(action_tiers, include_probe=True)
+    action_tiers = unique_action_tiers(
+        tuple(action_tiers or ()) + tuple(KNOWN_ACTION_TIERS),
+        include_probe=True,
+    )
     return {
         action_tier: {
             "new": make_score_pool(),

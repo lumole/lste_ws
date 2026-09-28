@@ -285,6 +285,19 @@ class GlobalFrontierExecutionResolutionMixin:
         route_distance, reason, watchdog,
     ):
         """Record a failed route lease before allowing another selector pass."""
+        # ``settle_active_work_item`` and ``release_active_frontier`` clear the
+        # mutable attempt/route fields. Capture the committed graph identity
+        # first so an active WorkItem failure can enter the same canonical
+        # materialization exclusion path as a pre-dispatch Navfn rejection.
+        durable_plan = None
+        durable_failure_epoch = getattr(self, "last_map_epoch", None)
+        find_plan = getattr(
+            self, "_graph_route_plan_for_active_durable_obligation", None
+        )
+        if callable(find_plan):
+            durable_plan = find_plan()
+        if durable_failure_epoch is None:
+            durable_failure_epoch = getattr(self, "active_route_map_epoch", None)
         settle_probe = getattr(self, "settle_active_portal_probe", None)
         if settle_probe is not None:
             settle_probe("failed", now, reason)
@@ -389,7 +402,86 @@ class GlobalFrontierExecutionResolutionMixin:
             local_egress_queued,
             portal_retry is not None and local_egress_queued,
         )
-        self.release_active_frontier()
+        terminal_contract = getattr(self, "active_terminal_contract", None)
+        terminal_contract = (
+            dict(terminal_contract)
+            if isinstance(terminal_contract, dict)
+            else None
+        )
+        # A watchdog failure can invalidate and cancel the route before the
+        # typed MoveBase terminal reaches Global Frontier.  The Bridge already
+        # has the dispatch-time contract in that case, so request the same
+        # exact release/ACK boundary instead of publishing a semantic-only
+        # release that leaves the Bridge's transport tombstone pending.
+        if terminal_contract is None:
+            dispatch_contracts = (
+                getattr(self, "_bridge_dispatch_contracts", None) or {}
+            )
+            candidate = dispatch_contracts.get(
+                int(getattr(self, "active_route_id", 0) or 0)
+            )
+            if isinstance(candidate, dict):
+                terminal_contract = dict(candidate)
+        await_controller_release_ack = bool(
+            getattr(self, "controller_owned_route_failure", False)
+            and int(getattr(self, "active_route_id", 0) or 0) > 0
+            and isinstance(terminal_contract, dict)
+        )
+        self.release_active_frontier(
+            queue_successor=not await_controller_release_ack,
+            await_controller_release_ack=await_controller_release_ack,
+            terminal_contract=terminal_contract,
+        )
+        if await_controller_release_ack:
+            self.publish_status(
+                "controller_failure_release_pending",
+                route_id=int(getattr(self, "last_released_route_id", 0) or 0),
+                transaction_id=int(
+                    getattr(self, "last_released_route_transaction_id", 0)
+                    or 0
+                ),
+                action_generation=int(
+                    getattr(self, "last_released_route_action_generation", 0)
+                    or 0
+                ),
+                lifecycle_transaction_id=int(
+                    getattr(
+                        self,
+                        "last_released_route_lifecycle_transaction_id",
+                        0,
+                    )
+                    or 0
+                ),
+                graph_transaction_id=int(
+                    getattr(
+                        self, "last_released_route_graph_transaction_id", 0
+                    )
+                    or 0
+                ),
+                map_epoch=getattr(self, "last_released_route_map_epoch", None),
+                origin_epoch=getattr(
+                    self, "last_released_route_origin_epoch", None
+                ),
+                projection_epoch=getattr(
+                    self, "last_released_route_projection_epoch", None
+                ),
+                reason=str(reason),
+            )
+        if durable_plan is not None:
+            # The route lease is already released above. The adapter now owns
+            # the durable obligation miss budget and can invalidate it without
+            # a second controller cancellation or a stale mutable attempt ID.
+            record_failure = getattr(
+                self,
+                "_record_active_durable_materialization_failure",
+                None,
+            )
+            if callable(record_failure):
+                record_failure(
+                    plan=durable_plan,
+                    map_epoch=durable_failure_epoch,
+                    reason=str(reason),
+                )
         if self.prefetched_frontier is None:
             self.prefetched_goal_map = None
 
@@ -445,9 +537,35 @@ class GlobalFrontierExecutionResolutionMixin:
         """Publish the complete, externally visible record for one failure."""
         # Consumers must explicitly release the old move_base action; this is
         # a mission lifecycle event, not private selector bookkeeping.
+        terminal_contract = getattr(self, "active_terminal_contract", None)
+        terminal_contract = (
+            terminal_contract if isinstance(terminal_contract, dict) else {}
+        )
+
+        def identity_int(value, fallback=0):
+            try:
+                return int(value or fallback)
+            except (TypeError, ValueError):
+                return int(fallback)
+
         self.publish_status(
             "route_invalidated",
             reason=reason,
+            transaction_id=identity_int(
+                terminal_contract.get("transaction_id")
+            ),
+            action_generation=identity_int(
+                terminal_contract.get("action_generation")
+            ),
+            lifecycle_transaction_id=identity_int(
+                terminal_contract.get("lifecycle_transaction_id")
+            ),
+            graph_transaction_id=identity_int(
+                terminal_contract.get("graph_transaction_id")
+            ),
+            map_epoch=terminal_contract.get("map_epoch"),
+            origin_epoch=terminal_contract.get("origin_epoch"),
+            projection_epoch=terminal_contract.get("projection_epoch"),
             goal=[round(float(x), 3), round(float(y), 3)],
             distance=round(float(distance), 3),
             elapsed=round(float(now - self.active_since), 3),

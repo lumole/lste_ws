@@ -142,6 +142,13 @@ class GoalManagerInputCallbacksMixin:
             # A task-version change invalidates the previous semantic
             # obligation. Never carry a confirmed target into a new mission.
             self.clear_target_memory(preserve_obligation=False)
+            self.target_room_entry_goal = None
+            self.target_room_entry_retry_blocked = False
+            self.target_room_entry_blocked_route_id = 0
+            self.frontier_terminal_count = 0
+            reset_room_entry = getattr(self, "reset_target_room_entry_state", None)
+            if callable(reset_room_entry):
+                reset_room_entry()
             self.set_navigation_hold(False, "new_task")
             # task_done is latched, so consumers need an explicit false for a
             # new task.

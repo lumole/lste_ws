@@ -30,8 +30,11 @@ def initialize_turn_supervisor_state(supervisor):
     supervisor.active_action_goal_transaction_id = 0
     supervisor.active_action_target_track_id = ""
     supervisor.active_action_transaction_id = 0
+    supervisor.active_action_lifecycle_transaction_id = 0
     supervisor.active_action_route_id = 0
     supervisor.active_action_map_epoch = None
+    supervisor.active_action_origin_epoch = None
+    supervisor.active_action_projection_epoch = None
     supervisor.active_action_graph_transaction_id = 0
     supervisor.active_action_generation = 0
     supervisor.active_action_identity = None
@@ -44,6 +47,8 @@ def initialize_turn_supervisor_state(supervisor):
     supervisor.planner_command_transaction_id = 0
     supervisor.planner_command_route_id = 0
     supervisor.planner_command_map_epoch = None
+    supervisor.planner_command_origin_epoch = None
+    supervisor.planner_command_projection_epoch = None
     supervisor.planner_command_graph_transaction_id = 0
     supervisor.planner_command_action_generation = 0
     supervisor.planner_command_action_identity = None
@@ -64,6 +69,12 @@ def initialize_turn_supervisor_state(supervisor):
     supervisor.recovery_identity = None
     supervisor.latest_recovery_command = Twist()
     supervisor.latest_recovery_command_wall = 0.0
+    # The mux is the only component that knows whether the command actually
+    # crossed the forward-only actuator boundary. Keep its latest identity-
+    # bearing result as sampled state for the timer-owned FSM.
+    supervisor.latest_mux_status = None
+    supervisor.latest_mux_status_wall = 0.0
+    supervisor.latest_mux_boundary_key = None
     supervisor.output_sequence = 0
     supervisor.last_output_transaction_id = 0
     supervisor.last_output_decision = "startup"
@@ -85,12 +96,15 @@ def initialize_turn_supervisor_state(supervisor):
     supervisor.latest_route_kind = ""
     supervisor.latest_route_id = 0
     supervisor.latest_map_epoch = None
+    supervisor.latest_origin_epoch = None
+    supervisor.latest_projection_epoch = None
     supervisor.latest_graph_transaction_id = 0
     supervisor.latest_intent_source = "unknown"
     supervisor.latest_intent_priority = 0
     supervisor.latest_intent_goal = None
     supervisor.latest_target_track_id = ""
     supervisor.turn_target_yaw = None
+    supervisor.turn_phase = ""
     supervisor.turn_goal_xy = None
     supervisor.turn_key = None
     supervisor.turn_action_identity = None
@@ -102,15 +116,36 @@ def initialize_turn_supervisor_state(supervisor):
     supervisor.turn_initial_abs_error = 0.0
     supervisor.turn_abs_rotation = 0.0
     supervisor.turn_rotation_cap = 0.0
+    # Turn budget is measured from odometry, never from the command emitted by
+    # this node.  A command can be blocked by the base, mux, or the physical
+    # environment while the odom pose remains unchanged.
+    supervisor.turn_last_odom_theta = None
+    supervisor.turn_last_odom_sample_wall = 0.0
+    supervisor.turn_last_odom_progress_wall = 0.0
+    supervisor.turn_odom_progress_epsilon = 0.0
+    supervisor.turn_no_progress_timeout = 0.0
+    supervisor.turn_odom_sample_count = 0
+    supervisor.turn_no_progress_releases = 0
     supervisor.turn_settle_until_wall = 0.0
     supervisor.turn_settle_yaw = None
     supervisor.stalled_route_candidate_identity = None
     supervisor.stalled_route_candidate_since_wall = 0.0
     supervisor.stalled_route_ready_identity = None
     supervisor.stalled_route_completed_identity = None
+    # A forward-only mux may repeatedly clamp the same authenticated TEB
+    # route's small reverse entry sample. Keep the selected forward trajectory
+    # eligible for that action until its identity changes; never carry it to a
+    # successor route.
+    supervisor.forward_only_trajectory_identity = None
+    # One bounded reorientation attempt belongs to one controller action. If
+    # it exhausts its rotation budget, the route watchdog must own the failure;
+    # re-entering the same turn would create an unbounded spin loop.
+    supervisor.stalled_route_reorientation_attempted_identity = None
     supervisor.turn_capped_releases = 0
     supervisor.turn_count = 0
     supervisor.turn_completed_count = 0
     supervisor.turn_released_count = 0
     supervisor.last_status_wall = 0.0
+    supervisor.last_output_command = Twist()
+    supervisor.last_output_wall = 0.0
     supervisor.tf_listener = tf.TransformListener()

@@ -26,6 +26,11 @@ class GlobalFrontierExecutionActiveRouteMixin:
             snapshot.now,
             portal_transition,
         )
+        if observation is None:
+            # A persistent Portal can be committed and released from the
+            # physical crossing observer before this method reaches the
+            # watchdog. The next selector tick owns the successor route.
+            return None, None
         watchdog = self.evaluate_active_route_watchdogs(
             x,
             y,
@@ -102,6 +107,8 @@ class GlobalFrontierExecutionActiveRouteMixin:
         observation, watchdog = self.observe_connected_active_route(
             snapshot, row, col, x, y, portal_transition,
         )
+        if observation is None:
+            return None, None
         # No-gain dwell is an observation diagnostic. The action remains the
         # bridge's property until its route-id-matched terminal arrives.
         early_promoted = self.prefetch_or_promote_connected_route(

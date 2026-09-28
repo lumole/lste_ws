@@ -17,6 +17,47 @@ from lifecycle_manager import EventType
 class GoalManagerTebCallbacksMixin:
     """Callbacks that commit or recover a single TEB navigation action."""
 
+    @staticmethod
+    def _bridge_status_identity(payload):
+        """Extract the transport identity observed from one Bridge status."""
+        def integer(*values):
+            for value in values:
+                try:
+                    return int(value or 0)
+                except (TypeError, ValueError):
+                    continue
+            return 0
+
+        return {
+            "route_id": integer(
+                payload.get("route_id"), payload.get("active_route_id")
+            ),
+            "action_generation": integer(
+                payload.get("action_generation"),
+                payload.get("active_action_generation"),
+            ),
+            "transaction_id": integer(
+                payload.get("transaction_id"),
+                payload.get("active_goal_transaction_id"),
+            ),
+            "lifecycle_transaction_id": integer(
+                payload.get("lifecycle_transaction_id")
+            ),
+            "graph_transaction_id": integer(
+                payload.get("graph_transaction_id"),
+                payload.get("active_graph_transaction_id"),
+            ),
+            "map_epoch": payload.get(
+                "map_epoch", payload.get("active_route_map_epoch")
+            ),
+            "origin_epoch": payload.get(
+                "origin_epoch", payload.get("active_origin_epoch")
+            ),
+            "projection_epoch": payload.get(
+                "projection_epoch", payload.get("active_projection_epoch")
+            ),
+        }
+
     def gather_teb_goal_terminal(self, msg: PoseStamped):
         enqueue = getattr(self, "_enqueue_lifecycle_event", None)
         if callable(enqueue):
@@ -37,6 +78,11 @@ class GoalManagerTebCallbacksMixin:
             return
         if not isinstance(payload, dict):
             return
+        bridge_identity = self._bridge_status_identity(payload)
+        self.bridge_action_identity = bridge_identity
+        self.bridge_action_generation = int(
+            bridge_identity["action_generation"]
+        )
         if str(payload.get("event", "")).strip() != (
             "target_terminal_observation_released"
         ):
@@ -256,6 +302,14 @@ class GoalManagerTebCallbacksMixin:
             return
         if self.last_goal_source != "global_slam_frontier":
             return
+        if getattr(self, "target_room_entry_retry_blocked", False):
+            self.target_room_entry_retry_blocked = False
+            self.target_room_entry_blocked_route_id = 0
+            self.publish_goal_arbitration(
+                "target_room_entry_retry_unblocked",
+                reason="frontier_terminal_after_failed_doorway_route",
+                route_id=int(getattr(self, "global_frontier_route_id", 0) or 0),
+            )
         # Match the committed frontier action history. ``last_goal`` may
         # already point at the next mission intent when move_base completes
         # the prior action.
@@ -291,6 +345,9 @@ class GoalManagerTebCallbacksMixin:
             )
             return
         self.teb_terminal_goal = msg
+        self.frontier_terminal_count = int(
+            getattr(self, "frontier_terminal_count", 0) or 0
+        ) + 1
         # The frontier node selects the successor. Let its update reach this
         # node on the first callback instead of waiting one cadence.
         self.next_update_time = 0.0
@@ -474,6 +531,20 @@ class GoalManagerTebCallbacksMixin:
         now = rospy.Time.now().to_sec()
         blocked_goal = copy.deepcopy(associated_goal)
         if fail_fast_failure:
+            if self.last_goal_source == "target_room_entry":
+                # Doorway-entry is a task route, not a visual target. Release
+                # only this cached handoff so frontier exploration can obtain
+                # a new map snapshot and prove the doorway again.
+                self.target_room_entry_goal = None
+                self.target_room_entry_retry_blocked = True
+                self.target_room_entry_blocked_route_id = int(
+                    getattr(self, "global_frontier_route_id", 0) or 0
+                )
+                self.publish_goal_arbitration(
+                    "target_room_entry_route_blocked",
+                    reason="controller_failure_requires_frontier_progress",
+                    route_id=self.target_room_entry_blocked_route_id,
+                )
             release = getattr(self, "release_failed_target_route", None)
             if callable(release):
                 release(

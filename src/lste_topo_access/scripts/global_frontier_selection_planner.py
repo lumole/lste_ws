@@ -23,6 +23,7 @@ from global_frontier_portal_probe_adapter import (
     selection_report,
 )
 from global_frontier_graph_route_gate import (
+    candidate_matches_graph_plan,
     candidate_refines_graph_plan,
     graph_plan_is_exclusive,
 )
@@ -35,6 +36,35 @@ from global_frontier_scoring import (
 
 class GlobalFrontierSelectionPlannerMixin:
     """Convert map evidence into local endpoints or one portal action."""
+
+    @staticmethod
+    def _graph_snapshot_identity_sets(candidates):
+        """Extract durable identities from candidates in one map snapshot."""
+        work_item_ids = set()
+        probe_ids = set()
+        portal_ids = set()
+        for candidate in candidates or ():
+            try:
+                work_item_id = int(getattr(candidate, "work_item_id", 0))
+            except (TypeError, ValueError):
+                work_item_id = 0
+            if work_item_id > 0:
+                work_item_ids.add(work_item_id)
+            try:
+                probe_id = int(getattr(candidate, "portal_id", 0))
+            except (TypeError, ValueError):
+                probe_id = 0
+            if probe_id > 0:
+                probe_ids.add(probe_id)
+            route = getattr(candidate, "route", ()) or ()
+            if len(route) > 19:
+                try:
+                    portal_id = int(route[19])
+                except (TypeError, ValueError):
+                    portal_id = 0
+                if portal_id > 0:
+                    portal_ids.add(portal_id)
+        return work_item_ids, probe_ids, portal_ids
 
     def choose_frontier(
         self, message, steps, frontier, unknown, occupied, now, excluded=None,
@@ -97,6 +127,17 @@ class GlobalFrontierSelectionPlannerMixin:
                 )
             ),
         )
+        if (
+            graph_route_planning
+            and getattr(self, "graph_route_planner_enabled", False)
+        ):
+            snapshot_epoch = getattr(components, "epoch", None)
+            self.last_graph_snapshot_projection_complete = False
+            self.last_graph_snapshot_visible_work_item_ids = None
+            self.last_graph_snapshot_visible_probe_ids = None
+            self.last_graph_snapshot_visible_portal_ids = None
+            self.last_graph_snapshot_candidate_count = 0
+            self.last_graph_snapshot_epoch = snapshot_epoch
         rows, cols = np.nonzero(frontier)
         structural_boundary_path = bool(
             graph_route_planning
@@ -147,36 +188,42 @@ class GlobalFrontierSelectionPlannerMixin:
             )
             rows, cols = rows[indices], cols[indices]
 
-        # Reconcile the current map into durable identities before the slow
-        # graph planner chooses an obligation.  A plan made one stage earlier
-        # could otherwise point at an old WorkItem while this snapshot creates
-        # its successor, allowing a different local candidate to win.
+        # Candidate projection is the first half of the graph boundary.  Do
+        # not filter this pass through a stale local WorkItem lease: the
+        # complete current snapshot must be allowed to rediscover the durable
+        # identity before the graph planner is asked to reuse it.
         graph_plan = None
         graph_prepare = getattr(self, "_prepare_graph_route_action", None)
         if graph_route_planning and graph_prepare is not None and getattr(
             self, "graph_route_planner_enabled", False
         ):
-            snapshot_epoch = getattr(
-                getattr(request, "components", None), "epoch", None
-            )
-            reuse_graph_plan_lease = bool(
+            # A crossed Portal/probe can be reprojection-only and needs its
+            # durable preference during portal collection. Local WorkItems
+            # must remain unfiltered until their current viewpoint is scored.
+            existing_plan = getattr(self, "last_graph_route_plan", None)
+            lease_reusable = bool(
                 getattr(self, "graph_route_plan_lease_active", False)
+                and existing_plan is not None
+                and (
+                    not callable(
+                        getattr(self, "_graph_route_plan_lease_matches_current", None)
+                    )
+                    or self._graph_route_plan_lease_matches_current(existing_plan)
+                )
             )
-            prepare_kwargs = {
-                "visible_work_item_ids": getattr(
-                    context, "work_item_details", None
-                ),
-                "reuse_existing_plan": reuse_graph_plan_lease,
-                "map_epoch": snapshot_epoch,
-            }
-            if not reuse_graph_plan_lease:
-                # The first pass only installs an identity preference for
-                # candidate collection.  It must not create a graph
-                # transaction before the complete snapshot is known.
-                prepare_kwargs["stage_only"] = True
-            graph_plan, _unused_graph_candidate = graph_prepare(
-                None, **prepare_kwargs,
-            )
+            if lease_reusable and getattr(existing_plan, "action", None) in {
+                "cross_portal", "probe_portal",
+            }:
+                install = getattr(self, "_install_graph_route_preference", None)
+                if callable(install):
+                    install(existing_plan)
+            else:
+                # Do not let a stale preference from the previous snapshot
+                # suppress the complete current candidate projection.
+                self.graph_route_work_item_id = None
+                self.graph_route_work_item_filter = None
+                self.graph_route_probe_id = None
+                self.graph_route_portal_id = None
         # A failed physical viewpoint is retried only through another safe
         # endpoint tied to the same WorkItem support, never as a generic goal.
         ranking_action_tiers = unique_action_tiers(
@@ -275,6 +322,17 @@ class GlobalFrontierSelectionPlannerMixin:
                 route_steps >= minimum_steps
                 or request.selection_tier == "navfn_observation_recovery"
             )
+            # A rehydrated WorkItem has already passed its own reachable-cell,
+            # costmap, and viewpoint-availability checks.  Keep its durable
+            # identity in the graph projection even when the recovered
+            # viewpoint is nearer than the generic frontier minimum.  That
+            # minimum is a ranking guard for raw frontier geometry; applying
+            # it here turns a valid durable local obligation into an empty
+            # projection and leaves the predecessor in terminal hold.
+            durable_work_item_projection = (
+                getattr(candidate, "work_item_match", None)
+                == "rehydrated_work_item"
+            )
             if frontier_decision_candidates is not None and route_is_executable:
                 frontier_decision_candidates.append(
                     candidate_from_route(
@@ -285,7 +343,9 @@ class GlobalFrontierSelectionPlannerMixin:
                         place_id=context.source_place_id,
                     )
                 )
-            if graph_obligation_candidates is not None:
+            if graph_obligation_candidates is not None and (
+                route_is_executable or durable_work_item_projection
+            ):
                 graph_obligation_candidates.append(
                     candidate_from_route(
                         scored_candidate,
@@ -304,32 +364,152 @@ class GlobalFrontierSelectionPlannerMixin:
                 )
 
         # Candidate construction can rehydrate a probe and bind a WorkItem.
-        # Replan once more from the identities that actually survived route
-        # admission; the initial context-only plan must not retain a stale
-        # local ID created before this snapshot was fully interpreted.
+        # This event is the explicit barrier consumed by the graph planner:
+        # every identity below has passed current-map reachability and
+        # costmap/Navfn admission before graph materialization begins.
         if graph_route_planning and graph_prepare is not None and getattr(
             self, "graph_route_planner_enabled", False
         ):
+            snapshot_epoch = getattr(request.components, "epoch", None)
             reuse_graph_plan_lease = bool(
                 getattr(self, "graph_route_plan_lease_active", False)
             )
-            visible_ids = {
-                candidate.work_item_id
-                for candidate in graph_obligation_candidates
-                if getattr(candidate, "work_item_id", None) is not None
+            visible_ids, visible_probe_ids, visible_portal_ids = (
+                self._graph_snapshot_identity_sets(graph_obligation_candidates)
+            )
+            identity_keys = {
+                ("work_item", value) for value in visible_ids
             }
-            visible_probe_ids = {
-                candidate.portal_id
-                for candidate in graph_obligation_candidates
-                if getattr(candidate, "portal_id", None) is not None
-            }
+            identity_keys.update(
+                ("portal_probe", value) for value in visible_probe_ids
+            )
+            identity_keys.update(
+                ("portal", value) for value in visible_portal_ids
+            )
+            self.last_graph_snapshot_projection_complete = True
+            self.last_graph_snapshot_visible_work_item_ids = tuple(
+                sorted(int(value) for value in visible_ids)
+            )
+            self.last_graph_snapshot_visible_probe_ids = tuple(
+                sorted(int(value) for value in visible_probe_ids)
+            )
+            self.last_graph_snapshot_visible_portal_ids = tuple(
+                sorted(int(value) for value in visible_portal_ids)
+            )
+            self.last_graph_snapshot_candidate_count = int(
+                len(identity_keys)
+            )
+            self.last_graph_snapshot_epoch = snapshot_epoch
+            projection_signature = (
+                snapshot_epoch,
+                tuple(sorted(identity_keys)),
+            )
+            if projection_signature != getattr(
+                self, "last_graph_snapshot_projection_signature", None
+            ):
+                self.last_graph_snapshot_projection_signature = (
+                    projection_signature
+                )
+                self.publish_status(
+                    "graph_route_projection_complete",
+                    map_epoch=snapshot_epoch,
+                    visible_work_item_ids=sorted(visible_ids),
+                    visible_probe_ids=sorted(visible_probe_ids),
+                    visible_portal_ids=sorted(visible_portal_ids),
+                    candidate_count=len(identity_keys),
+                    projection_complete=True,
+                    geometry_source="current_frontier_snapshot",
+                )
             graph_plan, _unused_graph_candidate = graph_prepare(
                 None,
                 visible_work_item_ids=visible_ids,
                 visible_probe_ids=visible_probe_ids,
+                visible_portal_ids=visible_portal_ids,
                 reuse_existing_plan=reuse_graph_plan_lease,
                 map_epoch=getattr(request.components, "epoch", None),
             )
+            plan_visible = getattr(
+                self, "_graph_plan_identity_is_visible", None
+            )
+            graph_plan_identity_visible = bool(
+                callable(plan_visible)
+                and plan_visible(
+                    graph_plan,
+                    visible_work_item_ids=visible_ids,
+                    visible_probe_ids=visible_probe_ids,
+                    visible_portal_ids=visible_portal_ids,
+                )
+            )
+            if graph_plan_identity_visible:
+                rehydration_event = "graph_route_rehydration_ready"
+                rehydration_complete = True
+                rehydration_reason = "current_snapshot_identity_matches_plan"
+            elif not identity_keys:
+                rehydration_event = "graph_route_rehydration_unavailable"
+                rehydration_complete = False
+                rehydration_reason = (
+                    "no_executable_identity_in_current_frontier_snapshot"
+                )
+            else:
+                rehydration_event = "graph_route_rehydration_pending"
+                rehydration_complete = False
+                rehydration_reason = (
+                    "selected_graph_obligation_not_in_current_frontier_snapshot"
+                )
+            rehydration_signature = (
+                snapshot_epoch,
+                tuple(sorted(identity_keys)),
+                None if graph_plan is None else graph_plan.signature(),
+                rehydration_event,
+            )
+            if rehydration_signature != getattr(
+                self, "last_graph_rehydration_signature", None
+            ):
+                self.last_graph_rehydration_signature = rehydration_signature
+                self.publish_status(
+                    rehydration_event,
+                    map_epoch=snapshot_epoch,
+                    visible_work_item_ids=sorted(visible_ids),
+                    visible_probe_ids=sorted(visible_probe_ids),
+                    visible_portal_ids=sorted(visible_portal_ids),
+                    candidate_count=len(identity_keys),
+                    rehydration_complete=rehydration_complete,
+                    graph_plan_identity_visible=graph_plan_identity_visible,
+                    graph_action=(
+                        None if graph_plan is None else str(graph_plan.action)
+                    ),
+                    graph_obligation_kind=(
+                        None
+                        if graph_plan is None
+                        else str(graph_plan.obligation_kind)
+                    ),
+                    graph_obligation_id=(
+                        None
+                        if graph_plan is None
+                        else graph_plan.obligation_id
+                    ),
+                    reason=rehydration_reason,
+                    geometry_source="current_frontier_snapshot",
+                )
+
+            # Projection completion is only a statement about the snapshot
+            # pass.  A ready durable plan whose identity is absent is already
+            # a materialization miss, including the empty-candidate case; do
+            # not defer the first miss to a later generic Hold path.
+            if (
+                graph_plan is not None
+                and getattr(graph_plan, "status", None) == "ready"
+                and not graph_plan_identity_visible
+            ):
+                record_miss = getattr(
+                    self, "_record_graph_route_materialization_miss", None
+                )
+                if callable(record_miss) and record_miss(
+                    graph_plan,
+                    snapshot_epoch,
+                    rehydration_reason,
+                ):
+                    return None
 
         # ``hold`` is a graph decision, not an empty score pool. Once the
         # durable planner reports a blocked plan, stop this snapshot before
@@ -434,14 +614,10 @@ class GlobalFrontierSelectionPlannerMixin:
                     first_portal_id=graph_plan.first_portal_id,
                     reason="durable_identity_not_in_current_frontier_snapshot",
                 )
-            publish_unavailable = getattr(
-                self, "_publish_graph_route_unavailable", None
-            )
-            if publish_unavailable is not None:
-                publish_unavailable(
-                    graph_plan,
-                    "durable_identity_not_in_current_frontier_snapshot",
-                )
+            # A durable identity missing from this projection is a retryable
+            # planning context event.  ``frontier_route_unavailable`` is a
+            # controller ownership boundary and must only be emitted by the
+            # exhausted graph invalidation path.
             return None
         if getattr(self, "frontier_action_policy", "legacy_scalar") == "event_pareto":
             selected = self._select_frontier_decision_candidate(
@@ -618,10 +794,51 @@ class GlobalFrontierSelectionPlannerMixin:
 
     def _select_graph_plan_candidate(self, candidates, plan, request):
         """Select only a candidate carrying the planner's durable identity."""
+        # Once a WorkItem has accumulated execution/materialization negative
+        # evidence, the graph lease must not be silently refined to a
+        # different WorkItem merely because it belongs to the same Place and
+        # action class.  Keep the original durable key while its miss budget
+        # is being evaluated; an alternate viewpoint of that same WorkItem is
+        # still admitted by the exact matcher.  The adapter clears this state
+        # on canonical invalidation, after which normal same-place refinement
+        # may resume for a newly selected plan.
+        exact_work_item_lease = False
+        materialization_miss_count = getattr(
+            self, "graph_route_materialization_miss_count", 0
+        )
+        try:
+            materialization_miss_count = int(materialization_miss_count or 0)
+        except (TypeError, ValueError):
+            materialization_miss_count = 0
+        if (
+            plan is not None
+            and str(getattr(plan, "obligation_kind", "") or "")
+            == "work_item"
+            and materialization_miss_count > 0
+            and not bool(
+                getattr(self, "graph_route_materialization_invalidated", False)
+            )
+        ):
+            key_method = getattr(plan, "durable_obligation_key", None)
+            tracked_key = getattr(
+                self, "graph_route_materialization_obligation_key", None
+            )
+            if callable(key_method) and tracked_key is not None:
+                try:
+                    exact_work_item_lease = tuple(key_method()) == tuple(
+                        tracked_key
+                    )
+                except (TypeError, ValueError):
+                    exact_work_item_lease = False
+        matcher = (
+            candidate_matches_graph_plan
+            if exact_work_item_lease
+            else candidate_refines_graph_plan
+        )
         matching = [
             candidate
             for candidate in (candidates or ())
-            if candidate_refines_graph_plan(plan, candidate)
+            if matcher(plan, candidate)
         ]
         if not matching:
             return None

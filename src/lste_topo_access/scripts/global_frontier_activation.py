@@ -82,18 +82,19 @@ class GlobalFrontierActivationMixin:
                 if selection.place_hops == 0 else None
             )
             probe = getattr(selection, "portal_observation_probe", None)
-            destination_probe_reobserve = (
-                probe is not None
-                and str(getattr(probe, "phase", "source")).strip().lower()
-                == "destination"
-                and physical_place_id is not None
+            current_place_durable_reobserve = bool(
+                physical_place_id is not None
+                and (
+                    probe is not None
+                    or getattr(selection, "work_item_match", None)
+                    == "rehydrated_work_item"
+                )
             )
-            if destination_probe_reobserve:
-                # A destination-side probe is a second evidence phase for an
-                # existing physical doorway. It must be executable even when
-                # the current Place is already covered/transit-only; reopening
-                # that Place through ``activate_frontier_region`` would reject
-                # the probe and leave its graph lease stranded.
+            if current_place_durable_reobserve:
+                # A durable PortalProbe or WorkItem belongs to the current
+                # physical Place even when its memory is dormant/transit-only.
+                # Keep the explicit rehydration route executable without
+                # reopening the Place for arbitrary frontier geometry.
                 region = self.region_memory.by_id(physical_place_id)
                 if region is not None:
                     region["route_dispatches"] = int(
@@ -126,8 +127,16 @@ class GlobalFrontierActivationMixin:
                 self.current_physical_place_id = None
         return region, departed_place
 
-    def _rollback_failed_activation(self, now, reason):
+    def _rollback_failed_activation(self, now, reason, selection=None):
         """Undo a partially installed route before the next graph wake."""
+        graph_rejection_recorded = False
+        record_rejection = getattr(
+            self, "_record_graph_route_activation_rejection", None
+        )
+        if callable(record_rejection):
+            graph_rejection_recorded = bool(
+                record_rejection(selection, reason=reason)
+            )
         settle_probe = getattr(self, "settle_active_portal_probe", None)
         if (
             callable(settle_probe)
@@ -143,7 +152,7 @@ class GlobalFrontierActivationMixin:
             self.active_portal_probe_phase = ""
 
         clear_lease = getattr(self, "_clear_graph_route_plan_lease", None)
-        if callable(clear_lease):
+        if callable(clear_lease) and not graph_rejection_recorded:
             clear_lease("activation_rejected:%s" % str(reason))
 
         lifecycle = getattr(self, "lifecycle_manager", None)
@@ -160,6 +169,12 @@ class GlobalFrontierActivationMixin:
         lifecycle = getattr(self, "lifecycle_manager", None)
         if lifecycle is not None:
             lifecycle.begin_transaction(State.DISPATCHED, now=now)
+            latest = getattr(lifecycle, "latest_transaction_id", None)
+            self.active_route_lifecycle_transaction_id = int(
+                latest() if callable(latest) else lifecycle.current_transaction_id
+            )
+        else:
+            self.active_route_lifecycle_transaction_id = 0
         self.frontier_exhausted = False
         self.active_frontier = (
             selection.row,
@@ -221,6 +236,27 @@ class GlobalFrontierActivationMixin:
         if not self.place_departure.active:
             self._clear_active_place_departure()
         self.active_route_id += 1
+        pending_predecessor = getattr(
+            self, "pending_graph_successor_predecessor_contract", None
+        )
+        if isinstance(pending_predecessor, dict):
+            try:
+                pending_predecessor_route_id = int(
+                    pending_predecessor.get("route_id", 0) or 0
+                )
+            except (TypeError, ValueError):
+                pending_predecessor_route_id = 0
+            if pending_predecessor_route_id >= int(self.active_route_id):
+                pending_predecessor = None
+                pending_predecessor_route_id = 0
+        else:
+            pending_predecessor_route_id = 0
+        if pending_predecessor is not None:
+            pending_predecessor = dict(pending_predecessor)
+            pending_predecessor_route_id = int(
+                pending_predecessor.get("route_id", 0) or 0
+            )
+        self.pending_graph_successor_predecessor_contract = None
         graph_transaction = getattr(
             self, "graph_route_action_transaction", None
         )
@@ -245,12 +281,15 @@ class GlobalFrontierActivationMixin:
             self.last_released_route_kind = ""
             self.last_released_route_terminal_received = False
             self.last_released_route_controller_pending = False
+            self.last_released_route_transaction_id = 0
             self.last_released_route_lifecycle_transaction_id = 0
             self.last_released_route_action_generation = 0
             self.last_released_route_graph_transaction_id = 0
             self.last_released_route_map_epoch = None
+            self.last_released_route_origin_epoch = None
+            self.last_released_route_projection_epoch = None
         self.active_transition_kind = "initial"
-        self.active_predecessor_route_id = 0
+        self.active_predecessor_route_id = pending_predecessor_route_id
         self.active_transition_distance = None
         self.recovery_pending_route_id = 0
         self.recovery_pending_behavior = ""
@@ -278,6 +317,54 @@ class GlobalFrontierActivationMixin:
         self.active_portal_retry = False
         self.active_terminal_received = False
         self.active_terminal_contract = None
+        graph_transaction_id = int(
+            getattr(graph_transaction, "graph_transaction_id", 0) or 0
+        )
+        route_origin_epoch = getattr(graph_transaction, "origin_epoch", None)
+        route_projection_epoch = getattr(
+            graph_transaction, "projection_epoch", None
+        )
+        if route_origin_epoch is None:
+            route_origin_epoch = self.active_route_map_epoch
+        if route_projection_epoch is None:
+            route_projection_epoch = self.active_route_map_epoch
+        # This record is the route-side source of truth while the asynchronous
+        # Bridge adoption event is still in flight.  Do not read the mutable
+        # graph transaction again during a later failure/replan callback.
+        self.active_route_dispatch_contract = {
+            "route_id": int(self.active_route_id),
+            "transaction_id": 0,
+            "lifecycle_transaction_id": int(
+                self.active_route_lifecycle_transaction_id
+            ),
+            "action_generation": 0,
+            "graph_transaction_id": graph_transaction_id,
+            "map_epoch": self.active_route_map_epoch,
+            "origin_epoch": route_origin_epoch,
+            "projection_epoch": route_projection_epoch,
+            "route_kind": str(self.active_route_kind or ""),
+            "mission_route_kind": str(self.active_mission_route_kind or ""),
+            "source": "global_slam_frontier",
+            "priority": 0,
+        }
+        if pending_predecessor is not None:
+            self.active_route_dispatch_contract["predecessor_contract"] = dict(
+                pending_predecessor
+            )
+            self.publish_status(
+                "frontier_successor_predecessor_bound",
+                route_id=int(self.active_route_id),
+                predecessor_route_id=int(pending_predecessor_route_id),
+                predecessor_contract=dict(pending_predecessor),
+                lifecycle_transaction_id=int(
+                    self.active_route_lifecycle_transaction_id
+                ),
+                graph_transaction_id=graph_transaction_id,
+                map_epoch=self.active_route_map_epoch,
+                origin_epoch=route_origin_epoch,
+                projection_epoch=route_projection_epoch,
+                reason="graph_materialization_failure_successor",
+            )
         start_probe = getattr(self, "start_active_portal_probe", None)
         if start_probe is not None and probe_record is None:
             probe_record = start_probe(selection, now)
@@ -512,6 +599,9 @@ class GlobalFrontierActivationMixin:
                 if getattr(self, "last_work_item_sensor_horizon_m", None) is None
                 else round(float(self.last_work_item_sensor_horizon_m), 3)
             ),
+            work_item_place_scope_skips=int(
+                getattr(self, "last_work_item_place_scope_skips", 0)
+            ),
             resolved_work_item_descendant_skips=int(
                 getattr(self, "last_work_item_resolved_descendant_skips", 0)
             ),
@@ -662,6 +752,9 @@ class GlobalFrontierActivationMixin:
                     route_id=prospective_route_id,
                     reason="durable_probe_lease_api_missing",
                 )
+                self._rollback_failed_activation(
+                    now, "durable_probe_lease_api_missing", selection
+                )
                 return False
             try:
                 probe_record = start_probe(
@@ -677,6 +770,9 @@ class GlobalFrontierActivationMixin:
                     route_id=prospective_route_id,
                     reason="durable_probe_lease_unavailable",
                 )
+                self._rollback_failed_activation(
+                    now, "durable_probe_lease_unavailable", selection
+                )
                 return False
         lifecycle = self.prepare_selected_frontier_lifecycle(
             message,
@@ -688,7 +784,9 @@ class GlobalFrontierActivationMixin:
             selection_mode,
         )
         if lifecycle is None:
-            self._rollback_failed_activation(now, "route_lifecycle_rejected")
+            self._rollback_failed_activation(
+                now, "route_lifecycle_rejected", selection
+            )
             return False
         region, departed_place = lifecycle
         initialized = self.initialize_active_frontier_route(
@@ -699,7 +797,9 @@ class GlobalFrontierActivationMixin:
             probe_record=probe_record,
         )
         if initialized is False:
-            self._rollback_failed_activation(now, "route_initialization_rejected")
+            self._rollback_failed_activation(
+                now, "route_initialization_rejected", selection
+            )
             return False
         if transaction is not None and selection.route_kind == "portal_transition":
             source_place_id = getattr(self.place_departure, "region_id", None)
@@ -763,7 +863,7 @@ class GlobalFrontierActivationMixin:
                     reason="invalid_portal_transaction_transition",
                 )
                 self._rollback_failed_activation(
-                    now, "invalid_portal_transaction_transition"
+                    now, "invalid_portal_transaction_transition", selection
                 )
                 return False
             self.publish_status(

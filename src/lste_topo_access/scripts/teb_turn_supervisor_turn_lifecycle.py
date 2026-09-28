@@ -25,27 +25,68 @@ class TebTurnSupervisorTurnLifecycleMixin:
         error = None
         if pose is not None and self.turn_target_yaw is not None:
             error = normalize_angle(self.turn_target_yaw - pose.theta)
+        route_id = int(
+            getattr(self, "active_action_route_id", 0) or 0
+        ) or int(getattr(self, "latest_route_id", 0) or 0)
+        action_generation = int(
+            getattr(self, "active_action_generation", 0) or 0
+        )
+        transaction_id = int(
+            getattr(self, "active_action_goal_transaction_id", 0) or 0
+        )
+        lifecycle_transaction_id = int(
+            self._lifecycle_transaction_id_locked()
+            if callable(getattr(self, "_lifecycle_transaction_id_locked", None))
+            else getattr(
+                getattr(self, "lifecycle_manager", None),
+                "current_transaction_id",
+                0,
+            )
+            or 0
+        )
+        graph_transaction_id = int(
+            getattr(self, "active_action_graph_transaction_id", 0) or 0
+        ) or int(getattr(self, "latest_graph_transaction_id", 0) or 0)
+        map_epoch = getattr(self, "active_action_map_epoch", None)
+        if map_epoch is None:
+            map_epoch = getattr(self, "latest_map_epoch", None)
+        origin_epoch = getattr(self, "active_action_origin_epoch", None)
+        if origin_epoch is None:
+            origin_epoch = getattr(self, "latest_origin_epoch", None)
+        projection_epoch = getattr(self, "active_action_projection_epoch", None)
+        if projection_epoch is None:
+            projection_epoch = getattr(self, "latest_projection_epoch", None)
+        output = getattr(self, "last_output_command", None)
+        output_linear = float(
+            getattr(getattr(output, "linear", None), "x", 0.0) or 0.0
+        )
+        output_angular = float(
+            getattr(getattr(output, "angular", None), "z", 0.0) or 0.0
+        )
         payload = {
             "event": str(event),
-            "lifecycle_transaction_id": int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
-                or 0
+            "route_id": route_id,
+            "action_generation": action_generation,
+            "transaction_id": transaction_id,
+            "lifecycle_transaction_id": lifecycle_transaction_id,
+            "graph_transaction_id": graph_transaction_id,
+            "map_epoch": map_epoch,
+            "origin_epoch": origin_epoch,
+            "projection_epoch": projection_epoch,
+            "dedupe_key": (
+                [route_id, action_generation]
+                if action_generation > 0 else None
             ),
             "state": self.state,
             "mode": self.mode,
             "route_kind": self.latest_route_kind,
-            "route_id": int(getattr(self, "latest_route_id", 0) or 0),
-            "map_epoch": getattr(self, "latest_map_epoch", None),
-            "graph_transaction_id": int(
-                getattr(self, "latest_graph_transaction_id", 0) or 0
-            ),
             "active_action": bool(self.active_action),
             "active_action_transaction_id": int(
                 getattr(self, "active_action_transaction_id", 0) or 0
+            ),
+            "active_action_lifecycle_transaction_id": int(
+                getattr(self, "active_action_lifecycle_transaction_id", 0)
+                or 0
             ),
             "active_action_goal_transaction_id": int(
                 getattr(self, "active_action_goal_transaction_id", 0) or 0
@@ -58,8 +99,15 @@ class TebTurnSupervisorTurnLifecycleMixin:
             "active_route_id": int(
                 getattr(self, "active_action_route_id", 0) or 0
             ),
+            "turn_phase": str(getattr(self, "turn_phase", "") or ""),
             "active_map_epoch": getattr(
                 self, "active_action_map_epoch", None
+            ),
+            "active_origin_epoch": getattr(
+                self, "active_action_origin_epoch", None
+            ),
+            "active_projection_epoch": getattr(
+                self, "active_action_projection_epoch", None
             ),
             "active_graph_transaction_id": int(
                 getattr(self, "active_action_graph_transaction_id", 0) or 0
@@ -109,6 +157,12 @@ class TebTurnSupervisorTurnLifecycleMixin:
             "planner_command_map_epoch": getattr(
                 self, "planner_command_map_epoch", None
             ),
+            "planner_command_origin_epoch": getattr(
+                self, "planner_command_origin_epoch", None
+            ),
+            "planner_command_projection_epoch": getattr(
+                self, "planner_command_projection_epoch", None
+            ),
             "planner_command_graph_transaction_id": int(
                 getattr(self, "planner_command_graph_transaction_id", 0) or 0
             ),
@@ -126,6 +180,35 @@ class TebTurnSupervisorTurnLifecycleMixin:
             ),
             "planner_contract_identity": getattr(
                 self, "planner_contract_identity", None
+            ),
+            "planner_contract_pending": (
+                None
+                if not isinstance(
+                    getattr(self, "planner_contract_pending", None), dict
+                )
+                else {
+                    "identity": getattr(
+                        self, "planner_contract_pending", {}
+                    ).get("identity"),
+                    "state": int(
+                        getattr(self, "planner_contract_pending", {}).get(
+                            "state", 0
+                        )
+                        or 0
+                    ),
+                    "age_seconds": round(
+                        max(
+                            0.0,
+                            now
+                            - float(
+                                getattr(
+                                    self, "planner_contract_pending", {}
+                                ).get("received_wall", now)
+                            ),
+                        ),
+                        3,
+                    ),
+                }
             ),
             "trajectory_feedback_valid": bool(
                 getattr(self, "trajectory_feedback_valid", False)
@@ -152,9 +235,57 @@ class TebTurnSupervisorTurnLifecycleMixin:
                 getattr(self, "last_output_decision", "unknown")
                 or "unknown"
             ),
+            # ``planner_command`` below is an input cache. Keep the actual
+            # command emitted by this timer separately so failure snapshots do
+            # not mistake TEB input for Supervisor output.
+            "output_command": [
+                round(output_linear, 4), round(output_angular, 4)
+            ],
+            "output_command_age_seconds": (
+                None
+                if float(getattr(self, "last_output_wall", 0.0) or 0.0) <= 0.0
+                else round(
+                    max(
+                        0.0,
+                        now - float(getattr(self, "last_output_wall", 0.0)),
+                    ),
+                    4,
+                )
+            ),
             "turns": int(self.turn_count),
             "completed_turns": int(self.turn_completed_count),
             "released_turns": int(self.turn_released_count),
+            "turn_abs_rotation": round(
+                float(getattr(self, "turn_abs_rotation", 0.0) or 0.0), 4
+            ),
+            "turn_rotation_cap": round(
+                float(getattr(self, "turn_rotation_cap", 0.0) or 0.0), 4
+            ),
+            "turn_odom_progress_age_seconds": (
+                None
+                if float(
+                    getattr(self, "turn_last_odom_progress_wall", 0.0) or 0.0
+                ) <= 0.0
+                else round(
+                    max(
+                        0.0,
+                        now
+                        - float(
+                            getattr(
+                                self, "turn_last_odom_progress_wall", 0.0
+                            )
+                        ),
+                    ),
+                    4,
+                )
+            ),
+            "turn_no_progress_timeout_seconds": round(
+                float(getattr(self, "turn_no_progress_timeout", 0.0) or 0.0),
+                4,
+            ),
+            "turn_odom_sample_count": int(
+                getattr(self, "turn_odom_sample_count", 0) or 0
+            ),
         }
         payload.update(fields)
         try:
@@ -162,18 +293,83 @@ class TebTurnSupervisorTurnLifecycleMixin:
         except (TypeError, ValueError):
             rospy.logwarn_throttle(5.0, "TEB turn supervisor status serialization failed")
 
+    def _observe_turn_odom_pose_locked(self, pose, now):
+        """Accumulate actual yaw progress for the current turn contract."""
+        if (
+            self.state != STATE_TURNING
+            or self.turn_target_yaw is None
+            or self.turn_action_identity is None
+            or self.turn_action_identity
+            != getattr(self, "active_action_identity", None)
+        ):
+            return
+        try:
+            theta = float(pose.theta)
+        except (AttributeError, TypeError, ValueError):
+            return
+        previous_theta = getattr(self, "turn_last_odom_theta", None)
+        self.turn_last_odom_sample_wall = float(now)
+        self.turn_odom_sample_count = int(
+            getattr(self, "turn_odom_sample_count", 0) or 0
+        ) + 1
+        if previous_theta is None:
+            self.turn_last_odom_theta = theta
+            if self.turn_last_odom_progress_wall <= 0.0:
+                self.turn_last_odom_progress_wall = float(now)
+            return
+        delta = abs(normalize_angle(theta - float(previous_theta)))
+        self.turn_last_odom_theta = theta
+        # Keep the swept-angle budget faithful to odom while ignoring only
+        # numerical noise.  A larger delta also refreshes the no-progress
+        # clock, which is the health signal used for a physically blocked turn.
+        if delta > 1.0e-4:
+            self.turn_abs_rotation += delta
+        if delta >= max(
+            0.005,
+            float(getattr(self, "turn_odom_progress_epsilon", 0.01) or 0.01),
+        ):
+            self.turn_last_odom_progress_wall = float(now)
+
     def _release_turn_locked(self, reason, completed=False):
+        previous_odom_rotation = float(
+            getattr(self, "turn_abs_rotation", 0.0) or 0.0
+        )
+        previous_odom_progress_age = None
+        last_progress = float(
+            getattr(self, "turn_last_odom_progress_wall", 0.0) or 0.0
+        )
+        if last_progress > 0.0:
+            previous_odom_progress_age = max(0.0, now_for(self) - last_progress)
+        previous_odom_samples = int(
+            getattr(self, "turn_odom_sample_count", 0) or 0
+        )
         if self.state != STATE_TURNING:
             self.turn_target_yaw = None
+            self.turn_phase = ""
             self.turn_goal_xy = None
             self.turn_velocity = 0.0
+            self.turn_last_odom_theta = None
+            self.turn_last_odom_sample_wall = 0.0
+            self.turn_last_odom_progress_wall = 0.0
+            self.turn_odom_sample_count = 0
             return
         previous_key = self.turn_key
+        previous_phase = str(getattr(self, "turn_phase", "") or "")
+        previous_action_identity = self.turn_action_identity
         previous_error = None
         if self.pose is not None and self.turn_target_yaw is not None:
             previous_error = normalize_angle(self.turn_target_yaw - self.pose.theta)
         if completed:
             self.completed_turn_key = previous_key
+            if (
+                previous_phase == "stalled_route_reorientation"
+                and previous_action_identity is not None
+            ):
+                # Do not suppress a second reorientation before the first one
+                # has actually reached its stricter completion boundary.
+                self.stalled_route_completed_identity = (
+                    previous_action_identity
+                )
             self.turn_completed_count += 1
             self.turn_settle_until_wall = (
                 now_for(self) + self.turn_settle_duration
@@ -188,16 +384,32 @@ class TebTurnSupervisorTurnLifecycleMixin:
         self.turn_released_count += 1
         self.state = STATE_PASS_THROUGH
         self.turn_target_yaw = None
+        self.turn_phase = ""
         self.turn_goal_xy = None
         self.turn_key = None
         self.turn_action_identity = None
         self.turn_velocity = 0.0
+        self.turn_last_odom_theta = None
+        self.turn_last_odom_sample_wall = 0.0
+        self.turn_last_odom_progress_wall = 0.0
+        self.turn_odom_sample_count = 0
         self.publish_status_locked(
             "turn_completed" if completed else "turn_released",
             reason=str(reason),
             previous_key=previous_key,
             previous_yaw_error=(
                 None if previous_error is None else round(float(previous_error), 4)
+            ),
+            odom_abs_rotation=round(previous_odom_rotation, 4),
+            odom_progress_age_seconds=(
+                None
+                if previous_odom_progress_age is None
+                else round(previous_odom_progress_age, 4)
+            ),
+            odom_sample_count=previous_odom_samples,
+            no_progress_timeout_seconds=round(
+                float(getattr(self, "turn_no_progress_timeout", 0.0) or 0.0),
+                4,
             ),
         )
         rospy.loginfo(
@@ -226,12 +438,10 @@ class TebTurnSupervisorTurnLifecycleMixin:
             )
             or action_identity is None
             or action_identity == self.stalled_route_completed_identity
-            or self.pose is None
-            or not (
-                getattr(self, "_trajectory_feedback_is_current_locked", lambda _identity: True)(
-                    action_identity
-                )
+            or action_identity == getattr(
+                self, "stalled_route_reorientation_attempted_identity", None
             )
+            or self.pose is None
         ):
             self.stalled_route_candidate_identity = None
             self.stalled_route_candidate_since_wall = 0.0
@@ -244,14 +454,19 @@ class TebTurnSupervisorTurnLifecycleMixin:
         feedback_timeout = self._trajectory_feedback_timeout_locked()
         linear = float(self.latest_trajectory_command.linear.x)
         angular = float(self.latest_trajectory_command.angular.z)
+        planner_linear = float(self.latest_planner_command.linear.x)
+        planner_command_age = (
+            None
+            if self.latest_planner_command_wall <= 0.0
+            else max(0.0, now_for(self) - self.latest_planner_command_wall)
+        )
+        actuator_clamp = getattr(
+            self, "_current_forward_only_clamp_locked", lambda _identity: None
+        )(action_identity)
         target_yaw = self._initial_navfn_yaw_in_pose_frame_locked()
         heading_error = (
             None if target_yaw is None
             else normalize_angle(target_yaw - self.pose.theta)
-        )
-        is_near_zero = (
-            abs(linear) <= self.stalled_route_reorientation_linear
-            and abs(angular) <= self.stalled_route_reorientation_angular
         )
         # With forward-only execution TEB may emit its small internal reverse
         # entry sample while it is already close to an endpoint.  The mux
@@ -263,25 +478,67 @@ class TebTurnSupervisorTurnLifecycleMixin:
         # and the normal one-shot action identity guard below. No reverse
         # velocity is ever forwarded to the actuator.
         reverse_entry = (
-            linear < -0.002
-            and abs(linear) <= self.stalled_route_reorientation_linear
+            (
+                linear < -0.002
+                and abs(linear) <= self.stalled_route_reorientation_linear
+            )
+            or (
+                planner_linear < -0.002
+                and abs(planner_linear)
+                <= self.stalled_route_reorientation_linear
+            )
+            or actuator_clamp is not None
+        )
+        feedback_current = bool(
+            getattr(
+                self,
+                "_trajectory_feedback_is_current_locked",
+                lambda _identity: True,
+            )(action_identity)
+        )
+        planner_current = bool(
+            self.latest_planner_command_wall > 0.0
+            and planner_command_age is not None
+            and planner_command_age <= self.planner_command_timeout
+        )
+        # FeedbackMsg has no route identity and can still contain the previous
+        # trajectory while a new planner contract is crossing the boundary.
+        # A fresh, identity-bearing reverse-entry contract is stronger evidence
+        # for this one bounded turn than that stale feedback.  This keeps the
+        # mux's forward-only safety rule intact while preventing the supervisor
+        # from forwarding a command it already knows the actuator will clamp.
+        feedback_ready = bool(
+            (feedback_current and feedback_age <= feedback_timeout)
+            or (reverse_entry and planner_current)
+            or actuator_clamp is not None
+        )
+        is_near_zero = bool(
+            reverse_entry
+            or (
+                abs(linear) <= self.stalled_route_reorientation_linear
+                and abs(angular) <= self.stalled_route_reorientation_angular
+            )
         )
         minimum_goal_distance = (
             0.0 if reverse_entry
             else self.stalled_route_reorientation_min_distance
         )
+        # Once the mux has already rejected the reverse component, a small
+        # remaining heading error is still a real control-boundary mismatch:
+        # TEB is asking for an entry sample that cannot produce translation.
+        # Let the existing bounded turn transaction consume that error instead
+        # of leaving the route in a long-lived near-zero command state.  The
+        # turn still requires a fresh identity-bearing planner command, fresh
+        # scan clearance, and the rotation cap below; this does not synthesize
+        # or forward a reverse velocity.
         minimum_heading_error = (
-            min(
-                self.stalled_route_reorientation_heading,
-                float(self.yaw_goal_tolerance),
-            )
-            if reverse_entry
+            0.0 if reverse_entry
             else self.stalled_route_reorientation_heading
         )
         eligible = (
             goal_distance is not None
             and goal_distance >= minimum_goal_distance
-            and feedback_age <= feedback_timeout
+            and feedback_ready
             and is_near_zero
             and heading_error is not None
             and abs(heading_error) >= minimum_heading_error
@@ -305,10 +562,28 @@ class TebTurnSupervisorTurnLifecycleMixin:
                 action_goal_distance=round(float(goal_distance), 4),
                 feedback_age_seconds=round(float(feedback_age), 4),
                 selected_command=[round(linear, 4), round(angular, 4)],
+                planner_command=[round(planner_linear, 4), round(
+                    float(self.latest_planner_command.angular.z), 4
+                )],
+                planner_command_age_seconds=(
+                    None
+                    if planner_command_age is None
+                    else round(float(planner_command_age), 4)
+                ),
+                feedback_current=feedback_current,
                 heading_error_deg=round(math.degrees(heading_error), 2),
+                actuator_boundary=(
+                    None
+                    if actuator_clamp is None
+                    else dict(actuator_clamp)
+                ),
                 reason=(
-                    "forward_only_reverse_entry"
-                    if reverse_entry else "near_zero_route_command"
+                    "forward_only_actuator_clamp"
+                    if actuator_clamp is not None
+                    else (
+                        "forward_only_reverse_entry"
+                        if reverse_entry else "near_zero_route_command"
+                    )
                 ),
             )
             rospy.logwarn(
@@ -415,7 +690,8 @@ class TebTurnSupervisorTurnLifecycleMixin:
             self.turn_pending_since_wall = now
             return False
         confirm_duration = (
-            0.0 if turn_phase == "legacy_connector"
+            0.0
+            if turn_phase in ("legacy_connector", "stalled_route_reorientation")
             else self.turn_start_confirm_duration
         )
         if now - self.turn_pending_since_wall < confirm_duration:
@@ -446,15 +722,13 @@ class TebTurnSupervisorTurnLifecycleMixin:
             return False
         if endpoint_alignment and turn_phase == "pre_route_alignment":
             self.pre_turn_checked_identity = action_identity
-        if turn_phase == "stalled_route_reorientation":
-            self.stalled_route_completed_identity = action_identity
-            self.stalled_route_candidate_identity = None
-            self.stalled_route_candidate_since_wall = 0.0
-            self.stalled_route_ready_identity = None
         self.state = STATE_TURNING
         self.turn_key = key
         self.turn_action_identity = action_identity
+        if turn_phase == "stalled_route_reorientation":
+            self.stalled_route_reorientation_attempted_identity = action_identity
         self.turn_target_yaw = target_yaw
+        self.turn_phase = str(turn_phase or "")
         self.turn_goal_xy = self._goal_xy(self.active_action_goal)
         self.turn_velocity = 0.0
         self.turn_started_wall = now
@@ -470,6 +744,30 @@ class TebTurnSupervisorTurnLifecycleMixin:
         self.turn_rotation_cap = max(
             initial_abs_error * self.turn_rotation_cap_factor,
             math.radians(120.0),
+        )
+        self.turn_odom_progress_epsilon = max(
+            0.005, min(0.02, 0.10 * float(self.yaw_goal_tolerance))
+        )
+        self.turn_last_odom_theta = (
+            float(self.pose.theta) if self.pose is not None else None
+        )
+        self.turn_last_odom_sample_wall = now
+        self.turn_last_odom_progress_wall = now
+        self.turn_odom_sample_count = 0
+        # This is derived from the already configured angular budget.  It is
+        # a liveness bound, not a second velocity parameter: if no odom yaw
+        # progress arrives within the time needed to consume the allowed
+        # swept-angle budget, release the turn to the route failure FSM.
+        max_vel_theta = max(
+            float(getattr(self, "max_vel_theta", 0.65) or 0.65),
+            0.05,
+        )
+        self.turn_no_progress_timeout = max(
+            2.0,
+            min(
+                12.0,
+                self.turn_rotation_cap / max_vel_theta,
+            ),
         )
         self.turn_count += 1
         self.publish_status_locked(

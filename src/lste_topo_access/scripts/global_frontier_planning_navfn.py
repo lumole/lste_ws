@@ -81,12 +81,7 @@ class GlobalFrontierPlanningNavfnMixin:
             "resolution": float(resolution),
             "submitted_wall": now_for(self),
             "transaction_id": int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
-                or 0
+                self.lifecycle_transaction_id()
             ),
         }
 

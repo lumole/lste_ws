@@ -11,6 +11,7 @@
   <arg name="goal_topic" default="/lste/final_goal"/>
   <arg name="intent_topic" default="/lste/goal_intent"/>
   <arg name="goal_command_topic" default="/lste/mission_goal"/>
+  <arg name="navigation_hold_topic" default="/lste/navigation_hold"/>
   <!-- Execute GoalManager's atomic pose-plus-intent transaction. Disable only
        for an explicit legacy pose-only publisher experiment. -->
   <arg name="use_goal_command" default="true"/>
@@ -436,6 +437,7 @@
     <param name="goal_topic" value="$(arg goal_topic)"/>
     <param name="intent_topic" value="$(arg intent_topic)"/>
     <param name="goal_command_topic" value="$(arg goal_command_topic)"/>
+    <param name="navigation_hold_topic" value="$(arg navigation_hold_topic)"/>
     <param name="use_goal_command" value="$(arg use_goal_command)"/>
     <param name="require_intent" value="$(arg require_intent)"/>
     <param name="bridge_status_topic" value="/lste/teb_goal_bridge/status"/>
@@ -506,6 +508,7 @@
     <param name="planner_cmd_topic" value="/lste/cmd_vel/teb_planner"/>
     <param name="command_contract_topic" value="/lste/cmd_vel/teb_contract"/>
     <param name="planner_command_contract_topic" value="$(arg persistent_planner_command_contract_topic)"/>
+    <param name="mux_status_topic" value="/lste/cmd_vel_mux/status"/>
     <param name="require_planner_command_contract" value="$(arg persistent_execution)"/>
     <param name="navfn_plan_topic" value="$(arg navfn_plan_topic)"/>
     <param name="output_cmd_topic" value="/lste/cmd_vel/teb"/>

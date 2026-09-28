@@ -1698,6 +1698,10 @@ def summarize(path: Path, manifest_path: Path = DEFAULT_MANIFEST) -> dict:
         data for event, data in structured_events if event == "task_done"
     ]
     completion_event = task_done_events[-1] if task_done_events else None
+    task_completed_events = [
+        data for event, data in structured_events if event == "task_completed"
+    ]
+    task_completed_event = task_completed_events[-1] if task_completed_events else None
     manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
     scoped_manifest, benchmark_level = scope_manifest_for_run(
         manifest, structured_events
@@ -1718,6 +1722,15 @@ def summarize(path: Path, manifest_path: Path = DEFAULT_MANIFEST) -> dict:
             (completion_event or {}).get("ros_time")
             if completion
             else reference.get("task_done_seconds")
+        ),
+        "task_done_policy": (
+            (task_completed_event or {}).get("task_done_policy")
+            or reference.get("task_done_policy")
+        ),
+        "task_done_completion_evidence": (
+            (task_completed_event or {}).get("completion_evidence")
+            or (completion_event or {}).get("completion_evidence")
+            or reference.get("task_done_completion_evidence")
         ),
         "ros_time": reference.get("ros_time"),
         "pose": reference.get("pose"),

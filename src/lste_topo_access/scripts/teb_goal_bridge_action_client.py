@@ -6,15 +6,26 @@ sending or cancelling an action.  Dispatch policy lives in sibling modules.
 """
 
 import copy
+import subprocess
+import time
 from types import MappingProxyType
 
 import rospy
+from actionlib_msgs.msg import GoalStatus
 from move_base_msgs.msg import MoveBaseGoal
 
 from clock_provider import now_for
 
 
 class TebGoalBridgeActionClientMixin:
+    # A cancelled move_base goal normally reaches PREEMPTED quickly.  Recovery
+    # behaviors can nevertheless leave the action server in PREEMPTING forever;
+    # keep that transport fault bounded without allowing a successor to run in
+    # parallel with the predecessor.
+    _TRANSPORT_HANDOFF_TIMEOUT_SECONDS = 15.0
+    _TRANSPORT_HANDOFF_CONTROLLER_RESTART_TIMEOUT_SECONDS = 15.0
+    _TRANSPORT_HANDOFF_CONTROLLER_RESTART_MAX_ATTEMPTS = 2
+
     def _effective_action_epoch_locked(self):
         """Use the map snapshot epoch for every executable route kind."""
         route_map_epoch = getattr(self, "latest_route_map_epoch", None)
@@ -46,12 +57,7 @@ class TebGoalBridgeActionClientMixin:
                 getattr(self, "latest_goal_transaction_id", 0) or 0
             ),
             "lifecycle_transaction_id": int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
-                or 0
+                self._canonical_lifecycle_transaction_id()
             ),
             "route_id": int(getattr(self, "latest_route_id", 0) or 0),
             "graph_transaction_id": int(
@@ -59,6 +65,8 @@ class TebGoalBridgeActionClientMixin:
             ),
             "epoch": self._effective_action_epoch_locked(),
             "map_epoch": map_epoch,
+            "origin_epoch": getattr(self, "latest_origin_epoch", None),
+            "projection_epoch": getattr(self, "latest_projection_epoch", None),
             "route_kind": str(
                 getattr(self, "latest_route_kind", "") or ""
             ).strip().lower(),
@@ -81,6 +89,342 @@ class TebGoalBridgeActionClientMixin:
         rospy.loginfo("TEB goal bridge connected to move_base action server")
         return True
 
+    @staticmethod
+    def _transport_state_is_terminal(status):
+        """Return whether actionlib has finished the tracked MoveBase goal."""
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            return False
+        return status in (
+            GoalStatus.PREEMPTED,
+            GoalStatus.SUCCEEDED,
+            GoalStatus.ABORTED,
+            GoalStatus.REJECTED,
+            GoalStatus.RECALLED,
+            GoalStatus.LOST,
+        )
+
+    @staticmethod
+    def _transport_action_server_available_locked(client):
+        """Probe one action client without waiting inside the lifecycle tick."""
+        wait_for_server = getattr(client, "wait_for_server", None)
+        if not callable(wait_for_server):
+            return False
+        try:
+            return bool(wait_for_server(rospy.Duration(0.0)))
+        except (TypeError, RuntimeError, rospy.ROSException):
+            return False
+
+    def _request_transport_controller_restart_locked(self, record, reason):
+        """Restart only move_base when a cancelled action never becomes terminal."""
+        if not isinstance(record, dict):
+            return False
+        attempts = int(record.get("controller_restart_attempts", 0) or 0)
+        if attempts >= self._TRANSPORT_HANDOFF_CONTROLLER_RESTART_MAX_ATTEMPTS:
+            return False
+        attempts += 1
+        record["controller_restart_attempts"] = attempts
+        record["controller_restart_requested"] = True
+        record["controller_restart_started_wall_monotonic"] = time.monotonic()
+        record["controller_restart_server_disconnect_observed"] = False
+        record["controller_restart_reason"] = str(reason or "transport_handoff_timeout")
+        record["controller_restart_error"] = None
+        # Force the action server to drop the recovery state.  The launch file
+        # owns respawn, so this does not restart Gazebo, SLAM, or the map.
+        client = record.get("client")
+        cancel_all_goals = getattr(client, "cancel_all_goals", None)
+        if callable(cancel_all_goals):
+            try:
+                cancel_all_goals()
+            except Exception as exc:  # pragma: no cover - ROS shutdown edge
+                record["controller_restart_error"] = "cancel_all_goals:%s" % exc
+        self.action_server_seen = False
+        try:
+            process = subprocess.Popen(
+                ["rosnode", "kill", "/move_base"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            record["controller_restart_pid"] = int(process.pid)
+        except (OSError, ValueError) as exc:
+            record["controller_restart_error"] = str(exc)
+            record["controller_restart_pid"] = None
+        self.publish_bridge_status(
+            "transport_handoff_controller_restart_requested",
+            route_id=int((record.get("old_contract") or {}).get("route_id", 0) or 0),
+            action_generation=int(record.get("old_generation", 0) or 0),
+            new_action_generation=int(record.get("new_generation", 0) or 0),
+            transport_handoff="pending",
+            controller_restart_attempts=attempts,
+            controller_restart_timeout_seconds=(
+                self._TRANSPORT_HANDOFF_CONTROLLER_RESTART_TIMEOUT_SECONDS
+            ),
+            reason=str(reason or "transport_handoff_timeout"),
+            controller_restart_error=record.get("controller_restart_error"),
+        )
+        return True
+
+    def _transport_action_state_locked(self, client=None):
+        """Read the tracked action state without blocking the lifecycle tick."""
+        if client is None:
+            client = getattr(self, "action_client", None)
+        getter = getattr(client, "get_state", None)
+        if not callable(getter):
+            return None
+        try:
+            return int(getter())
+        except (TypeError, ValueError, RuntimeError):
+            return None
+
+    def _clear_terminal_prepare_if_matches_locked(self, record, status=None):
+        """Drop the semantic prepare only after its transport has settled."""
+        prepare = getattr(self, "pending_terminal_prepare", None)
+        if not isinstance(prepare, dict) or not isinstance(record, dict):
+            return False
+        prepare_key = prepare.get("identity_key")
+        record_key = record.get("identity_key")
+        same_identity = bool(
+            prepare_key is not None
+            and record_key is not None
+            and tuple(prepare_key) == tuple(record_key)
+        )
+        same_generation = int(
+            prepare.get("old_generation", 0) or 0
+        ) == int(record.get("old_generation", 0) or 0)
+        if not same_identity and not same_generation:
+            return False
+        prepare["transport_terminal_observed"] = True
+        if status is not None:
+            try:
+                prepare["transport_terminal_status"] = int(status)
+            except (TypeError, ValueError):
+                pass
+        self.pending_terminal_prepare = None
+        # ``pending_lease_release_contract`` is a separate semantic tombstone.
+        # Global Frontier may publish its controller-lease release after the
+        # actionlib callback, so transport completion must not erase the
+        # contract needed to validate that later ACK.
+        return True
+
+    def _finish_transport_handoff_locked(self, status, source):
+        """Release the successor gate after actionlib reports a terminal."""
+        record = getattr(self, "transport_handoff_pending", None)
+        if not isinstance(record, dict):
+            return False
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            return False
+        if not self._transport_state_is_terminal(status):
+            return False
+        self.transport_handoff_pending = None
+        self._clear_terminal_prepare_if_matches_locked(record, status)
+        old_contract = dict(record.get("old_contract") or {})
+        self.publish_bridge_status(
+            "transport_terminal",
+            route_id=int(old_contract.get("route_id", 0) or 0),
+            transaction_id=int(old_contract.get("transaction_id", 0) or 0),
+            lifecycle_transaction_id=int(
+                old_contract.get("lifecycle_transaction_id", 0) or 0
+            ),
+            action_generation=int(record.get("old_generation", 0) or 0),
+            new_action_generation=int(
+                record.get("new_generation", 0) or 0
+            ),
+            transport_status=status,
+            transport_status_text=GoalStatus.to_string(status),
+            transport_handoff="complete",
+            source=str(source or "unknown"),
+            controller_lease="released",
+        )
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        enqueue = getattr(lifecycle, "enqueue_type", None)
+        if callable(enqueue):
+            from lifecycle_manager import EventType
+
+            enqueue(EventType.BRIDGE_WAKE, None)
+        else:
+            schedule = getattr(self, "schedule_terminal_dispatch_locked", None)
+            if callable(schedule):
+                schedule()
+        return True
+
+    def _observe_transport_terminal_locked(self, generation, status, source):
+        """Match a late predecessor callback to the transport gate."""
+        record = getattr(self, "transport_handoff_pending", None)
+        if not isinstance(record, dict):
+            return False
+        try:
+            generation = int(generation)
+            expected = int(record.get("old_generation", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if generation != expected:
+            return False
+        return self._finish_transport_handoff_locked(status, source)
+
+    def _poll_transport_handoff_locked(self):
+        """Poll actionlib once; never wait inside the bridge lifecycle tick."""
+        record = getattr(self, "transport_handoff_pending", None)
+        if not isinstance(record, dict):
+            return False
+        status = self._transport_action_state_locked(
+            record.get("client") if isinstance(record, dict) else None
+        )
+        if status is not None and self._transport_state_is_terminal(status):
+            return self._finish_transport_handoff_locked(status, "state_poll")
+        now = now_for(self)
+        wall_now = time.monotonic()
+        started_wall = float(
+            record.get("started_wall_monotonic", wall_now) or wall_now
+        )
+        restart_requested = bool(record.get("controller_restart_requested"))
+        if restart_requested:
+            client = record.get("client")
+            server_available = self._transport_action_server_available_locked(
+                client
+            )
+            if not server_available:
+                record["controller_restart_server_disconnect_observed"] = True
+            restart_started = float(
+                record.get("controller_restart_started_wall_monotonic", wall_now)
+                or wall_now
+            )
+            restart_age = max(0.0, wall_now - restart_started)
+            if (
+                server_available
+                and record.get("controller_restart_server_disconnect_observed")
+            ):
+                # A respawned action server cannot retain the predecessor goal.
+                # Treat an absent/nonterminal client state as LOST, then wake the
+                # normal dispatch path only after this transport boundary closes.
+                restart_status = self._transport_action_state_locked(client)
+                if not self._transport_state_is_terminal(restart_status):
+                    restart_status = GoalStatus.LOST
+                return self._finish_transport_handoff_locked(
+                    restart_status, "controller_restart"
+                )
+            if restart_age >= self._TRANSPORT_HANDOFF_CONTROLLER_RESTART_TIMEOUT_SECONDS:
+                if self._request_transport_controller_restart_locked(
+                    record, "controller_restart_timeout"
+                ):
+                    return True
+                # Two restart requests have been issued.  Close the old lease as
+                # LOST so the successor is no longer trapped behind an endless
+                # PREEMPTING gate; dispatch itself still waits for a live server.
+                self.publish_bridge_status(
+                    "transport_handoff_failed",
+                    route_id=int(
+                        (record.get("old_contract") or {}).get("route_id", 0)
+                        or 0
+                    ),
+                    action_generation=int(record.get("old_generation", 0) or 0),
+                    new_action_generation=int(
+                        record.get("new_generation", 0) or 0
+                    ),
+                    transport_handoff="forced_terminal",
+                    transport_status=GoalStatus.LOST,
+                    transport_status_text=GoalStatus.to_string(GoalStatus.LOST),
+                    controller_restart_attempts=int(
+                        record.get("controller_restart_attempts", 0) or 0
+                    ),
+                    reason="controller_restart_exhausted",
+                )
+                return self._finish_transport_handoff_locked(
+                    GoalStatus.LOST, "controller_restart_exhausted"
+                )
+        elif wall_now - started_wall >= self._TRANSPORT_HANDOFF_TIMEOUT_SECONDS:
+            if self._request_transport_controller_restart_locked(
+                record, "transport_handoff_timeout"
+            ):
+                return True
+        last_report = float(
+            getattr(self, "transport_handoff_last_report_monotonic", 0.0) or 0.0
+        )
+        if now - last_report >= 2.0:
+            self.transport_handoff_last_report_monotonic = now
+            self.publish_bridge_status(
+                "transport_handoff_waiting",
+                route_id=int(
+                    (record.get("old_contract") or {}).get("route_id", 0) or 0
+                ),
+                action_generation=int(record.get("old_generation", 0) or 0),
+                new_action_generation=int(
+                    record.get("new_generation", 0) or 0
+                ),
+                transport_status=status,
+                transport_status_text=(
+                    GoalStatus.to_string(status)
+                    if status is not None
+                    else "UNKNOWN"
+                ),
+                transport_handoff="pending",
+                wait_seconds=round(
+                    max(0.0, now - float(record.get("started_monotonic", now))),
+                    3,
+                ),
+            )
+        return True
+
+    def _transport_handoff_blocks_dispatch_locked(self):
+        """Return true while the predecessor action still owns the transport."""
+        self._poll_transport_handoff_locked()
+        return isinstance(
+            getattr(self, "transport_handoff_pending", None), dict
+        )
+
+    def _begin_transport_handoff_locked(
+        self, old_contract, old_generation, new_generation, reason, previous_active
+    ):
+        """Arm a non-blocking gate for an action being cancelled."""
+        existing = getattr(self, "transport_handoff_pending", None)
+        if isinstance(existing, dict):
+            return existing
+        status = self._transport_action_state_locked()
+        needs_gate = bool(
+            (previous_active and status is None)
+            or (status is not None and not self._transport_state_is_terminal(status))
+        )
+        if not needs_gate:
+            return None
+        now = now_for(self)
+        record = {
+            "old_contract": dict(old_contract or {}),
+            "old_generation": int(old_generation or 0),
+            "new_generation": int(new_generation or 0),
+            "reason": str(reason or "transport_handoff"),
+            "previous_active": bool(previous_active),
+            "status_before_cancel": status,
+            "started_monotonic": now,
+            "started_wall_monotonic": time.monotonic(),
+            "handoff_timeout_seconds": self._TRANSPORT_HANDOFF_TIMEOUT_SECONDS,
+            "controller_restart_requested": False,
+            "controller_restart_attempts": 0,
+            "controller_restart_server_disconnect_observed": False,
+            # Keep polling the same SimpleActionClient across a warm-reset
+            # state reinitialization; a fresh client has no knowledge of the
+            # goal that is still being cancelled by the old client.
+            "client": getattr(self, "action_client", None),
+            "identity_key": self._action_identity_key_locked(old_contract),
+        }
+        self.transport_handoff_pending = record
+        self.transport_handoff_last_report_monotonic = now
+        self.publish_bridge_status(
+            "transport_handoff_started",
+            route_id=int((old_contract or {}).get("route_id", 0) or 0),
+            action_generation=int(old_generation or 0),
+            new_action_generation=int(new_generation or 0),
+            transport_status=status,
+            transport_status_text=(
+                GoalStatus.to_string(status) if status is not None else "UNKNOWN"
+            ),
+            transport_handoff="pending",
+            reason=str(reason or "transport_handoff"),
+        )
+        return record
+
     def _request_cancel_for_pending_goal_locked(self, reason, pending_delta):
         """Cancel once and let the terminal callback authorize the handoff."""
         if not self.action_active or self.handoff_requested:
@@ -93,8 +437,6 @@ class TebGoalBridgeActionClientMixin:
             publish_terminal=False,
             arm_watchdog=False,
         )
-        self.pending_terminal_prepare = None
-        self.pending_lease_release_contract = None
         self.handoff_requested = True
         self.schedule_terminal_dispatch_locked()
         self.publish_bridge_status(
@@ -166,6 +508,10 @@ class TebGoalBridgeActionClientMixin:
         self.active_route_map_epoch = getattr(
             self, "latest_route_map_epoch", None
         )
+        self.active_origin_epoch = getattr(self, "latest_origin_epoch", None)
+        self.active_projection_epoch = getattr(
+            self, "latest_projection_epoch", None
+        )
         self.active_graph_transaction_id = int(
             getattr(self, "latest_graph_transaction_id", 0) or 0
         )
@@ -227,12 +573,7 @@ class TebGoalBridgeActionClientMixin:
             "generation": int(generation),
             "transaction_id": int(self.latest_goal_transaction_id),
             "lifecycle_transaction_id": int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
-                or 0
+                self._canonical_lifecycle_transaction_id()
             ),
             "route_id": int(self.latest_route_id),
             "graph_transaction_id": int(
@@ -240,6 +581,8 @@ class TebGoalBridgeActionClientMixin:
             ),
             "epoch": self._effective_action_epoch_locked(),
             "map_epoch": self.active_route_map_epoch,
+            "origin_epoch": self.active_origin_epoch,
+            "projection_epoch": self.active_projection_epoch,
             "route_kind": str(self.latest_route_kind or ""),
             "mission_route_kind": str(self.latest_mission_route_kind or ""),
             "graph_action": str(
@@ -305,6 +648,13 @@ class TebGoalBridgeActionClientMixin:
         """
         if source_message is None or not self._is_active_mode():
             return False
+        if self._transport_handoff_blocks_dispatch_locked():
+            self.publish_bridge_status(
+                "dispatch_deferred_transport_handoff",
+                reason=str(reason or "dispatch"),
+                transport_handoff="pending",
+            )
+            return False
         source_goal = self._normalize_goal(source_message)
         goal = self._goal_in_global_frame(source_goal)
         if goal is None:
@@ -316,6 +666,46 @@ class TebGoalBridgeActionClientMixin:
         generation = self._begin_action_lifecycle_locked(
             source_goal, execution_goal
         )
+        if bool(getattr(self, "persistent_execution", False)):
+            # A persistent MoveBase restart advances action_generation while
+            # keeping the semantic mission transaction. Re-announce the
+            # complete route contract before actionlib can ask Navfn/TEB for a
+            # command; otherwise the planner keeps publishing the predecessor
+            # generation and the strict downstream identity gates correctly
+            # reject every command from the new action.
+            republish_mission = getattr(
+                self, "_publish_persistent_mission_goal_locked", None
+            )
+            # A new target request is a two-phase transaction.  The action goal
+            # gives StreamingNavfnPlanner a planning cycle in which to validate
+            # the target; publishing the approved mission here would make
+            # ``onMissionCommand`` clear that still-provisional request before
+            # ``makePlan`` can emit ``target_plan_installed``.  The install
+            # acknowledgement publishes the approved mission itself.  An
+            # already-installed target, or an ordinary frontier route, still
+            # needs the generation rebind immediately.
+            target_plan_pending = bool(
+                int(
+                    getattr(
+                        self, "persistent_target_pending_transaction", 0
+                    )
+                    or 0
+                )
+                > 0
+                and int(getattr(self, "latest_intent_priority", 0) or 0) >= 2
+            )
+            if callable(republish_mission) and not target_plan_pending:
+                republish_mission("action_generation_rebind")
+            elif target_plan_pending:
+                self.publish_bridge_status(
+                    "persistent_target_mission_approval_deferred",
+                    reason="await_target_plan_installation",
+                    transaction_id=int(
+                        getattr(self, "persistent_target_pending_transaction", 0)
+                        or 0
+                    ),
+                    action_generation=int(self.action_generation),
+                )
         dispatch_contract = self.active_action_contract or {}
         self.action_client.send_goal(
             action_goal,
@@ -331,6 +721,8 @@ class TebGoalBridgeActionClientMixin:
                 dispatch_contract.get("epoch", self.active_target_epoch) or 0
             ),
             "map_epoch": dispatch_contract.get("map_epoch"),
+            "origin_epoch": dispatch_contract.get("origin_epoch"),
+            "projection_epoch": dispatch_contract.get("projection_epoch"),
             "lifecycle_transaction_id": int(
                 dispatch_contract.get("lifecycle_transaction_id", 0)
                 or 0
@@ -362,6 +754,23 @@ class TebGoalBridgeActionClientMixin:
             "replacement_kind": (replacement_kind or "none"),
         }
         dispatch_fields.update(event_fields)
+        if (
+            bool(getattr(self, "persistent_execution", False))
+            and str(
+                getattr(self, "active_intent_source", "unknown") or "unknown"
+            ).strip().lower() == "global_slam_frontier"
+            and int(getattr(self, "active_intent_priority", 0) or 0) == 0
+        ):
+            # This is the transport adoption boundary: the semantic mission
+            # has been accepted into the persistent MoveBase action. Keep it
+            # distinct from later path rollovers so the short experiment gate
+            # can require both adoption and dispatch for one identity.
+            adoption_fields = dict(dispatch_fields)
+            adoption_fields["adoption_kind"] = "move_base_action"
+            self.publish_bridge_status(
+                "persistent_mission_goal_adopted",
+                **adoption_fields,
+            )
         self.publish_bridge_status("dispatch", **dispatch_fields)
         predecessor_ack = getattr(self, "pending_successor_release_ack", None)
         if (
@@ -389,6 +798,10 @@ class TebGoalBridgeActionClientMixin:
                     predecessor_ack.get("graph_transaction_id", 0) or 0
                 ),
                 predecessor_map_epoch=predecessor_ack.get("map_epoch"),
+                predecessor_origin_epoch=predecessor_ack.get("origin_epoch"),
+                predecessor_projection_epoch=predecessor_ack.get(
+                    "projection_epoch"
+                ),
                 release_ack="exact",
                 **dispatch_fields
             )

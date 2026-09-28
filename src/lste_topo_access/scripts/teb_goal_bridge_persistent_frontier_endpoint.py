@@ -8,6 +8,7 @@ the bridge-owned route transaction before it becomes a mission terminal.
 import math
 
 import rospy
+from actionlib_msgs.msg import GoalStatus
 
 
 class TebGoalBridgePersistentFrontierEndpointMixin:
@@ -62,7 +63,29 @@ class TebGoalBridgePersistentFrontierEndpointMixin:
                 )
                 return
             route_id = int(self.active_route_id)
-            if route_id in self.persistent_frontier_endpoint_terminal_routes:
+            action_contract = getattr(self, "active_action_contract", None)
+            action_key = self._action_identity_key_locked(action_contract)
+            if action_key is None:
+                # Persistent endpoint reports must be tied to one transport
+                # action. A route-only fallback could suppress a legitimate
+                # later action generation that reused the semantic route id.
+                self.publish_bridge_status(
+                    "persistent_frontier_endpoint_ignored",
+                    reason="missing_action_identity",
+                    route_id=route_id,
+                )
+                return
+            terminal_keys = getattr(
+                self, "persistent_frontier_endpoint_terminal_keys", set()
+            )
+            if action_key in terminal_keys:
+                self.publish_bridge_status(
+                    "persistent_frontier_endpoint_duplicate_ignored",
+                    route_id=route_id,
+                    action_generation=int(action_key[1]),
+                    reason="terminal_key_already_applied",
+                    dedupe_key=[int(action_key[0]), int(action_key[1])],
+                )
                 return
             if self.last_dispatched_goal is None:
                 self.publish_bridge_status(
@@ -183,7 +206,6 @@ class TebGoalBridgePersistentFrontierEndpointMixin:
                 and getattr(self, "active_portal_source_goal", None) is not None
                 else self.last_dispatched_goal
             )
-            action_contract = getattr(self, "active_action_contract", None)
             try:
                 contract = dict(action_contract or {})
             except (TypeError, ValueError):
@@ -205,6 +227,8 @@ class TebGoalBridgePersistentFrontierEndpointMixin:
                     contract.get("graph_transaction_id", 0) or 0
                 ),
                 map_epoch=contract.get("map_epoch"),
+                origin_epoch=contract.get("origin_epoch"),
+                projection_epoch=contract.get("projection_epoch"),
                 route_kind=active_route_kind,
                 mission_route_kind=str(
                     contract.get("mission_route_kind", "") or ""
@@ -222,6 +246,86 @@ class TebGoalBridgePersistentFrontierEndpointMixin:
                     else round(navfn_endpoint_delta, 4)
                 ),
             )
+            if active_route_kind == "frontier_endpoint":
+                # In persistent-stream mode the C++ planner has already put
+                # its current path into terminal hold.  Close the semantic
+                # endpoint transaction, but keep the one MoveBase action
+                # alive so the next mission command can replace the stream
+                # without an actionlib cancel/re-dispatch pulse.  Portal and
+                # egress routes remain on the explicit transport-terminal
+                # path because their physical ownership must be rebound.
+                try:
+                    contract = dict(action_contract or {})
+                except (TypeError, ValueError):
+                    contract = {}
+                pending = {
+                    "route_id": route_id,
+                    "action_generation": int(
+                        contract.get("generation", 0) or 0
+                    ),
+                    "transaction_id": int(
+                        contract.get("transaction_id", 0) or 0
+                    ),
+                    "lifecycle_transaction_id": int(
+                        contract.get("lifecycle_transaction_id", 0) or 0
+                    ),
+                    "graph_transaction_id": int(
+                        contract.get("graph_transaction_id", 0) or 0
+                    ),
+                    "map_epoch": contract.get("map_epoch"),
+                    "origin_epoch": contract.get("origin_epoch"),
+                    "projection_epoch": contract.get("projection_epoch"),
+                    "ack_sent": False,
+                }
+                self.persistent_frontier_endpoint_pending = pending
+                terminal_goal = self._publish_execution_terminal_locked(
+                    terminal_source_goal,
+                    action_contract=action_contract,
+                    invalidate_feedback=False,
+                    status=GoalStatus.SUCCEEDED,
+                    reason="persistent_frontier_endpoint_terminal",
+                )
+                if terminal_goal is None:
+                    self.persistent_frontier_endpoint_pending = None
+                    return
+                self.persistent_frontier_endpoint_terminal_keys.add(action_key)
+                self._clear_target_failure_locked("persistent_frontier_endpoint")
+                self.terminal_count += 1
+                endpoint_fields = self._action_contract_status_fields(
+                    action_contract
+                )
+                endpoint_fields.update(
+                    {
+                        "successor_route_id": int(
+                            self.prefetched_frontier_route_id
+                        ),
+                        "canonical_delta": round(canonical_delta, 4),
+                        "action_delta": round(action_delta, 4),
+                        "navfn_endpoint_delta": (
+                            None
+                            if navfn_endpoint_delta is None
+                            else round(navfn_endpoint_delta, 4)
+                        ),
+                        "endpoint_match_basis": endpoint_match_basis,
+                        "endpoint_epsilon": round(endpoint_epsilon, 4),
+                        "lifecycle": (
+                            "semantic_terminal_transport_lease_held"
+                        ),
+                        "controller_lease": "held",
+                        "semantic_terminal": True,
+                        "transport_action_active": True,
+                    }
+                )
+                self.publish_bridge_status(
+                    "persistent_frontier_endpoint_terminal",
+                    **endpoint_fields,
+                )
+                rospy.loginfo(
+                    "TEB goal bridge accepted persistent frontier endpoint "
+                    "without transport cancellation: route_id=%d",
+                    route_id,
+                )
+                return
             termination = self._commit_termination(
                 "persistent_frontier_endpoint_terminal",
                 source_goal=terminal_source_goal,
@@ -230,7 +334,7 @@ class TebGoalBridgePersistentFrontierEndpointMixin:
             )
             if not termination.get("committed", False):
                 return
-            self.persistent_frontier_endpoint_terminal_routes.add(route_id)
+            self.persistent_frontier_endpoint_terminal_keys.add(action_key)
             self._clear_target_failure_locked("persistent_frontier_endpoint")
             self.terminal_count += 1
             terminal_event = (

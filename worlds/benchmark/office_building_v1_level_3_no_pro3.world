@@ -256,18 +256,18 @@
         </visual>
       </link>
       <link name="outer_south_west">
-        <pose>0.750 0.000 1.400 0 0 0.000000</pose>
+        <pose>0.900 0.000 1.400 0 0 0.000000</pose>
         <collision name="outer_south_west_collision">
           <geometry>
             <box>
-              <size>1.500 0.180 2.800</size>
+              <size>1.800 0.180 2.800</size>
             </box>
           </geometry>
         </collision>
         <visual name="outer_south_west_visual">
           <geometry>
             <box>
-              <size>1.500 0.180 2.800</size>
+              <size>1.800 0.180 2.800</size>
             </box>
           </geometry>
           <material>
@@ -278,7 +278,7 @@
         </visual>
       </link>
       <link name="outer_south_east">
-        <pose>14.500 0.000 1.400 0 0 0.000000</pose>
+        <pose>15.000 0.000 1.400 0 0 0.000000</pose>
         <collision name="outer_south_east_collision">
           <geometry>
             <box>

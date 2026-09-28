@@ -55,6 +55,14 @@ class TebTurnSupervisorControlMixin:
         return getattr(self, "trajectory_feedback_identity", None) == action_identity
 
     def _lifecycle_transaction_id_locked(self):
+        if bool(getattr(self, "active_action", False)):
+            active_action_lifecycle = int(
+                getattr(self, "active_action_lifecycle_transaction_id", 0)
+                or getattr(self, "active_action_transaction_id", 0)
+                or 0
+            )
+            if active_action_lifecycle > 0:
+                return active_action_lifecycle
         return int(
             getattr(
                 getattr(self, "lifecycle_manager", None),
@@ -73,6 +81,36 @@ class TebTurnSupervisorControlMixin:
                 getattr(self, "planner_contract_state", 0) or 0
             ) != 1:
                 return "planner_contract_boundary"
+            # During a persistent handoff the old planner frame can remain
+            # valid for one or more timer ticks after Bridge has cleared the
+            # predecessor action and before it announces the successor as
+            # active.  The command must still be zero, but comparing that old
+            # frame with the successor lifecycle would misclassify this
+            # expected boundary as a stale-identity fault.
+            if not bool(getattr(self, "active_action", False)):
+                pending = getattr(self, "planner_contract_pending", None)
+                active_route = int(
+                    getattr(self, "active_action_route_id", 0) or 0
+                )
+                planner_identity = getattr(
+                    self, "planner_contract_identity", None
+                )
+                planner_route = int(
+                    planner_identity.get("route_id", 0) or 0
+                ) if isinstance(planner_identity, dict) else 0
+                active_generation = int(
+                    getattr(self, "active_action_generation", 0) or 0
+                )
+                planner_generation = int(
+                    planner_identity.get("action_generation", 0) or 0
+                ) if isinstance(planner_identity, dict) else 0
+                if (
+                    isinstance(pending, dict)
+                    or active_route > planner_route
+                    or active_generation > planner_generation
+                ):
+                    return "bridge_action_alignment_pending"
+                return "bridge_action_inactive"
             mismatch = self._planner_contract_mismatch_locked(
                 getattr(self, "planner_contract_identity", {})
             )
@@ -176,6 +214,12 @@ class TebTurnSupervisorControlMixin:
             getattr(self, "planner_command_action_generation", 0) or 0
         )
         effective_planner_map_epoch = planner_map_epoch
+        effective_planner_origin_epoch = getattr(
+            self, "planner_command_origin_epoch", None
+        )
+        effective_planner_projection_epoch = getattr(
+            self, "planner_command_projection_epoch", None
+        )
         if supervisor_owned_turn:
             effective_planner_transaction_id = int(transaction_id)
             effective_planner_route_id = int(
@@ -188,9 +232,17 @@ class TebTurnSupervisorControlMixin:
                 getattr(self, "active_action_generation", 0) or 0
             )
             effective_planner_map_epoch = active_map_epoch
+            effective_planner_origin_epoch = getattr(
+                self, "active_action_origin_epoch", None
+            )
+            effective_planner_projection_epoch = getattr(
+                self, "active_action_projection_epoch", None
+            )
         payload = {
             "event": "teb_command",
             "transaction_id": int(transaction_id),
+            "lifecycle_transaction_id": int(transaction_id),
+            "mission_transaction_id": int(effective_planner_transaction_id),
             "command_sequence": int(getattr(self, "output_sequence", 0) or 0),
             "planner_command_sequence": int(
                 getattr(self, "planner_command_sequence", 0) or 0
@@ -216,6 +268,10 @@ class TebTurnSupervisorControlMixin:
             "active_action_transaction_id": int(
                 getattr(self, "active_action_transaction_id", 0) or 0
             ),
+            "active_action_lifecycle_transaction_id": int(
+                getattr(self, "active_action_lifecycle_transaction_id", 0)
+                or 0
+            ),
             "graph_transaction_id": int(
                 getattr(self, "active_action_graph_transaction_id", 0) or 0
             ),
@@ -234,8 +290,18 @@ class TebTurnSupervisorControlMixin:
             ),
             "map_epoch": command_map_epoch,
             "planner_map_epoch": effective_planner_map_epoch,
+            "origin_epoch": effective_planner_origin_epoch,
+            "projection_epoch": effective_planner_projection_epoch,
+            "planner_origin_epoch": effective_planner_origin_epoch,
+            "planner_projection_epoch": effective_planner_projection_epoch,
             "active_action_map_epoch": getattr(
                 self, "active_action_map_epoch", None
+            ),
+            "active_action_origin_epoch": getattr(
+                self, "active_action_origin_epoch", None
+            ),
+            "active_action_projection_epoch": getattr(
+                self, "active_action_projection_epoch", None
             ),
             "active_action": bool(self.active_action),
             "state": str(self.state),
@@ -269,10 +335,36 @@ class TebTurnSupervisorControlMixin:
         raw_linear_is_zero = abs(float(raw.linear.x)) <= 0.01
         raw_is_zero = raw_linear_is_zero and abs(float(raw.angular.z)) <= 0.01
         raw_is_reverse_only = (
-            float(raw.linear.x) < -0.01
+            float(raw.linear.x) < 0.0
             and abs(float(raw.angular.z)) <= 0.01
         )
-        transient_gap = raw_is_zero or raw_is_reverse_only or planner_command_stale
+        # PersistentTebLocalPlanner can return a small reverse/near-zero
+        # command for the current control cycle even while the selected TEB
+        # trajectory still contains a valid forward sample.  With the
+        # forward-only actuator boundary that command becomes zero translation
+        # and the route can stall indefinitely.  The selected sample is usable
+        # only when it has been re-armed by the current identity-bearing
+        # planner contract and is still fresh; it is never synthesized here.
+        feedback_age = max(0.0, now - self.latest_trajectory_command_wall)
+        feedback_current = self._trajectory_feedback_is_current_locked(
+            self.active_action_identity
+        )
+        selected_forward = bool(
+            getattr(self, "trajectory_feedback_valid", False)
+            and feedback_current
+            and feedback_age <= self._trajectory_feedback_timeout_locked()
+            and float(self.latest_trajectory_command.linear.x)
+            >= self.trajectory_continuity_min_forward
+        )
+        forward_only_command_gap = bool(
+            raw_linear_is_zero and selected_forward
+        )
+        transient_gap = bool(
+            raw_is_zero
+            or raw_is_reverse_only
+            or planner_command_stale
+            or forward_only_command_gap
+        )
         sharp_entry_error = (
             self._sharp_navfn_entry_heading_error_locked()
             if transient_gap else None
@@ -308,7 +400,6 @@ class TebTurnSupervisorControlMixin:
         goal_distance = self._goal_distance_in_pose_frame_locked(
             self.active_action_goal
         )
-        feedback_age = max(0.0, now - self.latest_trajectory_command_wall)
         feedback_timeout = self._trajectory_feedback_timeout_locked()
         self.trajectory_continuity_goal_distance = goal_distance
         action_or_same_tier_intent = (
@@ -354,7 +445,11 @@ class TebTurnSupervisorControlMixin:
             gap_kind=(
                 "planner_publish_gap"
                 if planner_command_stale
-                else ("reverse_only" if raw_is_reverse_only else "zero")
+                else (
+                    "forward_only_command_gap"
+                    if forward_only_command_gap
+                    else ("reverse_only" if raw_is_reverse_only else "zero")
+                )
             ),
             raw_command=[
                 round(float(raw.linear.x), 4),
@@ -375,6 +470,94 @@ class TebTurnSupervisorControlMixin:
             count=int(self.trajectory_continuity_events),
         )
         return copy.deepcopy(self.latest_trajectory_command)
+
+    def _forward_only_reorientation_command_locked(self, now):
+        """Keep a clamped route on its current forward TEB trajectory.
+
+        A forward-only mux must remove TEB's small reverse entry sample, but
+        that sample can remain the raw planner command after the route has
+        already been aligned. A fresh selected TEB trajectory is the only
+        valid continuation signal; do not fall back to the command the
+        actuator will necessarily clamp. The override is armed only by a
+        completed bounded reorientation or an actual mux clamp, and remains
+        scoped to the current action identity.
+        """
+        action_identity = getattr(self, "active_action_identity", None)
+        if action_identity is None:
+            return None
+        if not (
+            self.active_action
+            and self.state == STATE_PASS_THROUGH
+            and not self.task_done
+            and not self.navigation_hold
+            and (
+                self._is_frontier_endpoint_action_locked()
+                or self._is_portal_transition_action_locked()
+            )
+        ):
+            return None
+        completed_identity = getattr(
+            self, "stalled_route_completed_identity", None
+        )
+        override_identity = getattr(
+            self, "forward_only_trajectory_identity", None
+        )
+        if override_identity is not None and override_identity != action_identity:
+            self.forward_only_trajectory_identity = None
+            override_identity = None
+        clamp = self._current_forward_only_clamp_locked(action_identity)
+        if (
+            override_identity != action_identity
+            and completed_identity != action_identity
+            and clamp is None
+        ):
+            return None
+        raw = self.latest_planner_command
+        if float(raw.linear.x) >= -0.002:
+            return None
+        if not self._trajectory_feedback_is_current_locked(action_identity):
+            return None
+        feedback_age = max(0.0, now - self.latest_trajectory_command_wall)
+        feedback_timeout = self._trajectory_feedback_timeout_locked()
+        selected = self.latest_trajectory_command
+        if (
+            feedback_age > feedback_timeout
+            or not bool(getattr(self, "trajectory_feedback_valid", False))
+            or float(selected.linear.x) < self.trajectory_continuity_min_forward
+        ):
+            return None
+        goal_distance = self._goal_distance_in_pose_frame_locked(
+            self.active_action_goal
+        )
+        if (
+            goal_distance is None
+            or goal_distance <= self.trajectory_continuity_terminal_radius
+        ):
+            return None
+        armed = override_identity != action_identity
+        self.forward_only_trajectory_identity = action_identity
+        if armed:
+            self.publish_status_locked(
+                "forward_only_reorientation",
+                raw_command=[
+                    round(float(raw.linear.x), 4),
+                    round(float(raw.angular.z), 4),
+                ],
+                selected_command=[
+                    round(float(selected.linear.x), 4),
+                    round(float(selected.angular.z), 4),
+                ],
+                feedback_age_seconds=round(feedback_age, 4),
+                feedback_timeout_seconds=round(feedback_timeout, 4),
+                action_goal_distance=round(float(goal_distance), 4),
+                actuator_clamp=clamp,
+                reason=(
+                    "mux_clamp_forward_trajectory"
+                    if clamp is not None
+                    else "completed_reorientation_forward_trajectory"
+                ),
+            )
+        return copy.deepcopy(selected)
 
     def on_mode(self, message):
         mode = message.data.strip().lower()
@@ -439,11 +622,73 @@ class TebTurnSupervisorControlMixin:
             self.turn_velocity = 0.0
             return Twist()
         error = normalize_angle(self.turn_target_yaw - self.pose.theta)
-        if abs(error) <= self.yaw_goal_tolerance:
+        # A regular TEB endpoint may legitimately finish inside its configured
+        # yaw envelope.  A stalled forward-only route is different: the
+        # evidence says TEB is still requesting a reverse entry which the mux
+        # must remove.  Close that bounded reorientation against the Navfn
+        # tangent itself, otherwise a 14-degree residual can be declared done
+        # while the next command remains reverse and the route stalls again.
+        completion_tolerance = self.yaw_goal_tolerance
+        if getattr(self, "turn_phase", "") == "stalled_route_reorientation":
+            completion_tolerance = max(
+                0.05, min(self.yaw_goal_tolerance, self.yaw_goal_tolerance * 0.25)
+            )
+        if abs(error) <= completion_tolerance:
             self._release_turn_locked("yaw_tolerance_reached", completed=True)
             return copy.deepcopy(self.latest_planner_command)
 
-        remaining = max(0.0, abs(error) - self.yaw_goal_tolerance)
+        odom_rotation = float(getattr(self, "turn_abs_rotation", 0.0) or 0.0)
+        rotation_cap = float(getattr(self, "turn_rotation_cap", 0.0) or 0.0)
+        if rotation_cap > 0.0 and odom_rotation >= rotation_cap:
+            self.turn_capped_releases += 1
+            rospy.logwarn(
+                "TEB turn supervisor reached odom rotation budget: "
+                "odom_rotation=%.0fdeg cap=%.0fdeg initial_error=%.0fdeg",
+                math.degrees(odom_rotation),
+                math.degrees(rotation_cap),
+                math.degrees(self.turn_initial_abs_error),
+            )
+            self._release_turn_locked(
+                "odom_rotation_budget_exceeded", completed=False
+            )
+            return Twist()
+
+        last_progress = float(
+            getattr(self, "turn_last_odom_progress_wall", 0.0) or 0.0
+        )
+        no_progress_timeout = float(
+            getattr(self, "turn_no_progress_timeout", 0.0) or 0.0
+        )
+        if (
+            last_progress > 0.0
+            and no_progress_timeout > 0.0
+            and now_for(self) - last_progress >= no_progress_timeout
+        ):
+            self.turn_no_progress_releases = int(
+                getattr(self, "turn_no_progress_releases", 0) or 0
+            ) + 1
+            progress_age = now_for(self) - last_progress
+            self.publish_status_locked(
+                "turn_no_odom_progress",
+                reason="odom_yaw_stalled",
+                odom_abs_rotation=round(odom_rotation, 4),
+                odom_progress_age_seconds=round(progress_age, 4),
+                no_progress_timeout_seconds=round(no_progress_timeout, 4),
+                no_progress_releases=int(self.turn_no_progress_releases),
+            )
+            rospy.logwarn(
+                "TEB turn supervisor found no odom yaw progress: "
+                "age=%.2fs budget=%.0fdeg cap=%.0fdeg",
+                progress_age,
+                math.degrees(odom_rotation),
+                math.degrees(rotation_cap),
+            )
+            self._release_turn_locked(
+                "odom_turn_no_progress", completed=False
+            )
+            return Twist()
+
+        remaining = max(0.0, abs(error) - completion_tolerance)
         desired = min(
             self.max_vel_theta,
             math.sqrt(max(0.0, 2.0 * self.acc_lim_theta * remaining)),
@@ -463,19 +708,6 @@ class TebTurnSupervisorControlMixin:
             else:
                 magnitude = max(desired, previous_magnitude - step)
             self.turn_velocity = requested_sign * magnitude
-
-        self.turn_abs_rotation += abs(self.turn_velocity) * max(0.001, float(dt))
-        if self.turn_abs_rotation > self.turn_rotation_cap:
-            self.turn_capped_releases += 1
-            rospy.logwarn(
-                "TEB turn supervisor forced turn release: abs_rotation=%.0fdeg "
-                "cap=%.0fdeg initial_error=%.0fdeg",
-                math.degrees(self.turn_abs_rotation),
-                math.degrees(self.turn_rotation_cap),
-                math.degrees(self.turn_initial_abs_error),
-            )
-            self._release_turn_locked("rotation_budget_exceeded", completed=False)
-            return copy.deepcopy(self.latest_planner_command)
 
         command = Twist()
         command.angular.z = self.turn_velocity
@@ -500,7 +732,7 @@ class TebTurnSupervisorControlMixin:
                         "turn_clearance_lost_%s" % clearance_reason,
                         completed=False,
                     )
-                    command = copy.deepcopy(self.latest_planner_command)
+                    command = Twist()
                     decision = "turn_clearance_release"
                 else:
                     command = self._turn_command_locked(
@@ -535,13 +767,22 @@ class TebTurnSupervisorControlMixin:
                     decision = rejection_reason
                 else:
                     command = copy.deepcopy(self.latest_planner_command)
-                    continuity = self._trajectory_continuity_command_locked(
-                        now,
-                        planner_command_stale=False,
+                    forward_only_reorientation = (
+                        self._forward_only_reorientation_command_locked(now)
                     )
+                    continuity = forward_only_reorientation
+                    if continuity is None:
+                        continuity = self._trajectory_continuity_command_locked(
+                            now,
+                            planner_command_stale=False,
+                        )
                     if continuity is not None:
                         command = continuity
-                        decision = "trajectory_continuity"
+                        decision = (
+                            "forward_only_reorientation"
+                            if forward_only_reorientation is not None
+                            else "trajectory_continuity"
+                        )
                     else:
                         decision = "pass_through"
                 if (
@@ -578,6 +819,8 @@ class TebTurnSupervisorControlMixin:
             ):
                 self._activate_turn_locked()
             transaction_id = self._lifecycle_transaction_id_locked()
+            self.last_output_command = copy.deepcopy(command)
+            self.last_output_wall = now
             self.output_sequence += 1
             self.last_output_transaction_id = transaction_id
             self.last_output_decision = decision

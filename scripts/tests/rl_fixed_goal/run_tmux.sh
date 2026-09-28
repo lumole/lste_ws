@@ -9,6 +9,8 @@ CONFIG="${RL_FIXED_GOAL_CONFIG:-$TEST_DIR/config.yaml}"
 SESSION="${RL_FIXED_GOAL_SESSION:-rl-fixed-goal-test}"
 RUNTIME_DIR="$WS/runtime/rl_fixed_goal_test"
 LOG_ROOT="$RUNTIME_DIR/logs"
+PRUNE_LOGS="$WS/scripts/tools/prune_runtime_logs.py"
+LOG_MAX_BYTES_LIMIT=1000000000
 RL_DIR="$WS/rl_navigation"
 POLICY_DIR="$RL_DIR/policy"
 PYTHON_BIN="${SAPPO_PYTHON:-$HOME/miniconda3/envs/rlenvs/bin/python}"
@@ -53,11 +55,17 @@ LOCAL_PLANNER_PLUGIN="${CFG_LOCAL_PLANNER_PLUGIN:-teb_local_planner/TebLocalPlan
 CONTROLLER_METHOD="${CFG_CONTROLLER_METHOD:-}"
 LIVE_RVIZ="${CFG_LIVE_RVIZ:-true}"
 LOG_RETENTION_DAYS="${CFG_LOG_RETENTION_DAYS:-15}"
+LOG_MAX_BYTES="${CFG_LOG_MAX_BYTES:-1000000000}"
 SCREEN_RECORD="${CFG_SCREEN_RECORD:-false}"
 SCREEN_RECORD_START_DELAY_SECONDS="${CFG_SCREEN_RECORD_START_DELAY_SECONDS:-18}"
 SCREEN_RECORD_DURATION_SECONDS="${CFG_SCREEN_RECORD_DURATION_SECONDS:-75}"
 SCREEN_RECORD_FPS="${CFG_SCREEN_RECORD_FPS:-30}"
 SCREEN_RECORD_WINDOW="${CFG_SCREEN_RECORD_WINDOW:-RViz}"
+
+if ! [[ "$LOG_MAX_BYTES" =~ ^[1-9][0-9]*$ ]] || (( LOG_MAX_BYTES > LOG_MAX_BYTES_LIMIT )); then
+  echo "[error] LOG_MAX_BYTES must be between 1 and $LOG_MAX_BYTES_LIMIT bytes." >&2
+  exit 2
+fi
 
 # A single comparison config can select the controller while retaining one
 # shared world, spawn pose, goal publisher, and lifecycle. Older configs that
@@ -140,7 +148,19 @@ lifecycle_log() {
   printf '%s [INFO] [launcher] config_end\n' "$(date '+%Y-%m-%d %H:%M:%S.%3N')"
   printf '%s [INFO] [launcher] world=%s controller_method=%s controller_mode=%s local_planner=%s max_linear_speed=%s sappo_speed=%s initial_pose=(%s,%s,%s,%s) goal=(%s,%s) ros_port=%s gazebo_port=%s screen_record=%s git_revision=%s\n' \
     "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$WORLD" "${CONTROLLER_METHOD:-legacy}" "$CONTROLLER_MODE" "$LOCAL_PLANNER_PLUGIN" "$NAVIGATION_MAX_LINEAR_SPEED" "$SAPPO_SPEED" "$INITIAL_X" "$INITIAL_Y" "$INITIAL_Z" "$INITIAL_YAW" "$GOAL_X" "$GOAL_Y" "$ROS_PORT" "$GAZEBO_PORT" "$SCREEN_RECORD" "$(git -C "$WS" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  printf '%s [INFO] [launcher] log_max_bytes=%s log_root=%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$LOG_MAX_BYTES" "$LOG_ROOT"
 } >> "$LIFECYCLE_LOG"
+
+LOG_RETENTION_RESULT=applied
+if ! python3 "$PRUNE_LOGS" \
+    --runtime-root "$WS/runtime" \
+    --max-bytes "$LOG_MAX_BYTES" \
+    --keep "$LOG_DIR"; then
+  LOG_RETENTION_RESULT=failed
+  echo "[warning] runtime log budget cleanup failed" >&2
+fi
+lifecycle_log "log_retention result=$LOG_RETENTION_RESULT max_bytes=$LOG_MAX_BYTES runtime_root=$WS/runtime"
 
 if [[ "${SCREEN_RECORD,,}" == "true" ]]; then
   if ! [[ "$SCREEN_RECORD_START_DELAY_SECONDS" =~ ^[0-9]+$ && "$SCREEN_RECORD_DURATION_SECONDS" =~ ^[1-9][0-9]*$ && "$SCREEN_RECORD_FPS" =~ ^[1-9][0-9]*$ ]]; then

@@ -121,12 +121,7 @@ class TebGoalBridgePersistentTargetResultMixin:
                     "generation": int(getattr(self, "action_generation", 0) or 0),
                     "transaction_id": transaction_id,
                     "lifecycle_transaction_id": int(
-                        getattr(
-                            getattr(self, "lifecycle_manager", None),
-                            "current_transaction_id",
-                            0,
-                        )
-                        or 0
+                        self._canonical_lifecycle_transaction_id()
                     ),
                     "route_id": int(getattr(self, "active_route_id", 0) or 0),
                     "map_epoch": getattr(self, "active_route_map_epoch", None),

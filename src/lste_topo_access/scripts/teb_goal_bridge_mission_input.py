@@ -70,6 +70,18 @@ class TebGoalBridgeMissionInputMixin:
                 except (TypeError, ValueError):
                     return
                 with self.lock:
+                    try:
+                        lifecycle_transaction_id = max(
+                            0,
+                            int(
+                                payload.get(
+                                    "lifecycle_transaction_id", 0
+                                )
+                                or 0
+                            ),
+                        )
+                    except (TypeError, ValueError):
+                        lifecycle_transaction_id = 0
                     tombstone_transaction = int(
                         getattr(
                             self, "target_lease_tombstone_transaction_id", 0
@@ -166,6 +178,9 @@ class TebGoalBridgeMissionInputMixin:
                         payload.get("goal_context")
                     )
                     self.latest_goal_transaction_id = transaction_id
+                    self.latest_lifecycle_transaction_id = (
+                        lifecycle_transaction_id
+                    )
                     self.publish_bridge_status(
                         "target_terminal_observation_started",
                         transaction_id=transaction_id,
@@ -206,6 +221,12 @@ class TebGoalBridgeMissionInputMixin:
             target_epoch = max(0, int(payload.get("target_epoch", 0) or 0))
             transaction_id = max(0, int(payload.get("transaction_id", 0) or 0))
             map_epoch = max(0, int(payload.get("map_epoch", 0) or 0))
+            origin_epoch = max(
+                0, int(payload.get("origin_epoch", map_epoch) or 0)
+            )
+            projection_epoch = max(
+                0, int(payload.get("projection_epoch", map_epoch) or 0)
+            )
             graph_transaction_id = max(
                 0, int(payload.get("graph_transaction_id", 0) or 0)
             )
@@ -248,6 +269,34 @@ class TebGoalBridgeMissionInputMixin:
                     transaction_id=transaction_id,
                 )
                 return
+            raw_goal_context = payload.get("goal_context")
+            normalized_goal_context = normalize_goal_context(raw_goal_context)
+            context_graph_transaction_id = int(
+                normalized_goal_context.get("graph_transaction_id", 0) or 0
+            )
+            if (
+                graph_transaction_id > 0
+                and context_graph_transaction_id > 0
+                and context_graph_transaction_id != graph_transaction_id
+            ):
+                # A positive nested mismatch means two layers could adopt
+                # different graph owners. Keep the canonical route strict and
+                # reject the malformed mission before it reaches actionlib.
+                self.publish_bridge_status(
+                    "mission_goal_ignored",
+                    reason="goal_context_graph_transaction_mismatch",
+                    route_id=route_id,
+                    transaction_id=transaction_id,
+                    graph_transaction_id=graph_transaction_id,
+                    goal_context_graph_transaction_id=(
+                        context_graph_transaction_id
+                    ),
+                )
+                return
+            if graph_transaction_id > 0:
+                normalized_goal_context["graph_transaction_id"] = (
+                    graph_transaction_id
+                )
             # Target and frontier transactions share the wire field for
             # backwards compatibility, but they are different ownership
             # domains. A failed target may deliberately use a newer semantic
@@ -479,6 +528,15 @@ class TebGoalBridgeMissionInputMixin:
             self.latest_intent_source = (
                 str(payload.get("source", "unknown")).strip().lower() or "unknown"
             )
+            try:
+                self.latest_lifecycle_transaction_id = max(
+                    0,
+                    int(
+                        payload.get("lifecycle_transaction_id", 0) or 0
+                    ),
+                )
+            except (TypeError, ValueError):
+                self.latest_lifecycle_transaction_id = 0
             self.latest_intent_priority = priority
             self.latest_route_kind = str(
                 payload.get("route_kind", "")
@@ -489,6 +547,10 @@ class TebGoalBridgeMissionInputMixin:
                 payload.get("mission_route_kind", self.latest_route_kind)
             ).strip().lower() or self.latest_route_kind
             self.latest_route_map_epoch = map_epoch or None
+            self.latest_origin_epoch = origin_epoch or map_epoch or None
+            self.latest_projection_epoch = (
+                projection_epoch or map_epoch or None
+            )
             self.latest_graph_transaction_id = graph_transaction_id
             self.latest_graph_action = str(
                 payload.get("graph_action", "") or ""
@@ -516,8 +578,12 @@ class TebGoalBridgeMissionInputMixin:
             self.latest_target_viewpoint_attempt_id = str(
                 payload.get("target_viewpoint_attempt_id", "")
             ).strip()
-            self.latest_goal_context = normalize_goal_context(
-                payload.get("goal_context")
+            self.latest_goal_context = normalized_goal_context
+            predecessor_contract = payload.get("predecessor_contract")
+            self.latest_predecessor_contract = (
+                dict(predecessor_contract)
+                if isinstance(predecessor_contract, dict)
+                else None
             )
             self.latest_intent_goal = (x, y)
             self.latest_goal_transaction_id = transaction_id
@@ -525,13 +591,26 @@ class TebGoalBridgeMissionInputMixin:
             self.publish_bridge_status(
                 "mission_goal_received",
                 transaction_id=transaction_id,
+                lifecycle_transaction_id=int(
+                    self.latest_lifecycle_transaction_id
+                ),
                 priority=priority,
                 source=self.latest_intent_source,
                 goal=[round(x, 3), round(y, 3)],
                 goal_context=self.latest_goal_context,
                 route_id=int(self.latest_route_id),
                 map_epoch=self.latest_route_map_epoch,
+                origin_epoch=self.latest_origin_epoch,
+                projection_epoch=self.latest_projection_epoch,
                 graph_transaction_id=int(self.latest_graph_transaction_id),
+                predecessor_route_id=int(
+                    payload.get("predecessor_route_id", 0) or 0
+                ),
+                predecessor_contract=(
+                    None
+                    if self.latest_predecessor_contract is None
+                    else dict(self.latest_predecessor_contract)
+                ),
             )
             if priority >= 2:
                 # A visual ray remains a request until Navfn installs the route
@@ -556,3 +635,8 @@ class TebGoalBridgeMissionInputMixin:
                     self._adopt_persistent_mission_goal_locked()
             if self._is_active_mode():
                 self.dispatch_locked(force=False, reason="mission_goal_transaction")
+                retry_release = getattr(
+                    self, "_retry_deferred_frontier_lease_release_locked", None
+                )
+                if callable(retry_release):
+                    retry_release()

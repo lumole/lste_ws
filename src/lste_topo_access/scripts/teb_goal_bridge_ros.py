@@ -115,6 +115,12 @@ def _create_subscribers(bridge):
     rospy.Subscriber(bridge.controller_topic, String, bridge.on_mode, queue_size=1)
     rospy.Subscriber(bridge.task_done_topic, Bool, bridge.on_task_done, queue_size=1)
     rospy.Subscriber(
+        bridge.navigation_hold_topic,
+        Bool,
+        bridge.on_navigation_hold,
+        queue_size=1,
+    )
+    rospy.Subscriber(
         bridge.persistent_target_plan_result_topic,
         String,
         bridge.on_persistent_target_plan_result,

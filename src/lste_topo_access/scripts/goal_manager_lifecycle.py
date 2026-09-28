@@ -21,17 +21,25 @@ class GoalManagerLifecycleMixin:
 
     def _initialize_lifecycle_manager(self):
         gp = rospy.get_param
+        allow_local_transactions = not bool(
+            getattr(self, "global_frontier_enabled", False)
+        )
         self.lifecycle_manager = LifecycleManager(
             event_handler=self._handle_lifecycle_event,
             transition_handler=self._on_lifecycle_transition,
             timeout_handler=self._on_lifecycle_timeout,
-            allow_local_transactions=False,
+            # Online Global Frontier routes must adopt their upstream
+            # lifecycle identity.  The diagnostic direct-target profile has
+            # no upstream route owner, so it gets one local lifecycle epoch.
+            allow_local_transactions=allow_local_transactions,
             timeouts={
                 State.DISPATCHED: max(
                     1.0, float(gp("~lifecycle_dispatch_timeout", 120.0))
                 ),
             },
         )
+        if allow_local_transactions:
+            self.lifecycle_manager.begin_transaction(initial_state=State.IDLE)
         self._lifecycle_event_transaction_id = None
         self._last_hard_reset_id = None
         self._last_hard_reset_transaction_id = 0
@@ -41,7 +49,13 @@ class GoalManagerLifecycleMixin:
         return self.lifecycle_manager.current_state
 
     def lifecycle_transaction_id(self):
-        return self.lifecycle_manager.current_transaction_id
+        manager = getattr(self, "lifecycle_manager", None)
+        if manager is None:
+            return 0
+        latest = getattr(manager, "latest_transaction_id", None)
+        if callable(latest):
+            return int(latest() or 0)
+        return int(getattr(manager, "current_transaction_id", 0) or 0)
 
     def _enqueue_lifecycle_event(self, event_type, payload=None):
         if event_type == EventType.GLOBAL_FRONTIER_COMMAND:
@@ -118,6 +132,8 @@ class GoalManagerLifecycleMixin:
             "route_id": positive("route_id"),
             "graph_transaction_id": positive("graph_transaction_id"),
             "map_epoch": positive("map_epoch"),
+            "origin_epoch": positive("origin_epoch"),
+            "projection_epoch": positive("projection_epoch"),
         }
         for name, value in identity.items():
             if value <= 0:
@@ -135,6 +151,8 @@ class GoalManagerLifecycleMixin:
             ("route_id", "canonical_route_high_water"),
             ("graph_transaction_id", "canonical_graph_high_water"),
             ("map_epoch", "canonical_map_epoch_high_water"),
+            ("origin_epoch", "canonical_origin_epoch_high_water"),
+            ("projection_epoch", "canonical_projection_epoch_high_water"),
         )
         for field, attribute in high_water:
             if identity[field] < int(getattr(self, attribute, 0) or 0):
@@ -162,6 +180,12 @@ class GoalManagerLifecycleMixin:
                     identity.get("graph_transaction_id", 0) or 0
                 ),
                 received_map_epoch=int(identity.get("map_epoch", 0) or 0),
+                received_origin_epoch=int(
+                    identity.get("origin_epoch", 0) or 0
+                ),
+                received_projection_epoch=int(
+                    identity.get("projection_epoch", 0) or 0
+                ),
             )
         rospy.logwarn(
             "GoalManager discarded canonical route command: event=%s reason=%s "
@@ -319,6 +343,9 @@ class GoalManagerLifecycleMixin:
             # handler runs. Keep the exact wire ID for GoalManager output;
             # downstream nodes must see the same canonical value.
             self._lifecycle_event_transaction_id = int(event.transaction_id)
+            self.global_frontier_lifecycle_transaction_id = int(
+                identity["lifecycle_transaction_id"]
+            )
             self.canonical_lifecycle_high_water = max(
                 int(getattr(self, "canonical_lifecycle_high_water", 0) or 0),
                 identity["lifecycle_transaction_id"],
@@ -423,6 +450,8 @@ class GoalManagerLifecycleMixin:
         self.canonical_route_high_water = 0
         self.canonical_graph_high_water = 0
         self.canonical_map_epoch_high_water = 0
+        self.canonical_origin_epoch_high_water = 0
+        self.canonical_projection_epoch_high_water = 0
         self._hard_reset_count += 1
         self.publish_goal_arbitration(
             "hard_reset_complete",

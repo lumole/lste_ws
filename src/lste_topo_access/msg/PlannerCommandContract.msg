@@ -12,6 +12,8 @@ uint32 transaction_id
 uint32 route_id
 uint64 graph_transaction_id
 uint64 map_epoch
+uint64 origin_epoch
+uint64 projection_epoch
 string lifecycle_transaction_id
 uint32 action_generation
 uint64 planner_sequence

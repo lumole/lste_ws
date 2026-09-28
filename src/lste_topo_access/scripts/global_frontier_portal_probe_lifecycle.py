@@ -168,6 +168,18 @@ class GlobalFrontierPortalProbeLifecycleMixin:
                         suppression_reason = (
                             "same_wide_gate_as_crossed_portal_is_transit"
                         )
+            if reverse_edge is None:
+                physical_gate_query = getattr(
+                    hypothesis_ledger,
+                    "crossed_gate_at_physical_gate",
+                    None,
+                )
+                if callable(physical_gate_query):
+                    reverse_edge = physical_gate_query(physical_gate)
+                    if reverse_edge is not None:
+                        suppression_reason = (
+                            "same_physical_gate_as_crossed_portal"
+                        )
         if reverse_edge is not None:
             reports = getattr(self, "_portal_probe_suppression_reports", None)
             if reports is None:

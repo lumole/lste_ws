@@ -22,9 +22,15 @@ class GlobalFrontierPortalSelectionMixin(GlobalFrontierPortalAdmissionMixin):
     """
 
     def _refresh_or_certify_portal_hypothesis(
-        self, request, source, portal_gate_xy, destination_xy,
+        self, request, source, portal_gate_xy, destination_xy, *, create=True,
     ):
-        """Keep a durable Portal ID when its map projection is rehydrated."""
+        """Keep a durable Portal ID when its map projection is rehydrated.
+
+        ``create=False`` is used while a snapshot-local candidate is still
+        passing physical admission.  A rejected covered-room candidate must
+        not leave a durable Portal/probe behind as a side effect of merely
+        being inspected.
+        """
         ledger = getattr(self, "portal_hypothesis_ledger", None)
         source_place_id = getattr(self, "current_physical_place_id", None)
         if ledger is None or source_place_id is None:
@@ -40,6 +46,13 @@ class GlobalFrontierPortalSelectionMixin(GlobalFrontierPortalAdmissionMixin):
             if map_to_physical is None
             else map_to_physical(destination_xy[0], destination_xy[1])
         )
+        preferred_portal_id = getattr(self, "graph_route_portal_id", None)
+        try:
+            preferred_portal_id = (
+                None if preferred_portal_id is None else int(preferred_portal_id)
+            )
+        except (TypeError, ValueError):
+            preferred_portal_id = None
         # A crossed Portal defines a durable doorway band.  If the current
         # Place is that edge's destination, a fresh structural candidate at
         # the same physical gate is the reverse/transit side of the doorway,
@@ -104,13 +117,49 @@ class GlobalFrontierPortalSelectionMixin(GlobalFrontierPortalAdmissionMixin):
                         ),
                     )
                 return None
-        preferred_portal_id = getattr(self, "graph_route_portal_id", None)
-        try:
-            preferred_portal_id = (
-                None if preferred_portal_id is None else int(preferred_portal_id)
+            # A Place identity can split at a doorway after a loop closure,
+            # so the directional destination query above may not know that
+            # this is the same already-crossed physical gate.  Use the strict
+            # physical gate band as a canonical duplicate check, but preserve
+            # an explicitly selected crossed graph edge for rehydration.
+            crossed_at_gate = getattr(
+                ledger, "crossed_gate_at_physical_gate", None,
             )
-        except (TypeError, ValueError):
-            preferred_portal_id = None
+            if callable(crossed_at_gate) and physical_gate is not None:
+                crossed_gate = crossed_at_gate(physical_gate)
+                if crossed_gate is not None:
+                    try:
+                        preferred_matches = (
+                            preferred_portal_id is not None
+                            and int(crossed_gate.get("id", -1))
+                            == int(preferred_portal_id)
+                        )
+                    except (TypeError, ValueError, AttributeError):
+                        preferred_matches = False
+                    if not preferred_matches:
+                        reports = getattr(
+                            self, "_portal_hypothesis_suppression_reports", None,
+                        )
+                        if reports is None:
+                            reports = set()
+                            self._portal_hypothesis_suppression_reports = reports
+                        signature = (
+                            int(source_place_id),
+                            int(crossed_gate["id"]),
+                        )
+                        if signature not in reports:
+                            reports.add(signature)
+                            self.publish_status(
+                                "portal_hypothesis_suppressed",
+                                source_place_id=int(source_place_id),
+                                portal_id=int(crossed_gate["id"]),
+                                gate=[
+                                    round(float(physical_gate[0]), 3),
+                                    round(float(physical_gate[1]), 3),
+                                ],
+                                reason="same_physical_gate_as_crossed_portal",
+                            )
+                        return None
         hypothesis_id = getattr(source, "hypothesis_id", None)
         if hypothesis_id is not None:
             hypothesis = ledger.get(hypothesis_id)
@@ -190,6 +239,9 @@ class GlobalFrontierPortalSelectionMixin(GlobalFrontierPortalAdmissionMixin):
                         request, preferred, portal_gate_xy, destination_xy,
                     )
                     return preferred
+
+        if not create:
+            return None
 
         hypothesis, created = ledger.certify(
             source_place_id,
@@ -400,11 +452,16 @@ class GlobalFrontierPortalSelectionMixin(GlobalFrontierPortalAdmissionMixin):
             )
             # Refresh/reuse the durable identity before admission so a
             # transient component cannot reclassify a known destination.
+            # Existing identities may be refreshed before admission so a
+            # preferred graph edge remains bound to its physical gate.  A new
+            # candidate, however, is only an observation until the covered-
+            # destination and reverse-egress checks below accept it.
             hypothesis = self._refresh_or_certify_portal_hypothesis(
                 request,
                 source,
                 portal_gate_xy,
                 (portal_x, portal_y),
+                create=False,
             )
             if preferred_portal_id is not None:
                 if (
@@ -419,10 +476,7 @@ class GlobalFrontierPortalSelectionMixin(GlobalFrontierPortalAdmissionMixin):
                     # substitute; let the caller retain the plan and wait for
                     # that physical edge to be reprojected.
                     continue
-            if hypothesis is None and (
-                getattr(self, "portal_hypothesis_ledger", None) is not None
-                or getattr(source, "hypothesis_id", None) is not None
-            ):
+            if hypothesis is None and getattr(source, "hypothesis_id", None) is not None:
                 continue
             if not self.portal_destination_is_admissible(
                 request,
@@ -433,6 +487,15 @@ class GlobalFrontierPortalSelectionMixin(GlobalFrontierPortalAdmissionMixin):
                 hypothesis=hypothesis,
             ):
                 continue
+            if hypothesis is None:
+                hypothesis = self._refresh_or_certify_portal_hypothesis(
+                    request,
+                    source,
+                    portal_gate_xy,
+                    (portal_x, portal_y),
+                )
+                if hypothesis is None:
+                    continue
             certify_probe = getattr(self, "certify_portal_probe", None)
             if certify_probe is not None and hypothesis is not None:
                 certify_probe(

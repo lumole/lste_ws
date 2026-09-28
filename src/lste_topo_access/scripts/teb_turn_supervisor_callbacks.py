@@ -28,6 +28,25 @@ from teb_turn_supervisor_contract import (
 class TebTurnSupervisorCallbacksMixin:
     """Decode ROS callbacks into the supervisor's synchronized state."""
 
+    _BRIDGE_FEEDBACK_BOUNDARY_REASONS = frozenset(
+        {
+            "new_action_dispatch",
+            "route_owner_changed",
+            "planner_contract_endpoint_reached",
+            "planner_contract_terminal_hold",
+            "terminal_prepare",
+            "controller_stall",
+            "bridge_inactive",
+            "action_lease_cleared",
+            "controller_lease_released",
+            "persistent_endpoint_terminal",
+            "task_done",
+            "navigation_hold",
+            "controller_mode_changed",
+            "planner_zero_command",
+        }
+    )
+
     def _clear_recovery_execution_locked(self, reason):
         """Drop the recovery-command bridge after a route/contract boundary."""
         if not getattr(self, "recovery_active", False):
@@ -91,6 +110,12 @@ class TebTurnSupervisorCallbacksMixin:
                 getattr(message, "graph_transaction_id", 0)
             ),
             "map_epoch": integer(getattr(message, "map_epoch", 0)),
+            "origin_epoch": integer(
+                getattr(message, "origin_epoch", 0)
+            ),
+            "projection_epoch": integer(
+                getattr(message, "projection_epoch", 0)
+            ),
             "lifecycle_transaction_id": integer(
                 getattr(message, "lifecycle_transaction_id", "")
             ),
@@ -119,14 +144,22 @@ class TebTurnSupervisorCallbacksMixin:
             return True
         if self._lifecycle_transaction_id_locked() <= 0:
             return True
+        has_future_field = False
         for field, active_field in (
             ("transaction_id", "active_action_goal_transaction_id"),
             ("route_id", "active_action_route_id"),
             ("graph_transaction_id", "active_action_graph_transaction_id"),
             ("action_generation", "active_action_generation"),
+            ("origin_epoch", "active_action_origin_epoch"),
+            ("projection_epoch", "active_action_projection_epoch"),
         ):
             active_value = int(getattr(self, active_field, 0) or 0)
             received_value = int(identity[field] or 0)
+            # Direct target routes are valid without a Global Frontier graph
+            # route.  When both sides carry graph=0 there is no graph
+            # identity to align; non-zero graph identities remain strict.
+            if field == "graph_transaction_id" and active_value <= 0 and received_value <= 0:
+                continue
             if active_value <= 0:
                 return True
             if received_value > active_value:
@@ -141,6 +174,210 @@ class TebTurnSupervisorCallbacksMixin:
         except (TypeError, ValueError):
             return True
         return False
+
+    def _mux_status_identity_matches_action_locked(self, payload):
+        """Check that an actuator result belongs to the current route owner."""
+        if not isinstance(payload, dict) or not bool(payload.get("active")):
+            return False
+        identity = payload.get("command_identity")
+        if not isinstance(identity, dict):
+            return False
+
+        def integer(value):
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        expected_route = integer(getattr(self, "active_action_route_id", 0))
+        expected_generation = integer(
+            getattr(self, "active_action_generation", 0)
+        )
+        expected_transaction = integer(
+            getattr(self, "active_action_transaction_id", 0)
+        )
+        expected_graph = integer(
+            getattr(self, "active_action_graph_transaction_id", 0)
+        )
+        expected_map = getattr(self, "active_action_map_epoch", None)
+        if expected_route <= 0 or expected_generation <= 0:
+            return False
+
+        incoming_route = integer(
+            identity.get("active_action_route_id", identity.get("route_id"))
+        )
+        incoming_generation = integer(
+            identity.get(
+                "active_action_generation", identity.get("planner_action_generation")
+            )
+        )
+        incoming_transaction = integer(
+            identity.get(
+                "active_action_transaction_id", identity.get("transaction_id")
+            )
+        )
+        incoming_graph = integer(
+            identity.get(
+                "active_action_graph_transaction_id",
+                identity.get("graph_transaction_id"),
+            )
+        )
+        incoming_map = identity.get(
+            "active_action_map_epoch", identity.get("map_epoch")
+        )
+        if incoming_route != expected_route or incoming_generation != expected_generation:
+            return False
+        if expected_transaction > 0 and incoming_transaction != expected_transaction:
+            return False
+        if expected_graph > 0 and incoming_graph > 0 and incoming_graph != expected_graph:
+            return False
+        if expected_map is not None and incoming_map is not None:
+            try:
+                if int(incoming_map) != int(expected_map):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    def _current_forward_only_clamp_locked(self, action_identity=None):
+        """Return a current mux clamp that makes this route non-executable."""
+        status = getattr(self, "latest_mux_status", None)
+        if not isinstance(status, dict):
+            return None
+        now = now_for(self)
+        status_wall = float(getattr(self, "latest_mux_status_wall", 0.0) or 0.0)
+        if status_wall <= 0.0 or now - status_wall > 0.50:
+            return None
+        if not self._mux_status_identity_matches_action_locked(status):
+            return None
+        if str(status.get("filter_reason", "") or "").strip().lower() != (
+            "forward_only_reverse_clamp"
+        ):
+            return None
+        input_command = status.get("input")
+        output_command = status.get("output")
+        if not isinstance(input_command, dict) or not isinstance(output_command, dict):
+            return None
+        try:
+            input_linear = float(input_command.get("linear_x", 0.0) or 0.0)
+            output_linear = float(output_command.get("linear_x", 0.0) or 0.0)
+            output_angular = float(output_command.get("angular_z", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if input_linear >= -0.002 or abs(output_linear) > 0.001:
+            return None
+        if action_identity is not None:
+            expected_identity = getattr(self, "active_action_identity", None)
+            if expected_identity is not None and action_identity != expected_identity:
+                return None
+        return {
+            "reason": "forward_only_reverse_clamp",
+            "input_linear": round(input_linear, 4),
+            "output_linear": round(output_linear, 4),
+            "output_angular": round(output_angular, 4),
+            "status_sequence": int(status.get("sequence", 0) or 0),
+        }
+
+    def on_cmd_vel_mux_status(self, message):
+        """Record the final actuator result for the timer-owned turn FSM."""
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        with self.lock:
+            self.latest_mux_status = payload
+            self.latest_mux_status_wall = now_for(self)
+            clamp = self._current_forward_only_clamp_locked(
+                getattr(self, "active_action_identity", None)
+            )
+            if clamp is None:
+                return
+            identity = payload.get("command_identity") or {}
+            boundary_key = (
+                int(identity.get("active_action_route_id", 0) or 0),
+                int(identity.get("active_action_generation", 0) or 0),
+            )
+            if boundary_key == getattr(self, "latest_mux_boundary_key", None):
+                return
+            self.latest_mux_boundary_key = boundary_key
+            self.publish_status_locked(
+                "actuator_command_boundary",
+                reason=clamp["reason"],
+                input_linear=clamp["input_linear"],
+                output_linear=clamp["output_linear"],
+                output_angular=clamp["output_angular"],
+                mux_status_sequence=clamp["status_sequence"],
+                command_identity=dict(identity),
+            )
+
+    @staticmethod
+    def _planner_contract_order_key(identity):
+        """Return a monotonic key for coalescing pre-adoption contracts."""
+        return tuple(
+            int(identity.get(field, 0) or 0)
+            for field in (
+                "lifecycle_transaction_id",
+                "route_id",
+                "graph_transaction_id",
+                "action_generation",
+                "transaction_id",
+                "planner_sequence",
+            )
+        )
+
+    def _queue_planner_contract_pending_locked(
+        self, identity, command, state, reason, producer
+    ):
+        """Retain a future contract until Bridge publishes action adoption."""
+        previous = getattr(self, "planner_contract_pending", None)
+        incoming_key = self._planner_contract_order_key(identity)
+        if isinstance(previous, dict):
+            previous_identity = previous.get("identity", {})
+            previous_key = self._planner_contract_order_key(previous_identity)
+            if incoming_key < previous_key:
+                self.publish_status_locked(
+                    "planner_contract_pending_ignored",
+                    reason="older_pending_contract",
+                    planner_contract_identity=identity,
+                )
+                return False
+            if (
+                incoming_key == previous_key
+                and int(identity.get("planner_sequence", 0) or 0)
+                <= int(previous_identity.get("planner_sequence", 0) or 0)
+            ):
+                self.publish_status_locked(
+                    "planner_contract_pending_ignored",
+                    reason="duplicate_pending_contract",
+                    planner_contract_identity=identity,
+                )
+                return False
+        self.planner_contract_pending = {
+            "identity": dict(identity),
+            "command": copy.deepcopy(command),
+            "state": int(state),
+            "reason": str(reason or ""),
+            "producer": str(producer or ""),
+            "received_wall": now_for(self),
+        }
+        self.publish_status_locked(
+            "planner_contract_pending",
+            reason="bridge_action_alignment_pending",
+            planner_contract_identity=dict(identity),
+            pending_age_seconds=0.0,
+        )
+        return True
+
+    def _hold_for_pending_planner_contract_locked(self):
+        """Stop forwarding the predecessor while a future owner aligns."""
+        self.planner_contract_valid = False
+        self.planner_contract_state = PlannerCommandContract.STATE_INVALIDATED
+        self.planner_contract_reason = "bridge_action_alignment_pending"
+        self._invalidate_trajectory_feedback_locked(
+            "bridge_action_alignment_pending", clear_planner=True
+        )
 
     def _planner_contract_mismatch_locked(self, identity):
         current_lifecycle = self._lifecycle_transaction_id_locked()
@@ -160,6 +397,8 @@ class TebTurnSupervisorCallbacksMixin:
             ("route_id", "active_action_route_id"),
             ("graph_transaction_id", "active_action_graph_transaction_id"),
             ("action_generation", "active_action_generation"),
+            ("origin_epoch", "active_action_origin_epoch"),
+            ("projection_epoch", "active_action_projection_epoch"),
         ):
             active_value = int(getattr(self, active_field, 0) or 0)
             if active_value > 0 and identity[field] != active_value:
@@ -174,6 +413,31 @@ class TebTurnSupervisorCallbacksMixin:
     def _store_planner_contract_locked(
         self, identity, command, state, reason, producer
     ):
+        previous_identity = getattr(self, "planner_contract_identity", None)
+        previous_valid = bool(
+            getattr(self, "planner_contract_valid", False)
+        )
+        previous_state = getattr(self, "planner_contract_state", None)
+        identity_fields = (
+            "transaction_id",
+            "route_id",
+            "graph_transaction_id",
+            "map_epoch",
+            "origin_epoch",
+            "projection_epoch",
+            "lifecycle_transaction_id",
+            "action_generation",
+        )
+        identity_changed = not isinstance(previous_identity, dict) or any(
+            int(identity.get(field, 0) or 0)
+            != int(previous_identity.get(field, 0) or 0)
+            for field in identity_fields
+        )
+        contract_boundary = bool(
+            identity_changed
+            or not previous_valid
+            or previous_state != PlannerCommandContract.STATE_ACTIVE
+        )
         self.planner_contract_valid = state == PlannerCommandContract.STATE_ACTIVE
         self.planner_contract_state = int(state)
         self.planner_contract_reason = str(reason or "")
@@ -181,9 +445,14 @@ class TebTurnSupervisorCallbacksMixin:
         self.planner_contract_sequence = int(identity["planner_sequence"])
         self.planner_contract_wall = now_for(self)
         self.planner_contract_command = copy.deepcopy(command)
-        self.planner_contract_awaiting_feedback = bool(
-            self.planner_contract_valid
-        )
+        if contract_boundary:
+            # FeedbackMsg has no wire identity and is much slower than the
+            # command-contract stream.  A new route/state must re-arm it, but
+            # a command sample within the same authenticated route must not
+            # invalidate the latest usable trajectory on every callback.
+            self.planner_contract_awaiting_feedback = bool(
+                self.planner_contract_valid
+            )
         self.latest_planner_command = copy.deepcopy(command)
         self.latest_planner_command_wall = self.planner_contract_wall
         self.planner_command_transaction_id = int(
@@ -191,6 +460,10 @@ class TebTurnSupervisorCallbacksMixin:
         )
         self.planner_command_route_id = int(identity["route_id"])
         self.planner_command_map_epoch = int(identity["map_epoch"])
+        self.planner_command_origin_epoch = int(identity["origin_epoch"])
+        self.planner_command_projection_epoch = int(
+            identity["projection_epoch"]
+        )
         self.planner_command_graph_transaction_id = int(
             identity["graph_transaction_id"]
         )
@@ -198,15 +471,19 @@ class TebTurnSupervisorCallbacksMixin:
             identity["action_generation"]
         )
         self.planner_command_action_identity = self.active_action_identity
-        if self.planner_contract_valid:
+        if self.planner_contract_valid and contract_boundary:
             self._invalidate_trajectory_feedback_locked(
-                "planner_contract_command_changed", clear_planner=False
+                "planner_contract_identity_changed"
+                if identity_changed
+                else "planner_contract_boundary",
+                clear_planner=False,
             )
         else:
-            self._invalidate_trajectory_feedback_locked(
-                "planner_contract_%s" % (reason or "boundary"),
-                clear_planner=True,
-            )
+            if not self.planner_contract_valid:
+                self._invalidate_trajectory_feedback_locked(
+                    "planner_contract_%s" % (reason or "boundary"),
+                    clear_planner=True,
+                )
 
     def _apply_planner_contract_locked(
         self, identity, command, state, reason, producer
@@ -252,6 +529,8 @@ class TebTurnSupervisorCallbacksMixin:
                 "lifecycle_transaction_id",
                 "action_generation",
                 "map_epoch",
+                "origin_epoch",
+                "projection_epoch",
             )
             if int(identity.get(field, 0) or 0) <= 0
         ]
@@ -316,6 +595,23 @@ class TebTurnSupervisorCallbacksMixin:
         command = self._planner_contract_command(message)
         reason = str(getattr(message, "reason", "") or "")
         with self.lock:
+            # The persistent planner publishes a ZERO/INVALIDATED boundary as
+            # soon as it receives a newer mission command.  That wire frame is
+            # a future route contract, not a stale command, while the Bridge
+            # still reports the predecessor action as active.  Queue all
+            # future states until the matching Bridge action status arrives;
+            # otherwise a valid successor boundary is rejected by comparing
+            # its lifecycle with the predecessor's lifecycle.
+            if self._planner_contract_alignment_pending_locked(identity):
+                self._queue_planner_contract_pending_locked(
+                    identity,
+                    command,
+                    identity["state"],
+                    reason,
+                    identity["producer"],
+                )
+                self._hold_for_pending_planner_contract_locked()
+                return
             accepted = self._apply_planner_contract_locked(
                 identity,
                 command,
@@ -330,14 +626,83 @@ class TebTurnSupervisorCallbacksMixin:
         pending = getattr(self, "planner_contract_pending", None)
         if not isinstance(pending, dict):
             return False
+        pending_identity = pending.get("identity")
+        if self._pending_planner_contract_is_stale_locked(pending_identity):
+            self.planner_contract_pending = None
+            self.publish_status_locked(
+                "planner_contract_pending_ignored",
+                reason="pending_contract_older_than_active_action",
+                planner_contract_identity=dict(pending_identity or {}),
+            )
+            return False
+        # Do not turn an in-flight Bridge status update into a hard rejection.
+        # The pending frame is promoted on the next matching active status.
+        if self._planner_contract_alignment_pending_locked(
+            pending_identity
+        ):
+            return False
         accepted = self._apply_planner_contract_locked(
-            pending["identity"],
+            pending_identity,
             pending["command"],
             pending["state"],
             pending["reason"],
             pending["producer"],
         )
         return bool(accepted)
+
+    def _pending_planner_contract_is_stale_locked(self, identity):
+        """Reject an old boundary that arrived after successor adoption.
+
+        Planner contracts and Bridge status are separate ROS streams.  A
+        predecessor ZERO/INVALIDATED frame can therefore be queued while the
+        Bridge is inactive and only be promoted after a newer persistent
+        route is already active.  It must not be allowed to repeatedly run
+        the lifecycle-mismatch path or alter the successor's output state.
+        Future contracts remain pending until their matching Bridge status.
+        """
+        if not self.active_action or not isinstance(identity, dict):
+            return False
+        try:
+            incoming_lifecycle = int(
+                identity.get("lifecycle_transaction_id", 0) or 0
+            )
+            active_lifecycle = int(
+                getattr(self, "active_action_lifecycle_transaction_id", 0)
+                or getattr(self, "active_action_transaction_id", 0)
+                or 0
+            )
+        except (TypeError, ValueError):
+            return False
+        if (
+            incoming_lifecycle <= 0
+            or active_lifecycle <= 0
+            or incoming_lifecycle == active_lifecycle
+        ):
+            return False
+
+        # Lifecycle IDs are opaque UUID-like values, so classify ordering by
+        # the monotonic execution identity instead of comparing their integer
+        # values.  A future route must stay queued; an older or otherwise
+        # equal-shaped contract is stale once this action is active.
+        has_future_field = False
+        for field, active_field in (
+            ("route_id", "active_action_route_id"),
+            ("transaction_id", "active_action_goal_transaction_id"),
+            ("graph_transaction_id", "active_action_graph_transaction_id"),
+            ("action_generation", "active_action_generation"),
+        ):
+            try:
+                incoming = int(identity.get(field, 0) or 0)
+                active = int(getattr(self, active_field, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if active <= 0 or incoming <= 0:
+                continue
+            if incoming < active:
+                return True
+            if incoming > active:
+                has_future_field = True
+        return not has_future_field
 
     def _invalidate_trajectory_feedback_locked(
         self, reason, clear_planner=False
@@ -385,8 +750,16 @@ class TebTurnSupervisorCallbacksMixin:
             self.planner_command_transaction_id = 0
             self.planner_command_route_id = 0
             self.planner_command_map_epoch = None
+            self.planner_command_origin_epoch = None
+            self.planner_command_projection_epoch = None
             self.planner_command_graph_transaction_id = 0
             self.planner_command_action_identity = None
+            # A bridge status can race the typed planner stream. If the
+            # current contract was already admitted, keep the next feedback
+            # eligible until the next frame arrives instead of waiting for an
+            # identity change that may already have been processed.
+            if bool(getattr(self, "planner_contract_valid", False)):
+                self.planner_contract_awaiting_feedback = True
         if changed:
             self.publish_status_locked(
                 "trajectory_feedback_invalidated",
@@ -407,6 +780,8 @@ class TebTurnSupervisorCallbacksMixin:
         target_track_id = ""
         route_id = 0
         map_epoch = None
+        origin_epoch = None
+        projection_epoch = None
         graph_transaction_id = 0
         try:
             payload = json.loads(message.data)
@@ -420,6 +795,20 @@ class TebTurnSupervisorCallbacksMixin:
                     None
                     if raw_map_epoch is None
                     else max(0, int(raw_map_epoch or 0))
+                )
+                raw_origin_epoch = payload.get("origin_epoch", map_epoch)
+                raw_projection_epoch = payload.get(
+                    "projection_epoch", map_epoch
+                )
+                origin_epoch = (
+                    None
+                    if raw_origin_epoch is None
+                    else max(0, int(raw_origin_epoch or 0))
+                )
+                projection_epoch = (
+                    None
+                    if raw_projection_epoch is None
+                    else max(0, int(raw_projection_epoch or 0))
                 )
                 graph_transaction_id = max(
                     0, int(payload.get("graph_transaction_id", 0) or 0)
@@ -440,6 +829,8 @@ class TebTurnSupervisorCallbacksMixin:
             self.latest_route_kind = route_kind
             self.latest_route_id = route_id
             self.latest_map_epoch = map_epoch
+            self.latest_origin_epoch = origin_epoch
+            self.latest_projection_epoch = projection_epoch
             self.latest_graph_transaction_id = graph_transaction_id
             self.latest_intent_goal = intent_goal
             self.latest_target_track_id = target_track_id
@@ -522,6 +913,32 @@ class TebTurnSupervisorCallbacksMixin:
                 )
             except (TypeError, ValueError):
                 self.active_action_map_epoch = None
+            raw_active_origin_epoch = payload.get(
+                "active_origin_epoch",
+                payload.get("origin_epoch", payload.get("latest_origin_epoch")),
+            )
+            raw_active_projection_epoch = payload.get(
+                "active_projection_epoch",
+                payload.get(
+                    "projection_epoch", payload.get("latest_projection_epoch")
+                ),
+            )
+            try:
+                self.active_action_origin_epoch = (
+                    None
+                    if raw_active_origin_epoch is None
+                    else max(0, int(raw_active_origin_epoch or 0))
+                )
+            except (TypeError, ValueError):
+                self.active_action_origin_epoch = None
+            try:
+                self.active_action_projection_epoch = (
+                    None
+                    if raw_active_projection_epoch is None
+                    else max(0, int(raw_active_projection_epoch or 0))
+                )
+            except (TypeError, ValueError):
+                self.active_action_projection_epoch = None
             try:
                 self.active_action_graph_transaction_id = max(
                     0,
@@ -545,11 +962,22 @@ class TebTurnSupervisorCallbacksMixin:
             except (TypeError, ValueError):
                 self.active_action_generation = 0
             try:
-                self.active_action_transaction_id = int(
-                    payload.get("lifecycle_transaction_id", 0) or 0
+                self.active_action_lifecycle_transaction_id = int(
+                    payload.get(
+                        "active_action_lifecycle_transaction_id",
+                        payload.get("lifecycle_transaction_id", 0),
+                    )
+                    or 0
                 )
             except (TypeError, ValueError):
-                self.active_action_transaction_id = 0
+                self.active_action_lifecycle_transaction_id = 0
+            # Keep the historical field name for compatibility with the
+            # command/reporting surface.  Its value is the active action's
+            # lifecycle identity, never the newer status-event identity.
+            self.active_action_transaction_id = int(
+                getattr(self, "active_action_lifecycle_transaction_id", 0)
+                or 0
+            )
             self.latest_target_track_id = str(
                 payload.get("latest_target_track_id", self.latest_target_track_id)
             ).strip()
@@ -613,6 +1041,9 @@ class TebTurnSupervisorCallbacksMixin:
                 self.stalled_route_candidate_since_wall = 0.0
                 self.stalled_route_ready_identity = None
                 self.stalled_route_completed_identity = None
+                self.stalled_route_reorientation_attempted_identity = None
+                self.forward_only_trajectory_identity = None
+                self.latest_mux_boundary_key = None
                 self._invalidate_trajectory_feedback_locked(
                     "route_owner_changed", clear_planner=True
                 )
@@ -621,16 +1052,32 @@ class TebTurnSupervisorCallbacksMixin:
                     "bridge_inactive", clear_planner=True
                 )
             elif payload.get("teb_feedback_valid") is False:
-                self._invalidate_trajectory_feedback_locked(
-                    str(
-                        payload.get(
-                            "teb_feedback_invalid_reason",
-                            "bridge_feedback_invalidated",
-                        )
-                        or "bridge_feedback_invalidated"
-                    ),
-                    clear_planner=bool(payload.get("clear_planner", False)),
+                invalid_reason = str(
+                    payload.get(
+                        "teb_feedback_invalid_reason",
+                        "bridge_feedback_invalidated",
+                    )
+                    or "bridge_feedback_invalidated"
+                ).strip().lower()
+                # ``awaiting_teb_feedback`` and ``no_feedback`` are normal
+                # post-contract observations. They must not repeatedly erase
+                # the supervisor's usable trajectory while the bridge waits
+                # for the first sample of the current contract.
+                boundary = bool(payload.get("clear_planner", False)) or (
+                    invalid_reason in self._BRIDGE_FEEDBACK_BOUNDARY_REASONS
                 )
+                if boundary:
+                    self._invalidate_trajectory_feedback_locked(
+                        invalid_reason,
+                        clear_planner=bool(payload.get("clear_planner", False)),
+                    )
+                    if bool(getattr(self, "planner_contract_valid", False)):
+                        # The bridge may report a semantic route boundary
+                        # after the matching planner contract was already
+                        # consumed. Re-arm the first post-boundary feedback
+                        # explicitly so callback ordering cannot strand the
+                        # supervisor in the old feedback epoch.
+                        self.planner_contract_awaiting_feedback = True
             self._promote_pending_planner_contract_locked()
             if not self._is_managed_action_locked():
                 if self.state == STATE_TURNING:
@@ -668,8 +1115,14 @@ class TebTurnSupervisorCallbacksMixin:
                 self._activate_turn_locked()
 
     def on_pose(self, message):
+        now = now_for(self)
         with self.lock:
             self.pose = copy.deepcopy(message)
+            observe_turn = getattr(
+                self, "_observe_turn_odom_pose_locked", None
+            )
+            if callable(observe_turn):
+                observe_turn(self.pose, now)
 
     def on_scan(self, message):
         minimum = float("inf")
@@ -718,6 +1171,12 @@ class TebTurnSupervisorCallbacksMixin:
             self.planner_command_map_epoch = getattr(
                 self, "active_action_map_epoch", None
             )
+            self.planner_command_origin_epoch = getattr(
+                self, "active_action_origin_epoch", None
+            )
+            self.planner_command_projection_epoch = getattr(
+                self, "active_action_projection_epoch", None
+            )
             self.planner_command_graph_transaction_id = int(
                 getattr(self, "active_action_graph_transaction_id", 0) or 0
             )
@@ -762,21 +1221,13 @@ class TebTurnSupervisorCallbacksMixin:
                     )
                     return
                 if self.planner_contract_awaiting_feedback:
-                    contract_command = self.planner_contract_command
-                    linear_delta = abs(
-                        command.linear.x - contract_command.linear.x
-                    )
-                    angular_delta = abs(
-                        command.angular.z - contract_command.angular.z
-                    )
-                    if linear_delta > 0.20 or angular_delta > 0.35:
-                        self.publish_status_locked(
-                            "trajectory_feedback_rejected",
-                            reason="planner_contract_command_mismatch",
-                            linear_delta=round(linear_delta, 4),
-                            angular_delta=round(angular_delta, 4),
-                        )
-                        return
+                    # FeedbackMsg exposes TEB's selected trajectory point,
+                    # not the post-processed command in the planner contract.
+                    # Treating their velocities as an equality check rejects
+                    # valid feedback during normal angular interpolation. The
+                    # identity-bearing contract is the boundary; once it is
+                    # accepted, this first feedback frame may re-arm the
+                    # telemetry stream.
                     self.planner_contract_awaiting_feedback = False
                     self.trajectory_feedback_requires_fresh_planner_command = False
             if self.trajectory_feedback_requires_fresh_planner_command:

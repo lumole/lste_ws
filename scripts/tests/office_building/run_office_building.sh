@@ -14,8 +14,10 @@ VALIDATOR="$WS/scripts/tests/office_building/validate_office_building.py"
 SUMMARY="$WS/scripts/tests/office_building/summarize_run.py"
 TOPOLOGY_VERIFIER="$WS/scripts/tests/office_building/verify_topology_exploration.py"
 PREFIX_LOGGER="$WS/scripts/tests/office_building/prefix_log.py"
+PRUNE_LOGS="$WS/scripts/tools/prune_runtime_logs.py"
 LOG_ROOT="$WS/runtime/office_building_benchmark/logs"
 CURRENT_RUN_LINK="$WS/runtime/office_building_benchmark/current"
+LOG_MAX_BYTES_LIMIT=1000000000
 LEVEL="${OFFICE_BUILDING_LEVEL:-level_2}"
 PROFILE="${OFFICE_BUILDING_PROFILE:-primary}"
 
@@ -38,8 +40,8 @@ Commands:
   verify [log]             Assert topology exploration behavior (latest by default).
 
 Levels: level_1, level_2, level_3, level_4.
-Set OFFICE_BUILDING_PROFILE=target_entry for the benchmark-only target-room
-isolation profile; it bypasses exploration and is diagnostic evidence only.
+Set OFFICE_BUILDING_PROFILE=target_corridor_entry for the short target-context
+perception profile; it starts in the corridor closest to the target room.
 The launcher does not attach to tmux. Use `tmux attach -t lste` only for diagnosis.
 EOF
 }
@@ -97,6 +99,13 @@ print(value if value is not None else "")
 PY
 }
 
+LOG_MAX_BYTES="${OFFICE_BUILDING_LOG_MAX_BYTES:-$(config_scalar LOG_MAX_BYTES)}"
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-1000000000}"
+if ! [[ "$LOG_MAX_BYTES" =~ ^[1-9][0-9]*$ ]] || (( LOG_MAX_BYTES > LOG_MAX_BYTES_LIMIT )); then
+  echo "[error] LOG_MAX_BYTES must be between 1 and $LOG_MAX_BYTES_LIMIT bytes" >&2
+  exit 2
+fi
+
 resolve_task_json() {
   local task_json="$1"
   if [[ -z "$task_json" ]]; then
@@ -139,6 +148,14 @@ prepare_run_logs() {
   done
   LIFECYCLE_LOG="$RUN_DIR/${RUN_TIMESTAMP}_lifecycle.log"
   ln -sfn "$RUN_DIR" "$CURRENT_RUN_LINK"
+  LOG_RETENTION_RESULT=applied
+  if ! python3 "$PRUNE_LOGS" \
+      --runtime-root "$WS/runtime" \
+      --max-bytes "$LOG_MAX_BYTES" \
+      --keep "$RUN_DIR"; then
+    LOG_RETENTION_RESULT=failed
+    echo "[warning] runtime log budget cleanup failed" >&2
+  fi
   export OFFICE_BUILDING_RUN_TIMESTAMP="$RUN_TIMESTAMP"
   export OFFICE_BUILDING_LOG_DIR="$RUN_DIR"
   export NAVIGATION_LOG_DIR="$RUN_DIR"
@@ -227,7 +244,7 @@ record_resolved_start() {
   fi
   target="$(target_xy)"
   lifecycle_log "run_start" \
-    "scenario_id=office_building_v1 level=$level profile=$PROFILE trial_id=${OFFICE_BUILDING_TRIAL_ID:-none} gazebo_seed=${GAZEBO_RANDOM_SEED:-none} exploration_method=${GLOBAL_FRONTIER_METHOD:-$(config_scalar GLOBAL_FRONTIER_METHOD)} global_frontier_enabled=${GLOBAL_FRONTIER_ENABLED:-$(config_scalar GLOBAL_FRONTIER_ENABLED)} controller=$(config_scalar LSTE_CONTROLLER) detector=$(config_scalar DETECTOR) speed=$(config_scalar TEB_MAX_LINEAR_SPEED) initial_pose=${pose[*]} target=$target task_id=${TASK_ID:-unknown} task_json=${TASK_JSON:-unknown} world=$WORLD world_sha256=$world_hash git_revision=$git_revision git_dirty=$git_dirty"
+    "scenario_id=office_building_v1 level=$level profile=$PROFILE trial_id=${OFFICE_BUILDING_TRIAL_ID:-none} gazebo_seed=${GAZEBO_RANDOM_SEED:-none} exploration_method=${GLOBAL_FRONTIER_METHOD:-$(config_scalar GLOBAL_FRONTIER_METHOD)} global_frontier_enabled=${GLOBAL_FRONTIER_ENABLED:-$(config_scalar GLOBAL_FRONTIER_ENABLED)} controller=$(config_scalar LSTE_CONTROLLER) detector=$(config_scalar DETECTOR) speed=$(config_scalar TEB_MAX_LINEAR_SPEED) target_done_policy=${TARGET_DONE_POLICY:-$(config_scalar TARGET_DONE_POLICY)} target_room_entry_bounds=${TARGET_ROOM_ENTRY_MIN_X:-$(config_scalar TARGET_ROOM_ENTRY_MIN_X)},${TARGET_ROOM_ENTRY_MIN_Y:-$(config_scalar TARGET_ROOM_ENTRY_MIN_Y)},${TARGET_ROOM_ENTRY_MAX_X:-$(config_scalar TARGET_ROOM_ENTRY_MAX_X)},${TARGET_ROOM_ENTRY_MAX_Y:-$(config_scalar TARGET_ROOM_ENTRY_MAX_Y)} log_max_bytes=$LOG_MAX_BYTES initial_pose=${pose[*]} target=$target task_id=${TASK_ID:-unknown} task_json=${TASK_JSON:-unknown} world=$WORLD world_sha256=$world_hash git_revision=$git_revision git_dirty=$git_dirty"
 }
 
 start_benchmark() {
@@ -248,19 +265,24 @@ start_benchmark() {
     exit 1
   fi
 
-  echo "[office] stopping any previous LSTE run"
-  "$WS/scripts/bin/stopall" || true
+  if [[ "${OFFICE_BUILDING_PRESERVE_RUNTIME:-0}" == "1" ||
+        "${OFFICE_BUILDING_PRESERVE_RUNTIME:-}" == "true" ]]; then
+    echo "[office] preserving lste-env; rebuilding only business nodes"
+    if tmux has-session -t "=lste" 2>/dev/null; then
+      tmux kill-session -t "=lste"
+    fi
+  else
+    echo "[office] stopping any previous LSTE run"
+    "$WS/scripts/bin/stopall" || true
+  fi
 
   export TASK_JSON="$task_json"
   export TASK_ID="$task_id"
   prepare_run_logs
 
-  # ``target_entry`` is a declared diagnostic isolation profile.  It starts
-  # inside the target-room approach corridor, so launching the exploratory
-  # frontier would only add startup/route churn and could compete with the
-  # semantic target goal.  Keep online SLAM and the target/TEB path enabled;
-  # only the exploratory frontier is disabled for this profile.  Production
-  # and formal benchmark profiles leave the YAML/environment value untouched.
+  # ``target_entry`` remains a doorway-approach diagnostic profile. The newer
+  # ``target_corridor_entry`` deliberately keeps frontier exploration enabled
+  # so this short run tests perception from the nearest corridor start.
   if [[ "$PROFILE" == "target_entry" ]]; then
     export GLOBAL_FRONTIER_ENABLED=false
     export LEGACY_GP_FRONTIER_ENABLED=false
@@ -281,6 +303,8 @@ start_benchmark() {
   export OFFICE_BUILDING_COLLISION_TRUTH_ENABLED=true
   export OFFICE_BUILDING_CONTACT_SENSOR=true
 
+  lifecycle_log "log_retention" \
+    "result=$LOG_RETENTION_RESULT max_bytes=$LOG_MAX_BYTES runtime_root=$WS/runtime"
   echo "[office] starting scenario=office_building_v1 level=$level profile=$PROFILE"
   local launcher_log="$RUN_DIR/${RUN_TIMESTAMP}_launcher.log"
   if ! "$WS/scripts/lifecycle/run_all_tmux.sh" 2>&1 \

@@ -2,6 +2,7 @@
 
 import copy
 import json
+import math
 
 import rospy
 from geometry_msgs.msg import Twist
@@ -53,6 +54,12 @@ class TebGoalBridgeTebRuntimeMixin:
                 getattr(message, "graph_transaction_id", 0)
             ),
             "map_epoch": self._contract_int(getattr(message, "map_epoch", 0)),
+            "origin_epoch": self._contract_int(
+                getattr(message, "origin_epoch", 0)
+            ),
+            "projection_epoch": self._contract_int(
+                getattr(message, "projection_epoch", 0)
+            ),
             "lifecycle_transaction_id": self._contract_int(
                 getattr(message, "lifecycle_transaction_id", "")
             ),
@@ -69,36 +76,60 @@ class TebGoalBridgeTebRuntimeMixin:
     def _active_planner_contract_identity_locked(self):
         """Return the identity currently authorized by the action bridge."""
         contract = getattr(self, "active_action_contract", None)
+        # A persistent successor publishes its mission boundary before the
+        # controller lease is active.  The old action has already cleared the
+        # ``active_*`` fields at that point, so using them here turns a valid
+        # successor boundary into ``stale_boundary_transaction_id``.  Until
+        # dispatch installs a new immutable action contract, the latest
+        # accepted mission route is the only canonical boundary identity.
+        if contract is None:
+            transaction_id = getattr(
+                self,
+                "latest_goal_transaction_id",
+                getattr(self, "active_goal_transaction_id", 0),
+            )
+            route_id = getattr(
+                self, "latest_route_id", getattr(self, "active_route_id", 0)
+            )
+            graph_transaction_id = getattr(
+                self,
+                "latest_graph_transaction_id",
+                getattr(self, "active_graph_transaction_id", 0),
+            )
+            map_epoch = getattr(
+                self,
+                "latest_route_map_epoch",
+                getattr(self, "active_route_map_epoch", 0),
+            )
+            origin_epoch = getattr(
+                self,
+                "latest_origin_epoch",
+                getattr(self, "active_origin_epoch", 0),
+            )
+            projection_epoch = getattr(
+                self,
+                "latest_projection_epoch",
+                getattr(self, "active_projection_epoch", 0),
+            )
+        else:
+            transaction_id = contract.get("transaction_id", 0)
+            route_id = contract.get("route_id", 0)
+            graph_transaction_id = contract.get("graph_transaction_id", 0)
+            map_epoch = contract.get("map_epoch", 0)
+            origin_epoch = contract.get("origin_epoch", 0)
+            projection_epoch = contract.get("projection_epoch", 0)
         return {
-            "transaction_id": self._contract_int(
-                getattr(self, "active_goal_transaction_id", 0)
-                if contract is None
-                else contract.get("transaction_id", 0)
-            ),
-            "route_id": self._contract_int(
-                getattr(self, "active_route_id", 0)
-                if contract is None
-                else contract.get("route_id", 0)
-            ),
-            "graph_transaction_id": self._contract_int(
-                getattr(self, "active_graph_transaction_id", 0)
-                if contract is None
-                else contract.get("graph_transaction_id", 0)
-            ),
-            "map_epoch": self._contract_int(
-                getattr(self, "active_route_map_epoch", 0)
-                if contract is None
-                else contract.get("map_epoch", 0)
-            ),
+            "transaction_id": self._contract_int(transaction_id),
+            "route_id": self._contract_int(route_id),
+            "graph_transaction_id": self._contract_int(graph_transaction_id),
+            "map_epoch": self._contract_int(map_epoch),
             "lifecycle_transaction_id": self._contract_int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
+                self._canonical_lifecycle_transaction_id()
                 if contract is None
                 else contract.get("lifecycle_transaction_id", 0)
             ),
+            "origin_epoch": self._contract_int(origin_epoch),
+            "projection_epoch": self._contract_int(projection_epoch),
             "action_generation": self._contract_int(
                 getattr(self, "action_generation", 0)
                 if contract is None
@@ -106,15 +137,64 @@ class TebGoalBridgeTebRuntimeMixin:
             ),
         }
 
+    def _planner_boundary_expected_identity_locked(self):
+        """Use the predecessor tombstone while its invalidation is in flight.
+
+        Termination clears the live route before the planner's invalidation
+        frame is delivered.  During that short window the current route fields
+        intentionally contain zeroes, while ``pending_terminal_prepare`` still
+        owns the exact predecessor identity.  Boundary validation must use
+        that immutable contract; it must not weaken any identity comparison.
+        """
+        expected = self._active_planner_contract_identity_locked()
+        try:
+            expected_route = int(expected.get("route_id", 0) or 0)
+        except (TypeError, ValueError):
+            expected_route = 0
+        if expected_route > 0:
+            return expected
+        pending = getattr(self, "pending_terminal_prepare", None)
+        if not isinstance(pending, dict):
+            return expected
+        predecessor = pending.get("old_contract")
+        if not isinstance(predecessor, dict):
+            return expected
+        try:
+            predecessor_route = int(predecessor.get("route_id", 0) or 0)
+        except (TypeError, ValueError):
+            predecessor_route = 0
+        if predecessor_route <= 0:
+            return expected
+        return {
+            "transaction_id": self._contract_int(
+                predecessor.get("transaction_id")
+            ),
+            "route_id": predecessor_route,
+            "graph_transaction_id": self._contract_int(
+                predecessor.get("graph_transaction_id")
+            ),
+            "map_epoch": self._contract_int(predecessor.get("map_epoch")),
+            "lifecycle_transaction_id": self._contract_int(
+                predecessor.get("lifecycle_transaction_id")
+            ),
+            "origin_epoch": self._contract_int(
+                predecessor.get("origin_epoch")
+            ),
+            "projection_epoch": self._contract_int(
+                predecessor.get("projection_epoch")
+            ),
+            "action_generation": self._contract_int(
+                predecessor.get(
+                    "generation", predecessor.get("action_generation")
+                )
+            ),
+        }
+
     def _planner_contract_mismatch_locked(self, identity):
         """Reject a nonzero planner frame outside the live route contract."""
         expected = self._active_planner_contract_identity_locked()
         current_lifecycle = self._contract_int(
-            getattr(
-                getattr(self, "lifecycle_manager", None),
-                "current_transaction_id",
-                0,
-            )
+            self._canonical_lifecycle_transaction_id()
         )
         if identity["lifecycle_transaction_id"] <= 0:
             return "missing_lifecycle_transaction_id"
@@ -128,6 +208,8 @@ class TebGoalBridgeTebRuntimeMixin:
             "route_id",
             "graph_transaction_id",
             "map_epoch",
+            "origin_epoch",
+            "projection_epoch",
             "action_generation",
         ):
             expected_value = expected[field]
@@ -149,6 +231,12 @@ class TebGoalBridgeTebRuntimeMixin:
         if publisher is None:
             return
         contract = old_contract if isinstance(old_contract, dict) else {}
+        # This topic is also observed by the bridge itself.  There is no
+        # predecessor contract to invalidate when lifecycle cleanup is already
+        # idle; publishing a zero-identity frame would be re-admitted as a
+        # planner boundary and falsely report stale lifecycle ownership.
+        if not contract or self._action_identity_key_locked(contract) is None:
+            return
         message = PlannerCommandContract()
         message.transaction_id = self._contract_int(contract.get("transaction_id"))
         message.route_id = self._contract_int(contract.get("route_id"))
@@ -156,6 +244,10 @@ class TebGoalBridgeTebRuntimeMixin:
             contract.get("graph_transaction_id")
         )
         message.map_epoch = self._contract_int(contract.get("map_epoch"))
+        message.origin_epoch = self._contract_int(contract.get("origin_epoch"))
+        message.projection_epoch = self._contract_int(
+            contract.get("projection_epoch")
+        )
         message.lifecycle_transaction_id = str(
             self._contract_int(contract.get("lifecycle_transaction_id"))
         )
@@ -175,10 +267,15 @@ class TebGoalBridgeTebRuntimeMixin:
     ):
         """Phase 1: revoke ownership before touching actionlib transport."""
         existing = getattr(self, "pending_terminal_prepare", None)
-        contract = action_contract or getattr(self, "active_action_contract", None)
+        contract = (
+            action_contract
+            if action_contract is not None
+            else getattr(self, "active_action_contract", None)
+        )
         if contract is None:
             contract = getattr(self, "last_dispatch_identity", None)
         old_contract = {} if contract is None else dict(contract)
+        identity_key = self._action_identity_key_locked(old_contract)
         old_generation = self._contract_int(
             old_contract.get(
                 "generation",
@@ -187,10 +284,47 @@ class TebGoalBridgeTebRuntimeMixin:
                 ),
             )
         )
-        if isinstance(existing, dict) and self._contract_int(
-            existing.get("old_generation")
-        ) == old_generation:
-            return existing
+        if isinstance(existing, dict):
+            existing_key = existing.get("identity_key")
+            if existing_key is None:
+                existing_key = self._action_identity_key_locked(
+                    existing.get("old_contract")
+                )
+            if (
+                existing_key == identity_key
+                or (
+                    identity_key is None
+                    and self._contract_int(existing.get("old_generation"))
+                    == old_generation
+                )
+            ):
+                return existing
+        tombstone = self._terminal_tombstone_for_key_locked(identity_key)
+        if tombstone is not None:
+            tombstone["duplicate_attempts"] = self._contract_int(
+                tombstone.get("duplicate_attempts")
+            ) + 1
+            self.publish_bridge_status(
+                "termination_duplicate_ignored",
+                route_id=self._contract_int(identity_key[0]),
+                action_generation=self._contract_int(identity_key[1]),
+                transaction_id=self._contract_int(
+                    old_contract.get("transaction_id")
+                ),
+                lifecycle_transaction_id=self._contract_int(
+                    old_contract.get("lifecycle_transaction_id")
+                ),
+                graph_transaction_id=self._contract_int(
+                    old_contract.get("graph_transaction_id")
+                ),
+                map_epoch=old_contract.get("map_epoch"),
+                origin_epoch=old_contract.get("origin_epoch"),
+                projection_epoch=old_contract.get("projection_epoch"),
+                reason=str(reason or "control_pipeline_prepare"),
+                dedupe_key=[int(identity_key[0]), int(identity_key[1])],
+                duplicate_attempts=int(tombstone["duplicate_attempts"]),
+            )
+            return tombstone
         previous_active = bool(getattr(self, "action_active", False))
         new_generation = max(
             self._contract_int(getattr(self, "action_generation", 0)),
@@ -205,9 +339,18 @@ class TebGoalBridgeTebRuntimeMixin:
             "cancel_requested": False,
             "terminal_published": False,
             "lease_release_requested": False,
+            "identity_key": identity_key,
         }
         self.pending_terminal_prepare = prepared
         self.pending_lease_release_contract = prepared
+        self._remember_terminal_tombstone_locked(identity_key, prepared)
+        self._begin_transport_handoff_locked(
+            old_contract,
+            old_generation,
+            new_generation,
+            prepared["reason"],
+            previous_active,
+        )
         # This assignment is the first termination side effect. Every callback
         # which entered actionlib with the predecessor generation is stale
         # immediately, even before the zero boundary is published.
@@ -251,6 +394,7 @@ class TebGoalBridgeTebRuntimeMixin:
         *,
         terminal_status=None,
         watchdog_reason=None,
+        terminal_reason=None,
         publish_terminal=True,
         arm_watchdog=True,
     ):
@@ -275,6 +419,7 @@ class TebGoalBridgeTebRuntimeMixin:
             source_goal,
             terminal_status=terminal_status,
             watchdog_reason=watchdog_reason,
+            terminal_reason=terminal_reason,
             publish_terminal=publish_terminal,
             arm_watchdog=arm_watchdog,
         )
@@ -288,6 +433,7 @@ class TebGoalBridgeTebRuntimeMixin:
         *,
         terminal_status=None,
         watchdog_reason=None,
+        terminal_reason=None,
         publish_terminal=True,
         arm_watchdog=True,
     ):
@@ -315,7 +461,6 @@ class TebGoalBridgeTebRuntimeMixin:
             self.publish_bridge_status(
                 "move_base_cancel_or_terminal",
                 route_id=self._contract_int(old_contract.get("route_id")),
-                transaction_id=self._contract_int(old_contract.get("transaction_id")),
                 lifecycle_transaction_id=self._contract_int(
                     old_contract.get("lifecycle_transaction_id")
                 ),
@@ -328,6 +473,20 @@ class TebGoalBridgeTebRuntimeMixin:
                 transport_cancelled=transport_cancelled,
                 transport_error=transport_error,
             )
+        self._poll_transport_handoff_locked()
+        if getattr(self, "transport_handoff_pending", None) is None:
+            # If actionlib was already terminal (for example, the prepare was
+            # entered from done_cb), there is no asynchronous transport event
+            # left to wait for. Clear the prepare immediately; otherwise the
+            # successor remains blocked by a phantom terminal barrier.
+            self._clear_terminal_prepare_if_matches_locked(
+                prepared,
+                self._transport_action_state_locked(
+                    prepared.get("client")
+                    if isinstance(prepared, dict)
+                    else None
+                ),
+            )
         if (
             publish_terminal
             and not prepared.get("terminal_published")
@@ -337,6 +496,13 @@ class TebGoalBridgeTebRuntimeMixin:
                 source_goal,
                 action_contract=old_contract,
                 invalidate_feedback=False,
+                status=terminal_status,
+                reason=str(
+                    terminal_reason
+                    or watchdog_reason
+                    or prepared.get("reason")
+                    or "execution_terminal"
+                ),
             )
             prepared["terminal_published"] = True
         if (
@@ -348,7 +514,9 @@ class TebGoalBridgeTebRuntimeMixin:
             self.publish_bridge_status(
                 "lease_release_requested",
                 route_id=self._contract_int(old_contract.get("route_id")),
-                transaction_id=self._contract_int(old_contract.get("transaction_id")),
+                transaction_id=self._contract_int(
+                    old_contract.get("transaction_id")
+                ),
                 lifecycle_transaction_id=self._contract_int(
                     old_contract.get("lifecycle_transaction_id")
                 ),
@@ -356,6 +524,10 @@ class TebGoalBridgeTebRuntimeMixin:
                     old_contract.get("graph_transaction_id")
                 ),
                 map_epoch=self._contract_int(old_contract.get("map_epoch")),
+                origin_epoch=self._contract_int(old_contract.get("origin_epoch")),
+                projection_epoch=self._contract_int(
+                    old_contract.get("projection_epoch")
+                ),
                 action_generation=self._contract_int(
                     old_contract.get("generation")
                 ),
@@ -381,19 +553,19 @@ class TebGoalBridgeTebRuntimeMixin:
         """Return the route identity attached to the locally accepted feedback."""
         return {
             "generation": int(getattr(self, "action_generation", 0) or 0),
+            "action_generation": int(
+                getattr(self, "action_generation", 0) or 0
+            ),
             "route_id": int(getattr(self, "active_route_id", 0) or 0),
             "transaction_id": int(
                 getattr(self, "active_goal_transaction_id", 0) or 0
             ),
             "lifecycle_transaction_id": int(
-                getattr(
-                    getattr(self, "lifecycle_manager", None),
-                    "current_transaction_id",
-                    0,
-                )
-                or 0
+                self._canonical_lifecycle_transaction_id()
             ),
             "map_epoch": getattr(self, "active_route_map_epoch", None),
+            "origin_epoch": getattr(self, "active_origin_epoch", None),
+            "projection_epoch": getattr(self, "active_projection_epoch", None),
             "graph_transaction_id": int(
                 getattr(self, "active_graph_transaction_id", 0) or 0
             ),
@@ -564,31 +736,15 @@ class TebGoalBridgeTebRuntimeMixin:
                     )
                     return
                 if getattr(self, "planner_contract_awaiting_feedback", False):
-                    contract_command = getattr(
-                        self, "planner_contract_command", None
-                    )
-                    if contract_command is None:
-                        return
-                    linear_delta = abs(
-                        command.linear.x - contract_command.linear.x
-                    )
-                    angular_delta = abs(
-                        command.angular.z - contract_command.angular.z
-                    )
-                    if linear_delta > 0.20 or angular_delta > 0.35:
-                        self.publish_bridge_status(
-                            "teb_feedback_rejected",
-                            reason="planner_contract_command_mismatch",
-                            linear_delta=round(linear_delta, 4),
-                            angular_delta=round(angular_delta, 4),
-                            planner_sequence=int(
-                                getattr(
-                                    self, "planner_contract_sequence", 0
-                                )
-                                or 0
-                            ),
-                        )
-                        return
+                    # FeedbackMsg reports the first point of TEB's selected
+                    # trajectory, while PlannerCommandContract carries the
+                    # post-processed command returned to move_base. They are
+                    # related samples, not an equality contract; angular
+                    # interpolation and command limiting can make their
+                    # values differ substantially. The identity-bearing
+                    # planner contract already fenced off pre-boundary
+                    # feedback, so do not reject current feedback by speed
+                    # deltas.
                     self.planner_contract_awaiting_feedback = False
             if self.teb_feedback_requires_fresh_planner_command:
                 # A feedback message can be delivered after the old route was
@@ -639,20 +795,38 @@ class TebGoalBridgeTebRuntimeMixin:
             else:
                 self.teb_planner_stationary_since = 0.0
             if self._teb_planner_command_is_zero(linear, angular):
-                self._invalidate_teb_feedback_locked("planner_zero_command")
+                # TEB can publish a zero post-processed command for one cycle
+                # while its selected trajectory is still performing a bounded
+                # in-place reorientation.  That is not a route boundary: the
+                # selected feedback is the only available evidence that the
+                # action is intentionally turning. Preserve it and let the
+                # finite reorientation watchdog decide whether yaw progresses.
+                preserving_reorientation = bool(
+                    self.action_active
+                    and self._teb_reorientation_command_active_locked(now)
+                )
+                if not preserving_reorientation:
+                    self._invalidate_teb_feedback_locked("planner_zero_command")
 
     def on_planner_command_contract(self, message):
         """Accept only an identity-matched persistent planner command."""
         identity = self._planner_contract_identity(message)
         command = getattr(message, "command", Twist())
         state = identity["state"]
+        # The bridge publishes prepare/invalidation telemetry on the same ROS
+        # topic as the C++ planner contract. It has already applied this
+        # boundary locally, so feeding the self-published frame back through
+        # external planner admission would manufacture a stale-boundary
+        # rejection during lifecycle cleanup.
+        if identity["producer"] == "teb_goal_bridge":
+            return
         with self.lock:
             is_boundary = state in (
                 PlannerCommandContract.STATE_ZERO,
                 PlannerCommandContract.STATE_INVALIDATED,
             )
             if is_boundary:
-                expected = self._active_planner_contract_identity_locked()
+                expected = self._planner_boundary_expected_identity_locked()
                 identity_fields = (
                     "transaction_id",
                     "route_id",
@@ -713,6 +887,30 @@ class TebGoalBridgeTebRuntimeMixin:
                     **identity,
                 )
                 return
+            previous_state = getattr(self, "planner_contract_state", None)
+            previous_feedback_valid = bool(
+                getattr(self, "teb_feedback_valid", False)
+            )
+            identity_fields = (
+                "transaction_id",
+                "route_id",
+                "graph_transaction_id",
+                "map_epoch",
+                "origin_epoch",
+                "projection_epoch",
+                "lifecycle_transaction_id",
+                "action_generation",
+            )
+            identity_changed = not isinstance(previous, dict) or any(
+                int(identity.get(field, 0) or 0)
+                != int(previous.get(field, 0) or 0)
+                for field in identity_fields
+            )
+            contract_boundary = bool(
+                identity_changed
+                or not previous_feedback_valid
+                or previous_state != PlannerCommandContract.STATE_ACTIVE
+            )
             self.planner_contract_valid = True
             self.planner_contract_state = state
             self.planner_contract_reason = str(getattr(message, "reason", ""))
@@ -723,9 +921,22 @@ class TebGoalBridgeTebRuntimeMixin:
             self.planner_contract_command = Twist()
             self.planner_contract_command.linear.x = float(command.linear.x)
             self.planner_contract_command.angular.z = float(command.angular.z)
-            self.planner_contract_awaiting_feedback = True
-            self.teb_feedback_valid = False
-            self.teb_feedback_invalid_reason = "awaiting_teb_feedback"
+            if contract_boundary:
+                self.planner_contract_awaiting_feedback = True
+                # FeedbackMsg has no identity and is slower than this stream.
+                # Clear it when the route/state changes, but do not make every
+                # same-route command sample invalidate the latest trajectory.
+                self.teb_feedback_valid = False
+                self.teb_feedback_invalid_reason = "awaiting_teb_feedback"
+                self.latest_teb_selected_linear = None
+                self.latest_teb_selected_angular = None
+                self.latest_teb_feedback_monotonic = 0.0
+                self.teb_feedback_generation = 0
+                self.teb_feedback_route_id = 0
+                self.teb_feedback_transaction_id = 0
+                self.teb_feedback_map_epoch = None
+                self.teb_feedback_graph_transaction_id = 0
+                self._reset_teb_reorientation_locked()
             self.teb_feedback_requires_fresh_planner_command = False
             self.latest_teb_planner_linear = float(command.linear.x)
             self.latest_teb_planner_angular = float(command.angular.z)
@@ -745,10 +956,25 @@ class TebGoalBridgeTebRuntimeMixin:
     def on_pose(self, message):
         """Measure real turn progress in odometry, independent of SLAM drift."""
         now = now_for(self)
+        x = float(message.x)
+        y = float(message.y)
         yaw = float(message.theta)
         with self.lock:
             self.odom_yaw = yaw
             self.odom_pose_monotonic = now
+            if self.action_active:
+                # Physical motion health must come from odometry, not from
+                # MoveBase feedback.  Feedback may report a moving base pose
+                # while the robot is actually oscillating in place.
+                if self.active_motion_reference is None:
+                    self.active_motion_reference = (x, y)
+                    self.active_motion_progress_monotonic = now
+                elif math.hypot(
+                    x - self.active_motion_reference[0],
+                    y - self.active_motion_reference[1],
+                ) >= self.progress_epsilon:
+                    self.active_motion_reference = (x, y)
+                    self.active_motion_progress_monotonic = now
             if (
                 self.teb_reorientation_started_monotonic <= 0.0
                 or self.teb_reorientation_reference_yaw is None

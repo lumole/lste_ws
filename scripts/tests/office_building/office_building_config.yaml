@@ -4,9 +4,9 @@ TASK_JSON: model/Data_exchange/vlm_prompt/lab/yellow_cup.json
 TASK_ID: yellow_cup
 
 # The launcher replaces these four values from the selected robot profile.
-# Select it with OFFICE_BUILDING_PROFILE=target_entry when invoking
-# run_office_building.sh; target_entry is diagnostic-only and bypasses
-# exploration, so its run must not enter the final benchmark aggregate.
+# Select target_corridor_entry for the short target-context perception run.
+# It starts in the main corridor outside the target-room doorway; it does not
+# bypass exploration unless the launcher is explicitly configured to do so.
 PRO3_SPAWN_X: 2.8
 PRO3_SPAWN_Y: 11.0
 PRO3_SPAWN_Z: 0.1
@@ -53,23 +53,39 @@ TARGET_ROUTE_CONTINUITY_ENABLED: true
 TARGET_ROUTE_CONTINUITY_DEFER_SHARP_TAKEOVER: true
 TARGET_REACQUIRE_DURATION: 12.0
 
-# Benchmark acceptance profile: once a target track (candidate or confirmed)
-# exists, one fresh track frame can finish this diagnostic benchmark. Track
-# identity and freshness gates remain; physical close-range and confirmation
-# evidence are relaxed only for this benchmark profile.
+# Short perception acceptance: one compatible yellow-cup detection plus two
+# distinct context detections matching ctx_left/ctx_right is task_done.
+# Scores, box dimensions, hold time, approach terminal, and route terminal are
+# diagnostic only for this policy.
+TARGET_DONE_POLICY: target_context
+TARGET_ROOM_ENTRY_MIN_X: 21.4
+TARGET_ROOM_ENTRY_MIN_Y: 12.7
+TARGET_ROOM_ENTRY_MAX_X: 22.6
+TARGET_ROOM_ENTRY_MAX_Y: 13.6
+TARGET_ROOM_ENTRY_MARGIN: 0.30
+TARGET_ROOM_ENTRY_MIN_HOLD_TIME: 0.0
+TARGET_ROOM_ENTRY_REQUIRE_CROSSING: true
+
+# Benchmark perception profile: candidate and confirmed tracks may use a low
+# score and one fresh frame, but Level 4 completion still requires the target
+# approach terminal below.
 TARGET_DONE_MIN_BOX_WIDTH: 0.01
 TARGET_DONE_MIN_BOX_HEIGHT: 0.01
-# Completion is driven by the presence of a published target box in this
-# diagnostic benchmark; the detector's own output threshold remains 0.20.
+# The detector's own output threshold remains 0.20; task_done has a separate
+# execution-side approach gate so a distant false box cannot finish the task.
 TARGET_DONE_MIN_SCORE: 0.0
 TARGET_DONE_MIN_HOLD_TIME: 0.0
 TARGET_DONE_MIN_FRESH_HITS: 1
 TARGET_DONE_REQUIRE_CLOSE_EVIDENCE: false
 TARGET_DONE_REQUIRE_CONFIRMED_TRACK: false
-TARGET_DONE_REQUIRE_APPROACH_TERMINAL: false
+# A low detector score is acceptable, but Level 4 task_done must not be
+# emitted by an arbitrary candidate box outside the target approach route.
+# The approach terminal is the execution-side proof that the detected target
+# was actually reached as a navigation task.
+TARGET_DONE_REQUIRE_APPROACH_TERMINAL: true
 # The benchmark detector already filters the published target list. Once a
-# target box is present, do not apply a second score/size gate before the
-# candidate-track completion policy can acknowledge it.
+# target route reaches its approach terminal, do not add a second score/size
+# gate before the low-score completion policy acknowledges it.
 TARGET_FOLLOW_MIN_SCORE: 0.0
 TARGET_FOLLOW_MIN_BOX_SIZE: 0.0
 
@@ -94,3 +110,4 @@ TARGET_EVAL_TARGET_SIZE_M: "0.147,0.147,0.138"
 TARGET_EVAL_DEPTH_ENABLED: false
 
 LOG_RETENTION_DAYS: 15
+LOG_MAX_BYTES: 1000000000

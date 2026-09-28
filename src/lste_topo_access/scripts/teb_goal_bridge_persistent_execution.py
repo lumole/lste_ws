@@ -28,6 +28,8 @@ class TebGoalBridgePersistentExecutionMixin:
         if (
             completion_radius <= 0.0
             or self.frontier_observation_completion_pending is not None
+            or getattr(self, "persistent_frontier_endpoint_pending", None)
+            is not None
             or not self.action_active
             or self.active_intent_priority != 0
             or self.latest_intent_priority != 0

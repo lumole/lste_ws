@@ -117,6 +117,15 @@ def _target_viewpoint_key(manager):
 def handle_detections(manager, msg):
     """Process one detector frame without publishing a navigation goal."""
     manager.latest_dets = msg
+    if getattr(manager, "target_done_policy", "visual_target") in (
+        "target_room_entry",
+        "target_context",
+    ):
+        # Doorway-entry acceptance is a topology probe. Visual target tracks
+        # and context-only completion are intentionally observational here;
+        # letting a box claim a target route would divert the explorer before
+        # the completion timer can evaluate the declared acceptance contract.
+        return
     # Once the task has reached its terminal state, keep recording the
     # latest detector message for diagnostics but do not refresh target
     # follow/observation-hold state.

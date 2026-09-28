@@ -313,6 +313,7 @@ class NavigationMetricsObserverStateMixin:
         self.legacy_state_locked_ros = None
         self.target_lock_ros = None
         self.task_done_ros = None
+        self.task_done_completion_evidence = None
         # Keep target evidence by its mission identity. A detector may lose a
         # weak track and later confirm another one during the same task; the
         # timestamps must never be combined across those tracks.

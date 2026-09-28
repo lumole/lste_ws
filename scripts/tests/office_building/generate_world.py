@@ -267,8 +267,13 @@ def build_structure(world: ET.Element, level: str) -> None:
     add_box_link(structure, "outer_west", 0.0, 11.0, (wall, 22.0, h), rgba=gray)
     add_box_link(structure, "outer_east", 25.0, 11.0, (wall, 22.0, h), rgba=gray)
     add_box_link(structure, "outer_north", 12.5, 22.0, (25.0, wall, h), rgba=gray)
-    add_box_link(structure, "outer_south_west", 0.75, 0.0, (1.5, wall, h), rgba=gray)
-    add_box_link(structure, "outer_south_east", 14.5, 0.0, (20.0, wall, h), rgba=gray)
+    # Match the closed entrance's x extents exactly.  The previous west wall
+    # ended at x=1.5 while the door began at x=1.8, leaving a narrow physical
+    # gap that the structural-boundary detector promoted to an external
+    # Portal.  The benchmark starts indoors, so the outer shell must remain
+    # continuous around this deliberately closed entrance.
+    add_box_link(structure, "outer_south_west", 0.9, 0.0, (1.8, wall, h), rgba=gray)
+    add_box_link(structure, "outer_south_east", 15.0, 0.0, (20.0, wall, h), rgba=gray)
 
     # The robot starts inside the building. Keep the entrance visible as an
     # architectural feature, but close it for the autonomous benchmark so

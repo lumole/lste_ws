@@ -199,6 +199,12 @@ class GlobalFrontierRuntimeStateMixin:
         # an empty, not-yet-reconciled ledger for an empty room and immediately
         # select reverse transit.
         self.place_entry_rehydration_pending = None
+        # A branch-first Portal may be discovered to lead back into an
+        # already-known Place. Keep the interrupted source obligation as a
+        # one-shot graph resume until its certified route is reached.
+        self.pending_graph_resume_place_id = None
+        self.pending_graph_resume_portal_id = None
+        self.pending_graph_resume_destination_place_id = None
         self.active_work_item_id = None
         self.active_work_item_attempt_id = None
         self.active_work_item_place_id = None
@@ -308,13 +314,20 @@ class GlobalFrontierRuntimeStateMixin:
         self.last_released_route_kind = ""
         self.last_released_route_terminal_received = False
         self.last_released_route_controller_pending = False
+        self.last_released_route_transaction_id = 0
         self.last_released_route_lifecycle_transaction_id = 0
         self.last_released_route_action_generation = 0
         self.last_released_route_graph_transaction_id = 0
         self.last_released_route_map_epoch = None
+        self.last_released_route_origin_epoch = None
+        self.last_released_route_projection_epoch = None
         # A terminal releases semantic ownership first.  Successor planning is
         # held until the bridge confirms that the transport lease is released.
         self.active_terminal_contract = None
+        # One scalar cannot represent a delayed predecessor ACK after a
+        # successor has already become active. Keep contracts keyed by their
+        # route identity; the legacy scalar is maintained as a report alias.
+        self.pending_controller_lease_releases = {}
         self.pending_controller_lease_release = None
         self.awaiting_controller_lease_release_ack = False
         self.last_controller_lease_release_ack = None
@@ -330,6 +343,20 @@ class GlobalFrontierRuntimeStateMixin:
         # it only after the discrete path-prefix test proves continuity.
         self.active_route_id = 0
         self.active_route_map_epoch = None
+        # Capture the canonical lifecycle identity when a route is activated.
+        # Later failure/recovery transitions must not rewrite the predecessor
+        # contract that the controller is still draining.
+        self.active_route_lifecycle_transaction_id = 0
+        # Freeze the route-side predecessor identity before a later graph
+        # snapshot can replace ``graph_route_action_transaction``.  Mission
+        # transaction/action generation are filled when Bridge adoption is
+        # observed; route/lifecycle/epoch identity is available at activation.
+        self.active_route_dispatch_contract = None
+        # A graph materialization failure can be observed after the physical
+        # predecessor has already released its controller lease. Preserve the
+        # exact predecessor contract until the next route is activated so the
+        # graph failure, release ACK, and successor adoption remain one chain.
+        self.pending_graph_successor_predecessor_contract = None
         # Route id, rather than a bare Boolean, makes a late recovery message
         # harmless after the selector has already promoted a new branch.
         self.recovery_pending_route_id = 0
@@ -418,6 +445,13 @@ class GlobalFrontierRuntimeStateMixin:
         # Keep it independent from detector timing and from whether the
         # asynchronous target WorkItem has already been bound to this Place.
         self.target_reinspection_pending = False
+        # A target observation can remain an unresolved mission obligation even
+        # when the current map has no executable viewpoint for it.  Remember
+        # that bounded materialization outcome per Place so the graph planner
+        # can continue other legal work instead of rebuilding the same
+        # reinspection transaction on every map epoch.  New target evidence or
+        # a new task explicitly clears the deferral.
+        self.target_observation_materialization_deferred_places = set()
         self.last_semantic_pursuit_forward_candidates = 0
         self.last_target_direction_candidates = 0
         self.last_planning_wall = 0.0
@@ -468,9 +502,28 @@ class GlobalFrontierRuntimeStateMixin:
         self.graph_route_materialization_miss_count = 0
         self.graph_route_materialization_epochs = []
         self.graph_route_materialization_last_event = None
+        # Keep materialization budgets by durable obligation.  The legacy
+        # scalar fields below are only a view of the currently loaded bucket.
+        self.graph_route_materialization_trackers = {}
+        self.graph_route_materialization_obligation_key = None
+        self.graph_route_materialization_last_observation = None
+        self.graph_route_materialization_first_epoch = None
+        self.graph_route_materialization_last_epoch = None
+        self.graph_route_materialization_invalidated_obligations = set()
+        self.graph_route_materialization_invalidated_identity_map = {}
+        self.last_graph_route_materialization_invalidation = None
+        self.graph_route_materialization_invalidated = False
         self.graph_route_materialization_pending = False
         self.graph_route_materialization_exclusions = {}
         self.last_graph_route_materialization_negative_evidence = None
+        self.last_graph_rehydration_signature = None
+        self.last_graph_snapshot_projection_signature = None
+        self.last_graph_snapshot_projection_complete = False
+        self.last_graph_snapshot_visible_work_item_ids = None
+        self.last_graph_snapshot_visible_probe_ids = None
+        self.last_graph_snapshot_visible_portal_ids = None
+        self.last_graph_snapshot_candidate_count = 0
+        self.last_graph_snapshot_epoch = None
         self.last_map_epoch = None
         # The hard-reset handler re-runs this initializer, so no graph route
         # identity or map snapshot epoch can leak into the next slice.
@@ -486,6 +539,11 @@ class GlobalFrontierRuntimeStateMixin:
         # materializer. The graph adapter consumes it to release the stale
         # action lease and replan; it is cleared after that handoff.
         self.last_durable_portal_crossing_unavailable = None
+        # Reverse traversal has the same graph-owned materialization boundary
+        # as forward crossing. Keep its last snapshot-scoped miss available to
+        # the graph adapter instead of silently returning an empty candidate.
+        self.last_durable_portal_egress_unavailable = None
+        self.last_durable_portal_egress_report = None
         # The lifecycle tick owns all route-state computation.  Slow planning
         # compatibility fields remain observable for old diagnostics/tests,
         # but the live node does not use a second lock or proposal state

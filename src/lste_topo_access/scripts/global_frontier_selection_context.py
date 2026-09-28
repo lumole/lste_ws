@@ -83,6 +83,7 @@ class GlobalFrontierSelectionContextMixin:
         self.last_work_item_alternative_viewpoints = 0
         self.last_selected_viewpoint_retry = False
         self.last_work_item_sensor_horizon_m = None
+        self.last_work_item_place_scope_skips = 0
         self.last_crossed_portal_support_skips = 0
         # A selection pass evaluates several frontier endpoints along the
         # same BFS doorway. Cache its pure cut verdict for this one map epoch;
@@ -133,6 +134,49 @@ class GlobalFrontierSelectionContextMixin:
                     work_pending = True
                     break
         return work_pending
+
+    def _scope_observation_supports_to_source_place(
+        self, supports, components, source_label
+    ):
+        """Keep local WorkItems owned by the current structural Place.
+
+        ``observation_supports`` is computed from the map-wide frontier mask,
+        while WorkItems are durable obligations of one physical Place.  A
+        support whose frontier arc belongs to another labelled core must be
+        represented by the Portal/graph planner, not attached to the current
+        Place.  Zero-labelled throat cells are retained only when the same arc
+        also touches the current core; a throat by itself is a Portal concern.
+        """
+        if not supports or components is None or source_label is None:
+            return tuple(supports or ())
+        try:
+            source_label = int(source_label)
+            labels = components.labels
+            rows, cols = labels.shape
+        except (AttributeError, TypeError, ValueError):
+            return tuple(supports or ())
+        if source_label <= 0:
+            return tuple(supports or ())
+
+        scoped = []
+        skipped = 0
+        for support in supports:
+            positive_labels = set()
+            for row, col in getattr(support, "frontier_cells", ()) or ():
+                try:
+                    row, col = int(row), int(col)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= row < rows and 0 <= col < cols:
+                    label = int(labels[row, col])
+                    if label > 0:
+                        positive_labels.add(label)
+            if positive_labels and positive_labels.issubset({source_label}):
+                scoped.append(support)
+            else:
+                skipped += 1
+        self.last_work_item_place_scope_skips += skipped
+        return tuple(scoped)
 
     def _suppress_crossed_portal_supports(self, source_place_id, supports):
         """Remove reverse doorway arcs already represented by a crossed edge.
@@ -387,6 +431,11 @@ class GlobalFrontierSelectionContextMixin:
                 map_to_physical_xy=map_to_physical_xy,
                 resolution=message.info.resolution,
                 sensor_horizon_m=horizon,
+            )
+            supports = self._scope_observation_supports_to_source_place(
+                supports,
+                components,
+                source_label,
             )
             supports = self._suppress_crossed_portal_supports(
                 source_place_id,
