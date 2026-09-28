@@ -383,7 +383,7 @@ LOCAL_PLANNER_PLUGIN: teb_local_planner/TebLocalPlannerROS
 启动：
 
 ```bash
-cd /home/yhq/dh_ws/lste_ws
+cd .
 rltest
 ```
 

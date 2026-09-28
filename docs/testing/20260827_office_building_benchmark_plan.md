@@ -60,7 +60,7 @@
 最小可执行入口为：
 
 ```bash
-cd /home/yhq/dh_ws/lste_ws
+cd .
 scripts/tests/office_building/run_office_building.sh generate
 scripts/tests/office_building/run_office_building.sh validate level_1
 scripts/tests/office_building/run_office_building.sh start level_1
@@ -666,7 +666,7 @@ target detector --> goal manager ------+--> /lste/final_goal
 ### Step 0：准备环境
 
 ```bash
-cd /home/yhq/dh_ws/lste_ws
+cd .
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
 ```
@@ -858,7 +858,7 @@ Level 4 同时运行 Gazebo、SLAM、检测器、frontier、Navfn、TEB 和动�
 ```bash
 nvidia-smi
 free -h
-df -h /home/yhq/dh_ws/lste_ws
+df -h .
 rostopic hz /pro3/rlscan /pro3/wheel_odom
 ```
 
@@ -1265,14 +1265,14 @@ python3 scripts/tests/office_building/plot_benchmark_evidence.py \
 ### 28.2 G0：运行前检查
 
 ```bash
-cd /home/yhq/dh_ws/lste_ws
+cd .
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
 git rev-parse HEAD
 git status --short
 nvidia-smi
 free -h
-df -h /home/yhq/dh_ws/lste_ws
+df -h .
 for level in level_1 level_2 level_3 level_4; do
   OFFICE_BUILDING_LEVEL="$level" \
     scripts/tests/office_building/run_office_building.sh generate

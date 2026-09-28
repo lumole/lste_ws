@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-09-08
-- 工作区：`/home/yhq/dh_ws/lste_ws`
+- 工作区：当前工作区目录
 - 目标：将任务、路线和导航执行相关的异步状态管理收敛为 **Single-Threaded Event Queue + Tick FSM（Gather-Compute-Scatter）**。
 
 ## 2. 总体结论

@@ -194,9 +194,9 @@ F0001 的现场信息显示：
 
 本轮已修复这条断点：
 
-- [global_frontier_selection_planner.py](/home/yhq/dh_ws/lste_ws/src/lste_topo_access/scripts/global_frontier_selection_planner.py:163) 的两个规划阶段都显式传入当前 snapshot 的 `map_epoch`；
-- [global_frontier_planning_selection.py](/home/yhq/dh_ws/lste_ws/src/lste_topo_access/scripts/global_frontier_planning_selection.py:300) 的 fallback materialization 也显式传入 epoch；
-- [global_frontier_graph_route_adapter.py](/home/yhq/dh_ws/lste_ws/src/lste_topo_access/scripts/global_frontier_graph_route_adapter.py:670) 在 transaction 和 status 中保存该 epoch；
+- [global_frontier_selection_planner.py](../../src/lste_topo_access/scripts/global_frontier_selection_planner.py#L163) 的两个规划阶段都显式传入当前 snapshot 的 `map_epoch`；
+- [global_frontier_planning_selection.py](../../src/lste_topo_access/scripts/global_frontier_planning_selection.py#L300) 的 fallback materialization 也显式传入 epoch；
+- [global_frontier_graph_route_adapter.py](../../src/lste_topo_access/scripts/global_frontier_graph_route_adapter.py#L670) 在 transaction 和 status 中保存该 epoch；
 - 同一 graph obligation 连续物化失败时，adapter 记录负证据、清除旧 lease，并进入 `NEXT_ACTION`，planner 在当前 epoch 排除已经证明不可物化的 Portal/Probe/WorkItem；地图 epoch 变化后才重新允许尝试。
 
 因此，`map_epoch=null` 是历史运行的证据，不是当前实现的预期状态。仍需在正式 benchmark runner 中复核所有 route 类型都能带出完整 epoch。

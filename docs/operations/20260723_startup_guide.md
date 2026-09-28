@@ -16,7 +16,7 @@
 进入工作区：
 
 ```bash
-cd /home/yhq/dh_ws/lste_ws
+cd .
 ```
 
 首次使用，或修改过 Gazebo GUI 取点插件、点云转激光包时，先编译 SA-PPO 依赖：
@@ -52,7 +52,7 @@ runall
 完整路径形式仍然可用：
 
 ```bash
-cd /home/yhq/dh_ws/lste_ws
+cd .
 ./scripts/lifecycle/run_all_tmux.sh
 ```
 
@@ -95,7 +95,7 @@ Gazebo GUI 是必需组件，启动脚本会始终加载 `libgazebo_click_point.
 再启动大脑、车辆和默认的 TEB：
 
 ```bash
-cd /home/yhq/dh_ws/lste_ws
+cd .
 ./scripts/lifecycle/run_nodes_tmux.sh
 ```
 
@@ -178,7 +178,7 @@ SA-PPO 在收到第一条 `/lste/final_goal` 之前只发布零速度。到达�
 另开终端执行：
 
 ```bash
-cd /home/yhq/dh_ws/lste_ws
+cd .
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
 rostopic echo /lste/final_goal
@@ -246,7 +246,7 @@ SA-PPO 与 teleop 始终运行，并分别发布到 `/lste/cmd_vel/sappo` 和
 确保 `lste` 大脑会话未运行后，执行：
 
 ```bash
-cd /home/yhq/dh_ws/lste_ws
+cd .
 SAPPO_SPEED=0.50 ./scripts/lifecycle/run_sappo_tmux.sh
 ```
 

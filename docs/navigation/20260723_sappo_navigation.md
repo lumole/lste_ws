@@ -44,7 +44,7 @@ The command-line fallback is:
 ## Standalone Start
 
 ```bash
-cd /home/yhq/dh_ws/lste_ws
+cd .
 source /opt/ros/noetic/setup.bash
 catkin_make --pkg gazebo_click_point pointcloud_to_laserscan
 SAPPO_SPEED=0.50 ./scripts/lifecycle/run_sappo_tmux.sh

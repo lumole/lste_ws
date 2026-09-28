@@ -4,7 +4,7 @@
   "run_start": 0.0,
   "run_end": null,
   "test_name": "topo_pass",
-  "topo_tree_root": "/home/yhq/dh_ws/lste_ws/src/lste_topo_access/topo_tree/tree",
+  "topo_tree_root": "",
   "pose": {
     "x": 0.6379940809124292,
     "y": -1.1996555499716879
