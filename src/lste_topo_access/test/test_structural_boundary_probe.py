@@ -102,13 +102,18 @@ class _CrossPlaceProbeHarness(_CandidateHarness):
 
 
 class StructuralBoundaryProbeTest(unittest.TestCase):
-    def doorway_snapshot(self, *, closed=False):
+    def doorway_snapshot(self, *, closed=False, door_rows=(16, 25)):
         known_free = np.zeros((41, 61), dtype=bool)
         known_free[5:36, 5:56] = True
         structural = np.zeros_like(known_free)
         structural[5:36, 30] = True
         if not closed:
-            structural[18:23, 30] = False
+            # ``door_rows`` defaults to a 0.9 m opening: wide enough for the
+            # clearance disk the router actually drives (0.35 m -> nine cells
+            # at this resolution), so the fixture models a doorway the robot
+            # can physically pass. A narrower gap is rejected by the footprint
+            # test -- a gap narrower than the vehicle is a wall, not a door.
+            structural[door_rows[0]:door_rows[1], 30] = False
         known_free[structural] = False
         labels = np.zeros_like(known_free, dtype=np.int32)
         labels[8:33, 8:29] = 1
@@ -228,6 +233,72 @@ class StructuralBoundaryProbeTest(unittest.TestCase):
             candidate.portal_observation_probe.observation_source,
             "structural_boundary",
         )
+
+    def test_body_width_slit_never_becomes_a_probe_candidate(self):
+        """A gap the vehicle cannot pass is a wall, not a doorway.
+
+        Regression: a one- to three-cell rasterisation slit had opposing jambs
+        and a walkable raw-free route, so it became a probe, then a certified
+        portal, then a Place minted through a doorway no footprint fits.
+        """
+        known_free, structural, labels, steps = self.doorway_snapshot(
+            door_rows=(19, 22),
+        )
+        message = SimpleNamespace(
+            info=SimpleNamespace(
+                resolution=0.10,
+                origin=SimpleNamespace(
+                    position=SimpleNamespace(x=-3.05, y=-2.05)
+                ),
+            )
+        )
+        request = SimpleNamespace(
+            unknown=~known_free,
+            occupied=~known_free & ~structural,
+            components=SimpleNamespace(
+                labels=labels,
+                structural_occupied=structural,
+            ),
+            steps=steps,
+            preferred_steps=steps,
+            preferred_mask=known_free,
+            selection_tier="strict_clearance",
+            message=message,
+            validation=None,
+            map_to_physical_xy=None,
+        )
+        context = SimpleNamespace(
+            source_place_observed=True,
+            source_place_id=1,
+            source_label=1,
+        )
+
+        # The width rule -- not some other admission step -- is what rejects
+        # the slit: without the footprint bound the same fixture yields a
+        # boundary.
+        from global_frontier_structural_boundaries import (
+            structural_boundary_candidates,
+        )
+
+        unbounded = structural_boundary_candidates(
+            ~(request.unknown | request.occupied),
+            structural,
+            steps,
+            unknown=request.unknown,
+            labels=labels,
+            source_label=1,
+            support_radius=5,
+            minimum_wall_span_cells=5,
+        )
+        self.assertTrue(unbounded)
+
+        harness = _CandidateHarness()
+        candidates = harness.structural_boundary_probe_candidates(
+            request, context, approach_cells=12,
+        )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(harness.last_structural_boundary_rejections, 0)
 
     def test_candidate_adapter_rejects_source_viewpoint_in_another_place(self):
         known_free, structural, labels, steps = self.doorway_snapshot()
@@ -359,6 +430,130 @@ class StructuralBoundaryProbeTest(unittest.TestCase):
 
         self.assertTrue(candidates)
         self.assertTrue(all(candidate.normal == (1, 0) for candidate in candidates))
+
+    def test_extra_wide_doorway_uses_distant_jambs_once(self):
+        """A 3.2 m open partition is rejected, while a true 1.2 m doorway is accepted."""
+        # 1. 3.2m open partition (env04 root cause)
+        known_free = np.zeros((60, 120), dtype=bool)
+        known_free[5:55, 5:115] = True
+        structural = np.zeros_like(known_free)
+        structural[30, 5:51] = True
+        structural[30, 83:115] = True
+        known_free[structural] = False
+        unknown = np.zeros_like(known_free)
+        labels = np.zeros_like(known_free, dtype=np.int32)
+        labels[6:30, 6:114] = 2
+        labels[31:54, 6:114] = 1
+        steps = bfs(known_free, (40, 20))
+
+        candidates = structural_boundary_candidates(
+            known_free,
+            structural,
+            steps,
+            unknown=unknown,
+            labels=labels,
+            source_label=1,
+            support_radius=5,
+            minimum_wall_span_cells=5,
+            wall_search_radius=30,
+            minimum_opening_cells=13,
+            max_opening_m=1.8,
+        )
+
+        # When max_opening_m is set to 1.8m, the 3.2m opening is rejected
+        self.assertEqual(candidates, ())
+
+        # With default max_opening_m=3.5m, the real 3.2m doorway is recognized
+        candidates_door = structural_boundary_candidates(
+            known_free,
+            structural,
+            steps,
+            unknown=unknown,
+            labels=labels,
+            source_label=1,
+            support_radius=5,
+            minimum_wall_span_cells=5,
+            wall_search_radius=30,
+            minimum_opening_cells=13,
+            max_opening_m=3.5,
+        )
+        self.assertEqual(len(candidates_door), 1)
+        self.assertEqual(candidates_door[0].normal, (-1, 0))
+
+        request = SimpleNamespace(
+            unknown=unknown,
+            occupied=~known_free,
+            components=SimpleNamespace(
+                labels=labels,
+                structural_occupied=structural,
+            ),
+            steps=steps,
+            preferred_steps=steps,
+            preferred_mask=known_free,
+            selection_tier="strict_clearance",
+            message=SimpleNamespace(
+                info=SimpleNamespace(
+                    resolution=0.10,
+                    origin=SimpleNamespace(
+                        position=SimpleNamespace(x=0.0, y=0.0)
+                    ),
+                )
+            ),
+            validation=None,
+            map_to_physical_xy=None,
+        )
+        harness = _CandidateHarness()
+        harness.clearance = 0.52
+        harness.portal_max_opening_m = 1.8
+        routes = harness.structural_boundary_probe_candidates(
+            request,
+            SimpleNamespace(
+                source_place_observed=True,
+                source_place_id=1,
+                source_label=1,
+            ),
+            approach_cells=12,
+        )
+
+        # When portal_max_opening_m is 1.8m, opening is rejected
+        self.assertEqual(routes, [])
+
+        # When portal_max_opening_m is 3.5m, opening is detected as candidate doorway
+        harness.portal_max_opening_m = 3.5
+        routes_3_5 = harness.structural_boundary_probe_candidates(
+            request,
+            SimpleNamespace(
+                source_place_observed=True,
+                source_place_id=1,
+                source_label=1,
+            ),
+            approach_cells=12,
+        )
+        self.assertEqual(len(routes_3_5), 1)
+
+        # 2. In contrast, a true 1.2m doorway with opposing wall supports is detected
+        structural_door = np.zeros_like(known_free)
+        structural_door[30, 5:61] = True
+        structural_door[30, 73:115] = True
+        known_free_door = np.copy(known_free)
+        known_free_door[structural_door] = False
+
+        candidates_door = structural_boundary_candidates(
+            known_free_door,
+            structural_door,
+            steps,
+            unknown=unknown,
+            labels=labels,
+            source_label=1,
+            support_radius=5,
+            minimum_wall_span_cells=5,
+            wall_search_radius=30,
+            minimum_opening_cells=11,
+        )
+
+        self.assertEqual(len(candidates_door), 1)
+        self.assertEqual(candidates_door[0].normal, (-1, 0))
+        self.assertEqual(candidates_door[0].opening_cell[0], 30)
 
     def test_corridor_wall_thickness_is_not_a_portal(self):
         """Parallel corridor walls must not be mistaken for an opening.

@@ -7,6 +7,7 @@ import collections
 import rospy
 from nav_msgs.srv import GetPlan
 
+from clock_provider import now_for
 from global_frontier_place_lifecycle import (
     LocalEgressPlaceLease,
     PlaceDepartureTransaction,
@@ -96,6 +97,11 @@ class GlobalFrontierRuntimeStateMixin:
         self.navfn_startup_probe_distance = max(
             0.10, float(gp("~navfn_startup_probe_distance", 0.40))
         )
+        self.exploration_startup_warmup_seconds = max(
+            0.0, float(gp("~exploration_startup_warmup_seconds", 8.0))
+        )
+        self.first_map_received_time = None
+        self.last_startup_warmup_status_wall = 0.0
         self.navigation_stack_ready = not self.navfn_plan_validation
         self.navigation_readiness_state = (
             "navfn_validation_disabled"
@@ -117,6 +123,7 @@ class GlobalFrontierRuntimeStateMixin:
             self.navfn_make_plan_service, GetPlan
         )
         self.pose_odom = None
+        self.spawn_odom_xy = None
         # Recovery arbitration uses the forward lidar arc, not the global
         # minimum: a corridor wall close to either side is normal, while an
         # obstacle directly in front means a new global endpoint cannot make
@@ -193,6 +200,12 @@ class GlobalFrontierRuntimeStateMixin:
         # arrival.  It prevents snapshot-local component splits from minting
         # a second room while the base is still in the first one.
         self.current_physical_place_id = None
+        # Persist the bootstrap Place's physical anchor in every status
+        # snapshot. The marker node may start after the one-shot bootstrap
+        # event and must still draw P1 at the robot's safe birth pose rather
+        # than falling back to a WorkItem centroid.
+        self.physical_place_bootstrap_place_id = None
+        self.physical_place_bootstrap_anchor = None
         # A portal arrival commits the durable Place identity before the next
         # map snapshot has rehydrated its local WorkItems/Portal probes.  Keep
         # this one-shot boundary explicit so successor planning cannot mistake
@@ -220,10 +233,13 @@ class GlobalFrontierRuntimeStateMixin:
         # spatial semantics.  The former follows the place completion radius;
         # the latter follows the 0.25 m physical support lattice used by
         # observation WorkItems, allowing a real alternate view after a stall.
+        density_radius = float(getattr(self, "work_item_density_radius", 1.0))
         self.place_work_items = PlaceWorkItemLedger(
             self.completed_radius,
             viewpoint_merge_radius=0.25,
+            density_radius=density_radius,
         )
+        self.place_work_items.spawn_odom_xy = self.spawn_odom_xy
         # Keep the selected topological boundary independently from the route
         # kind. ``frontier_endpoint`` may be the first safe endpoint inside an
         # adjacent place and therefore still represents a physical crossing.
@@ -471,7 +487,16 @@ class GlobalFrontierRuntimeStateMixin:
         self.decision_wake_scheduler = DecisionWakeScheduler()
         # The durable graph planner chooses a complete Place/Portal route
         # between slow evidence updates. Geometry and TEB still own execution.
-        self.graph_route_planner = GraphRoutePlanner()
+        if not hasattr(self, "enable_dedicated_portal_probe_transaction"):
+            self.enable_dedicated_portal_probe_transaction = False
+        if not hasattr(self, "passive_plane_crossing_certification"):
+            self.passive_plane_crossing_certification = True
+        self._portal_plane_prev_signed = {}
+        self.graph_route_planner = GraphRoutePlanner(
+            enable_dedicated_portal_probe_transaction=self.enable_dedicated_portal_probe_transaction,
+            tsp_alpha=getattr(self, "tsp_alpha", 4.0),
+            tsp_beta=getattr(self, "tsp_beta", 3.0),
+        )
         self.last_graph_route_plan = None
         self.last_graph_route_plan_signature = None
         self.graph_route_action_transaction_sequence = 0
@@ -515,6 +540,13 @@ class GlobalFrontierRuntimeStateMixin:
         self.graph_route_materialization_invalidated = False
         self.graph_route_materialization_pending = False
         self.graph_route_materialization_exclusions = {}
+        # A durable local WorkItem can remain unresolved while every current
+        # safe viewpoint is blocked by the costmap or by the anchor-distance
+        # gate.  Keep that semantic obligation, but after a bounded number of
+        # distinct map epochs allow other frontier/graph work to proceed.
+        self.graph_route_deferred_work_item_ids = set()
+        self.graph_route_deferred_work_item_epochs = {}
+        self.last_graph_work_item_deferred_signature = None
         self.last_graph_route_materialization_negative_evidence = None
         self.last_graph_rehydration_signature = None
         self.last_graph_snapshot_projection_signature = None
@@ -633,8 +665,23 @@ class GlobalFrontierRuntimeStateMixin:
         # while preserving a wide room interior. The structural map separately
         # ignores compact observed furniture, so that furniture cannot split
         # the place identity used by exploration.
-        self.region_topology_clearance = self.clearance + min(
+        #
+        # The derived value couples two independent facts: how narrow a passage
+        # the vehicle can drive through (the route clearance) and at what width
+        # a passage counts as a wall opening (the structural clearance). They
+        # are only the same number by convention. A world whose only doorway is
+        # wider than twice the *route* clearance but narrower than twice the
+        # derived structural clearance needs them set apart, so an explicit
+        # parameter overrides the derived default and leaves every other
+        # composition unchanged.
+        configured_topology_clearance = gp("~region_topology_clearance", None)
+        derived_topology_clearance = self.clearance + min(
             0.20, max(0.10, self.frontier_clearance / 2.0)
+        )
+        self.region_topology_clearance = (
+            derived_topology_clearance
+            if configured_topology_clearance in (None, "")
+            else max(0.10, float(configured_topology_clearance))
         )
         self.region_topology_association_radius = max(
             self.frontier_approach_distance,
@@ -647,3 +694,24 @@ class GlobalFrontierRuntimeStateMixin:
         # updates by conservative world-space component signatures.
         self.topology_component_epoch = 0
         self.last_frontier_region_tier = "new"
+
+    def is_startup_warmup_active(self, now=None):
+        """Return True while the SLAM map is in its initial bootstrap warmup period."""
+        if getattr(self, "active_frontier", None) is not None:
+            return False
+        warmup_seconds = float(
+            getattr(self, "exploration_startup_warmup_seconds", 0.0) or 0.0
+        )
+        if warmup_seconds <= 0.0:
+            return False
+        first_map_time = getattr(self, "first_map_received_time", None)
+        if first_map_time is None:
+            return True
+        if now is None:
+            now = now_for(self)
+        try:
+            elapsed = float(now) - float(first_map_time)
+        except (TypeError, ValueError):
+            return False
+        return 0.0 <= elapsed < warmup_seconds
+

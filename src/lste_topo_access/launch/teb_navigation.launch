@@ -6,7 +6,7 @@
   <arg name="odom_topic" default="/pro3/wheel_odom"/>
   <arg name="global_frame" default="map"/>
   <arg name="max_linear_speed" default="0.50"/>
-  <arg name="teb_xy_goal_tolerance" default="0.50"/>
+  <arg name="teb_xy_goal_tolerance" default="0.20"/>
   <arg name="controller_mode" default="teb"/>
   <arg name="goal_topic" default="/lste/final_goal"/>
   <arg name="intent_topic" default="/lste/goal_intent"/>
@@ -111,6 +111,10 @@
   <arg name="compare_goal_yaw" default="false"/>
   <arg name="goal_min_update_interval" default="2.50"/>
   <arg name="goal_retry_interval" default="3.00"/>
+  <!-- A terminal action can leave the semantic controller lease waiting for
+       an exact upstream ACK. Bound that wait independently of active-route
+       progress watchdogs so a missing ACK cannot freeze dispatch forever. -->
+  <arg name="pending_lease_release_timeout" default="10.0"/>
   <!-- One move_base action is one execution transaction, but a continuous
        frontier route should not brake at every endpoint.  In-place
        replacement lets the bridge hot-swap the active goal through actionlib's
@@ -264,6 +268,10 @@
     <param name="global_costmap/robot_base_frame" value="base_footprint"/>
     <param name="global_costmap/update_frequency" value="2.0"/>
     <param name="global_costmap/publish_frequency" value="1.0"/>
+    <!-- The frontier executive may start after the initial map publication.
+         Keep sending full snapshots so it can initialize even when it missed
+         the first costmap message; incremental updates alone cannot seed it. -->
+    <param name="global_costmap/always_send_full_costmap" value="true"/>
     <param name="global_costmap/transform_tolerance" value="0.5"/>
     <param name="global_costmap/static_map" value="true"/>
     <param name="global_costmap/track_unknown_space" value="true"/>
@@ -377,10 +385,9 @@
          action. TEB therefore completes endpoint actions on XY arrival. The
          separate turn supervisor keeps its own 0.35-rad tolerance for the
          rare explicit in-place turn transaction. -->
-    <param name="TebLocalPlannerROS/yaw_goal_tolerance" value="3.14159"/>
-    <!-- Short visual/frontier segments should not force a full stop at every
-         handoff. The task_done mux gate still performs the final stop. -->
-    <param name="TebLocalPlannerROS/free_goal_vel" value="true"/>
+    <param name="TebLocalPlannerROS/yaw_goal_tolerance" value="0.20"/>
+    <!-- Come to a clean complete stop and accurate heading at the goal pose. -->
+    <param name="TebLocalPlannerROS/free_goal_vel" value="false"/>
     <param name="TebLocalPlannerROS/min_obstacle_dist" value="0.22"/>
     <param name="TebLocalPlannerROS/inflation_dist" value="0.55"/>
     <!-- Official TEB velocity limiter: slow continuously near furniture,
@@ -470,6 +477,7 @@
     <param name="compare_goal_yaw" value="$(arg compare_goal_yaw)"/>
     <param name="min_update_interval" value="$(arg goal_min_update_interval)"/>
     <param name="goal_retry_interval" value="$(arg goal_retry_interval)"/>
+    <param name="pending_lease_release_timeout" value="$(arg pending_lease_release_timeout)"/>
     <param name="allow_in_place_replacement" value="$(arg allow_in_place_replacement)"/>
     <param name="allow_route_continuation_replacement" value="$(arg allow_route_continuation_replacement)"/>
     <param name="handoff_distance" value="$(arg handoff_distance)"/>
@@ -523,7 +531,7 @@
     <param name="command_frequency" value="20.0"/>
     <param name="max_vel_theta" value="0.65"/>
     <param name="acc_lim_theta" value="0.90"/>
-    <param name="yaw_goal_tolerance" value="0.35"/>
+    <param name="yaw_goal_tolerance" value="0.20"/>
     <!-- Anti-spin protections: wait until the managed action is stable before
          starting a pre-route turn, cap a single turn's swept rotation so it
          can never wind up a full circle, and hold the achieved heading briefly

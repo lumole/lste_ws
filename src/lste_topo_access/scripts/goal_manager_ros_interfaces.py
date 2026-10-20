@@ -64,6 +64,12 @@ class GoalManagerRosInterfacesMixin:
         self.sub_map = rospy.Subscriber(
             "/map", OccupancyGrid, self.on_map, queue_size=1
         )
+        self.sub_goal_costmap = rospy.Subscriber(
+            self.goal_costmap_topic,
+            OccupancyGrid,
+            self.on_goal_costmap,
+            queue_size=1,
+        )
         self.sub_pose = rospy.Subscriber("/rbt_pose", Pose2D, self.on_pose, queue_size=1)
         self.sub_cam_info = rospy.Subscriber("/kinect/hd/camera_info", CameraInfo, self.on_cam_info, queue_size=1)
         if self.use_depth:

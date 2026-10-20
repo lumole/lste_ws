@@ -14,6 +14,17 @@ from goal_manager_modes import CATCH_TARGET_MODE, EXPLORE_SUS_C_MODE
 from goal_manager_target_utils import wrap_angle
 
 class GoalManagerLegacyGoalsMixin:
+    def _admit_context_goal(self, goal):
+        if goal is None:
+            return None
+        admission = self.costmap_endpoint_admission(goal)
+        if admission is not True:
+            self.ctx_last_goal = None
+            self.ctx_last_update = 0.0
+            self.goal_source = "waiting_costmap_endpoint"
+            return None
+        return goal
+
     def goal_from_ctx_follow(self, now: float) -> Optional[PoseStamped]:
         if self.ctx_start_time is None:
             self.ctx_start_time = now
@@ -103,14 +114,18 @@ class GoalManagerLegacyGoalsMixin:
                 "GoalManager: context observation complete; global coverage cooldown %.1fs",
                 self.context_follow_cooldown,
             )
-            return goal if goal is not None else self.goal_from_frontiers_prior()
+            return (
+                self._admit_context_goal(goal)
+                if goal is not None
+                else self.goal_from_frontiers_prior()
+            )
 
         if goal is None and self.ctx_last_goal is not None:
             self.goal_source = "ctx_cached"
-            return self.ctx_last_goal
+            return self._admit_context_goal(self.ctx_last_goal)
         if goal is None:
             return self.goal_from_frontiers_prior()
-        return goal
+        return self._admit_context_goal(goal)
 
     def goal_from_frontier(self, period_mode: str) -> Optional[PoseStamped]:
         if self.latest_frontier is None:
@@ -236,5 +251,4 @@ class GoalManagerLegacyGoalsMixin:
         x = self.latest_pose.x + dist * math.cos(heading_world)
         y = self.latest_pose.y + dist * math.sin(heading_world)
         return self.make_goal_pose((x, y, 0.0), heading_world)
-
 

@@ -82,16 +82,43 @@ class PortalObservationProbeTest(unittest.TestCase):
         ))
 
     def test_partially_observed_wall_uses_scan_horizon_for_probe_evidence(self):
-        walls = np.zeros((15, 15), dtype=bool)
-        walls[2:6, 7] = True
-        walls[8:12, 7] = True
+        walls = np.zeros((25, 15), dtype=bool)
+        walls[2:8, 7] = True
+        walls[17:23, 7] = True
         unknown = np.zeros_like(walls)
-        unknown[6, 8] = True
+        # The far-side cell of the doorway is still unknown: a partially
+        # observed wall. The gap itself spans nine cells (0.9 m), wide enough
+        # for the clearance disk the router drives, so it may become a probe.
+        unknown[8, 8] = True
         probe = ProbeHarness().portal_observation_probe_for_frontier(
-            ProbeHarness.request(unknown, walls), 6, 7,
+            ProbeHarness.request(unknown, walls), 8, 7,
         )
         self.assertIsNotNone(probe)
-        self.assertEqual(probe.opening_cell, (6, 7))
+        self.assertEqual(probe.opening_cell, (8, 7))
+
+    def test_probe_adapter_rejects_gap_narrower_than_the_vehicle(self):
+        """The same adapter must not probe a slit the body cannot pass."""
+        walls = np.zeros((25, 15), dtype=bool)
+        walls[2:8, 7] = True
+        walls[17:23, 7] = True
+        # Three free rows in the wall: a rasterisation slit, not a doorway.
+        walls[11:17, 7] = True
+        unknown = np.zeros_like(walls)
+        unknown[8, 8] = True
+
+        # The width bound is what rejects it: without the footprint check the
+        # same slit yields a probe.
+        self.assertIsNotNone(
+            portal_observation_probe(
+                unknown, walls, (8, 7),
+                support_radius=40, minimum_wall_span_cells=2,
+            )
+        )
+        self.assertIsNone(
+            ProbeHarness().portal_observation_probe_for_frontier(
+                ProbeHarness.request(unknown, walls), 8, 7,
+            )
+        )
 
 
 if __name__ == "__main__":

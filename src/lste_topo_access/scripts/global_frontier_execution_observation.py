@@ -1,22 +1,284 @@
 """Physical-progress observation for an active frontier route."""
 
 import math
+from types import SimpleNamespace
+
+import numpy as np
 
 import rospy
 
 from global_frontier_models import ActiveRouteObservation
 from global_frontier_physical_progress import physical_progress_decision
+from global_frontier_portal_certification import portal_certification_window
+from global_frontier_portal_probes import PortalObservationProbe
+from global_frontier_structural_boundaries import structural_boundary_candidates
+from global_frontier_grid import frontier_mask
 from global_frontier_topology import copy_component_evidence
 
 
 class GlobalFrontierExecutionObservationMixin:
     """Collect only map, odometry, and local-information progress evidence."""
 
+    def observe_live_portal_openings_from_map(self, message, robot_map, now):
+        """Run the live doorway pass when full planning is intentionally deferred."""
+        build_context = getattr(self, "_build_frontier_map_context", None)
+        if not callable(build_context) or message is None or robot_map is None:
+            return 0
+        map_context = build_context(message)
+        if map_context is None:
+            return 0
+        unknown = map_context.unknown
+        known_free = map_context.known_free
+        if (
+            not isinstance(unknown, np.ndarray)
+            or not isinstance(known_free, np.ndarray)
+            or unknown.shape != known_free.shape
+        ):
+            return 0
+        resolution = max(1e-6, float(message.info.resolution))
+        rows, cols = np.indices(unknown.shape)
+        world_x = (
+            float(message.info.origin.position.x) + (cols + 0.5) * resolution
+        )
+        world_y = (
+            float(message.info.origin.position.y) + (rows + 0.5) * resolution
+        )
+        distance_steps = np.hypot(
+            world_x - float(robot_map[0]),
+            world_y - float(robot_map[1]),
+        ) / resolution
+        route_steps = np.where(known_free, distance_steps, -1.0)
+        snapshot = SimpleNamespace(
+            message=message,
+            map_context=map_context,
+            route_graph=SimpleNamespace(
+                route_steps=route_steps,
+                frontier=frontier_mask(known_free, unknown),
+            ),
+            robot_map=robot_map,
+            now=now,
+        )
+        return self.observe_live_portal_openings(snapshot)
+
+    def observe_live_portal_openings(self, snapshot):
+        """Register doorway evidence while any route is being executed.
+
+        This pass is deliberately observation-only.  It consumes the same
+        frontier/structural helpers as normal selection, limits evidence to
+        the current sensor horizon, and writes durable PortalProbe identities;
+        it never changes ``active_frontier`` or publishes a replacement goal.
+        """
+        if snapshot is None:
+            return 0
+        components = getattr(snapshot.map_context, "components", None)
+        structural_occupied = getattr(components, "structural_occupied", None)
+        labels = getattr(components, "labels", None)
+        ledger = getattr(self, "portal_probe_ledger", None)
+        register = getattr(self, "register_portal_probe", None)
+        place_id = getattr(self, "current_physical_place_id", None)
+        if (
+            components is None
+            or structural_occupied is None
+            or ledger is None
+            or not callable(register)
+            or place_id is None
+        ):
+            return 0
+
+        message = snapshot.message
+        map_context = snapshot.map_context
+        route_graph = snapshot.route_graph
+        unknown = map_context.unknown
+        occupied = map_context.occupied
+        known_free = ~(unknown | occupied)
+        steps = route_graph.route_steps
+        if (
+            not isinstance(unknown, np.ndarray)
+            or not isinstance(occupied, np.ndarray)
+            or not isinstance(steps, np.ndarray)
+            or unknown.shape != occupied.shape
+            or unknown.shape != steps.shape
+        ):
+            return 0
+
+        projector_factory = getattr(self, "planar_xy_projector", None)
+        map_frame = getattr(message.header, "frame_id", "map") or "map"
+        map_to_physical = (
+            None
+            if projector_factory is None
+            else projector_factory("odom", map_frame)
+        )
+        request = SimpleNamespace(
+            message=message,
+            components=components,
+            unknown=unknown,
+            occupied=occupied,
+            now=snapshot.now,
+            map_to_physical_xy=map_to_physical,
+        )
+
+        resolution = max(1e-6, float(message.info.resolution))
+        horizon = getattr(self, "scan_observation_horizon", None)
+        try:
+            horizon = float(horizon)
+        except (TypeError, ValueError):
+            horizon = 0.0
+        horizon_cells = (
+            None if horizon <= 0.0 else horizon / resolution + 1.0
+        )
+
+        def in_sensor_horizon(cell):
+            try:
+                row, col = int(cell[0]), int(cell[1])
+                route_steps = float(steps[row, col])
+            except (IndexError, TypeError, ValueError):
+                return False
+            if horizon_cells is None:
+                return route_steps >= 0.0
+            cell_x = (
+                float(message.info.origin.position.x)
+                + (col + 0.5) * resolution
+            )
+            cell_y = (
+                float(message.info.origin.position.y)
+                + (row + 0.5) * resolution
+            )
+            return math.hypot(
+                cell_x - float(snapshot.robot_map[0]),
+                cell_y - float(snapshot.robot_map[1]),
+            ) <= float(horizon) + resolution
+
+        before = {
+            int(record.get("id"))
+            for record in ledger.snapshot()
+            if record.get("id") is not None
+        }
+        # A doorway may already be known free on both sides by the time the
+        # robot passes it.  Structural evidence preserves that opening even
+        # though no frontier cell remains to trigger the normal detector.
+        source_label = None
+        component_at_pose = getattr(self, "component_at_map_position", None)
+        if callable(component_at_pose):
+            try:
+                component = component_at_pose(
+                    message,
+                    components,
+                    ~(unknown | occupied),
+                    snapshot.robot_map[0],
+                    snapshot.robot_map[1],
+                )
+                source_label = None if component is None else int(component["label"])
+            except (AttributeError, IndexError, TypeError, ValueError):
+                source_label = None
+        if (
+            isinstance(labels, np.ndarray)
+            and source_label is not None
+            and source_label > 0
+        ):
+            throat_radius, window_margin = portal_certification_window(
+                resolution,
+                getattr(self, "region_topology_clearance", 0.50),
+                getattr(self, "place_furniture_max_span_m", 2.5),
+            )
+            route_radius = max(
+                1,
+                int(math.ceil(
+                    float(getattr(self, "clearance", 0.35)) / resolution
+                )),
+            )
+            portal_max_opening_m = float(getattr(self, "portal_max_opening_m", 1.8))
+            portal_max_opening_cells = int(math.ceil(portal_max_opening_m / resolution))
+            boundaries = structural_boundary_candidates(
+                ~(unknown | occupied),
+                structural_occupied,
+                steps,
+                unknown=unknown,
+                labels=labels,
+                source_label=source_label,
+                support_radius=throat_radius,
+                minimum_wall_span_cells=throat_radius,
+                wall_search_radius=window_margin,
+                minimum_opening_cells=2 * route_radius + 1,
+                maximum_opening_cells=portal_max_opening_cells,
+                resolution=resolution,
+                max_opening_m=portal_max_opening_m,
+            )
+            for boundary in boundaries:
+                if not in_sensor_horizon(boundary.source_cell):
+                    continue
+                # Live background recognition must not promote a wall crack or
+                # an unknown room boundary into a doorway.  Require a known
+                # free far-side cell and a distinct structural core beyond the
+                # throat.  Unknown-side openings remain owned by the normal
+                # frontier/WorkItem selector, where a source-side probe can be
+                # deliberately routed and certified.
+                destination = boundary.destination_cell
+                if not (
+                    0 <= int(destination[0]) < known_free.shape[0]
+                    and 0 <= int(destination[1]) < known_free.shape[1]
+                    and bool(known_free[destination])
+                ):
+                    continue
+                destination_label = None
+                for distance in range(1, int(window_margin) + 1):
+                    row = int(destination[0]) + distance * int(boundary.normal[0])
+                    col = int(destination[1]) + distance * int(boundary.normal[1])
+                    if not (
+                        0 <= row < labels.shape[0]
+                        and 0 <= col < labels.shape[1]
+                    ):
+                        break
+                    label = int(labels[row, col])
+                    if label > 0:
+                        destination_label = label
+                        break
+                if destination_label is None or destination_label == source_label:
+                    continue
+                self._register_live_structural_probe(request, boundary)
+
+        after = {
+            int(record.get("id")): record
+            for record in ledger.snapshot()
+            if record.get("id") is not None
+        }
+        new_ids = sorted(set(after) - before)
+        for probe_id in new_ids:
+            record = after[probe_id]
+            publish = getattr(self, "publish_status", None)
+            if callable(publish):
+                publish(
+                    "portal_opening_observed",
+                    probe_id=int(probe_id),
+                    source=str(record.get("observation_source", "live_scan")),
+                    source_place_id=int(record.get("source_place_id", place_id)),
+                    gate=[
+                        round(float(value), 3)
+                        for value in record.get("physical_gate_xy", ())
+                    ],
+                    map_epoch=record.get("last_map_epoch"),
+                )
+        return len(new_ids)
+
+    def _register_live_structural_probe(self, request, boundary):
+        """Register one known-free wall opening without scheduling motion."""
+        probe = PortalObservationProbe(
+            tuple(boundary.opening_cell),
+            tuple(boundary.normal),
+            None,
+            "source",
+            "live_structural_scan",
+        )
+        register = getattr(self, "register_portal_probe", None)
+        if callable(register):
+            register(request, probe)
+
     def observe_active_route(
         self, message, steps, validation, unknown, components, row, col, x, y,
         robot_map, now, portal_transition,
     ):
         """Update route-progress evidence and return the current map facts."""
+        if hasattr(self, "observe_passive_portal_plane_crossing"):
+            self.observe_passive_portal_plane_crossing(now)
         if portal_transition:
             self.observe_portal_gate_approach(now)
             # Portal topology is advanced by continuous physical evidence, not

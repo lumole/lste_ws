@@ -134,6 +134,58 @@ class PortalBeliefTest(unittest.TestCase):
         self.assertTrue(reverse_created)
         self.assertNotEqual(forward["id"], reverse["id"])
 
+    def test_crossed_gate_names_the_place_on_its_far_side(self):
+        ledger = PortalHypothesisLedger(match_radius=0.30)
+        edge, _created = ledger.certify(1, (0.0, 0.0), (0.0, 0.8), now=1.0)
+        ledger.crossed(edge["id"], now=2.0)
+        ledger.bind_destination(edge["id"], 2, now=2.0)
+
+        # Leaving the doorway's source: the crossed boundary already names the
+        # Place on the far side, so a later crossing must not mint another.
+        self.assertEqual(ledger.crossed_destination_for_gate((0.02, 0.0), 1), 2)
+        # Coming back out of that Place: the same boundary names its source.
+        self.assertEqual(ledger.crossed_destination_for_gate((0.02, 0.0), 2), 1)
+
+    def test_mirrored_hypothesis_reuses_the_crossed_doorway_destination(self):
+        """One doorway must not accumulate one Place per direction.
+
+        A revisit from the opposite side certifies a mirrored identity at the
+        same physical gate (test_opposite_direction_is_a_distinct_portal_
+        identity), and that identity is born with no destination.  Committing
+        its crossing is what used to mint a duplicate Place for one room.
+        """
+        ledger = PortalHypothesisLedger(match_radius=0.30)
+        forward, _created = ledger.certify(
+            1, (0.166, -0.141), (-0.059, -0.141), now=1.0,
+        )
+        ledger.crossed(forward["id"], now=2.0)
+        ledger.bind_destination(forward["id"], 2, now=2.0)
+        mirrored, created = ledger.certify(
+            1, (-0.061, -0.151), (0.164, -0.152), now=3.0,
+        )
+        self.assertTrue(created)
+        ledger.crossed(mirrored["id"], now=4.0)
+
+        self.assertIsNone(mirrored["destination_place_id"])
+        self.assertEqual(
+            ledger.crossed_destination_for_gate(mirrored["physical_gate"], 1),
+            2,
+        )
+
+    def test_crossed_gate_without_a_bound_destination_names_nothing(self):
+        ledger = PortalHypothesisLedger(match_radius=0.30)
+        edge, _created = ledger.certify(1, (0.0, 0.0), (0.0, 0.8), now=1.0)
+        ledger.crossed(edge["id"], now=2.0)
+
+        # Crossed but never bound: there is no far side to reuse yet.
+        self.assertIsNone(ledger.crossed_destination_for_gate((0.0, 0.0), 1))
+        # A bound edge that is not crossed is not a transit boundary yet.
+        pending, _created = ledger.certify(1, (9.0, 9.0), (9.0, 9.8), now=3.0)
+        ledger.bind_destination(pending["id"], 7, now=3.0)
+        self.assertIsNone(ledger.crossed_destination_for_gate((9.0, 9.0), 1))
+        # An unrelated doorway answers only for its own gate.
+        self.assertIsNone(ledger.crossed_destination_for_gate((5.0, 0.0), 1))
+
     def test_source_place_keeps_separate_doors(self):
         ledger = PortalHypothesisLedger(match_radius=0.20)
         first, _ = ledger.certify(2, (1.0, 0.0), (1.7, 0.0), now=1.0)

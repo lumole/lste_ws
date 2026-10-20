@@ -67,3 +67,23 @@
 - Transient candidate/planning waits are context events, not failures. Only a
   terminal failure, explicit route failure, unexpected preemption, or a
   sustained no-progress/lease wait may start a failure episode.
+
+<!-- FAST_INDEX_START -->
+## Fast Navigation & Asset Directory
+- **Canonical Worlds & Generators**:
+  - T-Junction Office (Primary Benchmark): Source `scripts/tests/generate_t_junction_world.py` -> outputs `worlds/t_junction_office_no_pro3.world`, manifest `worlds/t_junction_office_manifest.yaml`.
+  - Complex Office (Large Benchmark): Source `scripts/tests/office_building/generate_world.py` -> `worlds/benchmark/office_building_v1_level_*.world`.
+  - Always modify the generator script first, regenerate, and run `gz sdf -k <world_file>` to validate.
+- **Gazebo Model Placement Rules**:
+  - `cup_yellow`: Target yellow cup, desk $Z=0.75$, scale=(1.5, 1.5, 1.5).
+  - `desk_brown`: Office desk, top surface $Z=0.72$, length 1.6m, width 0.8m.
+  - `monitor_1`, `monitor_2`: Computer monitors, base $Z=0.72$, screen flanking offset $\pm 0.5\text{m}$.
+  - `table_conference_2`: Large conference table, top surface $Z=0.75$.
+  - `fire_hydrant`: Ground safety item $Z=0.0$, must tuck into wall corners (墙脚).
+  - `target_room_occluder`: Screen divider box (1.6 x 0.25 x 1.6m), $Z=0.8$.
+- **Core Runtime Commands**:
+  - Stack restart: `./run_demo_teb.sh restart` (autonomous TEB) or `CONTROLLER_MODE=teleop ./run_demo_teb.sh restart`.
+  - Switch controller: `rostopic pub -1 /lste/controller_mode std_msgs/String "data: 'teb'"` (or `'teleop'`).
+  - Diagnostics: `python3 .agents/skills/lste-status-debug/scripts/inspect_demo_status.py`.
+- **Detailed Full Index**: Refer to `docs/20261019_project_fast_index.md`.
+<!-- FAST_INDEX_END -->

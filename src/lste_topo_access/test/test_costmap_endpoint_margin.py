@@ -21,6 +21,15 @@ class _Harness(GlobalFrontierPlanningCostmapMixin):
     clearance = 0.52
     costmap_inscribed_radius = 0.30
 
+    @staticmethod
+    def world_cell(message, x, y):
+        origin = message.info.origin.position
+        resolution = float(message.info.resolution)
+        return (
+            int((float(y) - float(origin.y)) / resolution),
+            int((float(x) - float(origin.x)) / resolution),
+        )
+
 
 class CostmapEndpointMarginTest(unittest.TestCase):
     @staticmethod
@@ -49,6 +58,49 @@ class CostmapEndpointMarginTest(unittest.TestCase):
         data[2, 0] = 254
         message = self.message()
         self.assertTrue(harness._endpoint_has_lethal_margin(data, message, (2, 2)))
+
+    def test_inflated_endpoint_is_rejected_even_without_a_lethal_neighbour(self):
+        harness = _Harness()
+        harness.map_msg = SimpleNamespace(header=SimpleNamespace(frame_id="map"))
+        message = SimpleNamespace(
+            header=SimpleNamespace(frame_id="map"),
+            info=SimpleNamespace(
+                resolution=0.10,
+                width=5,
+                height=5,
+                origin=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0),
+                ),
+            ),
+        )
+        data = np.zeros((5, 5), dtype=np.int16)
+        data[2, 2] = 100
+        steps = np.zeros((5, 5), dtype=np.int32)
+        validation = (message, data, steps)
+        self.assertIsNone(
+            harness.candidate_costmap_distance(validation, 0.25, 0.25)
+        )
+
+    def test_unknown_endpoint_is_rejected(self):
+        harness = _Harness()
+        harness.map_msg = SimpleNamespace(header=SimpleNamespace(frame_id="map"))
+        message = SimpleNamespace(
+            header=SimpleNamespace(frame_id="map"),
+            info=SimpleNamespace(
+                resolution=0.10,
+                width=5,
+                height=5,
+                origin=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0),
+                ),
+            ),
+        )
+        data = np.zeros((5, 5), dtype=np.int16)
+        data[2, 2] = -1
+        steps = np.zeros((5, 5), dtype=np.int32)
+        self.assertIsNone(
+            harness.candidate_costmap_distance((message, data, steps), 0.25, 0.25)
+        )
 
 
 if __name__ == "__main__":

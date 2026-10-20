@@ -23,6 +23,7 @@ from global_frontier_portal_probe_adapter import (
     selection_report,
 )
 from global_frontier_graph_route_gate import (
+    _positive_id,
     candidate_matches_graph_plan,
     candidate_refines_graph_plan,
     graph_plan_is_exclusive,
@@ -77,6 +78,11 @@ class GlobalFrontierSelectionPlannerMixin:
         allow_portal_transitions=False, graph_route_planning=True,
     ):
         """Select a local endpoint or one deliberate doorway transition."""
+        if (
+            callable(getattr(self, "is_startup_warmup_active", None))
+            and self.is_startup_warmup_active(now)
+        ):
+            return None
         self.last_frontier_decision = None
         # Keep the named candidate alongside the legacy route tuple until the
         # outer lifecycle commits it.  The tuple is the public compatibility
@@ -211,9 +217,9 @@ class GlobalFrontierSelectionPlannerMixin:
                     or self._graph_route_plan_lease_matches_current(existing_plan)
                 )
             )
-            if lease_reusable and getattr(existing_plan, "action", None) in {
-                "cross_portal", "probe_portal",
-            }:
+            action = getattr(existing_plan, "action", None)
+            enable_probe = getattr(self, "enable_dedicated_portal_probe_transaction", True)
+            if lease_reusable and (action == "cross_portal" or (enable_probe and action == "probe_portal")):
                 install = getattr(self, "_install_graph_route_preference", None)
                 if callable(install):
                     install(existing_plan)
@@ -271,11 +277,12 @@ class GlobalFrontierSelectionPlannerMixin:
             )
         if getattr(self, "planning_should_preempt", lambda: False)():
             return None
-        # The full graph-first method also compiles a doorway when its far side
-        # is already known free.  That opening is no longer a frontier, so it
-        # cannot be found by the normal per-frontier loop above.  Keep this
-        # capability behind the named branch-first method contract; baselines
-        # and the strict ablation retain their historical frontier semantics.
+        # A known-free doorway is no longer a frontier, so it cannot be found
+        # by the normal per-frontier loop above.  Keep collecting this durable
+        # evidence in every graph-enabled Place/WorkItem method.  The
+        # ``branch_first`` capability still controls action priority below; it
+        # must not suppress continuous doorway recognition while local work is
+        # being completed.
         structural_boundary_probes = getattr(
             self, "structural_boundary_probe_candidates", None
         )
@@ -363,6 +370,16 @@ class GlobalFrontierSelectionPlannerMixin:
                     (scored_candidate, pool_name, ranking_action_tier)
                 )
 
+        # Keep an unresolved WorkItem durable, but do not let a finite series
+        # of empty safe-viewpoint projections freeze all other exploration.
+        # The adapter records distinct map epochs and applies the bounded
+        # deferral before the graph plan is built below.
+        defer_work = getattr(
+            self, "_record_graph_work_item_projection_miss", None
+        )
+        if callable(defer_work) and graph_route_planning:
+            defer_work(getattr(request.components, "epoch", None))
+
         # Candidate construction can rehydrate a probe and bind a WorkItem.
         # This event is the explicit barrier consumed by the graph planner:
         # every identity below has passed current-map reachability and
@@ -377,6 +394,11 @@ class GlobalFrontierSelectionPlannerMixin:
             visible_ids, visible_probe_ids, visible_portal_ids = (
                 self._graph_snapshot_identity_sets(graph_obligation_candidates)
             )
+            reopen_work = getattr(
+                self, "_clear_graph_work_item_projection_deferrals", None
+            )
+            if callable(reopen_work):
+                reopen_work(visible_ids)
             identity_keys = {
                 ("work_item", value) for value in visible_ids
             }
@@ -420,6 +442,10 @@ class GlobalFrontierSelectionPlannerMixin:
                     projection_complete=True,
                     geometry_source="current_frontier_snapshot",
                 )
+            robot_anchor = (
+                getattr(request, "robot_map", None)
+                or getattr(request, "route_anchor_xy", None)
+            )
             graph_plan, _unused_graph_candidate = graph_prepare(
                 None,
                 visible_work_item_ids=visible_ids,
@@ -427,6 +453,7 @@ class GlobalFrontierSelectionPlannerMixin:
                 visible_portal_ids=visible_portal_ids,
                 reuse_existing_plan=reuse_graph_plan_lease,
                 map_epoch=getattr(request.components, "epoch", None),
+                robot_pose=robot_anchor,
             )
             plan_visible = getattr(
                 self, "_graph_plan_identity_is_visible", None
@@ -713,6 +740,11 @@ class GlobalFrontierSelectionPlannerMixin:
                 )
                 if selected is not None:
                     return selected
+                selected = self._select_portal_probe_candidate(
+                    request, context, probe_candidates,
+                )
+                if selected is not None:
+                    return selected
             if getattr(self, "frontier_action_policy", "legacy_scalar") == "event_pareto":
                 selected = self._select_frontier_decision_candidate(
                     frontier_decision_candidates,
@@ -835,11 +867,61 @@ class GlobalFrontierSelectionPlannerMixin:
             if exact_work_item_lease
             else candidate_refines_graph_plan
         )
-        matching = [
-            candidate
-            for candidate in (candidates or ())
-            if matcher(plan, candidate)
-        ]
+        planned_obligation_id = _positive_id(getattr(plan, "obligation_id", None))
+        is_work_item_plan = bool(
+            plan is not None
+            and getattr(plan, "action", None)
+            in ("bootstrap_observation", "observe_local_work", "retry_viewpoint")
+            and planned_obligation_id is not None
+        )
+        if is_work_item_plan:
+            exact_matching = [
+                candidate
+                for candidate in (candidates or ())
+                if candidate_matches_graph_plan(plan, candidate)
+            ]
+            if exact_matching:
+                matching = exact_matching
+            else:
+                tour = (
+                    getattr(plan, "work_item_tour", ())
+                    or getattr(plan, "tour", ())
+                    or ()
+                )
+                tour_match = []
+                for tour_item_id in tour:
+                    if tour_item_id == planned_obligation_id:
+                        continue
+                    tour_candidates = [
+                        candidate
+                        for candidate in (candidates or ())
+                        if _positive_id(
+                            getattr(candidate, "work_item_id", None)
+                            or (
+                                getattr(candidate, "route", ())[12]
+                                if len(getattr(candidate, "route", ())) > 12
+                                else None
+                            )
+                        )
+                        == tour_item_id
+                    ]
+                    if tour_candidates:
+                        tour_match = tour_candidates
+                        break
+                if tour_match:
+                    matching = tour_match
+                else:
+                    matching = [
+                        candidate
+                        for candidate in (candidates or ())
+                        if matcher(plan, candidate)
+                    ]
+        else:
+            matching = [
+                candidate
+                for candidate in (candidates or ())
+                if matcher(plan, candidate)
+            ]
         if not matching:
             return None
         if getattr(self, "frontier_action_policy", "legacy_scalar") == "event_pareto":
@@ -949,6 +1031,8 @@ class GlobalFrontierSelectionPlannerMixin:
         self, request, context, probe_candidates,
     ):
         """Choose one full-method probe before legacy score-pool fallback."""
+        if not getattr(self, "enable_dedicated_portal_probe_transaction", True):
+            return None
         if not probe_candidates or not getattr(
             self, "task_semantic_value_enabled", False
         ):

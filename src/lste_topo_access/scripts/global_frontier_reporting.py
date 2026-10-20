@@ -288,13 +288,15 @@ class GlobalFrontierReportingMixin:
         if ledger is None:
             return None
         counts = {}
-        for record in ledger.snapshot():
+        records = ledger.snapshot()
+        for record in records:
             state = str(record.get("state", "unknown"))
             counts[state] = counts.get(state, 0) + 1
         return {
             "active_id": int(getattr(self, "active_portal_probe_id", 0) or 0),
             "count": int(sum(counts.values())),
             "states": counts,
+            "records": records,
         }
 
     def work_item_report(self):
@@ -624,6 +626,17 @@ class GlobalFrontierReportingMixin:
             "goal_context": self.active_goal_context(),
             "semantic_place": self.semantic_place_report(),
             "place_progress": self.place_progress_report(),
+            # This is repeated in every latched status snapshot so RViz can
+            # recover P1's physical birth anchor even when it starts after the
+            # one-shot ``physical_place_bootstrapped`` event.
+            "physical_place_bootstrap": {
+                "place_id": getattr(
+                    self, "physical_place_bootstrap_place_id", None,
+                ),
+                "physical_source": getattr(
+                    self, "physical_place_bootstrap_anchor", None,
+                ),
+            },
             "place_entry_rehydration_pending": getattr(
                 self, "place_entry_rehydration_pending", None
             ),

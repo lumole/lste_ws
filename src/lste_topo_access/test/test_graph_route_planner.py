@@ -201,6 +201,98 @@ class GraphRoutePlannerTest(unittest.TestCase):
         self.assertEqual(result.obligation_kind, "portal_edge")
         self.assertEqual(result.reason, "destination_view_promoted_to_portal")
 
+    def test_completed_probe_crosses_in_strict_non_branch_first_mode(self):
+        """Action ordering cannot turn terminal Portal evidence into a probe."""
+        result = self.plan(
+            1,
+            [place(1)],
+            [{
+                "id": 13,
+                "source_place_id": 1,
+                "destination_place_id": None,
+                "state": "selected",
+            }],
+            probes=[{
+                "id": 41,
+                "source_place_id": 1,
+                "portal_id": 13,
+                "state": "observed",
+            }],
+            branch_first=False,
+            visible_work_item_ids=(),
+            visible_probe_ids=(),
+            visible_portal_ids=(),
+        )
+
+        self.assertEqual(result.status, PLAN_READY)
+        self.assertEqual(result.action, ACTION_CROSS_PORTAL)
+        self.assertEqual(result.first_portal_id, 13)
+        self.assertEqual(result.reason, "destination_view_promoted_to_portal")
+
+    def test_strict_mode_crosses_observed_portal_before_local_work_backlog(self):
+        data = dict(
+            current=1,
+            places=[place(1)],
+            portals=[{
+                "id": 13,
+                "source_place_id": 1,
+                "destination_place_id": None,
+                "state": "selected",
+            }],
+            probes=[{
+                "id": 41,
+                "source_place_id": 1,
+                "portal_id": 13,
+                "state": "observed",
+            }],
+            visible_work_item_ids=(31,),
+            visible_probe_ids=(),
+            visible_portal_ids=(),
+            branch_first=False,
+        )
+
+        result = self.plan(
+            **data,
+            work_items=[work(31, 1, normal_xy=(1.0, 0.0))],
+        )
+
+        self.assertEqual(result.action, ACTION_CROSS_PORTAL)
+        self.assertEqual(result.first_portal_id, 13)
+        self.assertEqual(result.obligation_id, 13)
+        self.assertEqual(result.reason, "destination_view_promoted_to_portal")
+
+    def test_destination_evidence_reopens_materialization_excluded_portal(self):
+        """A stale projection exclusion cannot defeat a completed probe."""
+        result = self.plan(
+            1,
+            [place(1)],
+            [{
+                "id": 13,
+                "source_place_id": 1,
+                "destination_place_id": None,
+                "state": "selected",
+                "rejected_map_epoch": 7,
+            }],
+            probes=[{
+                "id": 41,
+                "source_place_id": 1,
+                "portal_id": 13,
+                "state": "observed",
+            }],
+            branch_first=True,
+            map_epoch=8,
+            visible_work_item_ids=(),
+            visible_probe_ids=(),
+            visible_portal_ids=(),
+            excluded_portal_ids=(13,),
+            excluded_probe_ids=(41,),
+        )
+
+        self.assertEqual(result.status, PLAN_READY)
+        self.assertEqual(result.action, ACTION_CROSS_PORTAL)
+        self.assertEqual(result.first_portal_id, 13)
+        self.assertEqual(result.reason, "destination_view_promoted_to_portal")
+
     def test_certified_portal_crossing_precedes_new_structural_probe(self):
         result = self.plan(
             1,
@@ -225,7 +317,7 @@ class GraphRoutePlannerTest(unittest.TestCase):
                     "observation_source": "structural_boundary",
                 },
             ],
-            branch_first=True,
+            branch_first=False,
             structural_boundary_first=True,
         )
 
@@ -372,6 +464,20 @@ class GraphRoutePlannerTest(unittest.TestCase):
         self.assertEqual(result.status, PLAN_BLOCKED)
         self.assertEqual(result.action, ACTION_HOLD)
         self.assertEqual(result.reason, "current_place_obligation_not_materialized")
+
+    def test_bounded_deferred_work_item_does_not_keep_graph_in_hold(self):
+        """A deferred item stays unresolved while other policy may continue."""
+        result = self.plan(
+            1,
+            [place(1)],
+            work_items=[work(31, 1, normal_xy=(1.0, 0.0))],
+            branch_first=True,
+            excluded_work_item_ids=(31,),
+        )
+
+        self.assertEqual(result.status, PLAN_READY)
+        self.assertEqual(result.action, ACTION_HOLD)
+        self.assertEqual(result.reason, "deferred_work_item_allows_other_work")
 
     def test_portal_crossing_becomes_legal_after_local_work_is_resolved(self):
         """Place closure changes the legal graph action, not a numeric score."""

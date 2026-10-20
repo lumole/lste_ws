@@ -56,6 +56,7 @@ class GlobalFrontierConfigurationTest(unittest.TestCase):
         self.assertEqual(configuration.region_memory_radius, 2.50)
         self.assertEqual(configuration.turn_execution_mode, "native_teb")
         self.assertEqual(configuration.planning_period, 1.5)
+        self.assertEqual(configuration.exploration_startup_warmup_seconds, 8.0)
         warn.assert_called_once()
 
 

@@ -248,11 +248,21 @@ class GoalManagerTargetCompletionMixin:
         evidence than a flickering context pair; use the existing follow
         threshold but retain the multi-frame close-box requirement.
         """
-        direct_track_confirmed = (
+        direct_track_confirmed = bool(
             self.target_follow_confirmed
-            and self.target_completed_segments >= 1
             and bool(self.target_track_id)
-            and self.target_approach_track_id == self.target_track_id
+            and (
+                (
+                    self.target_completed_segments >= 1
+                    and self.target_approach_track_id == self.target_track_id
+                )
+                # A confirmed direct track is already a valid close-view
+                # owner when the configured policy does not require a
+                # separate approach segment.  WeDetect-Large commonly scores
+                # the real yellow cup around 0.2-0.3, so retaining the stricter
+                # 0.4 completion score here would make this branch impossible.
+                or not self.target_done_require_approach_terminal
+            )
         )
         return (
             float(self.target_follow_min_score)

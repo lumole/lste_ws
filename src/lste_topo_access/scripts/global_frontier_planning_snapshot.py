@@ -252,6 +252,14 @@ class GlobalFrontierPlanningSnapshotMixin:
             graph_transit_available = graph_transit_available or getattr(
                 graph_plan, "action", None
             ) in ("cross_portal", "probe_portal")
+        # The identity of the *evidence* decides whether recovery may be asked
+        # for again, so it must survive map re-projection. It is therefore the
+        # plan's durable signature, not the one that carries ``map_epoch``:
+        # an idle planner rebuilds the identical blocked decision from every
+        # snapshot, and reading the epoch there makes each rebuild look like
+        # new evidence, so the recovery guard never reaches its explicit
+        # blocked terminal and the node spins at the planning period forever
+        # over an obligation that has not changed at all.
         evidence_signature = (
             getattr(self, "current_physical_place_id", None),
             getattr(self, "last_place_graph_hop_skips", 0),
@@ -267,7 +275,15 @@ class GlobalFrontierPlanningSnapshotMixin:
             (
                 None
                 if graph_plan is None
-                else graph_plan.signature()
+                else (
+                    graph_plan.durable_signature()
+                    if hasattr(graph_plan, "durable_signature")
+                    else (
+                        graph_plan.durable_obligation_key()
+                        if hasattr(graph_plan, "durable_obligation_key")
+                        else graph_plan.signature()
+                    )
+                )
             ),
         )
         completion_state = getattr(self, "graph_completion_state", None)
@@ -552,6 +568,14 @@ class GlobalFrontierPlanningSnapshotMixin:
         if robot_map is None or message.info.resolution <= 0.0:
             return None
         now = now_for(self)
+        if (
+            getattr(self, "first_map_received_time", None) is None
+            and message is not None
+            and getattr(message, "info", None) is not None
+            and getattr(message.info, "width", 0) > 0
+            and getattr(message.info, "height", 0) > 0
+        ):
+            self.first_map_received_time = now
         if not self.navigation_stack_is_ready(robot_map, map_frame, now):
             return None
         robot_yaw_map = self.transform_yaw(

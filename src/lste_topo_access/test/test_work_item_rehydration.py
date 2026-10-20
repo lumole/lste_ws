@@ -214,6 +214,66 @@ class WorkItemRehydrationTest(unittest.TestCase):
             "owned_by_portal_probe": 1,
         })
 
+    def test_viewpoint_far_from_anchor_is_not_rehydrated(self):
+        fixture = WorkItemRehydrationFixture()
+        fixture.nearest_reachable_cell = lambda _message, _steps, _x, _y: (5, 5)
+        fixture.place_work_items._new_item(
+            1,
+            frozenset({(3, 3)}),
+            1.0,
+            anchor_xy=(0.0, 0.0),
+            normal_xy=(1.0, 0.0),
+        )
+
+        candidates = fixture.pending_local_work_item_candidates(
+            request(), SimpleNamespace(source_place_id=1),
+            frontier=np.zeros((6, 6), dtype=bool), approach_cells=1,
+        )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(
+            fixture.events[-1][1]["rejection_reasons"],
+            {"viewpoint_too_far_from_work_item": 3},
+        )
+
+    def test_costmap_rejection_tries_the_next_viewpoint(self):
+        fixture = WorkItemRehydrationFixture()
+        fixture.nearest_reachable_cell = (
+            lambda _message, _steps, x, y: (int(round(y)), int(round(x)))
+        )
+        costmap_calls = []
+
+        def costmap_distance(_validation, _x, _y):
+            costmap_calls.append((_x, _y))
+            return None if len(costmap_calls) == 1 else 2.0
+
+        fixture.candidate_costmap_distance = costmap_distance
+        item = fixture.place_work_items._new_item(
+            1,
+            frozenset({(3, 3)}),
+            1.0,
+            anchor_xy=(2.0, 2.0),
+            normal_xy=(1.0, 0.0),
+        )
+        context = SimpleNamespace(source_place_id=1)
+        current_request = request()
+        current_request.validation = object()
+
+        candidates = fixture.pending_local_work_item_candidates(
+            current_request,
+            context,
+            frontier=np.zeros((6, 6), dtype=bool),
+            approach_cells=1,
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertGreaterEqual(len(costmap_calls), 2)
+        self.assertEqual(candidates[0][2].work_item_id, item["id"])
+        self.assertEqual(
+            fixture.events[-1][1]["rejection_reasons"],
+            {"costmap_route_unreachable": 1},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

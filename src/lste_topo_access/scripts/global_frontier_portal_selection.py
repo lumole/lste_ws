@@ -494,7 +494,7 @@ class GlobalFrontierPortalSelectionMixin(GlobalFrontierPortalAdmissionMixin):
                     portal_gate_xy,
                     (portal_x, portal_y),
                 )
-                if hypothesis is None:
+                if hypothesis is None and getattr(self, "portal_hypothesis_ledger", None) is not None:
                     continue
             certify_probe = getattr(self, "certify_portal_probe", None)
             if certify_probe is not None and hypothesis is not None:

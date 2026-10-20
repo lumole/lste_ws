@@ -145,6 +145,41 @@ def grid_line_is_known_free(known_free, start_row, start_col, end_row, end_col):
     return True
 
 
+def grid_line_reaches_cell(known_free, start_row, start_col, end_row, end_col):
+    """Return whether a pose has an unobstructed ray to one map cell.
+
+    Unlike :func:`grid_line_is_known_free`, the target itself may still be
+    unknown or occupied: this answers "is that cell in the sensor's line of
+    sight", not "has that cell been resolved".  Every cell the ray crosses
+    before the target must be known free, so a wall between the pose and the
+    cell hides it.  Occlusion, not Euclidean distance, is what stops a sensor
+    from observing a cell -- this is the test that keeps a cell hidden behind a
+    wall from being charged to a viewpoint that can never see it.
+    """
+    rows, cols = known_free.shape
+    start_row, start_col = int(start_row), int(start_col)
+    end_row, end_col = int(end_row), int(end_col)
+    if not (
+        0 <= start_row < rows
+        and 0 <= start_col < cols
+        and 0 <= end_row < rows
+        and 0 <= end_col < cols
+    ):
+        return False
+    steps = max(abs(end_row - start_row), abs(end_col - start_col))
+    if steps == 0:
+        return True
+    for index in range(steps + 1):
+        fraction = float(index) / float(steps)
+        row = int(round(start_row + (end_row - start_row) * fraction))
+        col = int(round(start_col + (end_col - start_col) * fraction))
+        if (row, col) == (end_row, end_col):
+            break
+        if not (0 <= row < rows and 0 <= col < cols and known_free[row, col]):
+            return False
+    return True
+
+
 def grid_frontier_observed_from_viewpoint(
     known_free,
     unknown,

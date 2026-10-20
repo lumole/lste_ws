@@ -216,6 +216,27 @@ class GlobalFrontierPlanningCostmapMixin:
         cell = self.world_cell(message, target[0], target[1])
         if cell is None or data[cell] >= 253 or steps[cell] < 0:
             return None
+        # A goal is a footprint centre, not merely a traversable path cell.
+        # Costmap values 1..252 are inflated obstacle costs; accepting one
+        # here lets Navfn/TEB terminate beside or inside a wall even though
+        # the lethal-margin disk below does not contain a lethal cell.
+        # Unknown (-1) is rejected as well: endpoint admission requires a
+        # currently known, zero-cost centre.
+        if int(data[cell]) != 0:
+            try:
+                rospy.loginfo_throttle(
+                    5.0,
+                    "Global frontier rejected non-free costmap endpoint "
+                    "goal=(%.2f,%.2f) cost=%d",
+                    float(x),
+                    float(y),
+                    int(data[cell]),
+                )
+            except Exception:
+                # Pure geometry fixtures may exercise this gate without a
+                # running ROS clock; rejection remains the authoritative fact.
+                pass
+            return None
         if not self._endpoint_has_lethal_margin(data, message, cell):
             rospy.loginfo_throttle(
                 5.0,

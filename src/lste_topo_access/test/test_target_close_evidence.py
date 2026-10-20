@@ -184,6 +184,15 @@ class TargetCloseEvidenceTest(unittest.TestCase):
         manager.target_follow_confirmed = False
         self.assertEqual(manager.target_close_score_threshold(), 0.40)
 
+    def test_direct_track_without_approach_terminal_uses_follow_score(self):
+        manager = self.GoalManagerStub()
+        manager.target_completed_segments = 0
+        manager.target_approach_track_id = ""
+        self.assertFalse(manager.target_done_require_approach_terminal)
+        self.assertEqual(manager.target_close_score_threshold(), 0.20)
+        manager.target_done_require_approach_terminal = True
+        self.assertEqual(manager.target_close_score_threshold(), 0.40)
+
     def test_strong_unconfirmed_candidate_can_request_information_view(self):
         manager = self.GoalManagerStub()
         manager.target_follow_confirmed = False

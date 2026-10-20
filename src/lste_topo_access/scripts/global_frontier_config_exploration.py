@@ -27,6 +27,21 @@ class GlobalFrontierExplorationConfigurationMixin:
         self.exploration_method = self.exploration_capabilities.name
         self.place_memory_enabled = self.exploration_capabilities.place_memory
         self.work_item_memory_enabled = self.exploration_capabilities.work_items
+        self.exploration_startup_warmup_seconds = max(
+            0.0, float(gp("~exploration_startup_warmup_seconds", 8.0))
+        )
+        self.work_item_density_radius = max(
+            0.1, float(gp("~work_item_density_radius", 1.0))
+        )
+        self.work_item_clearance_radius = max(
+            0.2, float(gp("~work_item_clearance_radius", 0.7))
+        )
+        self.work_item_min_clearance_ratio = max(
+            0.05, min(0.95, float(gp("~work_item_min_clearance_ratio", 0.35)))
+        )
+        self.work_item_corner_wall_distance = max(
+            0.1, float(gp("~work_item_corner_wall_distance", 0.4))
+        )
         self.distance_deduplication_enabled = (
             self.exploration_capabilities.distance_deduplication
         )
@@ -54,6 +69,18 @@ class GlobalFrontierExplorationConfigurationMixin:
                 False,
             )
         )
+        enable_probe_tx = gp("~enable_dedicated_portal_probe_transaction", False)
+        self.enable_dedicated_portal_probe_transaction = (
+            enable_probe_tx if isinstance(enable_probe_tx, bool)
+            else str(enable_probe_tx).strip().lower() in ("1", "true", "yes", "on")
+        )
+        passive_plane_crossing = gp("~passive_plane_crossing_certification", True)
+        self.passive_plane_crossing_certification = (
+            passive_plane_crossing if isinstance(passive_plane_crossing, bool)
+            else str(passive_plane_crossing).strip().lower() in ("1", "true", "yes", "on")
+        )
+        self.tsp_alpha = float(gp("~tsp_alpha", 4.0))
+        self.tsp_beta = float(gp("~tsp_beta", 3.0))
         # The named method owns this policy boundary. Do not expose another
         # score/weight switch: baselines and the graph method must remain
         # comparable by changing one declared method contract.
@@ -115,6 +142,12 @@ class GlobalFrontierExplorationConfigurationMixin:
         # place map; Navfn, costmaps, and TEB still receive the raw obstacle.
         self.place_furniture_max_span_m = max(
             0.25, float(gp("~place_furniture_max_span_m", 2.5))
+        )
+        # Maximum architectural doorway width. Openings wider than this (e.g.
+        # open room partitions like 3.2m in env04) are continuous spaces, not
+        # doorways, and must not be registered as blocking probes or split places.
+        self.portal_max_opening_m = max(
+            0.8, float(gp("~portal_max_opening_m", 1.8))
         )
         # A lidar max-range frontier in an empty open area is often just the
         # edge of a scan, not an entrance worth searching. Doorways, corridor

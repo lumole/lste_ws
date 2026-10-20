@@ -79,6 +79,12 @@ class GlobalFrontierRosInterfacesMixin:
             queue_size=10,
         )
         rospy.Subscriber(
+            self.route_actuator_status_topic,
+            String,
+            self.on_route_actuator_status,
+            queue_size=20,
+        )
+        rospy.Subscriber(
             self.terminal_contract_topic,
             FrontierExecutionTerminal,
             self.on_execution_terminal,

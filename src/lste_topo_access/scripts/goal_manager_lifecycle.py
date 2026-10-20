@@ -220,6 +220,19 @@ class GoalManagerLifecycleMixin:
         """Queue map snapshots used to version target-route validation."""
         return self._enqueue_lifecycle_event(EventType.MAP_UPDATED, message)
 
+    def on_goal_costmap(self, message):
+        """Cache the full global costmap for endpoint admission.
+
+        Costmap updates are an execution boundary, not a mission lifecycle
+        event. Keep the latest immutable ROS message directly so a local
+        context goal can be rejected before it reaches the controller.
+        """
+        self.latest_costmap = message
+        try:
+            self.latest_costmap_received_at = rospy.Time.now().to_sec()
+        except Exception:
+            self.latest_costmap_received_at = 0.0
+
     def on_cam_info(self, message):
         return self._enqueue_lifecycle_event(
             EventType.CAMERA_INFO_UPDATED, message

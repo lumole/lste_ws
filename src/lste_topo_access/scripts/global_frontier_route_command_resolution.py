@@ -162,6 +162,29 @@ class GlobalFrontierRouteCommandResolutionMixin(
             )
         else:
             inserted_turn_connector = False
+
+        # Ensure that an endpoint for an active WorkItem points strictly in the same
+        # direction as the WorkItem's own normal_xy (outward frontier pointing direction),
+        # or directly towards the anchor if normal is unavailable.
+        work_item_id = getattr(self, "active_work_item_id", None)
+        if work_item_id is not None and not inserted_turn_connector:
+            try:
+                normal = None
+                if hasattr(self, "_active_work_item_normal"):
+                    normal = self._active_work_item_normal(work_item_id)
+                elif hasattr(self, "place_work_items") and hasattr(self.place_work_items, "normal_for"):
+                    normal = self.place_work_items.normal_for(work_item_id)
+                if normal is not None and math.hypot(normal[0], normal[1]) > 1e-3:
+                    command_yaw = math.atan2(float(normal[1]), float(normal[0]))
+                elif hasattr(self, "_active_work_item_anchor"):
+                    anchor = self._active_work_item_anchor(work_item_id)
+                    if anchor is not None:
+                        dx = float(anchor[0]) - float(command_xy[0])
+                        dy = float(anchor[1]) - float(command_xy[1])
+                        if math.hypot(dx, dy) > 1e-3:
+                            command_yaw = math.atan2(dy, dx)
+            except Exception:
+                pass
         self.active_last_waypoint_map = command_xy
         self.active_last_waypoint_yaw = command_yaw
         self.active_route_kind = route_kind

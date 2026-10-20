@@ -290,6 +290,7 @@ install(FILES
   scripts/global_frontier_place_progress.py
   scripts/global_frontier_portal_selection.py
   scripts/global_frontier_portal_probes.py
+  scripts/global_frontier_polar_bifurcation.py
   scripts/global_frontier_structural_boundaries.py
   scripts/global_frontier_portal_probe_lifecycle.py
   scripts/global_frontier_portal_probe_ledger.py
@@ -317,6 +318,7 @@ install(FILES
   scripts/global_frontier_route_command_publication.py
   scripts/global_frontier_route_history.py
   scripts/global_frontier_route_lease.py
+  scripts/global_frontier_route_actuator.py
   scripts/global_frontier_semantic_belief.py
   scripts/global_frontier_target_belief.py
   scripts/global_frontier_target_observation_work.py
@@ -328,6 +330,7 @@ install(FILES
   scripts/global_frontier_runtime_state.py
   scripts/global_frontier_work_items.py
   scripts/global_frontier_work_item_components.py
+  scripts/global_frontier_work_item_tour.py
   scripts/global_frontier_scoring.py
   scripts/global_frontier_selection_context.py
   scripts/global_frontier_selection_planner.py

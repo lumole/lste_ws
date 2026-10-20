@@ -118,15 +118,35 @@ class GlobalFrontierPortalEgressMixin:
         if not isinstance(record, dict):
             return None
         state = str(record.get("state", "")).strip().lower()
-        if record.get("destination_place_id") is not None or state not in (
-            "certified", "selected",
+        destination_place_id = _positive_id(record.get("destination_place_id"))
+        source_place_id = _positive_id(record.get("source_place_id"))
+        if state not in ("certified", "selected", "crossed"):
+            return None
+
+        # A bound Portal remains a valid forward graph edge after its
+        # transient frontier arc disappears. The durable source/destination
+        # geometry is sufficient to rebuild the same crossing route; only an
+        # unbound hypothesis needs the two-sided probe proof below.
+        planned = getattr(self, "last_graph_route_plan", None)
+        planned_target = _positive_id(
+            getattr(planned, "target_place_id", None)
+        )
+        current_place = _positive_id(
+            getattr(self, "current_physical_place_id", None)
+        )
+        if source_place_id is not None and source_place_id != current_place:
+            return None
+        if (
+            destination_place_id is not None
+            and planned_target is not None
+            and destination_place_id != planned_target
         ):
             return None
 
         # Branch-first crossing requires completed destination-view evidence.
         # Without that typed proof, the planner must keep this as a probe.
         probe_ledger = getattr(self, "portal_probe_ledger", None)
-        if probe_ledger is not None:
+        if destination_place_id is None and probe_ledger is not None:
             probes = getattr(probe_ledger, "snapshot", lambda: ())()
             destination_evidence = False
             for probe in probes:

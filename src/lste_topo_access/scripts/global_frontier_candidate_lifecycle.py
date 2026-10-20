@@ -144,41 +144,19 @@ class GlobalFrontierCandidateLifecycleMixin:
                 self.target_region_claim_cross_region_skips += 1
                 return None
 
-        coverage_method = getattr(
-            self, "candidate_covered_by_covered_place_viewpoint", None
-        )
-        if coverage_method is None:
-            coverage_method = getattr(
-                self, "candidate_covered_by_ready_place_viewpoint", None
-            )
-        coverage = (
-            None
-            if coverage_method is None
-            else coverage_method(
-                request.message,
-                context.known_free,
-                candidate.row,
-                candidate.col,
-                candidate.x,
-                candidate.y,
-            )
-        )
-        if coverage is not None and not (is_portal_probe or is_work_item_rehydration):
-            self.last_ready_place_coverage_skips += 1
-            return None
-
-        covered_by = self.candidate_covered_by_completed_viewpoint(
-            request.message,
-            context.known_free,
-            components,
-            candidate.row,
-            candidate.col,
-            candidate.x,
-            candidate.y,
-        )
-        if covered_by is not None and not (is_portal_probe or is_work_item_rehydration):
-            self.last_visibility_coverage_skips += 1
-            return None
+        # A geometric line-of-sight certificate from a completed viewpoint is
+        # deliberately NOT suppression evidence here.  Visibility proves the
+        # free ray is known; it does not prove the unknown side of this
+        # frontier was ever observed -- a wall a viewpoint could see across
+        # the room still hides a corridor whose unknown cells survive the
+        # visit.  Suppressing on that certificate alone made an unexplored
+        # remainder of one room permanent: the obligations stayed at zero and
+        # the completion gate declared exploration finished while reachable
+        # unknown space remained.  Duplicate-observation protection now rests
+        # on physical evidence only: the WorkItem ledger's resolved-descendant
+        # rule suppresses a support whose unknown patch a resolved item
+        # already owns, and the observed-region reentry rule above keeps a
+        # covered room from being re-entered across a doorway.
 
         physical_xy = None if request.map_to_physical_xy is None else request.map_to_physical_xy(
             candidate.x, candidate.y,

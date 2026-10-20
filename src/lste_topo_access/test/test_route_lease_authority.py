@@ -57,6 +57,47 @@ class RouteLeaseAuthorityTest(unittest.TestCase):
         self.assertFalse(decision.release)
         self.assertEqual(decision.reason, "active_route_healthy")
 
+    def test_foreign_actuator_suppresses_every_elapsed_evidence_path(self):
+        """A route nobody is driving cannot run out of time."""
+        for evidence in (
+            {"route_stalled": True},
+            {"active_timeout": True, "route_stalled": True},
+            {"post_turn_stalled": True},
+            {"portal_edge_expired": True},
+        ):
+            with self.subTest(evidence=evidence):
+                decision = route_lease_failure_decision(
+                    controller_owns_failure=False,
+                    actuator_forwarding=False,
+                    **evidence
+                )
+
+                self.assertFalse(decision.release)
+                self.assertEqual(decision.reason, "actuator_not_forwarding")
+                self.assertEqual(
+                    decision.authority, AUTHORITY_GLOBAL_WATCHDOG
+                )
+
+    def test_controller_terminal_outranks_a_foreign_actuator(self):
+        """The controller's own verdict survives the actuator gate."""
+        decision = route_lease_failure_decision(
+            controller_owns_failure=False,
+            recovery_pending=True,
+            actuator_forwarding=False,
+        )
+
+        self.assertTrue(decision.release)
+        self.assertEqual(decision.reason, "controller_terminal_failure")
+
+    def test_forwarding_actuator_keeps_legacy_stall_semantics(self):
+        decision = route_lease_failure_decision(
+            actuator_forwarding=True,
+            route_stalled=True,
+        )
+
+        self.assertTrue(decision.release)
+        self.assertEqual(decision.reason, "stall")
+
 
 if __name__ == "__main__":
     unittest.main()

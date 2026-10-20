@@ -29,6 +29,10 @@ def candidate_graph_action(
         portal_certified = place_hops is not None and int(place_hops) >= 1
     except (TypeError, ValueError):
         portal_certified = False
+    portal_destination_unobserved = False
+    if place_hops is not None and int(place_hops) >= 1:
+        destination_class = getattr(host, "last_portal_destination_class", None)
+        portal_destination_unobserved = destination_class != "covered_transit"
     graph_action = choose_graph_action(
         graph_ready=context.place_graph_ready,
         source_place_id=context.source_place_id,
@@ -52,6 +56,7 @@ def candidate_graph_action(
         portal_branch_priority=bool(
             getattr(host, "branch_first_enabled", False)
         ),
+        portal_destination_unobserved=portal_destination_unobserved,
         target_work_pending=bool(
             getattr(context, "target_observation_work_pending", False)
         ),

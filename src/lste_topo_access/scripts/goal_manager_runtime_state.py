@@ -44,8 +44,11 @@ class GoalManagerRuntimeStateMixin:
         self.latest_frontiers: Optional[LsteFrontiers] = None
         self.latest_frontier: Optional[Vector3Stamped] = None
         self.latest_scan: Optional[LaserScan] = None
+        self.latest_costmap = None
+        self.latest_costmap_received_at = 0.0
         self.latest_cmd_vel: Optional[Twist] = None
         self.latest_global_frontier_goal: Optional[PoseStamped] = None
+        self.costmap_rejected_goal_key = None
         # Target routes are validated against the live Navfn/map snapshot even
         # when the exploration executive is disabled. Keep a local monotonic
         # epoch so direct target goals carry the same snapshot identity as

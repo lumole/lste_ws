@@ -30,6 +30,7 @@ def route_lease_failure_decision(
     *,
     controller_owns_failure=False,
     recovery_pending=False,
+    actuator_forwarding=True,
     route_stalled=False,
     post_turn_stalled=False,
     portal_edge_expired=False,
@@ -42,6 +43,13 @@ def route_lease_failure_decision(
     evidence remains the historical fallback.  In persistent mode those same
     values are diagnostics only: the route stays committed until the local
     controller reports a failure.
+
+    ``actuator_forwarding`` reports whether the actuator boundary is carrying
+    this node's route commands.  While it is not -- another mode owns
+    ``/cmd_vel``, or the mission holds the boundary -- the vehicle's motion is
+    not evidence about this route, so elapsed time cannot convict it.  A
+    controller terminal still does: the authority being yielded here is only
+    the frontier's own *clock*.
     """
     authority = (
         AUTHORITY_CONTROLLER_TERMINAL
@@ -59,6 +67,12 @@ def route_lease_failure_decision(
             False,
             authority,
             "controller_owns_failure_terminal",
+        )
+    if not actuator_forwarding:
+        return RouteLeaseDecision(
+            False,
+            authority,
+            "actuator_not_forwarding",
         )
     if portal_edge_expired:
         return RouteLeaseDecision(True, authority, "portal_edge_deadline")

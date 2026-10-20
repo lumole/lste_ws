@@ -28,6 +28,7 @@
        still creating its global costmap. Retry these startup responses rather
        than suppressing otherwise valid frontiers as unreachable. -->
   <arg name="navfn_empty_warmup_seconds" default="5.0"/>
+  <arg name="exploration_startup_warmup_seconds" default="8.0"/>
   <!-- Before selecting a real frontier, validate the complete online-SLAM
        navigation chain with a short plan to a connected nearby costmap cell.
        This prevents /map appearing before map->odom/costmap/Navfn are ready
@@ -54,7 +55,7 @@
        positioned beyond this success circle, so a TEB SUCCEEDED terminal is
        still provably on the destination side of the door. Keeping the value
        in this launch contract avoids depending on process start order. -->
-  <arg name="teb_xy_goal_tolerance" default="0.50"/>
+  <arg name="teb_xy_goal_tolerance" default="0.20"/>
   <!-- Strict clearance is the normal complete route topology. Recovery may
        use loose topology only between strict-clearance endpoints; the live
        costmap and exact Navfn plan remain hard executability gates. -->
@@ -96,6 +97,15 @@
   <arg name="unreachable_grace" default="20.0"/>
   <arg name="rejected_timeout" default="180.0"/>
   <arg name="completed_radius" default="1.25"/>
+  <!-- The actuator boundary that carries this node's route commands. The
+       explorer plans routes but never publishes /cmd_vel, so while the mux
+       forwards another source (a human on teleop, a navigation hold, a
+       finished task, a slice reset) elapsed time inside this node says
+       nothing about its routes and cannot fail them. A controller terminal
+       still can. Point this at the mux mode that executes frontier routes;
+       set the topic to an unused name to restore the un-gated watchdog. -->
+  <arg name="route_actuator_status_topic" default="/lste/cmd_vel_mux/status"/>
+  <arg name="route_actuator_source" default="teb"/>
   <!-- Research method boundary. All values keep the same SLAM, Navfn, TEB,
        perception and task pipeline; they only change persistent exploration
        memory: frontier, frontier_distance_dedup, place_portal, or
@@ -111,6 +121,12 @@
        jitter alone is not valid evidence that a room became unexplored again. -->
   <arg name="region_memory_radius" default="2.5"/>
   <arg name="region_information_delta" default="8"/>
+  <!-- Clearance at which a passage stops being room interior and becomes a
+       doorway the structural map seals. Defaults to the derived
+       ``clearance + min(0.20, max(0.10, fallback_clearance/2))``; set it
+       explicitly when the world's doorway is wider than twice the route
+       clearance. An empty value keeps the derived default. -->
+  <arg name="region_topology_clearance" default=""/>
   <!-- This is a no-information dwell bound, not a route timeout. The normal
        active/stall watchdog still owns blocked or non-executable paths. -->
   <arg name="region_stagnation_timeout" default="12.0"/>
@@ -151,9 +167,19 @@
        route is far from its frontier. Near-endpoint and stall checks wake it
        immediately. -->
   <arg name="planning_period" default="1.5"/>
+  <arg name="enable_dedicated_portal_probe_transaction" default="false"/>
+  <arg name="passive_plane_crossing_certification" default="true"/>
   <!-- Keep SLAM available for controller-only diagnostics while allowing the
        expensive frontier executive to be omitted from the fast inner loop. -->
   <arg name="start_frontier" default="true"/>
+  <!-- Command prefix for the frontier process itself.  Production leaves it
+       empty.  A composition that is driven by hand for the first seconds
+       passes ``bash -c 'sleep N; exec "$0" "$@"'`` so the executive wakes up
+       on a settled map instead of planning an endpoint against the first
+       SLAM snapshot: the delay is on the planner's own start, never on the
+       controller mode, so no route is ever dispatched from a map that is
+       still being built. -->
+  <arg name="frontier_launch_prefix" default=""/>
 
   <node pkg="gmapping" type="slam_gmapping" name="lste_online_slam" output="screen">
     <remap from="scan" to="$(arg scan_topic)"/>
@@ -173,7 +199,7 @@
     <param name="ymax" value="9.0"/>
   </node>
 
-  <node if="$(arg start_frontier)" pkg="lste_topo_access" type="lste_global_frontier_node.py" name="lste_global_frontier" output="screen">
+  <node if="$(arg start_frontier)" pkg="lste_topo_access" type="lste_global_frontier_node.py" name="lste_global_frontier" output="screen" launch-prefix="$(arg frontier_launch_prefix)">
     <param name="map_topic" value="/map"/>
     <param name="costmap_topic" value="$(arg costmap_topic)"/>
     <param name="costmap_updates_topic" value="$(arg costmap_updates_topic)"/>
@@ -185,6 +211,7 @@
     <param name="navfn_make_plan_timeout" value="$(arg navfn_make_plan_timeout)"/>
     <param name="navfn_make_plan_tolerance" value="$(arg navfn_make_plan_tolerance)"/>
     <param name="navfn_empty_warmup_seconds" value="$(arg navfn_empty_warmup_seconds)"/>
+    <param name="exploration_startup_warmup_seconds" value="$(arg exploration_startup_warmup_seconds)"/>
     <param name="navfn_startup_probe_distance" value="$(arg navfn_startup_probe_distance)"/>
     <param name="pose_topic" value="$(arg pose_topic)"/>
     <param name="scan_topic" value="$(arg scan_topic)"/>
@@ -218,10 +245,13 @@
     <param name="unreachable_grace" value="$(arg unreachable_grace)"/>
     <param name="rejected_timeout" value="$(arg rejected_timeout)"/>
     <param name="completed_radius" value="$(arg completed_radius)"/>
+    <param name="route_actuator_status_topic" value="$(arg route_actuator_status_topic)"/>
+    <param name="route_actuator_source" value="$(arg route_actuator_source)"/>
     <param name="exploration_method" value="$(arg exploration_method)"/>
     <param name="target_done_policy" value="$(arg target_done_policy)"/>
     <param name="region_memory_radius" value="$(arg region_memory_radius)"/>
     <param name="region_information_delta" value="$(arg region_information_delta)"/>
+    <param name="region_topology_clearance" value="$(arg region_topology_clearance)"/>
     <param name="region_stagnation_timeout" value="$(arg region_stagnation_timeout)"/>
     <param name="region_failure_limit" value="$(arg region_failure_limit)"/>
     <param name="structure_radius_cells" value="$(arg structure_radius_cells)"/>
@@ -239,5 +269,7 @@
     <param name="dead_end_check_distance" value="$(arg dead_end_check_distance)"/>
     <param name="dead_end_unknown_cells" value="$(arg dead_end_unknown_cells)"/>
     <param name="planning_period" value="$(arg planning_period)"/>
+    <param name="enable_dedicated_portal_probe_transaction" value="$(arg enable_dedicated_portal_probe_transaction)"/>
+    <param name="passive_plane_crossing_certification" value="$(arg passive_plane_crossing_certification)"/>
   </node>
 </launch>

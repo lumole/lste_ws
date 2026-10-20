@@ -61,4 +61,10 @@ class GlobalFrontierTopicConfigurationMixin:
         self.bridge_status_topic = gp(
             "~bridge_status_topic", "/lste/teb_goal_bridge/status"
         )
+        # The command mux is the only publisher of /cmd_vel. Its status is the
+        # observation contract at the actuator boundary, which is what tells
+        # this node whether the routes it plans are the ones being executed.
+        self.route_actuator_status_topic = gp(
+            "~route_actuator_status_topic", "/lste/cmd_vel_mux/status"
+        )
         self.scan_topic = gp("~scan_topic", "/pro3/rlscan")

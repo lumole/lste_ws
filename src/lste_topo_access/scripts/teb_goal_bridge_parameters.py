@@ -206,6 +206,9 @@ def _configure_action_health(bridge, gp):
     bridge.frontier_continuous_prefetch_handoff_timeout = max(
         0.20, float(gp("~frontier_continuous_prefetch_handoff_timeout", 1.50))
     )
+    bridge.pending_lease_release_timeout = max(
+        2.0, float(gp("~pending_lease_release_timeout", 10.0))
+    )
 
 
 def _configure_teb_execution(bridge, gp):

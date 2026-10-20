@@ -94,6 +94,19 @@ class GoalManagerNavigationConfigMixin:
         self.global_frontier_preempt_context = str(preempt_context).strip().lower() in (
             "1", "true", "yes", "on",
         )
+        # Every local/context/target endpoint is admitted against the same
+        # live global costmap used by Navfn.  This closes the gap where the
+        # frontier rejected an inflated endpoint but a context-follow branch
+        # reintroduced it through GoalManager.
+        self.goal_costmap_topic = gp(
+            "~goal_costmap_topic", "/move_base/global_costmap/costmap"
+        )
+        self.goal_costmap_max_age = max(
+            0.5, float(gp("~goal_costmap_max_age", 3.0))
+        )
+        self.goal_costmap_clearance = max(
+            0.05, float(gp("~goal_costmap_clearance", 0.52))
+        )
 
     def _load_mission_interface_parameters(self, gp):
         """Configure controller selection and Goal Manager topic contracts."""

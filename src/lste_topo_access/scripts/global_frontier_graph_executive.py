@@ -219,7 +219,7 @@ def choose_graph_action(
             place_hops=hops,
         )
 
-    if source_place_state in (PLACE_DORMANT, PLACE_READY_TO_EXIT):
+    if source_place_state in (PLACE_DORMANT, PLACE_READY_TO_EXIT) and work_item_id is None:
         return GraphAction(
             ACTION_HOLD,
             "covered_place_is_transit_only",

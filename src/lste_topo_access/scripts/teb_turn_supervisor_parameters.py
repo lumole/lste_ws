@@ -87,7 +87,7 @@ def configure_turn_supervisor_parameters(supervisor):
         float(gp(
             "~yaw_goal_tolerance",
             rospy.get_param(
-                "/move_base/TebLocalPlannerROS/yaw_goal_tolerance", 0.35
+                "/move_base/TebLocalPlannerROS/yaw_goal_tolerance", 0.20
             ),
         )),
     )

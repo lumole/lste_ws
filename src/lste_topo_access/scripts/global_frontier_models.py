@@ -34,6 +34,12 @@ class ActiveRouteWatchdogState:
     waypoint_reached: bool
     portal_edge_expired: bool
     expired: bool
+    # The actuator boundary is carrying this route's commands.  When it is
+    # not, ``stalled`` describes the frontier's clock rather than the route:
+    # ``stall_suppressed_by_actuator`` records that the clock had run out and
+    # the lease survived on the boundary fact alone.
+    actuator_forwarding: bool = True
+    stall_suppressed_by_actuator: bool = False
 
 
 @dataclass

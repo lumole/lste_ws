@@ -11,6 +11,28 @@ from global_frontier_route_lease import route_lease_failure_decision
 class GlobalFrontierExecutionWatchdogMixin:
     """Decide whether active-route progress remains healthy."""
 
+    def route_actuator_is_forwarding(self):
+        """Return whether the actuator boundary carries this node's routes.
+
+        Without a configured contract (no mux status in the composition) the
+        answer is True, which keeps the historical watchdog authority.  See
+        ``global_frontier_route_actuator`` for the ownership reasons that make
+        it False.
+        """
+        status = getattr(self, "route_actuator", None)
+        forwarding = getattr(status, "forwarding", None)
+        if not callable(forwarding):
+            return True
+        return bool(forwarding())
+
+    def route_actuator_diagnostic(self):
+        """Return the actuator-boundary fields for a status payload."""
+        status = getattr(self, "route_actuator", None)
+        diagnostic = getattr(status, "diagnostic", None)
+        if not callable(diagnostic):
+            return {}
+        return dict(diagnostic())
+
     def evaluate_active_route_watchdogs(
         self, x, y, robot_map, now, portal_transition, active_component,
         active_information,
@@ -51,19 +73,55 @@ class GlobalFrontierExecutionWatchdogMixin:
         recovery_pending = self.recovery_pending_route_id == self.active_route_id
         if turn_phase_active:
             self.active_progress_time = now
-
         (
             post_turn_goal_matches,
             post_turn_elapsed,
             post_turn_translation,
         ) = self.update_post_turn_watchdog(x, y, now)
-        post_turn_stalled = (
+        # Both elapsed clocks are read before the actuator gate freezes them,
+        # so the suppressed observation stays available for the status record.
+        observed_post_turn_stall = (
             not turn_phase_active
             and self.post_turn_stall_timeout is not None
             and post_turn_goal_matches
             and not self.active_turn_completed_launched
             and post_turn_elapsed >= self.post_turn_stall_timeout
             and now - self.active_progress_time >= self.post_turn_stall_timeout
+        )
+        observed_progress_stall = (
+            not turn_phase_active
+            and now - self.active_progress_time > self.stall_timeout
+        )
+        # Route progress is only attributable to this node while the actuator
+        # boundary carries its commands.  Someone else on /cmd_vel (a human on
+        # teleop, a navigation hold, a finished task, a slice reset) is not
+        # this route failing, so the clock is frozen exactly as it is for an
+        # owned turn: the route stays committed and resumes a full timeout
+        # window once the boundary forwards its commands again.  A controller
+        # terminal remains authoritative through ``recovery_pending``.
+        actuator_forwarding = self.route_actuator_is_forwarding()
+        # Time that accrued while the boundary held this route is not this
+        # route's time -- including when no tick ran during the hold, which is
+        # why the resume itself restarts the window.
+        resuming_held_route = (
+            actuator_forwarding
+            and int(getattr(self, "route_actuator_held_route_id", 0))
+            == int(self.active_route_id)
+        )
+        if not actuator_forwarding:
+            self.route_actuator_held_route_id = int(self.active_route_id)
+        elif resuming_held_route:
+            self.route_actuator_held_route_id = 0
+        suppress_elapsed_evidence = not actuator_forwarding or resuming_held_route
+        if suppress_elapsed_evidence:
+            self.active_progress_time = now
+            # The portal-edge deadline is the same kind of elapsed evidence:
+            # a crossing that was never driven has not run out of time.
+            if self.active_portal_gate_approached_at is not None:
+                self.active_portal_gate_approached_at = now
+
+        post_turn_stalled = (
+            observed_post_turn_stall and not suppress_elapsed_evidence
         )
         region_stagnant = self.active_region_is_stagnant(
             x,
@@ -83,10 +141,7 @@ class GlobalFrontierExecutionWatchdogMixin:
         stalled = (
             recovery_pending
             or post_turn_stalled
-            or (
-                not turn_phase_active
-                and now - self.active_progress_time > self.stall_timeout
-            )
+            or (observed_progress_stall and not suppress_elapsed_evidence)
         )
         waypoint_distance = self.active_waypoint_distance(robot_map)
         waypoint_reached = (
@@ -113,12 +168,45 @@ class GlobalFrontierExecutionWatchdogMixin:
                 getattr(self, "controller_owned_route_failure", False)
             ),
             recovery_pending=recovery_pending,
+            actuator_forwarding=actuator_forwarding,
             route_stalled=stalled,
             post_turn_stalled=post_turn_stalled,
             portal_edge_expired=portal_edge_expired,
             active_timeout=active_timeout,
         )
         expired = lease_decision.release
+        suppressed_stall = (
+            not actuator_forwarding
+            and not recovery_pending
+            and (observed_progress_stall or observed_post_turn_stall)
+        )
+        if (
+            suppressed_stall
+            and int(getattr(self, "last_suppressed_stall_route_id", 0))
+            != int(self.active_route_id)
+        ):
+            # One record per route: a suppressed stall is a statement about
+            # the boundary, not a repeated route event.
+            self.last_suppressed_stall_route_id = int(self.active_route_id)
+            actuator_diagnostic = self.route_actuator_diagnostic()
+            publish = getattr(self, "publish_status", None)
+            if callable(publish):
+                publish(
+                    "route_stall_not_attributable",
+                    route_id=int(self.active_route_id),
+                    route_kind=str(self.active_route_kind),
+                    active_elapsed=round(float(now - self.active_since), 3),
+                    observed_post_turn_stall=bool(observed_post_turn_stall),
+                    **actuator_diagnostic
+                )
+            rospy.logwarn(
+                "Global frontier withheld route failure: the actuator "
+                "boundary does not forward this route route_id=%d "
+                "selected_mode=%s block_reason=%s",
+                self.active_route_id,
+                actuator_diagnostic["route_actuator_selected_mode"],
+                actuator_diagnostic["route_actuator_block_reason"],
+            )
         if (
             bool(getattr(self, "controller_owned_route_failure", False))
             and stalled
@@ -158,6 +246,8 @@ class GlobalFrontierExecutionWatchdogMixin:
             waypoint_reached=waypoint_reached,
             portal_edge_expired=portal_edge_expired,
             expired=expired,
+            actuator_forwarding=bool(actuator_forwarding),
+            stall_suppressed_by_actuator=bool(suppressed_stall),
         )
 
     def update_post_turn_watchdog(self, x, y, now):

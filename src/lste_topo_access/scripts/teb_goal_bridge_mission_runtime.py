@@ -22,6 +22,11 @@ class TebGoalBridgeMissionRuntimeMixin:
             )
             if callable(tick_watchdog):
                 tick_watchdog()
+            tick_release_watchdog = getattr(
+                self, "_tick_pending_lease_release_watchdog_locked", None
+            )
+            if callable(tick_release_watchdog):
+                tick_release_watchdog()
             if self._is_active_mode():
                 if self.persistent_execution:
                     # Persistent execution has one long-lived action client,

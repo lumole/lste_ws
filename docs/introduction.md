@@ -11,6 +11,8 @@
 | --- | --- |
 | [20260723_setup.md](operations/20260723_setup.md) | 工作区、依赖与环境搭建 |
 | [20260723_startup_guide.md](operations/20260723_startup_guide.md) | 日常启动、controller 切换和 tmux 操作 |
+| [20261019_project_fast_index.md](20261019_project_fast_index.md) | 全局极速索引：Gazebo模型字典、世界生成器与ROS数据契约 |
+
 
 ## navigation
 

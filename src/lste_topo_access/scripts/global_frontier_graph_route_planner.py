@@ -11,13 +11,13 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from global_frontier_evidence_contract import action_contract_for
-
 from global_frontier_evidence_contract import (
     EVIDENCE_DESTINATION_VIEW,
     OWNER_PORTAL_PROBE,
     next_evidence_gap,
 )
 from global_frontier_portal_probe_ledger import destination_reobserve_available
+from global_frontier_work_item_tour import order_work_items_open_tsp
 
 
 PLAN_READY = "ready"
@@ -58,6 +58,7 @@ class GraphRoutePlan:
     # ``source`` and ``destination`` are separate information obligations for
     # one physical PortalProbe.  The phase is immutable for this route lease.
     portal_probe_phase: str = ""
+    work_item_tour: tuple = ()
 
     def __post_init__(self):
         """Attach the evidence boundary without changing route geometry."""
@@ -120,6 +121,20 @@ class GraphRoutePlan:
                 item.key() if callable(getattr(item, "key", None)) else repr(item)
                 for item in self.produces_evidence
             ),
+            str(self.portal_probe_phase or ""),
+        )
+
+    def durable_signature(self):
+        """Return the plan identity without transient map epoch."""
+        return (
+            self.status,
+            self.action,
+            self.current_place_id,
+            self.target_place_id,
+            self.obligation_kind,
+            self.obligation_id,
+            tuple(self.portal_path),
+            self.first_portal_id,
             str(self.portal_probe_phase or ""),
         )
 
@@ -474,6 +489,16 @@ class GraphRoutePlanner:
     first edge and replans after the corresponding physical crossing.
     """
 
+    def __init__(
+        self,
+        enable_dedicated_portal_probe_transaction=True,
+        tsp_alpha=4.0,
+        tsp_beta=3.0,
+    ):
+        self.enable_dedicated_portal_probe_transaction = bool(enable_dedicated_portal_probe_transaction)
+        self.tsp_alpha = float(tsp_alpha)
+        self.tsp_beta = float(tsp_beta)
+
     def plan(
         self,
         current_place_id,
@@ -495,7 +520,18 @@ class GraphRoutePlanner:
         excluded_portal_ids=(),
         excluded_work_item_ids=(),
         excluded_probe_ids=(),
+        robot_pose=None,
+        v_max=0.4,
+        omega_max=0.8,
+        enable_dedicated_portal_probe_transaction=None,
+        tsp_alpha=None,
+        tsp_beta=None,
     ):
+        if enable_dedicated_portal_probe_transaction is None:
+            enable_dedicated_portal_probe_transaction = getattr(
+                self, "enable_dedicated_portal_probe_transaction", True
+            )
+        enable_dedicated_portal_probe_transaction = bool(enable_dedicated_portal_probe_transaction)
         current = _positive_id(current_place_id)
         resume_place = _positive_id(resume_place_id)
         excluded_portals = {
@@ -706,7 +742,27 @@ class GraphRoutePlanner:
 
         current_place = place_by_id[current]
         current_covered = _covered(current_place)
-        local_work = work.get(current, ())
+        local_work = list(work.get(current, ()))
+        if tsp_alpha is None:
+            tsp_alpha = getattr(self, "tsp_alpha", 4.0)
+        if tsp_beta is None:
+            tsp_beta = getattr(self, "tsp_beta", 3.0)
+
+        if local_work:
+            local_work = order_work_items_open_tsp(
+                robot_pose,
+                local_work,
+                v_max=v_max,
+                omega_max=omega_max,
+                alpha=float(tsp_alpha),
+                beta=float(tsp_beta),
+            )
+
+        tour_ids = tuple(
+            _positive_id(item.get("id"))
+            for item in local_work
+            if _positive_id(item.get("id")) is not None
+        )
         local_probe = probe_by_place.get(current, ())
         local_unbound = unbound_by_place.get(current, ())
 
@@ -715,11 +771,11 @@ class GraphRoutePlanner:
         if not current_covered:
             if local_work:
                 return self._bootstrap(
-                    current, local_work[0], "place_observation_required"
+                    current, local_work[0], "place_observation_required", tour=tour_ids
                 )
-            if local_probe:
+            if enable_dedicated_portal_probe_transaction and local_probe:
                 return self._probe(current, local_probe[0], "place_observation_required")
-            if local_unbound:
+            if enable_dedicated_portal_probe_transaction and local_unbound:
                 return self._unbound_portal(
                     current,
                     local_unbound[0],
@@ -745,7 +801,7 @@ class GraphRoutePlanner:
                 current_place_id=current,
                 reason="local_work_attempt_active",
             )
-        if active_probe_by_place.get(current):
+        if enable_dedicated_portal_probe_transaction and active_probe_by_place.get(current):
             return GraphRoutePlan(
                 PLAN_BLOCKED,
                 ACTION_HOLD,
@@ -820,7 +876,8 @@ class GraphRoutePlanner:
             probes=evidence_probe_records,
         )
         if (
-            evidence_gap is not None
+            enable_dedicated_portal_probe_transaction
+            and evidence_gap is not None
             and evidence_gap.owner_kind == OWNER_PORTAL_PROBE
             and evidence_gap.kind == EVIDENCE_DESTINATION_VIEW
         ):
@@ -865,7 +922,7 @@ class GraphRoutePlanner:
         # before another local WorkItem can starve the doorway.  The probe
         # identity is kept separate from the Portal identity so the source
         # observation still follows the normal two-phase contract.
-        if branch_first and local_unbound:
+        if enable_dedicated_portal_probe_transaction and branch_first and local_unbound:
             for portal in local_unbound:
                 probe = _bound_probe_for_portal(
                     probe_records,
@@ -885,7 +942,7 @@ class GraphRoutePlanner:
         # obligation in the full branch-first method.  It is deliberately
         # checked after target and destination-view obligations, but before
         # ordinary local WorkItems can hide the only route to a new Place.
-        if structural_boundary_first:
+        if enable_dedicated_portal_probe_transaction and structural_boundary_first:
             boundary_probe = structural_boundary_by_place.get(current, ())
             if boundary_probe:
                 return self._probe(
@@ -924,6 +981,7 @@ class GraphRoutePlanner:
                 only_unobserved=True,
                 explicit_target=explicit_target,
                 excluded_portal_ids=excluded_portals,
+                enable_dedicated_portal_probe_transaction=enable_dedicated_portal_probe_transaction,
             )
             if unobserved_path is not None:
                 return self._cross(
@@ -976,6 +1034,7 @@ class GraphRoutePlanner:
                 only_unobserved=True,
                 explicit_target=explicit_target,
                 excluded_portal_ids=excluded_portals,
+                enable_dedicated_portal_probe_transaction=enable_dedicated_portal_probe_transaction,
             )
             if path is not None:
                 return self._cross(
@@ -1001,19 +1060,20 @@ class GraphRoutePlanner:
                 only_unobserved=True,
                 explicit_target=explicit_target,
                 excluded_portal_ids=excluded_portals,
+                enable_dedicated_portal_probe_transaction=enable_dedicated_portal_probe_transaction,
             )
             if path is not None:
                 return self._cross(current, path, "branch_first_to_unobserved_place")
 
         if local_work:
-            return self._local(current, local_work[0], "local_work_pending")
+            return self._local(current, local_work[0], "local_work_pending", tour=tour_ids)
 
         # A source-side probe is itself an information obligation.  It cannot
         # be replaced by a generic frontier or silently cleared by a route
         # failure.
-        if local_probe:
+        if enable_dedicated_portal_probe_transaction and local_probe:
             return self._probe(current, local_probe[0], "portal_probe_pending")
-        if local_unbound:
+        if enable_dedicated_portal_probe_transaction and local_unbound:
             # A Portal hypothesis may already own a source-side probe even
             # though SLAM has not projected that probe into this snapshot's
             # frontier set.  Convert the graph identity to the action identity
@@ -1046,8 +1106,8 @@ class GraphRoutePlanner:
         if branch_first and (
             work.get(current)
             or local_work_has_rehydratable_view
-            or unresolved_probe_places.get(current)
-            or local_unbound
+            or (enable_dedicated_portal_probe_transaction and unresolved_probe_places.get(current))
+            or (enable_dedicated_portal_probe_transaction and local_unbound)
         ):
             return GraphRoutePlan(
                 PLAN_BLOCKED,
@@ -1067,6 +1127,7 @@ class GraphRoutePlanner:
             only_unobserved=False,
             explicit_target=explicit_target,
             excluded_portal_ids=excluded_portals,
+            enable_dedicated_portal_probe_transaction=enable_dedicated_portal_probe_transaction,
         )
         if path is not None:
             return self._cross(current, path, "transit_to_pending_graph_obligation")
@@ -1075,8 +1136,8 @@ class GraphRoutePlanner:
         # disconnected from the known graph.  Neither condition is completion.
         if (
             any(unresolved_work.values())
-            or any(unresolved_probe_places.values())
-            or any(unbound_by_place.values())
+            or (enable_dedicated_portal_probe_transaction and any(unresolved_probe_places.values()))
+            or (enable_dedicated_portal_probe_transaction and any(unbound_by_place.values()))
         ):
             return GraphRoutePlan(
                 PLAN_BLOCKED,
@@ -1135,7 +1196,7 @@ class GraphRoutePlanner:
         return explicit_target is not None and explicit_target == current and bool(local_work)
 
     @staticmethod
-    def _bootstrap(place_id, item, reason):
+    def _bootstrap(place_id, item, reason, tour=()):
         """Name the first observation as a phase transition, not local work."""
         item_id = _positive_id(item.get("id"))
         return GraphRoutePlan(
@@ -1146,10 +1207,11 @@ class GraphRoutePlanner:
             obligation_kind="work_item",
             obligation_id=item_id,
             reason=reason,
+            work_item_tour=tuple(tour),
         )
 
     @staticmethod
-    def _local(place_id, item, reason):
+    def _local(place_id, item, reason, tour=()):
         item_id = _positive_id(item.get("id"))
         return GraphRoutePlan(
             PLAN_READY,
@@ -1159,6 +1221,7 @@ class GraphRoutePlanner:
             obligation_kind="work_item",
             obligation_id=item_id,
             reason=reason,
+            work_item_tour=tuple(tour),
         )
 
     @staticmethod
@@ -1239,6 +1302,7 @@ class GraphRoutePlanner:
         only_unobserved,
         explicit_target,
         excluded_portal_ids=(),
+        enable_dedicated_portal_probe_transaction=True,
     ):
         """Find a shortest stable path to the next graph obligation."""
         queue = deque([start])
@@ -1265,7 +1329,7 @@ class GraphRoutePlanner:
             obligation_id = None
             priority = 9
             if explicit_target is not None and place_id == explicit_target and (
-                is_unobserved or work.get(place_id) or probes.get(place_id)
+                is_unobserved or work.get(place_id) or (enable_dedicated_portal_probe_transaction and probes.get(place_id))
             ):
                 priority = 0
                 obligation_kind = "target_place"
@@ -1276,11 +1340,11 @@ class GraphRoutePlanner:
                 priority = 2
                 obligation_kind = "work_item"
                 obligation_id = _positive_id(work[place_id][0].get("id"))
-            elif probes.get(place_id):
+            elif enable_dedicated_portal_probe_transaction and probes.get(place_id):
                 priority = 3
                 obligation_kind = "portal_probe"
                 obligation_id = _positive_id(probes[place_id][0].get("id"))
-            elif unbound.get(place_id):
+            elif enable_dedicated_portal_probe_transaction and unbound.get(place_id):
                 priority = 4
                 obligation_kind = "unbound_portal"
                 obligation_id = _positive_id(unbound[place_id][0].get("id"))

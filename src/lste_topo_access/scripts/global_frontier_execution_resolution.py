@@ -106,6 +106,8 @@ class GlobalFrontierExecutionResolutionMixin:
         distance, route_distance, active_component,
     ):
         """Release an ordinary endpoint once the current lidar view resolved it."""
+        if getattr(self, "active_work_item_id", None) is not None:
+            return False
         if (
             distance >= self.dead_end_check_distance
             or not self.active_endpoint_observed_from_map(
@@ -302,9 +304,33 @@ class GlobalFrontierExecutionResolutionMixin:
         if settle_probe is not None:
             settle_probe("failed", now, reason)
         if not portal_transition:
-            settle = getattr(self, "settle_active_work_item", None)
-            if settle is not None:
-                settle(now, "deferred", reason)
+            item_id = getattr(self, "active_work_item_id", None)
+            is_dead_corner_failure = any(
+                k in str(reason).lower()
+                for k in (
+                    "stall",
+                    "timeout",
+                    "recovery",
+                    "unreachable",
+                    "abort",
+                    "failure",
+                    "disconnected",
+                    "no_progress",
+                )
+            )
+            if item_id is not None and is_dead_corner_failure:
+                dead_reason = str(reason) if str(reason).startswith("dead_corner_") else ("dead_corner_abandoned_" + str(reason))
+                settle = getattr(self, "settle_active_work_item", None)
+                if settle is not None:
+                    settle(now, "resolved", dead_reason)
+                else:
+                    ledger = getattr(self, "place_work_items", None)
+                    if ledger is not None:
+                        ledger.resolve(item_id, now, dead_reason)
+            else:
+                settle = getattr(self, "settle_active_work_item", None)
+                if settle is not None:
+                    settle(now, "deferred", reason)
         self.rejected_frontiers.append((now, x, y))
         portal_retry = None
         physical_crossing_committed = bool(

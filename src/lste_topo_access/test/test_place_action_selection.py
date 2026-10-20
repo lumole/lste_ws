@@ -17,10 +17,17 @@ from global_frontier_place_memory import FrontierRegionMemory
 from global_frontier_portal_belief import PortalHypothesisLedger
 from global_frontier_work_item_components import ObservationSupport
 from global_frontier_work_items import PlaceWorkItemLedger, WORK_RESOLVED
-from global_frontier_target_observation_work import TargetObservationWorkLedger
-sys.modules.setdefault("rospy", SimpleNamespace())
+rospy_stub = sys.modules.setdefault("rospy", SimpleNamespace())
+if not hasattr(rospy_stub, "loginfo"):
+    rospy_stub.loginfo = lambda *args, **kwargs: None
+if not hasattr(rospy_stub, "logwarn"):
+    rospy_stub.logwarn = lambda *args, **kwargs: None
+if not hasattr(rospy_stub, "logerr"):
+    rospy_stub.logerr = lambda *args, **kwargs: None
 
+from global_frontier_target_observation_work import TargetObservationWorkLedger
 from global_frontier_selection import GlobalFrontierSelectionMixin
+
 
 
 class RegionMemory:

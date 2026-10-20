@@ -424,6 +424,55 @@ class PortalHypothesisLedger:
             return None
         return min(matches, key=lambda value: value[:2])[2]
 
+    def crossed_destination_for_gate(self, physical_gate_xy, source_place_id):
+        """Return the Place a crossed doorway already reaches, or ``None``.
+
+        A doorway is one undirected transit boundary, but its two directions
+        are separate directed identities, so a revisit from the opposite side
+        certifies a *new* hypothesis that holds no destination.  Committing
+        that arrival through the ordinary path mints a second Place for the
+        same room.  Derive the destination from the boundary that is already
+        crossed instead: keep one Place per room, not one per direction.
+
+        ``source_place_id`` is never returned -- a crossing that resolves to
+        the Place it left is the self-loop this identity exists to prevent.
+        """
+        gate = _xy(physical_gate_xy)
+        try:
+            source_place_id = int(source_place_id)
+        except (TypeError, ValueError):
+            return None
+        if gate is None:
+            return None
+        matches = []
+        for record in self._records.values():
+            if str(record.get("state", "")).strip().lower() != "crossed":
+                continue
+            try:
+                record_source = int(record.get("source_place_id"))
+                record_destination = int(record.get("destination_place_id"))
+            except (TypeError, ValueError):
+                continue
+            if record_destination == source_place_id:
+                # Leaving the Place this boundary reaches: the crossing
+                # arrives at the Place the boundary came from.
+                destination = record_source
+            elif record_source == source_place_id:
+                # Leaving the boundary's source: this boundary already names
+                # the Place on the far side.
+                destination = record_destination
+            else:
+                continue
+            if destination <= 0 or destination == source_place_id:
+                continue
+            distance = _distance(record.get("physical_gate"), gate)
+            if distance > self.match_radius:
+                continue
+            matches.append((distance, int(record["id"]), destination))
+        if not matches:
+            return None
+        return min(matches, key=lambda value: value[:2])[2]
+
     def incoming_for_place(self, destination_place_id, gate_xy=None):
         """Return forward hypotheses that arrived at one Place."""
         try:

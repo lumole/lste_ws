@@ -68,33 +68,71 @@ class TebGoalBridgeActionDispatchMixin(
                 and self.latest_intent_source == "global_slam_frontier"
                 and int(self.latest_intent_priority) == 0
             ):
-                rospy.loginfo_throttle(
-                    2.0,
-                    "TEB goal bridge holds dispatch until controller lease "
-                    "ACK route_id=%d reason=%s",
-                    old_route_id,
-                    reason,
+                answered = getattr(
+                    self,
+                    "_frontier_release_answers_dispatch_hold_locked",
+                    None,
                 )
-                self.publish_bridge_status(
-                    "dispatch_deferred_controller_lease_release",
-                    route_id=old_route_id,
-                    action_generation=int(
-                        old_contract.get(
-                            "generation",
-                            old_contract.get("action_generation", 0),
-                        ) or 0
-                    ),
-                    transaction_id=int(old_contract.get("transaction_id", 0) or 0),
-                    lifecycle_transaction_id=int(
-                        old_contract.get("lifecycle_transaction_id", 0) or 0
-                    ),
-                    graph_transaction_id=int(
-                        old_contract.get("graph_transaction_id", 0) or 0
-                    ),
-                    reason="pending_controller_lease_release",
-                    deferred_reason=str(reason or "dispatch"),
+                released_predecessor = (
+                    answered(old_contract) if callable(answered) else None
                 )
-                return
+                if released_predecessor is None:
+                    rospy.loginfo_throttle(
+                        2.0,
+                        "TEB goal bridge holds dispatch until controller lease "
+                        "ACK route_id=%d reason=%s",
+                        old_route_id,
+                        reason,
+                    )
+                    self.publish_bridge_status(
+                        "dispatch_deferred_controller_lease_release",
+                        route_id=old_route_id,
+                        action_generation=int(
+                            old_contract.get(
+                                "generation",
+                                old_contract.get("action_generation", 0),
+                            ) or 0
+                        ),
+                        transaction_id=int(old_contract.get("transaction_id", 0) or 0),
+                        lifecycle_transaction_id=int(
+                            old_contract.get("lifecycle_transaction_id", 0) or 0
+                        ),
+                        graph_transaction_id=int(
+                            old_contract.get("graph_transaction_id", 0) or 0
+                        ),
+                        reason="pending_controller_lease_release",
+                        deferred_reason=str(reason or "dispatch"),
+                    )
+                    return
+                # GlobalFrontier has already stated that this predecessor's
+                # controller lease is released, and the pending successor is
+                # strictly newer, so the hold has been answered.  The
+                # predecessor contract itself is kept: a later authoritative
+                # release carrying a transport terminal still needs it to
+                # complete the teardown.  Only the deferral ends here, and the
+                # transport half of the handoff is gated on its own above.
+                if not pending_release.get("hold_answered"):
+                    pending_release["hold_answered"] = True
+                    self.publish_bridge_status(
+                        "controller_lease_release_hold_cleared",
+                        route_id=old_route_id,
+                        action_generation=int(
+                            released_predecessor.get("action_generation", 0) or 0
+                        ),
+                        release_phase=str(
+                            released_predecessor.get("release_phase", "") or ""
+                        ),
+                        release_reason=str(
+                            released_predecessor.get("release_reason", "") or ""
+                        ),
+                        terminal_received=bool(
+                            released_predecessor.get("terminal_received", False)
+                        ),
+                        latest_route_id=int(
+                            getattr(self, "latest_route_id", 0) or 0
+                        ),
+                        reason="predecessor_release_already_stated",
+                    )
         if (
             not force
             and self.frontier_portal_wait

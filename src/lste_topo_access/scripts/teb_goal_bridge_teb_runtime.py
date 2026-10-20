@@ -343,6 +343,11 @@ class TebGoalBridgeTebRuntimeMixin:
         }
         self.pending_terminal_prepare = prepared
         self.pending_lease_release_contract = prepared
+        arm_release_watchdog = getattr(
+            self, "_arm_pending_lease_release_watchdog_locked", None
+        )
+        if callable(arm_release_watchdog):
+            arm_release_watchdog(prepared)
         self._remember_terminal_tombstone_locked(identity_key, prepared)
         self._begin_transport_handoff_locked(
             old_contract,

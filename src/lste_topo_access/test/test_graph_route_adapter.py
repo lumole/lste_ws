@@ -250,6 +250,99 @@ class GraphRouteAdapterTest(unittest.TestCase):
         self.assertFalse(fixture.graph_route_plan_lease_active)
         self.assertEqual(fixture.events[-1][0], "graph_route_edge_materialized")
 
+    def test_bound_cross_plan_uses_durable_crossing_when_arc_is_hidden(self):
+        """A crossed edge remains executable without a current frontier arc."""
+        fixture = AdapterFixture(
+            portals=[
+                {
+                    "id": 11,
+                    "source_place_id": 1,
+                    "destination_place_id": 2,
+                    "state": "crossed",
+                },
+            ],
+            work_items=[
+                {"id": 31, "place_id": 2, "state": "unresolved", "active_attempt_id": None},
+            ],
+        )
+        candidate = (
+            1, 2, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, None, 1,
+            "portal_transition", (0.0, 0.0), None, None, 0, None,
+            False, "cross_portal", "durable_portal_crossing", 11,
+            False,
+        )
+        fixture.select_durable_portal_crossing = lambda _snapshot: candidate
+
+        fixture.last_graph_snapshot_projection_complete = True
+        fixture.last_graph_snapshot_epoch = 1
+        snapshot = SimpleNamespace(
+            map_context=SimpleNamespace(components=SimpleNamespace(epoch=1)),
+        )
+        plan, selected = fixture._prepare_graph_route_action(snapshot)
+
+        self.assertEqual(plan.action, ACTION_CROSS_PORTAL)
+        self.assertIs(selected, candidate)
+        self.assertTrue(fixture.graph_route_plan_lease_active)
+        self.assertEqual(fixture.events[-1][0], "graph_route_edge_materialized")
+
+    def test_completed_probe_makes_hidden_cross_plan_visible(self):
+        """Destination evidence survives disappearance of the frontier arc."""
+        fixture = AdapterFixture(
+            portals=[{
+                "id": 11,
+                "source_place_id": 1,
+                "destination_place_id": None,
+                "state": "selected",
+            }],
+            probes=[{
+                "id": 21,
+                "source_place_id": 1,
+                "portal_id": 11,
+                "state": "observed",
+            }],
+        )
+        plan = GraphRoutePlan(
+            PLAN_READY,
+            ACTION_CROSS_PORTAL,
+            current_place_id=1,
+            target_place_id=None,
+            obligation_kind="portal_edge",
+            obligation_id=11,
+            first_portal_id=11,
+        )
+
+        self.assertTrue(
+            fixture._graph_plan_identity_is_visible(
+                plan,
+                visible_work_item_ids=(),
+                visible_probe_ids=(),
+                visible_portal_ids=(),
+            )
+        )
+
+    def test_work_item_no_viewpoint_is_deferred_after_three_map_epochs(self):
+        """Deferral releases other work without resolving the WorkItem."""
+        fixture = AdapterFixture()
+        for epoch in (4, 5, 6):
+            fixture.last_local_work_item_rehydration_report = {
+                "candidate_count": 0,
+                "map_epoch": epoch,
+                "item_audit": [{
+                    "work_item_id": 31,
+                    "reason": "costmap_route_unreachable",
+                }],
+            }
+            fixture._record_graph_work_item_projection_miss(epoch)
+
+        self.assertEqual(fixture.graph_route_deferred_work_item_ids, {31})
+        _portals, work_items, _probes = (
+            fixture._graph_route_materialization_exclusions(6)
+        )
+        self.assertIn(31, work_items)
+        self.assertEqual(
+            fixture.events[-1][0], "graph_work_item_materialization_deferred"
+        )
+
     def test_unavailable_crossing_replans_to_local_work_in_same_map_epoch(self):
         """A rejected Portal must not retain a graph lease indefinitely."""
         fixture = AdapterFixture(

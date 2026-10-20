@@ -15,6 +15,7 @@ from global_frontier_portal_certification_wall import (
 
 def _certification_cache_key(
     transition, radius, margin, structural_occupied, minimum_wall_span_cells,
+    minimum_opening_cells=2, wall_search_radius=None,
 ):
     """Describe evidence that is immutable during one selection pass."""
     return (
@@ -27,18 +28,24 @@ def _certification_cache_key(
         margin,
         structural_occupied is not None,
         minimum_wall_span_cells,
+        # The opening-width and wall-search evidence belong to this key too:
+        # two callers that require different opening widths must not share one
+        # cached verdict.
+        minimum_opening_cells,
+        wall_search_radius,
     )
 
 
 def _certify_transition(
     known_free, structural_occupied, transition, radius, margin,
-    minimum_wall_span_cells,
+    minimum_wall_span_cells, minimum_opening_cells=2, wall_search_radius=None,
 ):
     """Return ``(accepted, opening_cell)`` for one topology edge.
 
     The raw-free cut proves that the route crosses a narrow separator.  When
     structural occupancy is available, the wall scan identifies the exact
-    throat cell that is a persistent architectural opening.
+    throat cell that is a persistent architectural opening, and the opening's
+    own free width proves a footprint can pass it.
     """
     if not is_structural_cut(known_free, transition, radius, margin):
         return False, None
@@ -49,6 +56,9 @@ def _certify_transition(
         transition,
         radius,
         minimum_wall_span_cells,
+        known_free=known_free,
+        minimum_opening_cells=minimum_opening_cells,
+        wall_search_radius=wall_search_radius,
     )
     return opening_cell is not None, opening_cell
 
@@ -71,6 +81,7 @@ def certified_route_place_transitions(
     labels, steps, known_free, target_row, target_col, source_label,
     throat_radius_cells, window_margin_cells=None, cache=None,
     structural_occupied=None, minimum_wall_span_cells=None,
+    minimum_opening_cells=2, wall_search_radius=None,
 ):
     """Return crossings with both local-cut and wall-opening evidence.
 
@@ -97,6 +108,8 @@ def certified_route_place_transitions(
             margin,
             structural_occupied,
             minimum_wall_span_cells,
+            minimum_opening_cells,
+            wall_search_radius,
         )
         accepted, opening_cell = _cached_certification(
             cache,
@@ -108,6 +121,8 @@ def certified_route_place_transitions(
                 radius,
                 margin,
                 minimum_wall_span_cells,
+                minimum_opening_cells=minimum_opening_cells,
+                wall_search_radius=wall_search_radius,
             ),
         )
         if accepted:
@@ -124,6 +139,7 @@ def certified_route_place_hops(
     labels, steps, known_free, target_row, target_col, source_label,
     throat_radius_cells, window_margin_cells=None, cache=None,
     structural_occupied=None, minimum_wall_span_cells=None,
+    minimum_opening_cells=2, wall_search_radius=None,
 ):
     """Count certified architectural transitions on one route."""
     return len(certified_route_place_transitions(
@@ -138,6 +154,8 @@ def certified_route_place_hops(
         cache=cache,
         structural_occupied=structural_occupied,
         minimum_wall_span_cells=minimum_wall_span_cells,
+        minimum_opening_cells=minimum_opening_cells,
+        wall_search_radius=wall_search_radius,
     ))
 
 
@@ -145,6 +163,7 @@ def first_certified_route_place_transition_goal(
     labels, steps, known_free, target_row, target_col, source_label,
     throat_radius_cells, window_margin_cells=None, cache=None,
     structural_occupied=None, minimum_wall_span_cells=None,
+    minimum_opening_cells=2, wall_search_radius=None,
 ):
     """Return the first destination core after a certified portal crossing."""
     transitions = certified_route_place_transitions(
@@ -167,6 +186,7 @@ def certified_adjacent_place_transitions(
     labels, steps, known_free, source_label, throat_radius_cells,
     closed_labels=None, max_candidates=32, window_margin_cells=None,
     cache=None, structural_occupied=None, minimum_wall_span_cells=None,
+    minimum_opening_cells=2, wall_search_radius=None,
 ):
     """Return first certified doorway edges without relying on frontiers."""
     if labels is None or steps is None or labels.shape != steps.shape:
@@ -201,6 +221,8 @@ def certified_adjacent_place_transitions(
                 cache=cache,
                 structural_occupied=structural_occupied,
                 minimum_wall_span_cells=minimum_wall_span_cells,
+                minimum_opening_cells=minimum_opening_cells,
+                wall_search_radius=wall_search_radius,
             )
             if not candidates:
                 continue
@@ -228,6 +250,7 @@ def certified_adjacent_place_transition_goals(
     labels, steps, known_free, source_label, throat_radius_cells,
     closed_labels=None, max_candidates=32, window_margin_cells=None,
     cache=None, structural_occupied=None, minimum_wall_span_cells=None,
+    minimum_opening_cells=2, wall_search_radius=None,
 ):
     """Return legacy destination tuples while retaining full transition data."""
     return [
@@ -248,5 +271,7 @@ def certified_adjacent_place_transition_goals(
             cache=cache,
             structural_occupied=structural_occupied,
             minimum_wall_span_cells=minimum_wall_span_cells,
+            minimum_opening_cells=minimum_opening_cells,
+            wall_search_radius=wall_search_radius,
         )
     ]

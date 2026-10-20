@@ -583,6 +583,14 @@ class GlobalFrontierCandidatePortalMixin:
             getattr(self, "place_furniture_max_span_m", 2.5),
         )
         known_free = ~(request.unknown | request.occupied)
+        # The opening has to fit the vehicle, not just look wall-bounded. The
+        # route clearance disk is the physical footprint: an opening narrower
+        # than its diameter is a rasterisation slit, not a doorway.
+        route_radius_cells = max(
+            1, int(math.ceil(float(getattr(self, "clearance", 0.35)) / resolution))
+        )
+        portal_max_opening_m = float(getattr(self, "portal_max_opening_m", 3.5))
+        portal_max_opening_cells = int(math.ceil(portal_max_opening_m / resolution))
         boundaries = structural_boundary_candidates(
             known_free,
             structural_occupied,
@@ -591,15 +599,12 @@ class GlobalFrontierCandidatePortalMixin:
             labels=labels,
             source_label=context.source_label,
             support_radius=throat_radius_cells,
-            # Use the same clearance-scale wall support as Portal
-            # certification.  A two-cell support is only the thickness of a
-            # rasterized wall at the usual map resolution; accepting it here
-            # makes the two walls of an ordinary corridor look like a
-            # doorway.  The source probe is still weaker than certification,
-            # but it must describe an architectural wall run rather than a
-            # local obstacle edge.
             minimum_wall_span_cells=throat_radius_cells,
             wall_search_radius=window_margin_cells,
+            minimum_opening_cells=2 * route_radius_cells + 1,
+            maximum_opening_cells=portal_max_opening_cells,
+            resolution=resolution,
+            max_opening_m=portal_max_opening_m,
         )
         candidates = []
         for boundary in boundaries:
@@ -836,7 +841,9 @@ class GlobalFrontierCandidatePortalMixin:
             endpoint_col=int(exit_col),
         )
 
-    def portal_observation_probe_for_frontier(self, request, frontier_row, frontier_col):
+    def portal_observation_probe_for_frontier(
+        self, request, frontier_row, frontier_col, observation_source="frontier",
+    ):
         """Recognize a source-side doorway observation without crossing it."""
         components = request.components
         structural_occupied = getattr(components, "structural_occupied", None)
@@ -859,6 +866,14 @@ class GlobalFrontierCandidatePortalMixin:
                 throat_radius_cells,
                 int(math.ceil(float(observed_horizon) / resolution)),
             )
+        occupied = getattr(request, "occupied", None)
+        known_free = (
+            ~(request.unknown | occupied)
+            if occupied is not None
+            else ~request.unknown & ~structural_occupied
+        )
+        portal_max_opening_m = float(getattr(self, "portal_max_opening_m", 1.8))
+        portal_max_opening_cells = int(math.ceil(portal_max_opening_m / resolution))
         probe = portal_observation_probe(
             request.unknown,
             structural_occupied,
@@ -866,11 +881,103 @@ class GlobalFrontierCandidatePortalMixin:
             support_radius=throat_radius_cells,
             minimum_wall_span_cells=2,
             wall_search_radius=window_margin_cells,
+            known_free=known_free,
+            # The probe becomes a certified portal once both of its views
+            # agree, so it must pass the footprint test already: a slit no
+            # vehicle fits through is not a doorway, only a raster artefact.
+            minimum_opening_cells=(
+                2 * max(
+                    1,
+                    int(math.ceil(
+                        float(getattr(self, "clearance", 0.35)) / resolution
+                    )),
+                ) + 1
+            ),
+            maximum_opening_cells=portal_max_opening_cells,
+            resolution=resolution,
+            max_opening_m=portal_max_opening_m,
         )
+        if probe is not None and not self._production_probe_has_distinct_core(
+            request, probe, known_free,
+        ):
+            probe = None
+        if probe is not None and observation_source != "frontier":
+            probe = PortalObservationProbe(
+                probe.opening_cell,
+                probe.normal,
+                probe.probe_id,
+                probe.phase,
+                str(observation_source),
+            )
         register = getattr(self, "register_portal_probe", None)
         if probe is not None and register is not None:
             probe = register(request, probe)
         return probe
+
+    def _production_probe_has_distinct_core(self, request, probe, known_free):
+        """Reject frontier probes without a mapped far-side Place core.
+
+        Geometry-only fixtures intentionally omit topology labels and robot
+        pose; they retain the pure wall-opening contract.  The live node has
+        both, so a production probe must point from the current Place into a
+        different known structural core.  An unknown far side is left to the
+        ordinary WorkItem observation first, preventing room-boundary noise
+        and wall cracks from becoming pending Portal markers.
+        """
+        components = getattr(request, "components", None)
+        labels = getattr(components, "labels", None)
+        robot_map = getattr(request, "robot_map", None)
+        component_at_pose = getattr(self, "component_at_map_position", None)
+        if (
+            not isinstance(labels, np.ndarray)
+            or robot_map is None
+            or not callable(component_at_pose)
+        ):
+            return True
+        try:
+            source_component = component_at_pose(
+                request.message,
+                components,
+                known_free,
+                float(robot_map[0]),
+                float(robot_map[1]),
+            )
+            source_label = (
+                None
+                if source_component is None
+                else int(source_component["label"])
+            )
+            normal_row, normal_col = (
+                int(probe.normal[0]), int(probe.normal[1])
+            )
+            opening_row, opening_col = (
+                int(probe.opening_cell[0]), int(probe.opening_cell[1])
+            )
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            return False
+        if source_label is None or source_label <= 0:
+            return False
+        destination = opening_row + normal_row, opening_col + normal_col
+        if not (
+            0 <= destination[0] < known_free.shape[0]
+            and 0 <= destination[1] < known_free.shape[1]
+            and bool(known_free[destination])
+        ):
+            return False
+        _throat, window_margin = portal_certification_window(
+            request.message.info.resolution,
+            getattr(self, "region_topology_clearance", 0.50),
+            getattr(self, "place_furniture_max_span_m", 2.5),
+        )
+        for distance in range(1, int(window_margin) + 1):
+            row = destination[0] + distance * normal_row
+            col = destination[1] + distance * normal_col
+            if not (0 <= row < labels.shape[0] and 0 <= col < labels.shape[1]):
+                break
+            label = int(labels[row, col])
+            if label > 0:
+                return label != source_label
+        return False
 
     def _portal_wall_support_kwargs(self, message, components):
         """Adapt structural occupancy into portal-certifier wall evidence."""
@@ -892,9 +999,31 @@ class GlobalFrontierCandidatePortalMixin:
             float(getattr(self, "region_topology_clearance", 0.50)),
         )
         throat_radius_cells = max(1, int(math.ceil(clearance / resolution)))
+        # An opening is a doorway only if the vehicle can pass it.  The
+        # navigation mask keeps a passage open when the route clearance disk
+        # fits through it, so that same width is the physical bound here: a
+        # one- or two-cell slit left where two wall segments rasterise apart
+        # carries opposing "jambs" and a walkable raw-free route, but no
+        # footprint, and it must not become a Place edge.
+        route_clearance = max(
+            0.10, float(getattr(self, "clearance", clearance)),
+        )
+        route_radius_cells = max(1, int(math.ceil(route_clearance / resolution)))
         return {
             "structural_occupied": structural_occupied,
             "minimum_wall_span_cells": throat_radius_cells,
+            "minimum_opening_cells": 2 * route_radius_cells + 1,
+            # A wide architectural opening places its jambs farther from the
+            # centre than the throat radius; search walls over the structural
+            # window the caller already computed instead of merging or
+            # rejecting those openings.
+            "wall_search_radius": max(
+                throat_radius_cells + 1,
+                int(math.ceil(
+                    getattr(self, "place_furniture_max_span_m", 2.5)
+                    / resolution
+                )),
+            ),
         }
 
     @staticmethod

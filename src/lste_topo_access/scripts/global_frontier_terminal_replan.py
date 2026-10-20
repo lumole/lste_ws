@@ -302,6 +302,17 @@ class GlobalFrontierTerminalReplanMixin:
             last_released_route_id in pending_table
         )
         self.last_planning_wall = 0.0
+        # The predecessor terminal may have invalidated the in-flight
+        # optimistic planning pass before the controller ACK arrived.  The
+        # ACK is the ownership boundary that proves the old actuator lease is
+        # gone; leaving this flag set makes every successor cycle abort in
+        # WAITING_MATERIALIZATION even though the release table is empty.
+        clear_preempt = getattr(self, "clear_planning_preempt", None)
+        if callable(clear_preempt):
+            clear_preempt()
+        else:
+            self.planning_preempt_requested = False
+            self.planning_preempt_reason = ""
         self.publish_status(
             "controller_lease_release_acknowledged",
             **identity,

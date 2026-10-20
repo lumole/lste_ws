@@ -64,6 +64,13 @@ def _initialize_action_state(bridge):
     # the release, so a late callback cannot reopen the route.
     bridge.pending_terminal_prepare = None
     bridge.pending_lease_release_contract = None
+    bridge.pending_lease_release_watchdog = None
+    bridge.pending_lease_release_watchdog_timer = None
+    # GlobalFrontier's own statement that a route's controller lease is
+    # released, keyed by route id. It is retained separately from the applied
+    # tombstones because a release the bridge refuses to apply as a transport
+    # boundary can still be the release a dispatch hold is waiting for.
+    bridge.frontier_controller_lease_releases = {}
     # One bounded table is shared by stall, terminal, watchdog, and explicit
     # cancel paths. Its key is (route_id, action_generation), not geometry.
     bridge.terminal_action_tombstones = {}

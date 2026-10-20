@@ -9,6 +9,7 @@ to test without constructing a running navigation stack.
 """
 
 import collections
+import heapq
 import math
 
 import numpy as np
@@ -207,3 +208,248 @@ def route_path(steps, seed, target):
         )
         reverse_path.append(current)
     return list(reversed(reverse_path))
+
+
+def geodesic_dijkstra(free, seed, resolution=1.0, should_abort=None):
+    """Return an 8-connected weighted shortest-path geodesic distance field.
+
+    Orthogonal edges are weighted by 1.0 * resolution.
+    Diagonal edges are weighted by sqrt(2) * resolution.
+    Unreachable or obstacle cells remain float('inf').
+    """
+    rows, cols = free.shape
+    distances = np.full((rows, cols), np.inf, dtype=np.float64)
+    if seed is None:
+        return distances
+    try:
+        s_row, s_col = int(seed[0]), int(seed[1])
+    except (IndexError, TypeError, ValueError):
+        return distances
+
+    if not (0 <= s_row < rows and 0 <= s_col < cols):
+        return distances
+    if not free[s_row, s_col]:
+        return distances
+
+    res = float(resolution)
+    if res <= 0.0:
+        res = 1.0
+    diag_cost = math.sqrt(2.0) * res
+    ortho_cost = 1.0 * res
+
+    distances[s_row, s_col] = 0.0
+    heap = [(0.0, s_row, s_col)]
+
+    ortho_dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    diag_dirs = ((1, 1), (1, -1), (-1, 1), (-1, -1))
+
+    visited = 0
+    while heap:
+        if should_abort is not None and visited % 2048 == 0 and should_abort():
+            return None
+        d, r, c = heapq.heappop(heap)
+        visited += 1
+        if d > distances[r, c]:
+            continue
+
+        for dr, dc in ortho_dirs:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols and free[nr, nc]:
+                cand = d + ortho_cost
+                if cand < distances[nr, nc]:
+                    distances[nr, nc] = cand
+                    heapq.heappush(heap, (cand, nr, nc))
+
+        for dr, dc in diag_dirs:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols and free[nr, nc]:
+                # Corner-cutting prevention: require orthogonal neighbors to be free
+                if free[r, nc] and free[nr, c]:
+                    cand = d + diag_cost
+                    if cand < distances[nr, nc]:
+                        distances[nr, nc] = cand
+                        heapq.heappush(heap, (cand, nr, nc))
+
+    return distances
+
+
+def _extract_xy_from_object(obj):
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        if obj.get("anchor_xy") is not None:
+            return obj["anchor_xy"]
+        if obj.get("viewpoint_xy") is not None:
+            return obj["viewpoint_xy"]
+        if obj.get("x") is not None and obj.get("y") is not None:
+            return (float(obj["x"]), float(obj["y"]))
+        if obj.get("xy") is not None:
+            return obj["xy"]
+    elif hasattr(obj, "anchor_xy") and getattr(obj, "anchor_xy", None) is not None:
+        return getattr(obj, "anchor_xy")
+    elif hasattr(obj, "viewpoint_xy") and getattr(obj, "viewpoint_xy", None) is not None:
+        return getattr(obj, "viewpoint_xy")
+    elif hasattr(obj, "x") and hasattr(obj, "y"):
+        return (float(getattr(obj, "x")), float(getattr(obj, "y")))
+    elif isinstance(obj, (tuple, list)) and len(obj) >= 2:
+        return (float(obj[0]), float(obj[1]))
+    return None
+
+
+def point_to_grid_cell(
+    xy,
+    message=None,
+    resolution=None,
+    origin_xy=None,
+    physical_to_map=None,
+    shape=None,
+):
+    """Convert an arbitrary (x, y) or object to integer grid cell (row, col)."""
+    if xy is None:
+        return None
+    raw_xy = _extract_xy_from_object(xy)
+    if raw_xy is None:
+        return None
+    px, py = float(raw_xy[0]), float(raw_xy[1])
+
+    if physical_to_map is not None and callable(physical_to_map):
+        try:
+            m_xy = physical_to_map(px, py)
+            if m_xy is not None:
+                px, py = float(m_xy[0]), float(m_xy[1])
+        except Exception:
+            pass
+
+    if message is not None:
+        return xy_to_grid_cell(message, px, py)
+
+    if resolution is not None and origin_xy is not None:
+        res = float(resolution)
+        if res <= 0:
+            return None
+        col = int(math.floor((px - float(origin_xy[0])) / res))
+        row = int(math.floor((py - float(origin_xy[1])) / res))
+        if shape is not None:
+            if not (0 <= row < shape[0] and 0 <= col < shape[1]):
+                return None
+        return row, col
+
+    # Fallback when coordinates are already grid indices
+    row, col = int(round(px)), int(round(py))
+    if shape is not None:
+        if not (0 <= row < shape[0] and 0 <= col < shape[1]):
+            return None
+    return row, col
+
+
+def get_or_compute_spawn_geodesic_field(
+    free,
+    spawn_xy,
+    message=None,
+    resolution=None,
+    origin_xy=None,
+    physical_to_map=None,
+    search_limit=25,
+    should_abort=None,
+):
+    """Compute the 8-connected Dijkstra distance field from the spawn point."""
+    if free is None or spawn_xy is None:
+        return None
+    res = float(message.info.resolution if message is not None else (resolution or 1.0))
+    shape = free.shape
+    seed_cell = point_to_grid_cell(
+        spawn_xy,
+        message=message,
+        resolution=res,
+        origin_xy=origin_xy,
+        physical_to_map=physical_to_map,
+        shape=shape,
+    )
+    if seed_cell is None:
+        return None
+    r, c = seed_cell
+    if not (0 <= r < shape[0] and 0 <= c < shape[1] and free[r, c]):
+        snapped = nearest_seed(free, r, c, limit=search_limit)
+        if snapped is None:
+            return None
+        seed_cell = snapped
+
+    return geodesic_dijkstra(
+        free, seed_cell, resolution=res, should_abort=should_abort
+    )
+
+
+def compute_geodesic_distance_to_work_item(
+    free,
+    spawn_xy,
+    target_item_or_xy,
+    message=None,
+    resolution=None,
+    origin_xy=None,
+    physical_to_map=None,
+    search_limit=25,
+    geodesic_field=None,
+):
+    """Compute shortest obstacle-avoiding geodesic distance from spawn_xy to target."""
+    if free is None or spawn_xy is None or target_item_or_xy is None:
+        return None
+
+    if geodesic_field is None:
+        geodesic_field = get_or_compute_spawn_geodesic_field(
+            free=free,
+            spawn_xy=spawn_xy,
+            message=message,
+            resolution=resolution,
+            origin_xy=origin_xy,
+            physical_to_map=physical_to_map,
+            search_limit=search_limit,
+        )
+    if geodesic_field is None:
+        return None
+
+    shape = free.shape
+    res = float(message.info.resolution if message is not None else (resolution or 1.0))
+
+    target_cell = point_to_grid_cell(
+        target_item_or_xy,
+        message=message,
+        resolution=res,
+        origin_xy=origin_xy,
+        physical_to_map=physical_to_map,
+        shape=shape,
+    )
+    if target_cell is None:
+        return None
+
+    tr, tc = target_cell
+    if not (0 <= tr < shape[0] and 0 <= tc < shape[1] and free[tr, tc]):
+        snapped = nearest_seed(free, tr, tc, limit=search_limit)
+        if snapped is not None:
+            tr, tc = snapped
+        elif isinstance(target_item_or_xy, dict) and target_item_or_xy.get("viewpoint_xy") is not None:
+            vp_xy = target_item_or_xy["viewpoint_xy"]
+            vp_cell = point_to_grid_cell(
+                vp_xy,
+                message=message,
+                resolution=res,
+                origin_xy=origin_xy,
+                physical_to_map=physical_to_map,
+                shape=shape,
+            )
+            if vp_cell is not None and free[vp_cell[0], vp_cell[1]]:
+                tr, tc = vp_cell
+            elif vp_cell is not None:
+                vp_snapped = nearest_seed(free, vp_cell[0], vp_cell[1], limit=search_limit)
+                if vp_snapped is not None:
+                    tr, tc = vp_snapped
+                else:
+                    return None
+            else:
+                return None
+        else:
+            return None
+
+    dist = geodesic_field[tr, tc]
+    if math.isfinite(dist):
+        return float(dist)
+    return None

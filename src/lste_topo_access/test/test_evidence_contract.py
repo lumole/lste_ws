@@ -10,12 +10,15 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from global_frontier_evidence_contract import (  # noqa: E402
+    ACTION_BOOTSTRAP,
     EVIDENCE_DESTINATION_VIEW,
     EVIDENCE_LOCAL_OBSERVATION,
     EVIDENCE_PORTAL_CROSSING,
     EVIDENCE_SOURCE_VIEW,
     EVIDENCE_PORTAL_CERTIFIED,
     EvidenceObservation,
+    action_contract_for,
+    action_for_gap,
     apply_observation,
     build_contract,
     next_evidence_gap,
@@ -194,6 +197,90 @@ class EvidenceContractTest(unittest.TestCase):
         payload = plan.as_dict()
         self.assertEqual(payload["required_evidence"][0]["kind"], "place_view")
         self.assertEqual(payload["produces_evidence"][0]["kind"], EVIDENCE_LOCAL_OBSERVATION)
+
+    def test_local_work_gap_is_retired_by_place_view_and_endpoint_observation(self):
+        """An open work item must not be an unsatisfiable requirement.
+
+        The live two-room run ended with the frontier reporting no reachable
+        unknown while the graph kept re-planning a route it could never
+        materialize.  The evidence contract for ``observe_local_work`` declared
+        two gaps, and only one of them (the place's own view) has a producer in
+        the lifecycle: "the work item is open" is the *state* that created the
+        gap, never a fact a later observation can report.  The contract could
+        therefore never be emptied.
+        """
+        plan = GraphRoutePlan(
+            "ready",
+            "observe_local_work",
+            current_place_id=1,
+            target_place_id=1,
+            obligation_kind="work_item",
+            obligation_id=3,
+        )
+        graph = EvidenceEventGraph()
+        graph.ingest("route_command", {
+            "route_id": 9,
+            "graph_route_plan": plan.as_dict(),
+        })
+        pending = graph.evidence_contract.pending()
+        self.assertEqual([item.kind for item in pending], ["place_view"])
+        self.assertNotIn(
+            "work_item_open", [item.kind for item in pending],
+        )
+
+        graph.ingest("frontier_place_closed", {"region_id": 1, "place_id": 1})
+        graph.ingest("frontier_endpoint_observed", {
+            "work_item_id": 3, "place_id": 1, "route_id": 9,
+        })
+
+        self.assertEqual(graph.evidence_contract.pending(), ())
+
+    def test_bootstrap_declares_no_unobservable_requirement(self):
+        """A bootstrap plan must be retirable by the place's own view.
+
+        The action is selected *by* a ``place_view`` gap and reports the place
+        view when it succeeds; the Place's identity is the state the planner
+        asserts, not an observation any event publishes.  Declaring it as a
+        requirement left the contract permanently non-empty.
+        """
+        action = action_contract_for(ACTION_BOOTSTRAP, current_place_id=1)
+        self.assertEqual(action.requires, ())
+        self.assertEqual(
+            [item.kind for item in action.produces], ["place_view"],
+        )
+
+        graph = EvidenceEventGraph()
+        graph.ingest("route_command", {
+            "route_id": 3,
+            "evidence_requirements": [
+                item.as_dict() for item in action.requires
+            ],
+        })
+        self.assertEqual(graph.evidence_contract.pending(), ())
+        self.assertEqual(action_for_gap(graph.evidence_contract).kind, "hold")
+
+    def test_place_defining_event_is_read_through_region_id(self):
+        """A Place named only by ``region_id`` must still close its own gap.
+
+        ``frontier_place_closed`` and ``portal_place_entered`` name the Place
+        they define by ``region_id``; ignoring that field dropped the fact and
+        left an already-viewed Place permanently pending.
+        """
+        graph = EvidenceEventGraph()
+        graph.ingest("route_command", {
+            "route_id": 4,
+            "evidence_requirements": [{
+                "owner_kind": "place",
+                "owner_id": 1,
+                "kind": "place_view",
+            }],
+        })
+        self.assertEqual(len(graph.evidence_contract.pending()), 1)
+
+        graph.ingest("frontier_place_closed", {"region_id": 1})
+
+        self.assertEqual(graph.evidence_contract.pending(), ())
+        self.assertEqual(graph.evidence_contract.resolved[0].owner_id, 1)
 
 
 if __name__ == "__main__":

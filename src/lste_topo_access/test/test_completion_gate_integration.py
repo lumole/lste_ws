@@ -15,6 +15,22 @@ from global_frontier_completion_gate import evaluate_completion  # noqa: E402
 from global_frontier_completion_recovery import (  # noqa: E402
     GraphCompletionStateMachine,
 )
+from global_frontier_graph_route_planner import (  # noqa: E402
+    ACTION_HOLD,
+    PLAN_BLOCKED,
+    GraphRoutePlan,
+)
+
+
+def blocked_plan(map_epoch, current_place_id=3):
+    """Return the plan one idle blocked cycle rebuilds from a new snapshot."""
+    return GraphRoutePlan(
+        PLAN_BLOCKED,
+        ACTION_HOLD,
+        map_epoch=map_epoch,
+        current_place_id=current_place_id,
+        reason="durable_obligation_has_no_certified_graph_path",
+    )
 
 
 def load_report_method():
@@ -142,6 +158,59 @@ class CompletionGateIntegrationTest(unittest.TestCase):
 
         self.assertEqual(explorer.status[-1][0], "graph_recovery_requested")
         self.assertFalse(explorer.frontier_exhausted)
+
+    def test_a_reprojected_blocked_plan_cannot_reopen_recovery_forever(self):
+        """An idle planner must reach its blocked terminal, not spin.
+
+        Every cycle rebuilds the blocked plan from a fresh map snapshot, so
+        ``map_epoch`` -- and with it the full plan signature -- differs every
+        time. Recovery is a one-shot transition for one unchanged evidence
+        identity, and that identity is the durable obligation, not the
+        projection that re-derived it.
+        """
+        explorer = CompletionGateExplorer()
+        explorer.last_graph_route_plan = blocked_plan(310)
+
+        explorer._report_no_frontier_selection()
+        self.assertEqual(explorer.status[-1][0], "graph_recovery_requested")
+
+        # The same blocked obligation, re-projected onto newer map epochs.
+        for epoch in (311, 312, 313):
+            explorer.last_graph_route_plan = blocked_plan(epoch)
+            explorer._report_no_frontier_selection()
+
+        self.assertEqual(explorer.status[-1][0], "graph_exploration_blocked")
+        self.assertFalse(explorer.frontier_exhausted)
+        self.assertNotIn(
+            "frontier_exhausted",
+            [event for event, _fields in explorer.status],
+        )
+        self.assertEqual(
+            [event for event, _fields in explorer.status],
+            ["graph_recovery_requested", "graph_exploration_blocked"],
+        )
+
+    def test_a_new_durable_obligation_reopens_recovery(self):
+        """Real graph progress must still restart the recovery protocol."""
+        explorer = CompletionGateExplorer()
+        explorer.last_graph_route_plan = blocked_plan(310)
+        explorer._report_no_frontier_selection()
+        explorer._report_no_frontier_selection()
+        self.assertEqual(explorer.status[-1][0], "graph_exploration_blocked")
+
+        # A different obligation is a different evidence identity.
+        explorer.last_graph_route_plan = GraphRoutePlan(
+            PLAN_BLOCKED,
+            ACTION_HOLD,
+            map_epoch=311,
+            current_place_id=3,
+            obligation_kind="work_item",
+            obligation_id=42,
+            reason="durable_obligation_has_no_certified_graph_path",
+        )
+        explorer._report_no_frontier_selection()
+
+        self.assertEqual(explorer.status[-1][0], "graph_recovery_requested")
 
     def test_rejected_portal_sources_do_not_count_as_graph_transit(self):
         explorer = CompletionGateExplorer()

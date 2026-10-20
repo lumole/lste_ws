@@ -102,18 +102,25 @@ TARGET_DONE_REQUIRE_APPROACH_TERMINAL: false
 # confirmation window promotes it to long-lived follow mode. Score and box size
 # are normalized to [0, 1].
 TARGET_FOLLOW_MIN_SCORE: 0.20
-TARGET_FOLLOW_MIN_BOX_SIZE: 0.01
-TARGET_FOLLOW_CANDIDATE_TIMEOUT: 8.0
+# Small objects are allowed to enter the follow candidate ledger from a safe
+# distance.  This does not weaken completion: the close gate below still
+# requires a 0.05 normalized dimension (or independently validated standoff).
+TARGET_FOLLOW_MIN_BOX_SIZE: 0.005
+# Keep a detected object alive through one bounded Navfn-validated parallax
+# step.  This is still a finite candidate timeout; it is not task completion.
+TARGET_FOLLOW_CANDIDATE_TIMEOUT: 20.0
 TARGET_FOLLOW_CONFIRM_HITS: 2
 # A confirmed direct target keeps the current room/viewpoint for this whole
 # evidence window while it waits for the remaining close-confirmation frames.
 # Missing monitor/context boxes never shorten this window.
-TARGET_FOLLOW_CONFIRM_WINDOW: 20.0
+TARGET_FOLLOW_CONFIRM_WINDOW: 45.0
 # Weak target boxes (low score and smaller than 5% of the image) need a
 # longer, spatially consistent run. This prevents a tiny false WeDetect box
 # from taking over the frontier route after only two inference frames.
 TARGET_FOLLOW_WEAK_CONFIRM_HITS: 5
-TARGET_FOLLOW_WEAK_MIN_AVERAGE_SCORE: 0.24
+# WeDetect-large often scores a real, distant yellow cup around 0.20-0.23.
+# Stable geometry and five hits remain mandatory before target ownership.
+TARGET_FOLLOW_WEAK_MIN_AVERAGE_SCORE: 0.20
 TARGET_FOLLOW_SPATIAL_TOLERANCE: 0.10
 # After the first (or a close-range) target hit, hold the vehicle at its
 # current pose while the slow detector obtains another independent frame.
@@ -387,13 +394,16 @@ GLOBAL_FRONTIER_PREEMPT_CONTEXT: false
 # robot radius (0.30 m) plus TEB's minimum obstacle distance (0.22 m), with an
 # additional SLAM-margin cell. Live costmap + exact Navfn, followed by TEB,
 # are the hard route and collision gates for every published goal.
-GLOBAL_FRONTIER_CLEARANCE: 0.62
+GLOBAL_FRONTIER_CLEARANCE: 0.52
 # Do not falsely terminate exploration at a narrow doorway. When no normal
 # strict route remains, recovery can use looser topology *between strict
 # endpoints* only after live costmap connectivity and exact Navfn validation.
 # It never publishes a looser, wall-adjacent endpoint; TEB remains the final
 # collision authority.
-GLOBAL_FRONTIER_NAVFN_OBSERVATION_RECOVERY_ENABLED: true
+# Executable frontier, WorkItem and Portal viewpoints must stay in the strict
+# clearance mask.  The wider observation fallback can select an inflated-band
+# cell, so keep it disabled for autonomous runs and recordings.
+GLOBAL_FRONTIER_NAVFN_OBSERVATION_RECOVERY_ENABLED: false
 # Kept under the historical name for launch compatibility. This is the looser
 # known-free observation mask used to detect information boundaries. Normally
 # the stricter preferred approach wins; only recovery may publish a looser
@@ -509,6 +519,13 @@ GLOBAL_FRONTIER_SEMANTIC_HINT_MAX_DISTANCE: 12.0
 # Minimum wall-clock interval between expensive full map/costmap frontier
 # searches while the committed endpoint is far away and making progress.
 GLOBAL_FRONTIER_PLANNING_PERIOD: 1.5
+# Dedicated 2-phase portal probe transactions (source viewpoint -> destination viewpoint).
+# Default false disables dedicated probe transactions, prioritizing normal WorkItem exploration
+# and allowing passive plane crossing certification.
+GLOBAL_FRONTIER_ENABLE_DEDICATED_PORTAL_PROBE_TRANSACTION: false
+# Automatically certify a portal and execute Place transition when the robot physically
+# crosses the doorway plane during normal exploration.
+GLOBAL_FRONTIER_PASSIVE_PLANE_CROSSING_CERTIFICATION: true
 # Goal Manager publishes this machine-readable mission ownership signal before
 # each /lste/final_goal. The TEB bridge uses it to let confirmed target intent
 # take over exploration without exposing another controller tuning parameter.

@@ -1,0 +1,99 @@
+schema_version: 1
+scenario_id: t_junction_office
+display_name: T-Junction Two-Room Office Benchmark
+world: worlds/t_junction_office_no_pro3.world
+building:
+  bounds_m:
+  - 0.0
+  - 0.0
+  - 12.0
+  - 10.5
+  wall_height_m: 2.5
+  wall_thickness_m: 0.18
+  door_width_m: 1.2
+  corridor_width_m: 2.0
+robot_profiles:
+  primary:
+    pose:
+    - 6.0
+    - 1.0
+    - 0.05
+    - 1.570796
+    semantic: Entrance stem facing T-junction north
+  junction_center:
+    pose:
+    - 6.0
+    - 4.5
+    - 0.05
+    - 1.570796
+    semantic: Center of T-junction crossbar
+rooms:
+- id: corridor_foyer
+  semantic: T-junction entrance and transverse corridor
+  bounds_m:
+  - 0.0
+  - 0.0
+  - 12.0
+  - 5.5
+  doors:
+  - door_a
+  - door_b
+- id: room_a
+  semantic: Left meeting and discussion room with fire hydrants
+  bounds_m:
+  - 0.0
+  - 5.5
+  - 6.0
+  - 10.5
+  doors:
+  - door_a
+  models:
+  - room_a_conference_table
+  - room_a_bookshelf
+  - fire_hydrant_1
+  - fire_hydrant_2
+  - fire_hydrant_3
+- id: room_b
+  semantic: Right target office with workstation against left wall
+  bounds_m:
+  - 6.0
+  - 5.5
+  - 12.0
+  - 10.5
+  doors:
+  - door_b
+  models:
+  - target_desk
+  - target_monitor_left
+  - target_monitor_right
+  - cup_yellow
+  - target_room_occluder
+  - room_b_cabinet
+  - room_b_bookshelf
+doors:
+- id: door_a
+  center_m:
+  - 3.0
+  - 5.5
+  width_m: 1.2
+  connects:
+  - corridor_foyer
+  - room_a
+- id: door_b
+  center_m:
+  - 9.0
+  - 5.5
+  width_m: 1.2
+  connects:
+  - corridor_foyer
+  - room_b
+targets:
+  primary:
+    model: cup_yellow
+    label: yellow cup
+    pose_xy:
+    - 6.6
+    - 8.5
+    room: room_b
+    occluder: target_room_occluder
+    distractors: []

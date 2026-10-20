@@ -21,6 +21,9 @@ from global_frontier_work_item_components import (
     ObservationSupport,
     observation_supports,
 )
+from global_frontier_candidate_work_items import (
+    GlobalFrontierCandidateWorkItemMixin,
+)
 from global_frontier_work_items import (
     ATTEMPT_FAILED,
     GlobalFrontierWorkItemLifecycleMixin,
@@ -124,6 +127,28 @@ class FrontierWorkItemComponentsTest(unittest.TestCase):
 
         self.assertEqual(shifted_cells[(8, 8)], item_id)
         self.assertEqual(details[item_id]["match"], "inherited")
+        self.assertEqual(ledger.anchor_for(item_id), (1.0, 1.0))
+
+    def test_reconcile_does_not_move_established_anchor_to_new_snapshot(self):
+        ledger = PlaceWorkItemLedger(merge_radius=0.5)
+        first = ObservationSupport(
+            frozenset({(1, 1)}),
+            frozenset({(10, 10)}),
+            anchor_xy=(1.0, 1.0),
+            normal_xy=(1.0, 0.0),
+        )
+        moved = ObservationSupport(
+            frozenset({(2, 2)}),
+            frozenset({(10, 10)}),
+            anchor_xy=(1.3, 1.0),
+            normal_xy=(1.0, 0.0),
+        )
+        first_cells, _details = ledger.reconcile(4, (first,), now=1.0)
+        item_id = first_cells[(1, 1)]
+        moved_cells, _details = ledger.reconcile(4, (moved,), now=2.0)
+
+        self.assertEqual(moved_cells[(2, 2)], item_id)
+        self.assertEqual(ledger.anchor_for(item_id), (1.0, 1.0))
 
     def test_physical_anchor_keeps_distinct_nearby_support_from_merging(self):
         ledger = PlaceWorkItemLedger(merge_radius=0.5)
@@ -181,7 +206,10 @@ class FrontierWorkItemComponentsTest(unittest.TestCase):
         )
 
     def test_active_lifecycle_emits_one_dispatch_and_one_terminal_event(self):
-        class Explorer(GlobalFrontierWorkItemLifecycleMixin):
+        class Explorer(
+            GlobalFrontierWorkItemLifecycleMixin,
+            GlobalFrontierCandidateWorkItemMixin,
+        ):
             def __init__(self):
                 self.place_work_items = PlaceWorkItemLedger(merge_radius=0.5)
                 self.active_work_item_id = None
@@ -191,6 +219,11 @@ class FrontierWorkItemComponentsTest(unittest.TestCase):
                 self.active_work_item_route_kind = None
                 self.active_work_item_dispatch_announced = False
                 self.active_route_id = 17
+                self.frontier_approach_distance = 1.0
+                self.completed_radius = 1.25
+                self.map_msg = SimpleNamespace(
+                    info=SimpleNamespace(resolution=0.5),
+                )
                 self.events = []
 
             def publish_status(self, event, **fields):
@@ -224,6 +257,96 @@ class FrontierWorkItemComponentsTest(unittest.TestCase):
         ])
         self.assertEqual(explorer.events[0][1]["place_id"], 4)
         self.assertEqual(explorer.events[1][1]["work_item_state"], "resolved")
+
+    def test_far_endpoint_coverage_fails_attempt_without_resolving_work_item(self):
+        class Explorer(
+            GlobalFrontierWorkItemLifecycleMixin,
+            GlobalFrontierCandidateWorkItemMixin,
+        ):
+            def __init__(self):
+                self.place_work_items = PlaceWorkItemLedger(merge_radius=0.5)
+                self.active_work_item_id = None
+                self.active_work_item_attempt_id = None
+                self.active_work_item_place_id = None
+                self.active_work_item_goal = None
+                self.active_work_item_route_kind = None
+                self.active_work_item_dispatch_announced = False
+                self.active_route_id = 22
+                self.frontier_approach_distance = 1.0
+                self.completed_radius = 1.25
+                self.map_msg = SimpleNamespace(
+                    info=SimpleNamespace(resolution=0.5),
+                )
+                self.events = []
+
+            def publish_status(self, event, **fields):
+                self.events.append((event, fields))
+
+        explorer = Explorer()
+        item = explorer.place_work_items._new_item(
+            4,
+            frozenset({(1, 1)}),
+            now=1.0,
+            anchor_xy=(0.0, 0.0),
+            normal_xy=(1.0, 0.0),
+        )
+        explorer.place_work_items.dispatch_existing(
+            item["id"],
+            now=1.1,
+            viewpoint_xy=(5.0, 0.0),
+            map_goal=(5.0, 0.0),
+            route_kind="frontier_endpoint",
+        )
+        explorer.active_work_item_id = item["id"]
+        explorer.active_work_item_attempt_id = explorer.place_work_items.active_attempt_id(
+            item["id"]
+        )
+        explorer.active_work_item_place_id = 4
+        explorer.active_work_item_goal = (5.0, 0.0)
+        explorer.active_work_item_route_kind = "frontier_endpoint"
+
+        result = explorer.settle_active_work_item(
+            2.0, WORK_RESOLVED, "endpoint_coverage_recorded",
+        )
+
+        self.assertIs(result, item)
+        self.assertEqual(item["state"], "unresolved")
+        self.assertEqual(item["attempts"][-1]["state"], ATTEMPT_FAILED)
+        self.assertEqual(
+            item["attempts"][-1]["reason"], "goal_too_far_from_work_item",
+        )
+        self.assertFalse(any(
+            event == "work_item_settled" for event, _fields in explorer.events
+        ))
+        rejected = [
+            fields for event, fields in explorer.events
+            if event == "viewpoint_attempt_settled"
+        ]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "goal_too_far_from_work_item")
+
+        retry = explorer.place_work_items.dispatch_existing(
+            item["id"],
+            now=3.0,
+            viewpoint_xy=(0.5, 0.0),
+            map_goal=(0.5, 0.0),
+            route_kind="frontier_endpoint",
+        )
+        explorer.active_work_item_id = retry
+        explorer.active_work_item_attempt_id = explorer.place_work_items.active_attempt_id(
+            retry
+        )
+        explorer.active_work_item_place_id = 4
+        explorer.active_work_item_goal = (0.5, 0.0)
+        explorer.active_work_item_route_kind = "frontier_endpoint"
+        explorer.settle_active_work_item(
+            4.0, WORK_RESOLVED, "endpoint_coverage_recorded",
+        )
+
+        self.assertEqual(item["state"], WORK_RESOLVED)
+        self.assertTrue(any(
+            event == "work_item_settled" for event, _fields in explorer.events
+        ))
 
     def test_prefetched_reservation_respects_the_method_capability_gate(self):
         class Explorer(GlobalFrontierWorkItemLifecycleMixin):
@@ -277,12 +400,12 @@ class FrontierWorkItemComponentsTest(unittest.TestCase):
         ledger.settle(item_id, WORK_RESOLVED, now=2.0, reason="observed")
 
         # GMapping moved the map frame by +0.4 m. The new map frontier is
-        # farther along the same unknown side, while its odom support remains
+        # shifted slightly along the same unknown side, while its odom support remains
         # physically continuous with the completed parent.
         next_frontier = np.zeros_like(first_frontier)
         next_unknown = np.zeros_like(first_frontier)
-        next_frontier[2, 7] = True
-        next_unknown[2, 8:18] = True
+        next_frontier[2, 3] = True
+        next_unknown[2, 4:18] = True
         shifted = observation_supports(
             next_frontier,
             next_unknown,
@@ -293,7 +416,7 @@ class FrontierWorkItemComponentsTest(unittest.TestCase):
         )
         second_cells, details = ledger.reconcile(4, shifted, now=3.0)
 
-        self.assertEqual(second_cells[(2, 7)], item_id)
+        self.assertEqual(second_cells[(2, 3)], item_id)
         self.assertEqual(details[item_id]["match"], "resolved_descendant")
         self.assertFalse(ledger.work_item_is_available(item_id))
 
@@ -411,6 +534,67 @@ class FrontierWorkItemComponentsTest(unittest.TestCase):
         self.assertEqual(cells[(3, 3)], item_id)
         self.assertEqual(details[item_id]["match"], "resolved_descendant")
         self.assertFalse(ledger.work_item_is_available(item_id))
+
+    def test_unobserved_remainder_of_a_resolved_support_mints_new_work(self):
+        """Coverage evidence may only include cells the map proved observed.
+
+        The endpoint's view can cover part of a support patch.  Recording the
+        whole patch as resolution evidence would let the resolved-descendant
+        rule suppress the unseen remainder forever, which is how exploration
+        could declare itself complete with reachable unknown space left.
+        """
+        ledger = PlaceWorkItemLedger(merge_radius=0.5)
+        parent = ObservationSupport(
+            frontier_cells=frozenset({(1, 1)}),
+            support_cells=frozenset({(10, 10), (10, 11)}),
+            anchor_xy=(1.0, 1.0),
+            normal_xy=(1.0, 0.0),
+        )
+        cells, _details = ledger.reconcile(9, (parent,), now=1.0)
+        item_id = cells[(1, 1)]
+        ledger.dispatch_existing(item_id, now=1.1)
+        ledger.settle(item_id, WORK_RESOLVED, now=2.0, reason="observed")
+
+        # The map proves (10,10) observed but (10,11) still unknown.
+        unobserved = ledger.restrict_support_to_observed(
+            item_id,
+            lambda cell: cell == (10, 11),
+        )
+
+        self.assertEqual(unobserved, 1)
+        self.assertEqual(ledger.support_for(item_id), frozenset({(10, 10)}))
+        self.assertEqual(
+            ledger._items[item_id]["unobserved_support_cells"],
+            frozenset({(10, 11)}),
+        )
+
+        # An arc over the still-unknown remainder must be new work: it was
+        # never observed, so it cannot be a descendant of observed coverage.
+        remainder = ObservationSupport(
+            frontier_cells=frozenset({(5, 5)}),
+            support_cells=frozenset({(10, 11)}),
+            anchor_xy=(3.0, 3.0),
+            normal_xy=(1.0, 0.0),
+        )
+        remainder_cells, remainder_details = ledger.reconcile(
+            9, (remainder,), now=3.0,
+        )
+        self.assertNotEqual(remainder_cells[(5, 5)], item_id)
+        self.assertEqual(remainder_details[remainder_cells[(5, 5)]]["match"], "created")
+        self.assertTrue(ledger.work_item_is_available(remainder_cells[(5, 5)]))
+
+        # An arc over the genuinely observed cell near the original anchor is still suppressed.
+        observed = ObservationSupport(
+            frontier_cells=frozenset({(6, 6)}),
+            support_cells=frozenset({(10, 10)}),
+            anchor_xy=(1.2, 1.0),
+            normal_xy=(1.0, 0.0),
+        )
+        observed_cells, observed_details = ledger.reconcile(
+            9, (observed,), now=4.0,
+        )
+        self.assertEqual(observed_cells[(6, 6)], item_id)
+        self.assertEqual(observed_details[item_id]["match"], "resolved_descendant")
 
     def test_wall_separated_unknown_sides_remain_two_work_items(self):
         ledger = PlaceWorkItemLedger(merge_radius=0.5)

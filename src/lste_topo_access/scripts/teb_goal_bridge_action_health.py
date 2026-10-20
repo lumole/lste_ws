@@ -19,6 +19,7 @@ from clock_provider import now_for
 
 class TebGoalBridgeActionHealthMixin:
     _ROUTE_LEASE_WATCHDOG_SECONDS = 10.0
+    _PENDING_LEASE_RELEASE_WATCHDOG_SECONDS = 10.0
     _ACTION_TOMBSTONE_LIMIT = 128
 
     @staticmethod
@@ -507,6 +508,193 @@ class TebGoalBridgeActionHealthMixin:
             return False
         return self._expire_route_lease_watchdog_locked(current)
 
+    def _shutdown_pending_lease_release_watchdog_timer_locked(self):
+        timer = getattr(self, "pending_lease_release_watchdog_timer", None)
+        self.pending_lease_release_watchdog_timer = None
+        if timer is None:
+            return
+        shutdown = getattr(timer, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception as exc:  # pragma: no cover - ROS shutdown edge
+                rospy.logwarn(
+                    "pending lease-release watchdog timer shutdown failed: %s",
+                    exc,
+                )
+
+    def _cancel_pending_lease_release_watchdog_locked(self, reason):
+        record = getattr(self, "pending_lease_release_watchdog", None)
+        if not isinstance(record, dict):
+            return False
+        self._shutdown_pending_lease_release_watchdog_timer_locked()
+        self.pending_lease_release_watchdog = None
+        self.publish_bridge_status(
+            "pending_controller_lease_release_watchdog_cancelled",
+            route_id=self._watchdog_int(record.get("route_id")),
+            action_generation=self._watchdog_int(
+                record.get("action_generation")
+            ),
+            transaction_id=self._watchdog_int(record.get("transaction_id")),
+            reason=str(reason or "unspecified"),
+            watchdog_record=dict(record),
+        )
+        return True
+
+    def _arm_pending_lease_release_watchdog_locked(self, prepared):
+        """Bound the semantic release wait independently of actionlib."""
+        if not isinstance(prepared, dict):
+            return False
+        old_contract = prepared.get("old_contract")
+        if not isinstance(old_contract, dict):
+            old_contract = {}
+        existing = getattr(self, "pending_lease_release_watchdog", None)
+        if isinstance(existing, dict):
+            existing_route = self._watchdog_int(existing.get("route_id"))
+            current_route = self._watchdog_int(old_contract.get("route_id"))
+            if existing_route == current_route and current_route > 0:
+                return True
+            self._cancel_pending_lease_release_watchdog_locked("rearmed")
+        now = float(now_for(self))
+        record = {
+            "old_contract": dict(old_contract),
+            "route_id": self._watchdog_int(old_contract.get("route_id")),
+            "action_generation": self._watchdog_int(
+                old_contract.get(
+                    "generation", old_contract.get("action_generation")
+                )
+            ),
+            "transaction_id": self._watchdog_int(
+                old_contract.get("transaction_id")
+            ),
+            "graph_transaction_id": self._watchdog_int(
+                old_contract.get("graph_transaction_id")
+            ),
+            "started_at": now,
+            "deadline": now + float(
+                getattr(
+                    self,
+                    "pending_lease_release_timeout",
+                    self._PENDING_LEASE_RELEASE_WATCHDOG_SECONDS,
+                )
+            ),
+            "reason": str(prepared.get("reason", "terminal_release")),
+        }
+        self.pending_lease_release_watchdog = record
+        self.pending_lease_release_watchdog_timer = None
+        try:
+            if not getattr(rospy, "is_shutdown", lambda: False)():
+                self.pending_lease_release_watchdog_timer = rospy.Timer(
+                    rospy.Duration(
+                        max(0.1, record["deadline"] - now)
+                    ),
+                    self._pending_lease_release_watchdog_timer_callback,
+                    oneshot=True,
+                )
+        except Exception as exc:  # pragma: no cover - ROS startup edge
+            rospy.logwarn(
+                "pending lease-release watchdog timer start failed: %s", exc
+            )
+        self.publish_bridge_status(
+            "pending_controller_lease_release_watchdog_armed",
+            route_id=record["route_id"],
+            action_generation=record["action_generation"],
+            transaction_id=record["transaction_id"],
+            graph_transaction_id=record["graph_transaction_id"],
+            started_at=record["started_at"],
+            deadline=record["deadline"],
+            timeout_seconds=record["deadline"] - now,
+            reason=record["reason"],
+        )
+        return True
+
+    def _pending_lease_release_watchdog_timer_callback(self, _event):
+        lifecycle = getattr(self, "lifecycle_manager", None)
+        enqueue = getattr(lifecycle, "enqueue_type", None)
+        if callable(enqueue):
+            from lifecycle_manager import EventType
+
+            enqueue(EventType.BRIDGE_WAKE, None)
+            return
+        with self.lock:
+            self._tick_pending_lease_release_watchdog_locked(now_for(self))
+
+    def _tick_pending_lease_release_watchdog_locked(self, now=None):
+        record = getattr(self, "pending_lease_release_watchdog", None)
+        pending = getattr(self, "pending_lease_release_contract", None)
+        if not isinstance(record, dict) or not isinstance(pending, dict):
+            if isinstance(record, dict):
+                self._cancel_pending_lease_release_watchdog_locked(
+                    "pending_contract_cleared"
+                )
+            return False
+        current = float(now_for(self) if now is None else now)
+        if current < float(record.get("deadline", current)):
+            return False
+        return self._expire_pending_lease_release_watchdog_locked(current)
+
+    def _expire_pending_lease_release_watchdog_locked(self, now=None):
+        """Release a semantic lease whose exact upstream ACK never arrived."""
+        record = getattr(self, "pending_lease_release_watchdog", None)
+        pending = getattr(self, "pending_lease_release_contract", None)
+        if not isinstance(record, dict) or not isinstance(pending, dict):
+            return False
+        self._shutdown_pending_lease_release_watchdog_timer_locked()
+        self.pending_lease_release_watchdog = None
+        old_contract = pending.get("old_contract")
+        old_contract = old_contract if isinstance(old_contract, dict) else pending
+        route_id = self._watchdog_int(
+            old_contract.get("route_id", record.get("route_id"))
+        )
+        reason = "pending_controller_lease_release_timeout"
+        self.publish_bridge_status(
+            "pending_controller_lease_release_watchdog_expired",
+            route_id=route_id,
+            action_generation=self._watchdog_int(
+                old_contract.get(
+                    "generation", old_contract.get("action_generation")
+                )
+            ),
+            transaction_id=self._watchdog_int(old_contract.get("transaction_id")),
+            timeout_seconds=float(
+                getattr(
+                    self,
+                    "pending_lease_release_timeout",
+                    self._PENDING_LEASE_RELEASE_WATCHDOG_SECONDS,
+                )
+            ),
+            expired_at=float(now_for(self) if now is None else now),
+            reason=reason,
+            owner_revoked=True,
+        )
+        source = str(old_contract.get("source", "unknown") or "unknown").strip().lower()
+        if source == "global_slam_frontier" and route_id > 0:
+            release = getattr(self, "_release_frontier_controller_lease_locked", None)
+            if callable(release):
+                release(
+                    route_id,
+                    reason,
+                    publish_release_ack=True,
+                    release_contract=old_contract,
+                )
+            else:
+                self.pending_lease_release_contract = None
+            return True
+        # Target/controller handoffs do not use the frontier ACK protocol, but
+        # they still must not leave the bridge permanently blocked.
+        self.pending_lease_release_contract = None
+        self.pending_terminal_prepare = None
+        self.handoff_requested = False
+        self.latest_goal = None
+        self.last_dispatched_goal = None
+        self.last_dispatch_identity = None
+        self.publish_bridge_status(
+            "pending_controller_lease_release_forced_clear",
+            route_id=route_id,
+            reason=reason,
+        )
+        return True
+
     def _expire_route_lease_watchdog_locked(self, now=None):
         """Force release a terminal route whose downstream handoff is silent."""
         record = getattr(self, "route_lease_watchdog", None)
@@ -587,6 +775,9 @@ class TebGoalBridgeActionHealthMixin:
                 release_phase="route_lease_watchdog_expired",
             )
             self.pending_lease_release_contract = None
+            self._cancel_pending_lease_release_watchdog_locked(
+                "route_lease_watchdog_expired"
+            )
         if self._watchdog_int(record.get("priority")) >= 2:
             self.target_lease_tombstone_transaction_id = max(
                 self._watchdog_int(
@@ -949,6 +1140,9 @@ class TebGoalBridgeActionHealthMixin:
         # MoveBase reports terminal, but the separate semantic tombstone has
         # already been consumed and must not block the successor indefinitely.
         self.pending_lease_release_contract = None
+        self._cancel_pending_lease_release_watchdog_locked(
+            "frontier_controller_release"
+        )
         self.handoff_requested = False
         self.frontier_observation_completion_pending = None
         self.frontier_continuous_prefetch_handoff_pending = None
@@ -1062,6 +1256,10 @@ class TebGoalBridgeActionHealthMixin:
             publish_terminal=False,
             arm_watchdog=False,
         )
+        self._cancel_pending_lease_release_watchdog_locked(
+            "explicit_cancel"
+        )
+        self.pending_lease_release_contract = None
         self.handoff_requested = False
         self.persistent_frontier_endpoint_pending = None
         self.persistent_target_terminal_boundary_transaction = 0

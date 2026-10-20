@@ -274,6 +274,16 @@ class EvidenceEventGraph:
 
     def _apply(self, event, fields, route_id, place_id, work_item_id, portal_id):
         """Project stable IDs and lifecycle labels for replay diagnostics."""
+        # Every event that *defines* a Place names it ``region_id``:
+        # physical_place_bootstrapped, portal_place_entered,
+        # portal_place_covered_arrival and the frontier_place_* lifecycle.  The
+        # shared extraction above reads place_id/active_region_id/
+        # source_place_id instead, and for a Portal arrival that chain falls
+        # back to the *source* Place.  Without this fallback a Place that
+        # really exists -- the destination of a crossing the robot has already
+        # made -- was absent from ``place_states``, so place_count reported 1
+        # while the robot stood in P2.
+        region_place_id = _id(fields.get("region_id"))
         if event == "semantic_task_updated":
             self.task_version = _text(fields.get("task_version"))
         elif event == "route_command":
@@ -296,13 +306,21 @@ class EvidenceEventGraph:
                     self.active_route_id = 0
                     self.active_route_kind = ""
         elif event.startswith("frontier_place_") or event == "physical_place_bootstrapped":
-            if place_id:
-                self.place_states[place_id] = _text(
+            place_key = place_id or region_place_id
+            if place_key:
+                self.place_states[place_key] = _text(
                     fields.get("state", event.replace("frontier_place_", ""))
                 )
         elif event.startswith("portal_"):
             if portal_id:
                 self.portal_states[portal_id] = event
+            if event in (
+                "portal_place_entered",
+                "portal_place_covered_arrival",
+            ) and region_place_id:
+                # A Portal arrival is the only announcement the destination
+                # Place ever gets, and it names it as region_id.
+                self.place_states[region_place_id] = "entered"
         elif event in ("frontier_action_selected",):
             if work_item_id:
                 self.work_states[work_item_id] = _text(

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Durable place-memory commit for structurally verified portal arrivals."""
 
+import math
+
 import rospy
 
 
@@ -126,6 +128,21 @@ class GlobalFrontierPortalArrivalCommitMixin:
                 bound_destination = int(hypothesis["source_place_id"])
         except (TypeError, ValueError):
             bound_destination = None
+        # The active hypothesis may be a freshly certified edge for a doorway
+        # that is already crossed: a revisit from the opposite side presents
+        # the mirrored direction, which is a different directed identity, so
+        # this hypothesis holds no destination of its own.  Mattering here is
+        # the difference between one Place per room and one Place per
+        # direction -- without it the force_new path below mints a duplicate.
+        if bound_destination is None:
+            sibling_lookup = getattr(
+                hypothesis_ledger, "crossed_destination_for_gate", None,
+            )
+            if callable(sibling_lookup):
+                bound_destination = sibling_lookup(
+                    arrival.physical_portal_gate_xy,
+                    arrival.source_region_id,
+                )
         enter_bound = getattr(
             self.region_memory, "enter_bound_portal_destination", None,
         )
@@ -590,3 +607,222 @@ class GlobalFrontierPortalArrivalCommitMixin:
             evidence_source,
         )
         return region
+
+    def detect_and_commit_post_hoc_place_transition(
+        self, x, y, physical_xy=None, component=None, source_place_id=None, now=None,
+    ):
+        """Detect and commit a retroactive Place and Portal when navigating into a new space.
+
+        When a WorkItem route traverses an uncertified opening into a new space
+        without an explicit portal_transition action, this method detects upon
+        arrival that the robot has entered a new room/component, retroactively
+        creates the destination Place, certifies and binds the crossed doorway in
+        portal_hypothesis_ledger, reattributes the WorkItem, and updates
+        current_physical_place_id.
+        """
+        if not getattr(self, "enable_post_hoc_place_transition", False):
+            return None
+        if now is None:
+            now = (
+                getattr(self, "now_for", lambda _: 0.0)(self)
+                if hasattr(self, "now_for")
+                else 0.0
+            )
+        if source_place_id is None:
+            source_place_id = getattr(self, "current_physical_place_id", None) or getattr(
+                self, "active_frontier_region_id", None
+            )
+        if source_place_id is None:
+            return None
+        try:
+            source_place_id = int(source_place_id)
+        except (TypeError, ValueError):
+            return None
+
+        memory = getattr(self, "region_memory", None)
+        if memory is None:
+            return None
+        source_region = memory.by_id(source_place_id)
+        if source_region is None:
+            return None
+
+        # Check if the arrival endpoint indicates a transition to a different or new Place.
+        # 1. Candidate tier check
+        candidate_tier_fn = getattr(memory, "candidate_tier", None)
+        is_new_place = False
+        target_place_id = None
+        if callable(candidate_tier_fn):
+            tier, candidate_region = candidate_tier_fn(
+                x, y, 0.0, component=component, physical_xy=physical_xy,
+            )
+            if tier == "new" or candidate_region is None:
+                is_new_place = True
+            elif candidate_region is not None and int(candidate_region["id"]) != source_place_id:
+                target_place_id = int(candidate_region["id"])
+
+        # 2. Structural component label mismatch check within same epoch
+        if not is_new_place and target_place_id is None and component is not None:
+            source_component = source_region.get("component")
+            if source_component is not None:
+                try:
+                    same_epoch = int(source_component.get("epoch", -1)) == int(
+                        component.get("epoch", -2)
+                    )
+                    diff_label = int(source_component.get("label", -1)) != int(
+                        component.get("label", -2)
+                    )
+                    if same_epoch and diff_label and int(component.get("label", -2)) > 0:
+                        is_new_place = True
+                except (KeyError, TypeError, ValueError):
+                    pass
+
+        # 3. Anchor distance check (far outside source region radius)
+        if not is_new_place and target_place_id is None:
+            source_x = float(source_region.get("x", x))
+            source_y = float(source_region.get("y", y))
+            radius = float(getattr(memory, "radius", 5.0))
+            if math.hypot(float(x) - source_x, float(y) - source_y) > radius * 1.5:
+                is_new_place = True
+
+        if not is_new_place and target_place_id is None:
+            return None
+
+        # Estimate gate coordinates between source region and arrival point
+        source_x = float(source_region.get("x", x))
+        source_y = float(source_region.get("y", y))
+        gate_xy = ((source_x + float(x)) / 2.0, (source_y + float(y)) / 2.0)
+
+        physical_destination = physical_xy if physical_xy is not None else (float(x), float(y))
+        source_physical_pts = source_region.get("physical_viewpoints") or source_region.get(
+            "physical_arrival_points"
+        )
+        if source_physical_pts:
+            src_pt = source_physical_pts[0]
+            physical_gate = (
+                (float(src_pt[0]) + float(physical_destination[0])) / 2.0,
+                (float(src_pt[1]) + float(physical_destination[1])) / 2.0,
+            )
+        else:
+            physical_gate = gate_xy
+
+        # Certify and cross in portal_hypothesis_ledger
+        ledger = getattr(self, "portal_hypothesis_ledger", None)
+        portal_id = None
+        record = None
+        if ledger is not None:
+            certify_fn = getattr(ledger, "certify", None)
+            if callable(certify_fn):
+                record, _created = certify_fn(
+                    source_place_id=source_place_id,
+                    gate_xy=physical_gate,
+                    destination_xy=physical_destination,
+                    now=now,
+                    map_gate_xy=gate_xy,
+                    map_destination_xy=(float(x), float(y)),
+                )
+                if record is not None:
+                    portal_id = int(record["id"])
+                    crossed_fn = getattr(ledger, "crossed", None)
+                    if callable(crossed_fn):
+                        crossed_fn(portal_id, now=now)
+
+        # Materialize / enter destination Place
+        new_region = None
+        tier = "new"
+        if target_place_id is not None:
+            enter_bound = getattr(memory, "enter_bound_portal_destination", None)
+            if callable(enter_bound):
+                new_region, tier = enter_bound(
+                    target_place_id,
+                    float(x),
+                    float(y),
+                    now,
+                    component=component,
+                    entry_portal=gate_xy,
+                    physical_xy=physical_destination,
+                    physical_entry_portal=physical_gate,
+                    source_place_id=source_place_id,
+                )
+            if new_region is None:
+                new_region = memory.by_id(target_place_id)
+        else:
+            destination_enter = getattr(memory, "enter_new_portal_destination", None)
+            if callable(destination_enter):
+                new_region, tier = destination_enter(
+                    float(x),
+                    float(y),
+                    now,
+                    component=component,
+                    entry_portal=gate_xy,
+                    physical_xy=physical_destination,
+                    physical_entry_portal=physical_gate,
+                    source_place_id=source_place_id,
+                )
+            else:
+                enter_fn = getattr(memory, "enter", None)
+                if callable(enter_fn):
+                    new_region, tier = enter_fn(
+                        float(x),
+                        float(y),
+                        now,
+                        component=component,
+                        entry_portal=gate_xy,
+                        physical_xy=physical_destination,
+                        physical_entry_portal=physical_gate,
+                        source_place_id=source_place_id,
+                        force_new=True,
+                    )
+
+        if new_region is None:
+            return None
+
+        new_place_id = int(new_region["id"])
+
+        # Bind destination in portal ledger
+        if ledger is not None and portal_id is not None:
+            bind_fn = getattr(ledger, "bind_destination", None)
+            if callable(bind_fn):
+                bind_fn(portal_id, new_place_id, now=now)
+
+        # Update physical place and active region
+        self.current_physical_place_id = new_place_id
+        self.active_frontier_region_id = new_place_id
+        if hasattr(self, "active_work_item_place_id"):
+            self.active_work_item_place_id = new_place_id
+
+        # Reattribute active WorkItem and nearby items to the new Place
+        work_items = getattr(self, "place_work_items", None)
+        active_item_id = getattr(self, "active_work_item_id", None)
+        if work_items is not None:
+            if active_item_id is not None:
+                reattribute_fn = getattr(work_items, "reattribute_work_item", None)
+                if callable(reattribute_fn):
+                    reattribute_fn(active_item_id, new_place_id, now=now)
+            reattribute_near = getattr(work_items, "reattribute_items_near", None)
+            if callable(reattribute_near):
+                reattribute_near(
+                    source_place_id, new_place_id, physical_destination, now=now
+                )
+
+        # Publish status events
+        publish = getattr(self, "publish_status", None)
+        if callable(publish):
+            publish(
+                "work_item_promoted_to_new_place",
+                source_place_id=source_place_id,
+                new_place_id=new_place_id,
+                work_item_id=(None if active_item_id is None else int(active_item_id)),
+                portal_id=portal_id,
+                reason="post_hoc_place_transition_committed",
+            )
+            publish(
+                "portal_place_entered",
+                portal_id=portal_id,
+                region_id=new_place_id,
+                region_tier=str(tier),
+                reason="post_hoc_place_transition_committed",
+                evidence_source="post_hoc_work_item_arrival",
+            )
+
+        return new_region
+

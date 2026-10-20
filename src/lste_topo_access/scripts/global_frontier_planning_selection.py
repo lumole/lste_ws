@@ -24,11 +24,17 @@ class GlobalFrontierPlanningSelectionMixin:
         if not callable(get_ids):
             return None
         visible_work_item_ids, visible_probe_ids, visible_portal_ids = get_ids()
+        robot_pose = getattr(self, "robot_map", None)
+        if robot_pose is None:
+            context = getattr(self, "last_selection_context", None)
+            if context is not None:
+                robot_pose = getattr(context, "robot_map", None) or getattr(context, "route_anchor_xy", None)
         return {
             "visible_work_item_ids": visible_work_item_ids,
             "visible_probe_ids": visible_probe_ids,
             "visible_portal_ids": visible_portal_ids,
             "map_epoch": snapshot_epoch,
+            "robot_pose": robot_pose,
         }
 
     def _materialize_graph_successor_first(self, snapshot, snapshot_epoch):
@@ -273,6 +279,11 @@ class GlobalFrontierPlanningSelectionMixin:
 
     def select_next_active_frontier(self, snapshot):
         """Choose a terminal successor after resolving cache and claim policy."""
+        if (
+            callable(getattr(self, "is_startup_warmup_active", None))
+            and self.is_startup_warmup_active(snapshot.now)
+        ):
+            return None, "startup_warmup_wait", True
         snapshot_epoch = getattr(
             getattr(getattr(snapshot, "map_context", None), "components", None),
             "epoch",

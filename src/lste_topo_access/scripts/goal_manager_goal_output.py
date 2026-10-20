@@ -278,7 +278,142 @@ class GoalManagerGoalOutputMixin:
             goal.pose.orientation.w = qw
         return goal
 
+    def costmap_endpoint_admission(self, goal: Optional[PoseStamped]):
+        """Return whether ``goal`` is a known, zero-cost safe endpoint.
+
+        Navfn can return a path to an inflated endpoint because its tolerance
+        is a path-connectivity check. GoalManager owns several non-frontier
+        sources (context follow, recovery, and target viewpoints), so they
+        need the explicit endpoint contract as well. ``None`` means the live
+        costmap/TF is not ready; callers must defer rather than publish.
+        """
+        if goal is None:
+            return False
+        costmap = getattr(self, "latest_costmap", None)
+        if costmap is None:
+            rospy.loginfo_throttle(
+                5.0,
+                "GoalManager: defer goal until global costmap is available",
+            )
+            return None
+        try:
+            received = float(getattr(self, "latest_costmap_received_at", 0.0))
+            if received > 0.0:
+                now = rospy.Time.now().to_sec()
+                if now - received > float(self.goal_costmap_max_age):
+                    rospy.logwarn_throttle(
+                        5.0,
+                        "GoalManager: defer goal while global costmap is stale age=%.2fs limit=%.2fs",
+                        now - received,
+                        float(self.goal_costmap_max_age),
+                    )
+                    return None
+            resolution = float(costmap.info.resolution)
+            width = int(costmap.info.width)
+            height = int(costmap.info.height)
+            if resolution <= 0.0 or width <= 0 or height <= 0:
+                return None
+            if len(costmap.data) != width * height:
+                return None
+            frame = self._frame_name(
+                getattr(costmap.header, "frame_id", "map") or "map"
+            )
+            endpoint = self._pose_in_frame(goal, frame)
+            if endpoint is None:
+                return None
+            origin = costmap.info.origin.position
+            col = int(math.floor(
+                (float(endpoint.pose.position.x) - float(origin.x)) / resolution
+            ))
+            row = int(math.floor(
+                (float(endpoint.pose.position.y) - float(origin.y)) / resolution
+            ))
+            if not (0 <= row < height and 0 <= col < width):
+                self.publish_goal_arbitration(
+                    "goal_rejected_costmap_endpoint",
+                    reason="out_of_bounds",
+                    source=str(getattr(self, "goal_source", "unknown")),
+                    goal=[float(goal.pose.position.x), float(goal.pose.position.y)],
+                )
+                return False
+            data = costmap.data
+            cost = int(data[row * width + col])
+            if cost != 0:
+                self.publish_goal_arbitration(
+                    "goal_rejected_costmap_endpoint",
+                    reason="non_free_endpoint",
+                    source=str(getattr(self, "goal_source", "unknown")),
+                    goal=[float(goal.pose.position.x), float(goal.pose.position.y)],
+                    cost=cost,
+                )
+                rospy.logwarn_throttle(
+                    2.0,
+                    "GoalManager: rejected non-free endpoint goal=(%.2f,%.2f) cost=%d source=%s",
+                    float(goal.pose.position.x),
+                    float(goal.pose.position.y),
+                    cost,
+                    str(getattr(self, "goal_source", "unknown")),
+                )
+                return False
+            # Costmap lethal cells already include the inscribed footprint;
+            # reserve the remaining route clearance around the endpoint.
+            radius = max(
+                0.0,
+                float(self.goal_costmap_clearance)
+                - float(rospy.get_param("/move_base/global_costmap/robot_radius", 0.30)),
+            )
+            margin = int(math.ceil(radius / resolution))
+            margin_sq = margin * margin
+            for dr in range(-margin, margin + 1):
+                for dc in range(-margin, margin + 1):
+                    if dr * dr + dc * dc > margin_sq:
+                        continue
+                    rr, cc = row + dr, col + dc
+                    if 0 <= rr < height and 0 <= cc < width:
+                        if int(data[rr * width + cc]) >= 100:
+                            self.publish_goal_arbitration(
+                                "goal_rejected_costmap_endpoint",
+                                reason="lethal_margin",
+                                source=str(getattr(self, "goal_source", "unknown")),
+                                goal=[float(goal.pose.position.x), float(goal.pose.position.y)],
+                            )
+                            return False
+            return True
+        except (AttributeError, IndexError, TypeError, ValueError, rospy.ROSException):
+            return None
+
     def publish_goal(self, goal: PoseStamped, force_republish: bool = False):
+        if (
+            str(getattr(self, "goal_source", "")) == "global_slam_frontier"
+            and int(getattr(self, "frontier_replan_pending_id", 0) or 0) > 0
+            and int(getattr(self, "frontier_replan_ready_id", 0) or 0)
+            != int(getattr(self, "frontier_replan_pending_id", 0) or 0)
+        ):
+            self.goal_source = "waiting_costmap_endpoint_replan"
+            return False
+        admission = self.costmap_endpoint_admission(goal)
+        if admission is not True:
+            if (
+                admission is False
+                and str(getattr(self, "goal_source", "")) == "global_slam_frontier"
+            ):
+                key = (
+                    int(getattr(self, "global_frontier_route_id", 0) or 0),
+                    round(float(goal.pose.position.x), 3),
+                    round(float(goal.pose.position.y), 3),
+                )
+                if key != getattr(self, "costmap_rejected_goal_key", None):
+                    self.costmap_rejected_goal_key = key
+                    self.request_global_frontier_replan(
+                        "costmap_endpoint_rejected",
+                        blocked_goal=[key[1], key[2]],
+                        route_id=key[0],
+                    )
+            if str(getattr(self, "goal_source", "")).startswith("ctx_"):
+                self.ctx_last_goal = None
+                self.ctx_last_update = 0.0
+            self.goal_source = "waiting_costmap_endpoint"
+            return False
         previous_goal = self.last_goal
         frontier_context = None
         frontier_context_changed = False

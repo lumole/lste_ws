@@ -58,6 +58,18 @@ FAILURE_REASON = load_method(
     "active_route_failure_reason",
     {},
 )
+ACTUATOR_FORWARDING = load_method(
+    WATCHDOG_SOURCE,
+    "GlobalFrontierExecutionWatchdogMixin",
+    "route_actuator_is_forwarding",
+    {},
+)
+ACTUATOR_DIAGNOSTIC = load_method(
+    WATCHDOG_SOURCE,
+    "GlobalFrontierExecutionWatchdogMixin",
+    "route_actuator_diagnostic",
+    {},
+)
 GATE_APPROACH = load_method(
     OBSERVATION_SOURCE,
     "GlobalFrontierExecutionObservationMixin",
@@ -69,6 +81,10 @@ GATE_APPROACH = load_method(
 class PortalWatchdogExplorer:
     evaluate_active_route_watchdogs = EVALUATE
     active_route_failure_reason = FAILURE_REASON
+    # No ``route_actuator`` here, so the actuator gate reports forwarding and
+    # these cases keep the historical elapsed-time semantics they assert.
+    route_actuator_is_forwarding = ACTUATOR_FORWARDING
+    route_actuator_diagnostic = ACTUATOR_DIAGNOSTIC
 
     def __init__(self, route_kind):
         self.active_route_kind = route_kind

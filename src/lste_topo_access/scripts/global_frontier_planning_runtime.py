@@ -250,7 +250,39 @@ class GlobalFrontierPlanningRuntimeMixin:
         if pose is None:
             return
         message, robot_map, robot_yaw_map, now = pose
+        if (
+            callable(getattr(self, "is_startup_warmup_active", None))
+            and self.is_startup_warmup_active(now)
+        ):
+            first_map_time = getattr(self, "first_map_received_time", now)
+            warmup_remaining = max(
+                0.0,
+                float(getattr(self, "exploration_startup_warmup_seconds", 0.0) or 0.0)
+                - (float(now) - float(first_map_time)),
+            )
+            now_wall = time.monotonic()
+            last_report = float(
+                getattr(self, "last_startup_warmup_status_wall", 0.0) or 0.0
+            )
+            if now_wall - last_report >= 1.0:
+                self.last_startup_warmup_status_wall = now_wall
+                publish = getattr(self, "publish_status", None)
+                if callable(publish):
+                    publish(
+                        "startup_warmup_active",
+                        status="startup_warmup_active",
+                        remaining_seconds=round(warmup_remaining, 2),
+                        warmup_seconds=float(
+                            getattr(self, "exploration_startup_warmup_seconds", 0.0) or 0.0
+                        ),
+                    )
+            return
         if self.active_route_planning_is_deferred(robot_map, now):
+            live_portal_scan = getattr(
+                self, "observe_live_portal_openings_from_map", None
+            )
+            if callable(live_portal_scan):
+                live_portal_scan(message, robot_map, now)
             return
         self.last_planning_wall = now
         snapshot_started = time.monotonic()
@@ -272,6 +304,9 @@ class GlobalFrontierPlanningRuntimeMixin:
         self.last_map_epoch = getattr(
             getattr(snapshot.map_context, "components", None), "epoch", None
         )
+        live_portal_scan = getattr(self, "observe_live_portal_openings", None)
+        if callable(live_portal_scan):
+            live_portal_scan(snapshot)
         if self.planning_should_preempt() or (
             token is not None
             and not self._planning_proposal_is_current(

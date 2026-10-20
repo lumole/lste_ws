@@ -28,6 +28,10 @@ from global_frontier_portal_certification import (
     portal_transition_exit_cell,
     portal_transition_verified_exit_cell,
 )
+from global_frontier_portal_certification_wall import (
+    _has_opposing_wall_supports,
+    _opening_free_run,
+)
 
 
 class PortalCertificationTest(unittest.TestCase):
@@ -143,18 +147,29 @@ class PortalCertificationTest(unittest.TestCase):
         self.assertEqual(transitions[0].portal_cell, (11, 15))
 
     def test_runtime_wall_support_uses_clearance_not_furniture_span(self):
-        """A valid short jamb must survive the runtime evidence adapter."""
+        """A valid short jamb must survive the runtime evidence adapter.
+
+        The doorway is sized the way the runtime sizes evidence: this fixture
+        is 0.10 m per cell, the route clearance is 0.10 m and the structural
+        clearance 0.30 m.  The opening is then passable for the vehicle (route
+        clearance disk plus one cell, three cells) and still narrow enough for
+        the structural-clearance disk to seal it, which is what makes it a
+        throat.  The jambs beside it are only three cells long, so the wall
+        span must come from the structural clearance -- not from the 2.50 m
+        furniture scale.
+        """
         known_free = np.zeros((25, 30), dtype=bool)
         known_free[1:24, 1:29] = True
         known_free[1:24, 15] = False
-        known_free[11:14, 15] = True
+        known_free[10:13, 15] = True
         labels = np.zeros_like(known_free, dtype=np.int32)
         labels[3:22, 2:12] = 1
         labels[3:22, 18:28] = 2
         steps = bfs(known_free, (6, 5))
         structural_occupied = ~known_free
         selector = GlobalFrontierCandidatePortalMixin()
-        selector.region_topology_clearance = 0.52
+        selector.clearance = 0.10
+        selector.region_topology_clearance = 0.30
         selector.place_furniture_max_span_m = 2.50
         request = SimpleNamespace(
             message=SimpleNamespace(info=SimpleNamespace(resolution=0.10)),
@@ -165,7 +180,12 @@ class PortalCertificationTest(unittest.TestCase):
             request.message, request.components,
         )
 
-        self.assertEqual(support_kwargs["minimum_wall_span_cells"], 6)
+        self.assertEqual(support_kwargs["minimum_wall_span_cells"], 3)
+        self.assertEqual(support_kwargs["minimum_opening_cells"], 3)
+        self.assertLess(
+            support_kwargs["minimum_wall_span_cells"],
+            int(selector.place_furniture_max_span_m / 0.10),
+        )
         transitions = certified_route_place_transitions(
             labels,
             steps,
@@ -173,13 +193,54 @@ class PortalCertificationTest(unittest.TestCase):
             6,
             24,
             source_label=1,
-            throat_radius_cells=2,
+            throat_radius_cells=3,
             window_margin_cells=12,
             **support_kwargs,
         )
 
         self.assertEqual(len(transitions), 1)
-        self.assertEqual(transitions[0].portal_cell, (11, 15))
+        self.assertEqual(transitions[0].portal_cell[1], 15)
+        self.assertIn(transitions[0].portal_cell[0], (10, 11, 12))
+
+    def test_one_cell_wall_slit_is_not_a_doorway(self):
+        """Two wall runs one cell apart are a raster slit, not an opening.
+
+        The live demo certified exactly this: a wall column whose two segments
+        rasterised a single free cell apart, with a walkable raw-free route
+        through the slit.  It carries opposing jambs and passes the local cut
+        test, but no footprint fits, so no Place may be minted from it.
+        """
+        known_free = np.zeros((25, 30), dtype=bool)
+        known_free[1:24, 1:29] = True
+        known_free[1:24, 15] = False
+        known_free[12, 15] = True
+        labels = np.zeros_like(known_free, dtype=np.int32)
+        labels[3:22, 2:12] = 1
+        labels[3:22, 18:28] = 2
+        steps = bfs(known_free, (6, 5))
+        structural_occupied = ~known_free
+
+        # The slit satisfies the wall-support evidence on its own.
+        self.assertTrue(_has_opposing_wall_supports(
+            structural_occupied, (12, 15), (1, 0), 6, 3,
+        ))
+        self.assertEqual(_opening_free_run(known_free, (12, 15), (1, 0)), 1)
+
+        transitions = certified_route_place_transitions(
+            labels,
+            steps,
+            known_free,
+            6,
+            24,
+            source_label=1,
+            throat_radius_cells=3,
+            window_margin_cells=12,
+            structural_occupied=structural_occupied,
+            minimum_wall_span_cells=3,
+            minimum_opening_cells=3,
+        )
+
+        self.assertEqual(transitions, [])
 
     def test_portal_execution_exit_is_shortly_beyond_the_doorway(self):
         """A portal action ends after one graph edge, not at a remote core."""

@@ -24,9 +24,28 @@ from global_frontier_observation_coverage import (  # noqa: E402
 from global_frontier_candidate_lifecycle import (  # noqa: E402
     GlobalFrontierCandidateLifecycleMixin,
 )
+from global_frontier_work_items import (  # noqa: E402
+    GlobalFrontierWorkItemLifecycleMixin,
+)
+
+
+# The coverage gate is part of the settle contract; bind the real methods so
+# these tests exercise the production evidence rule rather than a stub.
+COVERAGE_GATE = GlobalFrontierWorkItemLifecycleMixin
+COVERAGE_METHODS = (
+    "active_work_item_support_is_observed",
+    "active_work_item_unknown_support_checker",
+    "_active_support_quantum",
+)
 
 
 class CoverageStub(GlobalFrontierObservationCoverageMixin):
+    # Bind the production settle gate; with no active WorkItem it fails open
+    # (observed), preserving the historical resolve behavior of these tests.
+    for _method in COVERAGE_METHODS:
+        locals()[_method] = getattr(COVERAGE_GATE, _method)
+    del _method
+
     def __init__(self, active_probe, active_phase="source"):
         self.target_region_claim_active = False
         self.pose_odom = None
@@ -88,6 +107,44 @@ class TargetObservationLifecycleStub(CandidateLifecycleStub):
         return {"id": 31, "state": "pending"}
 
 
+def _coverage_explorer(support_cell, unknown_value, wall_cell=None):
+    """Build a coverage stub with one active item on a small known map.
+
+    The map is 6x6 at 0.25 m from origin (0,0); the support lattice quantum
+    matches the resolution, so lattice cell (4,0) projects to map cell
+    (row=0, col=4) at physical (1.0, 0.0).  The pose sits 0.5 m away, well
+    inside a 10 m scan horizon, so the gate evaluates that one cell.
+    ``wall_cell`` marks one occupied map cell, which occludes whatever lies
+    behind it from the pose.
+    """
+    explorer = CoverageStub(active_probe=None)
+    data = [0] * 36
+    data[0 * 6 + 4] = unknown_value
+    if wall_cell is not None:
+        data[wall_cell[0] * 6 + wall_cell[1]] = 100
+    explorer.place_work_items = SimpleNamespace(
+        support_for=lambda _item_id: frozenset({(4, 0)}),
+    )
+    explorer.active_work_item_id = 7
+    explorer.scan_range_max = 10.0
+    explorer.pose_odom = SimpleNamespace(x=1.0, y=0.5)
+    explorer.map_msg = SimpleNamespace(
+        header=SimpleNamespace(frame_id="map"),
+        info=SimpleNamespace(
+            resolution=0.25,
+            width=6,
+            height=6,
+            origin=SimpleNamespace(
+                position=SimpleNamespace(x=0.0, y=0.0),
+            ),
+        ),
+        data=data,
+    )
+    # Identity projector: the physical (odom) frame coincides with the map.
+    explorer.planar_xy_projector = lambda _target, _source: (lambda x, y: (x, y))
+    return explorer
+
+
 class PortalProbeObservationBoundaryTest(unittest.TestCase):
     def test_source_arrival_does_not_resolve_observation_work(self):
         explorer = CoverageStub(active_probe=9)
@@ -103,6 +160,58 @@ class PortalProbeObservationBoundaryTest(unittest.TestCase):
         explorer.mark_frontier_observed(1.0, 2.0, now=3.0)
 
         self.assertTrue(any(event[0] == "work" for event in explorer.events))
+
+    def test_endpoint_with_unseen_support_defers_instead_of_resolving(self):
+        # The dispatch goal was reached, but the item's support cell is still
+        # unknown on the map within scan range: arrival is not coverage.
+        explorer = _coverage_explorer((4, 0), unknown_value=-1)
+
+        explorer.mark_frontier_observed(1.0, 2.0, now=3.0)
+
+        work_events = [e for e in explorer.events if e[0] == "work"]
+        self.assertEqual(len(work_events), 1)
+        self.assertEqual(work_events[0][2], "deferred")
+        self.assertEqual(work_events[0][3], "endpoint_reached_support_unobserved")
+
+    def test_endpoint_with_observed_support_resolves_observation_work(self):
+        # Same geometry, but the support cell is known free on the map: the
+        # coverage gate passes and the item resolves with its evidence.
+        explorer = _coverage_explorer((4, 0), unknown_value=0)
+
+        explorer.mark_frontier_observed(1.0, 2.0, now=3.0)
+
+        work_events = [e for e in explorer.events if e[0] == "work"]
+        self.assertEqual(len(work_events), 1)
+        self.assertEqual(work_events[0][2], "resolved")
+        self.assertEqual(work_events[0][3], "endpoint_coverage_recorded")
+
+    def test_support_cell_hidden_behind_a_wall_does_not_block_observation(self):
+        # The live two-room failure: the support patch is the whole unknown
+        # flood out to the sensor horizon, and part of it lies behind a wall
+        # no standoff can see past.  Charging that occluded cell to this
+        # observation would defer every ordinary boundary forever.
+        explorer = _coverage_explorer(
+            (4, 0), unknown_value=-1, wall_cell=(1, 4),
+        )
+
+        explorer.mark_frontier_observed(1.0, 2.0, now=3.0)
+
+        work_events = [e for e in explorer.events if e[0] == "work"]
+        self.assertEqual(len(work_events), 1)
+        self.assertEqual(work_events[0][2], "resolved")
+
+    def test_support_cell_beyond_the_sensor_horizon_does_not_block(self):
+        # A patch cell farther than the sensor can reach cannot be observed
+        # from this pose either, so it is not this observation's evidence.
+        explorer = _coverage_explorer((4, 0), unknown_value=-1)
+        explorer.scan_range_max = 0.4
+        explorer.pose_odom = SimpleNamespace(x=1.0, y=0.5)
+
+        explorer.mark_frontier_observed(1.0, 2.0, now=3.0)
+
+        work_events = [e for e in explorer.events if e[0] == "work"]
+        self.assertEqual(len(work_events), 1)
+        self.assertEqual(work_events[0][2], "resolved")
 
     def test_destination_arrival_uses_observed_terminal(self):
         explorer = CoverageStub(active_probe=9, active_phase="destination")

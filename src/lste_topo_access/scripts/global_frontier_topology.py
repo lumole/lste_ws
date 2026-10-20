@@ -15,6 +15,7 @@ from global_frontier_topology_evidence import (
 from global_frontier_topology_grid import (
     grid_frontier_observed_from_viewpoint,
     grid_line_is_known_free,
+    grid_line_reaches_cell,
     grid_reachable_without_closed_places,
     grid_route_avoids_closed_places,
     grid_visible_free_footprint,
@@ -46,6 +47,7 @@ __all__ = [
     "same_topology_component",
     "grid_frontier_observed_from_viewpoint",
     "grid_line_is_known_free",
+    "grid_line_reaches_cell",
     "grid_reachable_without_closed_places",
     "grid_route_avoids_closed_places",
     "grid_visible_free_footprint",

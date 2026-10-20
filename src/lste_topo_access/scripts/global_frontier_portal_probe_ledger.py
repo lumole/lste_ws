@@ -505,6 +505,21 @@ class PortalProbeLedger:
         record["last_reason"] = "directed_portal_certified"
         return self.view(record)
 
+    def certify_probe(self, probe_id, portal_id=None, now=0.0, reason="passive_plane_crossing_certified"):
+        """Directly certify a probe without requiring source_arrived phase."""
+        record = self.get(probe_id)
+        if record is None:
+            return None
+        record["state"] = PROBE_CERTIFIED
+        if portal_id is not None:
+            try:
+                record["portal_id"] = int(portal_id)
+            except (TypeError, ValueError):
+                pass
+        record["last_finished_at"] = float(now)
+        record["last_reason"] = str(reason)
+        return self.view(record)
+
     def start(self, probe_id, now=0.0, viewpoint_xy=None, map_epoch=None):
         """Reserve one probe when its executable route is published."""
         record = self.get(probe_id)

@@ -12,6 +12,7 @@ import math
 
 import numpy as np
 
+from global_frontier_polar_bifurcation import analyze_polar_bifurcation
 from global_frontier_portal_certification_wall import (
     structural_wall_opening_for_normal,
 )
@@ -115,7 +116,9 @@ def source_verification_viewpoints(gate_xy, normal_xy, depth):
 
 def portal_observation_probe(
     unknown, structural_occupied, frontier_cell, *, support_radius,
-    minimum_wall_span_cells, wall_search_radius=None,
+    minimum_wall_span_cells, wall_search_radius=None, known_free=None,
+    minimum_opening_cells=2, maximum_opening_cells=None,
+    resolution=0.1, max_opening_m=1.8, use_polar_bifurcation=True,
 ):
     """Return a wall-bounded unknown opening suitable for an observation probe.
 
@@ -123,6 +126,14 @@ def portal_observation_probe(
     by the caller. The immediate far-side cell must remain unknown. Known free
     space has already been observed and known occupied space is a wall, so
     neither can justify this information-gathering action.
+
+    When ``known_free`` is supplied the opening's width is checked against the
+    vehicle footprint as well: a slit one cell wide has opposing jambs on both
+    sides of a rasterised wall, but no vehicle passes through it, so it must
+    never start a probe that later certifies into a portal.
+
+    Polar continuous field multimodal bifurcation analysis is applied to
+    verify true geometric bottlenecks and reject over-wide open partitions.
     """
     if not isinstance(unknown, np.ndarray) or unknown.ndim != 2:
         return None
@@ -130,11 +141,18 @@ def portal_observation_probe(
     rows, cols = unknown.shape
     if not (0 <= row < rows and 0 <= col < cols):
         return None
+    res = max(1e-6, float(resolution))
+    resolved_max_cells = (
+        int(math.ceil(float(max_opening_m) / res))
+        if maximum_opening_cells is None
+        else int(maximum_opening_cells)
+    )
     search_radius = max(
         int(support_radius),
         int(support_radius)
         if wall_search_radius is None else int(wall_search_radius),
     )
+    search_radius = min(search_radius, resolved_max_cells)
     for normal in ((1, 0), (-1, 0), (0, 1), (0, -1)):
         next_row, next_col = row + normal[0], col + normal[1]
         if not (
@@ -143,12 +161,31 @@ def portal_observation_probe(
             and unknown[next_row, next_col]
         ):
             continue
-        if structural_wall_opening_for_normal(
+        if not structural_wall_opening_for_normal(
             structural_occupied,
             (row, col),
             normal,
             search_radius,
             minimum_wall_span_cells,
+            known_free=known_free,
+            minimum_opening_cells=minimum_opening_cells,
+            maximum_opening_cells=resolved_max_cells,
         ):
-            return PortalObservationProbe((row, col), normal)
+            continue
+
+        if use_polar_bifurcation and known_free is not None:
+            min_op_m = max(0.1, float(minimum_opening_cells) * res)
+            bifurcation = analyze_polar_bifurcation(
+                structural_occupied,
+                (row, col),
+                resolution=res,
+                max_opening_m=float(max_opening_m),
+                min_opening_m=min_op_m,
+                min_wall_span_cells=minimum_wall_span_cells,
+                known_free=known_free,
+            )
+            if not bifurcation.is_bottleneck:
+                continue
+
+        return PortalObservationProbe((row, col), normal)
     return None

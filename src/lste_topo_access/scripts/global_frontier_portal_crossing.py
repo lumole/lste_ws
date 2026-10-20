@@ -152,3 +152,74 @@ def portal_crossing_evidence(
         terminal_signed_distance=terminal_signed,
         required_destination_depth=required_depth,
     )
+
+
+def portal_plane_cross_lateral_distance(point_xy, gate_xy, destination_xy):
+    """Return the absolute lateral offset of point_xy along the gate plane.
+
+    Direction is the vector from gate_xy to destination_xy. The lateral axis
+    is perpendicular to this direction.
+    """
+    if not all((point_xy, gate_xy, destination_xy)):
+        return None
+    try:
+        direction_x = float(destination_xy[0]) - float(gate_xy[0])
+        direction_y = float(destination_xy[1]) - float(gate_xy[1])
+        point_x, point_y = float(point_xy[0]), float(point_xy[1])
+        gate_x, gate_y = float(gate_xy[0]), float(gate_xy[1])
+    except (IndexError, TypeError, ValueError):
+        return None
+    direction_length = math.hypot(direction_x, direction_y)
+    if direction_length <= 1e-6:
+        return None
+    dx = point_x - gate_x
+    dy = point_y - gate_y
+    return abs(-dx * direction_y + dy * direction_x) / direction_length
+
+
+def check_portal_plane_crossing(
+    point_xy,
+    gate_xy,
+    destination_xy,
+    previous_signed_distance=None,
+    lateral_tolerance=1.2,
+    max_approach_distance=3.0,
+    allow_source_depth=0.5,
+):
+    """Return whether point_xy crossed the portal plane from source to destination.
+
+    A crossing requires:
+    1. The point is within max_approach_distance of the gate.
+    2. The lateral offset along the gate plane is within lateral_tolerance.
+    3. The signed distance crossed the plane (previous < 0.0 and current >= 0.0).
+
+    Returns:
+        (crossed: bool, current_signed_distance: float or None, lateral_distance: float or None)
+    """
+    if not all((point_xy, gate_xy, destination_xy)):
+        return False, None, None
+    try:
+        px, py = float(point_xy[0]), float(point_xy[1])
+        gx, gy = float(gate_xy[0]), float(gate_xy[1])
+    except (IndexError, TypeError, ValueError):
+        return False, None, None
+    if math.hypot(px - gx, py - gy) > float(max_approach_distance):
+        return False, None, None
+    s = portal_signed_distance(point_xy, gate_xy, destination_xy)
+    lat = portal_plane_cross_lateral_distance(point_xy, gate_xy, destination_xy)
+    if s is None or lat is None:
+        return False, s, lat
+    if lat > float(lateral_tolerance):
+        return False, s, lat
+    crossed = False
+    if previous_signed_distance is not None:
+        try:
+            prev_s = float(previous_signed_distance)
+            if prev_s < 0.0 and s >= 0.0:
+                crossed = True
+        except (TypeError, ValueError):
+            pass
+    elif 0.0 <= s <= float(allow_source_depth):
+        crossed = True
+    return crossed, s, lat
+

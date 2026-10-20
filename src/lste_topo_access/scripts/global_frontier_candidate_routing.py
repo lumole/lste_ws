@@ -127,6 +127,11 @@ class GlobalFrontierCandidateRoutingMixin(
                     path_distance,
                     score_path_distance,
                 ) = source_route
+        if portal_probe is None and work_item_id is not None:
+            detail = context.work_item_details.get(work_item_id, {})
+            is_local = getattr(self, "_work_item_viewpoint_is_local", None)
+            if callable(is_local) and not is_local(request, detail, x, y):
+                return None
         # A probe is a durable information obligation. Its safe viewpoint may
         # lie inside an ordinary coverage footprint, and a failed viewpoint
         # must be replaceable by another point on the same opening. The

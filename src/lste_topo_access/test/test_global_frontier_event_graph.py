@@ -112,6 +112,54 @@ class EvidenceEventGraphTest(unittest.TestCase):
         self.assertFalse(duplicate.wake)
         self.assertEqual(graph.report()["work_item_count"], 1)
 
+    def test_portal_arrival_counts_the_place_it_creates(self):
+        """A crossing announces its destination Place only as ``region_id``.
+
+        The shared place-id extraction reads place_id/active_region_id/
+        source_place_id, and for a Portal arrival it falls back to the *source*
+        Place.  Reading ``region_id`` for the arrival events is what makes the
+        created Place visible: without it place_count stayed at 1 while the
+        robot stood in the Place its own Portal had just committed.
+        """
+        graph = EvidenceEventGraph()
+        graph.ingest("route_command", {"route_id": 1, "place_id": 1})
+        graph.ingest(
+            "portal_place_entered",
+            {"portal_id": 1, "region_id": 2, "source_place_id": 1},
+        )
+
+        self.assertEqual(graph.report()["place_count"], 2)
+
+    def test_covered_arrival_counts_the_place_it_re_enters(self):
+        graph = EvidenceEventGraph()
+        graph.ingest(
+            "portal_place_covered_arrival",
+            {"portal_id": 1, "region_id": 4},
+        )
+
+        self.assertEqual(graph.report()["place_count"], 1)
+
+    def test_bootstrap_place_is_counted_from_its_region_id(self):
+        """The bootstrap Place has no other announcement either."""
+        graph = EvidenceEventGraph()
+        graph.ingest(
+            "physical_place_bootstrapped", {"region_id": 3, "state": "open"}
+        )
+
+        report = graph.report()
+        self.assertEqual(report["place_count"], 1)
+
+    def test_arrival_does_not_credit_the_source_place(self):
+        """The arrival must name the destination, never the Place left behind."""
+        graph = EvidenceEventGraph()
+        graph.ingest(
+            "portal_place_entered",
+            {"portal_id": 1, "region_id": 2, "source_place_id": 7},
+        )
+
+        self.assertEqual(graph.report()["place_count"], 1)
+        self.assertEqual(sorted(graph.place_states), [2])
+
 
 if __name__ == "__main__":
     unittest.main()

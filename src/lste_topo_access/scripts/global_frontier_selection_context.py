@@ -6,6 +6,7 @@ sealed-portal rule.  It deliberately contains no candidate scoring or ROS
 planner calls, so those policies can evolve independently.
 """
 
+from collections import defaultdict
 import numpy as np
 
 from global_frontier_models import FrontierSelectionContext
@@ -78,6 +79,8 @@ class GlobalFrontierSelectionContextMixin:
         self.last_action_tier_order = ("unconstrained",)
         self.last_work_item_created = 0
         self.last_work_item_inherited = 0
+        self.last_work_item_density_absorbed = 0
+        self.last_work_item_corner_rejected = 0
         self.last_work_item_resolved_descendant_skips = 0
         self.last_work_item_failed_viewpoint_skips = 0
         self.last_work_item_alternative_viewpoints = 0
@@ -138,45 +141,12 @@ class GlobalFrontierSelectionContextMixin:
     def _scope_observation_supports_to_source_place(
         self, supports, components, source_label
     ):
-        """Keep local WorkItems owned by the current structural Place.
+        """Keep local WorkItems owned by the current exploration context.
 
-        ``observation_supports`` is computed from the map-wide frontier mask,
-        while WorkItems are durable obligations of one physical Place.  A
-        support whose frontier arc belongs to another labelled core must be
-        represented by the Portal/graph planner, not attached to the current
-        Place.  Zero-labelled throat cells are retained only when the same arc
-        also touches the current core; a throat by itself is a Portal concern.
+        When room boundaries are relaxed for global exploration, all valid
+        frontier supports generate WorkItems across the field.
         """
-        if not supports or components is None or source_label is None:
-            return tuple(supports or ())
-        try:
-            source_label = int(source_label)
-            labels = components.labels
-            rows, cols = labels.shape
-        except (AttributeError, TypeError, ValueError):
-            return tuple(supports or ())
-        if source_label <= 0:
-            return tuple(supports or ())
-
-        scoped = []
-        skipped = 0
-        for support in supports:
-            positive_labels = set()
-            for row, col in getattr(support, "frontier_cells", ()) or ():
-                try:
-                    row, col = int(row), int(col)
-                except (TypeError, ValueError):
-                    continue
-                if 0 <= row < rows and 0 <= col < cols:
-                    label = int(labels[row, col])
-                    if label > 0:
-                        positive_labels.add(label)
-            if positive_labels and positive_labels.issubset({source_label}):
-                scoped.append(support)
-            else:
-                skipped += 1
-        self.last_work_item_place_scope_skips += skipped
-        return tuple(scoped)
+        return tuple(supports or ())
 
     def _suppress_crossed_portal_supports(self, source_place_id, supports):
         """Remove reverse doorway arcs already represented by a crossed edge.
@@ -413,17 +383,44 @@ class GlobalFrontierSelectionContextMixin:
         work_item_cells = {}
         work_item_details = {}
         ledger = getattr(self, "place_work_items", None)
+        warmup_active = bool(
+            callable(getattr(self, "is_startup_warmup_active", None))
+            and self.is_startup_warmup_active(now)
+        )
         if (
             getattr(self, "work_item_memory_enabled", True)
-            and
-            ledger is not None
-            and source_place_id is not None
+            and ledger is not None
             and frontier is not None
+            and not warmup_active
         ):
             horizon = getattr(self, "scan_observation_horizon", None)
             if horizon is None or horizon <= 0.0:
                 horizon = getattr(self, "scan_range_max", None)
             self.last_work_item_sensor_horizon_m = horizon
+            density_separation = float(
+                getattr(self, "work_item_density_radius", 1.0)
+            )
+            clearance_radius = float(
+                getattr(self, "work_item_clearance_radius", 0.7)
+            )
+            min_clearance_ratio = float(
+                getattr(self, "work_item_min_clearance_ratio", 0.35)
+            )
+            corner_wall_distance = float(
+                getattr(self, "work_item_corner_wall_distance", 0.4)
+            )
+            min_wall_distance = float(
+                getattr(self, "work_item_min_wall_distance", 0.25)
+            )
+            max_unknown_ratio = float(
+                getattr(self, "work_item_max_unknown_ratio", 0.70)
+            )
+            min_free_ratio = float(
+                getattr(self, "work_item_min_free_ratio", 0.25)
+            )
+            min_free_area_m2 = float(
+                getattr(self, "work_item_min_free_area_m2", 0.20)
+            )
             supports = observation_supports(
                 frontier,
                 unknown,
@@ -431,6 +428,16 @@ class GlobalFrontierSelectionContextMixin:
                 map_to_physical_xy=map_to_physical_xy,
                 resolution=message.info.resolution,
                 sensor_horizon_m=horizon,
+                known_free=known_free,
+                occupied=occupied,
+                clearance_radius_m=clearance_radius,
+                min_clearance_ratio=min_clearance_ratio,
+                corner_wall_distance_m=corner_wall_distance,
+                density_separation_m=density_separation,
+                min_wall_distance_m=min_wall_distance,
+                max_unknown_ratio=max_unknown_ratio,
+                min_free_ratio=min_free_ratio,
+                min_free_area_m2=min_free_area_m2,
             )
             supports = self._scope_observation_supports_to_source_place(
                 supports,
@@ -441,11 +448,45 @@ class GlobalFrontierSelectionContextMixin:
                 source_place_id,
                 supports,
             )
+            spawn_xy = getattr(self, "spawn_odom_xy", None)
+            if spawn_xy is None and getattr(self, "pose_odom", None) is not None:
+                rx = getattr(self.pose_odom, "x", None)
+                ry = getattr(self.pose_odom, "y", None)
+                if rx is not None and ry is not None:
+                    spawn_xy = (float(rx), float(ry))
+                    self.spawn_odom_xy = spawn_xy
+                    if ledger is not None:
+                        ledger.spawn_odom_xy = spawn_xy
+
+            projector_factory = getattr(self, "planar_xy_projector", None)
+            header = getattr(message, "header", None)
+            map_frame = getattr(header, "frame_id", "map") or "map"
+            phys_to_map = (
+                None
+                if projector_factory is None
+                else projector_factory(map_frame, "odom")
+            )
             work_item_cells, work_item_details = ledger.reconcile(
-                source_place_id,
+                source_place_id or 1,
                 supports,
                 now=now,
+                spawn_odom_xy=spawn_xy,
+                free=known_free,
+                map_msg=message,
+                physical_to_map=phys_to_map,
             )
+            other_place_supports = getattr(self, "_other_place_supports", None)
+            if other_place_supports:
+                for other_place, other_supp in other_place_supports.items():
+                    ledger.reconcile(
+                        other_place,
+                        other_supp,
+                        now=now,
+                        spawn_odom_xy=spawn_xy,
+                        free=known_free,
+                        map_msg=message,
+                        physical_to_map=phys_to_map,
+                    )
             for detail in work_item_details.values():
                 if detail["match"] == "created":
                     self.last_work_item_created += 1
@@ -453,6 +494,35 @@ class GlobalFrontierSelectionContextMixin:
                     self.last_work_item_inherited += 1
                 elif detail["match"] == "resolved_descendant":
                     self.last_work_item_resolved_descendant_skips += 1
+                elif detail["match"] == "density_absorbed":
+                    self.last_work_item_density_absorbed += 1
+
+            # Opportunistic clearance: only resolve non-active WorkItems if the robot physically
+            # passed through them (dist <= 0.4m and heading error <= 30 deg).
+            pose_odom = getattr(self, "pose_odom", None)
+            active_id = getattr(self, "active_work_item_id", None)
+            if active_id is None:
+                active_id = getattr(getattr(self, "goal_context", None), "work_item_id", None)
+            prune_fn = getattr(ledger, "prune_passed_through_work_items", None)
+            if callable(prune_fn) and pose_odom is not None:
+                rx = getattr(pose_odom, "x", None)
+                ry = getattr(pose_odom, "y", None)
+                rtheta = getattr(pose_odom, "theta", 0.0)
+                if rx is not None and ry is not None:
+                    robot_pose = (float(rx), float(ry), float(rtheta))
+                    passed_ids = prune_fn(
+                        robot_pose,
+                        active_id,
+                        now=float(now),
+                        distance_threshold=0.4,
+                        angle_threshold_deg=30.0,
+                    )
+                    if passed_ids and callable(getattr(self, "publish_status", None)):
+                        self.publish_status(
+                            "work_items_passed_through_resolved",
+                            resolved_work_item_ids=passed_ids,
+                            reason="opportunistic_pass_through",
+                        )
         pending_entry = getattr(self, "place_entry_rehydration_pending", None)
         if pending_entry is not None:
             try:

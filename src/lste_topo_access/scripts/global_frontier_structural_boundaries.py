@@ -13,9 +13,11 @@ score, timeout, or motion parameter is involved here.
 """
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 
+from global_frontier_polar_bifurcation import analyze_polar_bifurcation
 from global_frontier_portal_certification_wall import (
     structural_wall_opening_for_normal,
 )
@@ -81,6 +83,21 @@ def _nearest_label(labels, cell, direction, maximum_distance):
     return 0
 
 
+def _nearest_occupied_cell(mask, cell, direction, maximum_distance):
+    """Return the first structural wall cell along one tangent ray."""
+    if mask is None:
+        return None
+    row, col = int(cell[0]), int(cell[1])
+    delta_row, delta_col = int(direction[0]), int(direction[1])
+    for distance in range(1, max(0, int(maximum_distance)) + 1):
+        candidate = row + distance * delta_row, col + distance * delta_col
+        if not _in_bounds(mask.shape, candidate):
+            break
+        if bool(mask[candidate]):
+            return candidate
+    return None
+
+
 def _orientation_is_source_side(
     labels, steps, source_label, opening, normal, source, destination,
     support_radius,
@@ -135,24 +152,87 @@ def _orientation_is_source_side(
     return tuple(normal) in ((0, 1), (1, 0))
 
 
-def _deduplicate(candidates, support_radius):
-    """Keep one representative for each contiguous directed opening run."""
+def _deduplicate(
+    candidates, support_radius, structural_occupied=None,
+    wall_search_radius=None,
+):
+    """Keep one representative for each pair of structural jamb runs."""
     selected = []
-    separation = max(1, int(support_radius))
+    selected_support_pairs = []
+    separation = 2 * max(1, int(support_radius)) + 1
+    search_radius = max(
+        max(1, int(support_radius)),
+        max(1, int(support_radius))
+        if wall_search_radius is None else int(wall_search_radius),
+    )
     for candidate in candidates:
-        same_run = False
-        for prior in selected:
-            if prior.normal != candidate.normal:
-                continue
-            distance = (
-                abs(int(prior.opening_cell[0]) - int(candidate.opening_cell[0]))
-                + abs(int(prior.opening_cell[1]) - int(candidate.opening_cell[1]))
+        tangent = (0, 1) if candidate.normal[0] else (1, 0)
+        negative_support = _nearest_occupied_cell(
+            structural_occupied,
+            candidate.opening_cell,
+            (-tangent[0], -tangent[1]),
+            search_radius,
+        )
+        positive_support = _nearest_occupied_cell(
+            structural_occupied,
+            candidate.opening_cell,
+            tangent,
+            search_radius,
+        )
+        support_pair = (
+            None
+            if negative_support is None or positive_support is None
+            else (
+                tuple(candidate.normal),
+                negative_support,
+                positive_support,
             )
-            if distance <= separation:
-                same_run = True
-                break
-        if not same_run:
-            selected.append(candidate)
+        )
+        if support_pair is not None:
+            matched_index = None
+            for index, prior_pair in enumerate(selected_support_pairs):
+                if prior_pair is None or prior_pair[0] != support_pair[0]:
+                    continue
+                if all(
+                    abs(int(a[0]) - int(b[0])) <= 1
+                    and abs(int(a[1]) - int(b[1])) <= 1
+                    for a, b in zip(prior_pair[1:], support_pair[1:])
+                ):
+                    matched_index = index
+                    break
+            if matched_index is not None:
+                tangent_axis = 0 if tangent[0] else 1
+                midpoint_twice = (
+                    int(support_pair[1][tangent_axis])
+                    + int(support_pair[2][tangent_axis])
+                )
+                prior = selected[matched_index]
+                if abs(
+                    2 * int(candidate.opening_cell[tangent_axis])
+                    - midpoint_twice
+                ) < abs(
+                    2 * int(prior.opening_cell[tangent_axis])
+                    - midpoint_twice
+                ):
+                    selected[matched_index] = candidate
+                    selected_support_pairs[matched_index] = support_pair
+                continue
+        else:
+            same_run = False
+            for prior in selected:
+                if prior.normal != candidate.normal:
+                    continue
+                distance = (
+                    abs(int(prior.opening_cell[0]) - int(candidate.opening_cell[0]))
+                    + abs(int(prior.opening_cell[1]) - int(candidate.opening_cell[1]))
+                )
+                if distance <= separation:
+                    same_run = True
+                    break
+            if same_run:
+                continue
+        selected.append(candidate)
+        selected_support_pairs.append(support_pair)
     return tuple(selected)
 
 
@@ -167,6 +247,11 @@ def structural_boundary_candidates(
     support_radius,
     minimum_wall_span_cells,
     wall_search_radius=None,
+    minimum_opening_cells=2,
+    maximum_opening_cells=None,
+    resolution=0.1,
+    max_opening_m=3.5,
+    use_polar_bifurcation=True,
 ):
     """Return directed wall openings reachable from the current Place.
 
@@ -175,6 +260,10 @@ def structural_boundary_candidates(
     current frontier cell preserves the doorway lineage.  The source-side
     route remains the only executable part; the far side is evidence, not a
     crossing permission.
+
+    Polar continuous field multimodal bifurcation analysis is applied to
+    verify true geometric bottlenecks and reject over-wide open partitions
+    (such as 3.2m open spans).
     """
     if not isinstance(known_free, np.ndarray) or known_free.ndim != 2:
         return ()
@@ -195,6 +284,14 @@ def structural_boundary_candidates(
     ):
         return ()
 
+    res = max(1e-6, float(resolution))
+    if maximum_opening_cells is not None:
+        resolved_max_cells = int(maximum_opening_cells)
+        resolved_max_m = resolved_max_cells * res
+    else:
+        resolved_max_m = float(max_opening_m)
+        resolved_max_cells = int(math.ceil(resolved_max_m / res))
+
     radius = max(1, int(support_radius))
     # The throat radius controls candidate identity/deduplication. A wider
     # architectural opening may place its jambs farther from the center than
@@ -204,6 +301,9 @@ def structural_boundary_candidates(
         radius,
         radius if wall_search_radius is None else int(wall_search_radius),
     )
+    # A wall opening cannot place its jambs farther apart than the maximum
+    # allowable physical doorway width.
+    wall_radius = min(wall_radius, resolved_max_cells)
     span = max(1, int(minimum_wall_span_cells))
     # The opening cell itself may be removed by the inflated navigation mask:
     # it is evidence at the wall plane, not an executable robot footprint.
@@ -248,12 +348,21 @@ def structural_boundary_candidates(
             )
             if not destination_known and not destination_unknown:
                 continue
+            # Wide doorways can put their jambs farther apart than a local
+            # throat radius. Require both structural wall runs within the
+            # architectural search window; candidate deduplication below uses
+            # the actual support pair so one wide opening still yields one
+            # physical hypothesis.
+            jamb_radius = wall_radius
             if not structural_wall_opening_for_normal(
                 structural_occupied,
                 opening,
                 normal,
-                wall_radius,
+                jamb_radius,
                 span,
+                known_free=known_free,
+                minimum_opening_cells=minimum_opening_cells,
+                maximum_opening_cells=resolved_max_cells,
             ):
                 continue
             if not _orientation_is_source_side(
@@ -267,6 +376,22 @@ def structural_boundary_candidates(
                 wall_radius,
             ):
                 continue
+
+            # Continuous polar Gaussian multimodal bifurcation filter
+            if use_polar_bifurcation:
+                min_op_m = max(0.1, float(minimum_opening_cells) * res)
+                bifurcation = analyze_polar_bifurcation(
+                    structural_occupied,
+                    opening,
+                    resolution=res,
+                    max_opening_m=float(resolved_max_m),
+                    min_opening_m=min_op_m,
+                    min_wall_span_cells=span,
+                    known_free=known_free,
+                )
+                if not bifurcation.is_bottleneck:
+                    continue
+
             candidates.append(
                 StructuralBoundary(
                     opening_cell=opening,
@@ -275,7 +400,12 @@ def structural_boundary_candidates(
                     destination_cell=destination,
                 )
             )
-    return _deduplicate(candidates, radius)
+    return _deduplicate(
+        candidates,
+        radius,
+        structural_occupied=structural_occupied,
+        wall_search_radius=wall_radius,
+    )
 
 
 __all__ = ["StructuralBoundary", "structural_boundary_candidates"]

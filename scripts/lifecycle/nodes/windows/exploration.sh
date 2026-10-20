@@ -62,5 +62,7 @@ start_exploration_windows() {
       navfn_empty_warmup_seconds:=$GLOBAL_FRONTIER_NAVFN_EMPTY_WARMUP_SECONDS \\
       navfn_startup_probe_distance:=$GLOBAL_FRONTIER_NAVFN_STARTUP_PROBE_DISTANCE \\
       start_frontier:=$GLOBAL_FRONTIER_ENABLED \\
-      planning_period:=$GLOBAL_FRONTIER_PLANNING_PERIOD"
+      planning_period:=$GLOBAL_FRONTIER_PLANNING_PERIOD \\
+      enable_dedicated_portal_probe_transaction:=$GLOBAL_FRONTIER_ENABLE_DEDICATED_PORTAL_PROBE_TRANSACTION \\
+      passive_plane_crossing_certification:=$GLOBAL_FRONTIER_PASSIVE_PLANE_CROSSING_CERTIFICATION"
 }

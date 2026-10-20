@@ -9,11 +9,62 @@ import math
 
 import numpy as np
 
+try:
+    import rospy
+except ImportError:
+    rospy = None
+
 from global_frontier_models import FrontierCandidateRoute
 
 
 class GlobalFrontierCandidateWorkItemMixin:
     """Build current-map candidates for unresolved local WorkItems."""
+
+    def _work_item_viewpoint_distance_limit(self, resolution):
+        """Return the maximum local standoff-to-anchor distance.
+
+        The normal and two lateral views are generated at ``depth`` from the
+        physical boundary anchor.  Reassociation can move a desired point by
+        a couple of cells, so keep that existing grid scale in the bound
+        instead of introducing a second user-facing distance parameter.
+        """
+        resolution = max(1e-6, float(resolution))
+        work_item_approach = float(getattr(self, "work_item_approach_distance", 0.55))
+        depth = max(
+            0.35,
+            work_item_approach,
+            resolution,
+        )
+        return math.sqrt(2.0) * depth + 2.0 * resolution
+
+    def _work_item_viewpoint_distance(self, request, anchor, x, y):
+        """Measure a candidate endpoint against a durable physical anchor."""
+        anchor = self._finite_xy(anchor)
+        if anchor is None:
+            return None
+        candidate = (float(x), float(y))
+        projector = getattr(request, "map_to_physical_xy", None)
+        if projector is not None:
+            try:
+                projected = self._finite_xy(projector(candidate[0], candidate[1]))
+            except Exception:
+                projected = None
+            if projected is None:
+                return None
+            candidate = projected
+        return math.hypot(candidate[0] - anchor[0], candidate[1] - anchor[1])
+
+    def _work_item_viewpoint_is_local(self, request, item, x, y):
+        """Return whether a WorkItem endpoint stays near its anchor."""
+        distance = self._work_item_viewpoint_distance(
+            request, item.get("anchor_xy"), x, y,
+        )
+        return (
+            distance is not None
+            and distance <= self._work_item_viewpoint_distance_limit(
+                request.message.info.resolution
+            )
+        )
 
     @staticmethod
     def _finite_xy(value):
@@ -90,9 +141,9 @@ class GlobalFrontierCandidateWorkItemMixin:
         the identity and the desired side of the observation.
         """
         ledger = getattr(self, "place_work_items", None)
-        place_id = getattr(context, "source_place_id", None)
+        place_id = getattr(context, "source_place_id", None) or 1
         del frontier, approach_cells
-        if ledger is None or place_id is None:
+        if ledger is None:
             return []
         snapshot = getattr(ledger, "snapshot", None)
         records = () if snapshot is None else snapshot()
@@ -123,10 +174,13 @@ class GlobalFrontierCandidateWorkItemMixin:
         map_epoch = getattr(
             getattr(request, "components", None), "epoch", None
         )
+        work_item_approach = float(getattr(self, "work_item_approach_distance", 0.55))
         depth = max(
-            float(getattr(self, "frontier_approach_distance", resolution)),
-            float(getattr(self, "completed_radius", resolution)) * 0.5,
+            0.35,
+            work_item_approach,
+            resolution,
         )
+        distance_limit = self._work_item_viewpoint_distance_limit(resolution)
         report = {
             "place_id": int(place_id),
             "map_epoch": getattr(
@@ -152,12 +206,7 @@ class GlobalFrontierCandidateWorkItemMixin:
                 item_place = int(item.get("place_id"))
             except (TypeError, ValueError):
                 continue
-            if item_place != int(place_id):
-                continue
-            if (
-                work_item_filter == "selected"
-                and item_id != selected_work_item_id
-            ):
+            if work_item_filter == "selected" and item_id != selected_work_item_id:
                 continue
             if str(item.get("state", "")).strip().lower() != "unresolved":
                 continue
@@ -181,7 +230,9 @@ class GlobalFrontierCandidateWorkItemMixin:
                 report["item_audit"].append(audit)
                 reject("physical_anchor_projection_unavailable")
                 continue
+
             if normal is None:
+
                 # A one-cell or symmetric frontier arc can have a valid
                 # physical anchor but no unique unknown-side normal.  That is
                 # insufficient for a durable *identity* update, but it is
@@ -227,6 +278,26 @@ class GlobalFrontierCandidateWorkItemMixin:
                     continue
                 row, col = cell
                 x, y = self.cell_xy(message, row, col)
+                viewpoint_distance = self._work_item_viewpoint_distance(
+                    request, item.get("anchor_xy"), x, y,
+                )
+                if (
+                    viewpoint_distance is None
+                    or viewpoint_distance > distance_limit
+                ):
+                    view_audit["cell"] = [int(row), int(col)]
+                    view_audit["viewpoint_distance"] = (
+                        None
+                        if viewpoint_distance is None
+                        else round(float(viewpoint_distance), 3)
+                    )
+                    view_audit["viewpoint_distance_limit"] = round(
+                        float(distance_limit), 3,
+                    )
+                    view_audit["reason"] = "viewpoint_too_far_from_work_item"
+                    report["item_audit"].append(view_audit)
+                    reject("viewpoint_too_far_from_work_item")
+                    continue
                 costmap_distance = self.candidate_costmap_distance(
                     request.validation, x, y,
                 )
@@ -273,7 +344,28 @@ class GlobalFrontierCandidateWorkItemMixin:
                 )
                 break
             if selected is None:
+                now_sec = 0.0
+                stamp = getattr(getattr(message, "header", None), "stamp", None)
+                if stamp is not None and hasattr(stamp, "to_sec"):
+                    now_sec = float(stamp.to_sec())
+                elif rospy is not None and hasattr(rospy, "Time"):
+                    try:
+                        now_sec = float(rospy.Time.now().to_sec())
+                    except Exception:
+                        now_sec = 0.0
+
+                record_unreachable = getattr(ledger, "record_unreachable_viewpoint", None)
+                if callable(record_unreachable):
+                    abandoned = record_unreachable(item_id, now=now_sec, threshold=2)
+                    if abandoned:
+                        audit["reason"] = "dead_corner_unreachable"
+                        report["item_audit"].append(audit)
+                        reject("dead_corner_unreachable")
                 continue
+            else:
+                reset_unreachable = getattr(ledger, "reset_unreachable_viewpoint", None)
+                if callable(reset_unreachable):
+                    reset_unreachable(item_id)
             row, col, x, y, costmap_distance, path_distance, physical, strategy, retry = selected
             candidate = FrontierCandidateRoute(
                 row=int(row),
@@ -299,6 +391,32 @@ class GlobalFrontierCandidateWorkItemMixin:
             audit["viewpoint_map"] = [round(float(x), 3), round(float(y), 3)]
             audit["reason"] = "executable"
             report["item_audit"].append(audit)
+
+        # Spatial NMS on rehydrated candidates: prevent clustering multiple viewpoints
+        # within density_separation distance.
+        density_sep = float(getattr(self, "work_item_density_radius", 0.8))
+        if len(candidates) > 1 and density_sep > 0.0:
+            candidates.sort(
+                key=lambda entry: (
+                    -int(getattr(entry[2], "work_item_support_cells", 0)),
+                    float(getattr(entry[2], "path_distance", 0.0)),
+                )
+            )
+            filtered_candidates = []
+            for r, c, cand in candidates:
+                cand_xy = (cand.x, cand.y)
+                suppressed = False
+                for _fr, _fc, accepted in filtered_candidates:
+                    dist = math.hypot(cand_xy[0] - accepted.x, cand_xy[1] - accepted.y)
+                    if dist <= density_sep:
+                        suppressed = True
+                        break
+                if not suppressed:
+                    filtered_candidates.append((r, c, cand))
+                else:
+                    reject("suppressed_by_denser_candidate")
+            candidates = filtered_candidates
+            report["candidate_count"] = len(candidates)
 
         report["rejection_reasons"] = dict(sorted(report["rejection_reasons"].items()))
         if report != getattr(self, "last_local_work_item_rehydration_report", None):

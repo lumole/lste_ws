@@ -178,6 +178,176 @@ class PlaceWorkItemTest(unittest.TestCase):
             0,
         )
 
+    def test_dead_corner_abandonment_marks_blacklist_and_resolves(self):
+        work = PlaceWorkItemLedger(merge_radius=0.5, density_radius=1.0)
+        item = work._new_item(
+            place_id=2,
+            support_cells=frozenset({(10, 10)}),
+            now=1.0,
+            anchor_xy=(5.0, 5.0),
+            normal_xy=(1.0, 0.0),
+        )
+        item_id = item["id"]
+
+        # Abandon as dead corner
+        resolved = work.resolve(item_id, now=2.0, reason="dead_corner_abandoned_controller_stall")
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["state"], WORK_RESOLVED)
+        self.assertTrue(work.is_dead_corner((5.0, 5.0)))
+        self.assertTrue(work.is_dead_corner((5.2, 5.1), radius=0.6))
+        self.assertFalse(work.is_dead_corner((6.0, 6.0), radius=0.6))
+
+        # Dead corner blacklist prevents recreation in reconcile
+        from global_frontier_work_item_components import ObservationSupport
+        supp = ObservationSupport(
+            frontier_cells=frozenset({(1, 1)}),
+            support_cells=frozenset({(10, 10)}),
+            anchor_xy=(5.1, 5.0),
+            normal_xy=(1.0, 0.0),
+        )
+        cells, details = work.reconcile(2, (supp,), now=3.0)
+        self.assertEqual(len(cells), 0)
+        self.assertEqual(len(details), 0)
+
+    def test_record_unreachable_viewpoint_abandonment(self):
+        work = PlaceWorkItemLedger(merge_radius=0.5)
+        item = work._new_item(
+            place_id=2,
+            support_cells=frozenset({(10, 10)}),
+            now=1.0,
+            anchor_xy=(2.0, 3.0),
+            normal_xy=(1.0, 0.0),
+        )
+        item_id = item["id"]
+
+        # First failure: not yet abandoned
+        abandoned1 = work.record_unreachable_viewpoint(item_id, now=1.0, threshold=2)
+        self.assertFalse(abandoned1)
+        self.assertEqual(item["state"], WORK_UNRESOLVED)
+        self.assertEqual(item["unreachable_viewpoint_count"], 1)
+
+        # Second failure: abandoned as dead corner
+        abandoned2 = work.record_unreachable_viewpoint(item_id, now=2.0, threshold=2)
+        self.assertTrue(abandoned2)
+        self.assertEqual(item["state"], WORK_RESOLVED)
+        self.assertEqual(item["last_reason"], "dead_corner_unreachable")
+        self.assertTrue(work.is_dead_corner((2.0, 3.0)))
+
+    def test_prune_passed_through_work_items_resolves_when_close_and_aligned(self):
+        work = PlaceWorkItemLedger(merge_radius=0.5)
+        item = work._new_item(
+            place_id=1,
+            support_cells=frozenset({(8, 8)}),
+            now=1.0,
+            anchor_xy=(2.0, 2.0),
+            normal_xy=(1.0, 0.0),  # heading = 0.0
+        )
+        item_id = item["id"]
+
+        # Robot at (2.2, 2.1) -> dist = 0.223m <= 0.4m, heading = 0.1 rad (~5.7 deg <= 30 deg)
+        # Not the active target (active_target = 999)
+        robot_pose = (2.2, 2.1, 0.1)
+        pruned = work.prune_passed_through_work_items(
+            robot_pose,
+            active_work_item_id=999,
+            now=2.0,
+            distance_threshold=0.4,
+            angle_threshold_deg=30.0,
+        )
+        self.assertIn(item_id, pruned)
+        self.assertEqual(item["state"], WORK_RESOLVED)
+        self.assertEqual(item["resolved_reason"], "opportunistic_pass_through")
+
+    def test_prune_passed_through_work_items_ignores_when_angle_mismatched(self):
+        work = PlaceWorkItemLedger(merge_radius=0.5)
+        item = work._new_item(
+            place_id=1,
+            support_cells=frozenset({(8, 8)}),
+            now=1.0,
+            anchor_xy=(2.0, 2.0),
+            normal_xy=(1.0, 0.0),  # heading = 0.0
+        )
+        item_id = item["id"]
+
+        # Robot at (2.2, 2.1) -> dist = 0.223m <= 0.4m, but heading = 1.57 rad (90 deg > 30 deg)
+        robot_pose = (2.2, 2.1, 1.57)
+        pruned = work.prune_passed_through_work_items(
+            robot_pose,
+            active_work_item_id=999,
+            now=2.0,
+            distance_threshold=0.4,
+            angle_threshold_deg=30.0,
+        )
+        self.assertEqual(pruned, [])
+        self.assertEqual(item["state"], WORK_UNRESOLVED)
+
+    def test_prune_passed_through_work_items_ignores_when_distance_too_far(self):
+        work = PlaceWorkItemLedger(merge_radius=0.5)
+        item = work._new_item(
+            place_id=1,
+            support_cells=frozenset({(8, 8)}),
+            now=1.0,
+            anchor_xy=(2.0, 2.0),
+            normal_xy=(1.0, 0.0),
+        )
+        item_id = item["id"]
+
+        # Robot at (2.5, 2.0) -> dist = 0.5m > 0.4m, even though angle is 0
+        robot_pose = (2.5, 2.0, 0.0)
+        pruned = work.prune_passed_through_work_items(
+            robot_pose,
+            active_work_item_id=999,
+            now=2.0,
+            distance_threshold=0.4,
+            angle_threshold_deg=30.0,
+        )
+        self.assertEqual(pruned, [])
+        self.assertEqual(item["state"], WORK_UNRESOLVED)
+
+    def test_prune_passed_through_work_items_never_resolves_active_target(self):
+        work = PlaceWorkItemLedger(merge_radius=0.5)
+        item = work._new_item(
+            place_id=1,
+            support_cells=frozenset({(8, 8)}),
+            now=1.0,
+            anchor_xy=(2.0, 2.0),
+            normal_xy=(1.0, 0.0),
+        )
+        item_id = item["id"]
+
+        # Robot at (2.1, 2.0, 0.0), BUT this item IS the active target being executed!
+        robot_pose = (2.1, 2.0, 0.0)
+        pruned = work.prune_passed_through_work_items(
+            robot_pose,
+            active_work_item_id=item_id,
+            now=2.0,
+            distance_threshold=0.4,
+            angle_threshold_deg=30.0,
+        )
+        self.assertEqual(pruned, [])
+        self.assertEqual(item["state"], WORK_UNRESOLVED)
+
+    def test_unresolved_work_item_keeps_stable_anchor_and_absorbs_support(self):
+        from types import SimpleNamespace
+        work = PlaceWorkItemLedger(merge_radius=0.5)
+        item = work._new_item(
+            place_id=1,
+            support_cells=frozenset({(8, 8)}),
+            now=1.0,
+            anchor_xy=(2.0, 2.0),
+            normal_xy=(1.0, 0.0),
+        )
+        support = SimpleNamespace(
+            support_cells=frozenset({(8, 8), (9, 8)}),
+            frontier_cells=frozenset({(8, 8)}),
+            anchor_xy=(2.4, 2.1),
+            normal_xy=(1.0, 0.0),
+        )
+        _cells, details = work.reconcile(1, [support], now=2.0)
+        self.assertEqual(item["anchor_xy"], (2.0, 2.0))
+        self.assertIn((9, 8), item["support_cells"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

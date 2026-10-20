@@ -55,6 +55,11 @@ class CmdVelMuxNode:
         self.teb_contract_identity = None
         self.task_done = False
         self.navigation_hold = False
+        # Manual pause is an actuator-level gate independent of Goal
+        # Manager's observation hold.  It stays latched until the operator's
+        # pause panel explicitly releases it, so a mission callback cannot
+        # accidentally resume motion while the demo is frozen.
+        self.manual_pause = False
         self.hard_reset_hold = False
         self.last_hard_reset_id = ""
         self.last_hard_reset_transaction_id = 0
@@ -133,6 +138,9 @@ class CmdVelMuxNode:
             Bool,
             self.on_navigation_hold,
             queue_size=1,
+        )
+        self.manual_pause_sub = rospy.Subscriber(
+            "/lste/pause", Bool, self.on_manual_pause, queue_size=1
         )
         self.hard_reset_ack_pub = rospy.Publisher(
             "/lste/experiment/hard_reset_ack", String, queue_size=20
@@ -327,6 +335,7 @@ class CmdVelMuxNode:
                 "active": bool(active),
                 "task_done": bool(self.task_done),
                 "navigation_hold": bool(self.navigation_hold),
+                "manual_pause": bool(self.manual_pause),
                 "block_reason": str(block_reason or "none"),
                 "input": self._command_payload(input_command),
                 "output": self._command_payload(output_command),
@@ -361,6 +370,7 @@ class CmdVelMuxNode:
                 source == self.mode
                 and not self.task_done
                 and not self.navigation_hold
+                and not self.manual_pause
                 and not self.hard_reset_hold
             )
             if source != self.mode:
@@ -369,6 +379,8 @@ class CmdVelMuxNode:
                 block_reason = "task_complete"
             elif self.navigation_hold:
                 block_reason = "navigation_hold"
+            elif self.manual_pause:
+                block_reason = "manual_pause"
             elif self.hard_reset_hold:
                 block_reason = "hard_reset_hold"
             else:
@@ -555,6 +567,31 @@ class CmdVelMuxNode:
         rospy.loginfo(
             "Command velocity observation gate %s",
             "closed" if self.navigation_hold else "opened",
+        )
+
+    def on_manual_pause(self, message):
+        """Apply the operator's global pause at the sole actuator boundary."""
+        with self.lock:
+            changed = bool(message.data) != self.manual_pause
+            self.manual_pause = bool(message.data)
+        if not changed:
+            return
+        if self.manual_pause:
+            self.output_pub.publish(Twist())
+            self.reset_teb_filter()
+            self.publish_status(
+                source="none",
+                input_command=None,
+                output_command=Twist(),
+                active=False,
+                block_reason="manual_pause",
+                governor_reason="not_evaluated",
+                governor_limit=None,
+                filter_reason="reset",
+            )
+        rospy.loginfo(
+            "Command velocity manual pause %s",
+            "closed" if self.manual_pause else "opened",
         )
 
     def on_sappo_cmd(self, message):

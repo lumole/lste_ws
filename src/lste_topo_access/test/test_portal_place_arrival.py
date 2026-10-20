@@ -529,6 +529,136 @@ class PortalPlaceArrivalTest(unittest.TestCase):
         )
         self.assertEqual(len(explorer.events), event_count)
 
+    def test_mirrored_crossing_reuses_the_room_instead_of_minting_a_third_place(
+        self,
+    ):
+        """One doorway, two directions, one Place per room.
+
+        A revisit from the opposite side certifies a mirrored identity at the
+        same physical gate (test_opposite_direction_is_a_distinct_portal_
+        identity in test_portal_belief), and that identity is born with no
+        destination.  Committing its crossing through the ordinary path minted
+        a *third* Place for a room the doorway already reached.
+        """
+        explorer = PortalExplorer()
+        # The crossing that reaches a room the map has not separated yet
+        # commits without a SLAM component (evidence source
+        # portal_identity_without_component), which is the condition under
+        # which the destination has to come from the edge identity.
+        explorer.active_frontier_component = None
+        source, _tier = explorer.region_memory.enter(
+            5.0, 4.0, now=1.0, component=None,
+        )
+        explorer.region_memory.endpoint_observed(
+            5.0,
+            4.0,
+            now=2.0,
+            component=None,
+            region_id=source["id"],
+        )
+        explorer.place_departure.region_id = source["id"]
+        ledger = PortalHypothesisLedger()
+        explorer.portal_hypothesis_ledger = ledger
+
+        def cross(edge, terminal_x):
+            explorer.active_portal_crossing_observed = False
+            explorer.place_departure.region_id = source["id"]
+            explorer.last_portal_hypothesis_id = edge["id"]
+            # The base really passes through the doorway on this crossing:
+            # east of the gate for the forward edge, west of it for the mirror.
+            explorer.pose_odom = SimpleNamespace(x=float(terminal_x), y=4.0)
+            transaction = PortalTransaction()
+            transaction.start(
+                explorer.active_route_id,
+                portal_id=edge["id"],
+                source_place_id=source["id"],
+                gate_xy=tuple(edge["physical_gate"]),
+                destination_xy=tuple(edge["physical_destination"]),
+                source_side_proven=True,
+            )
+            transaction.crossing_verified(explorer.active_route_id)
+            explorer.portal_transaction = transaction
+            return explorer.record_portal_place_arrival(
+                (10, 20, float(terminal_x), 4.0), now=4.0,
+            )
+
+        # First crossing: the machinery mints the room beyond the doorway.
+        forward, _created = ledger.certify(
+            source["id"],
+            explorer.active_portal_gate_odom_xy,
+            explorer.active_portal_destination_odom_xy,
+            now=2.0,
+        )
+        ledger.crossed(forward["id"], now=2.5)
+        destination = cross(forward, 8.0)
+        self.assertIsNotNone(destination)
+        self.assertNotEqual(destination["id"], source["id"])
+        self.assertEqual(forward["destination_place_id"], destination["id"])
+        places_before = len(explorer.region_memory.regions)
+
+        # Second crossing, same doorway, opposite direction.
+        mirrored, created = ledger.certify(
+            source["id"], (7.0, 4.0), (6.3, 4.0), now=3.0,
+        )
+        self.assertTrue(created)
+        self.assertIsNone(mirrored["destination_place_id"])
+        entered = cross(mirrored, 6.5)
+
+        self.assertIsNotNone(entered)
+        self.assertEqual(entered["id"], destination["id"])
+        self.assertEqual(len(explorer.region_memory.regions), places_before)
+        # The mirrored identity adopts the doorway's established endpoint, so
+        # later traversals through it reuse the same room.
+        self.assertEqual(mirrored["destination_place_id"], destination["id"])
+
+    def test_unrelated_crossing_still_creates_a_destination_place(self):
+        """The gate fallback must not turn an unseen doorway into a reuse."""
+        explorer = PortalExplorer()
+        source, _tier = explorer.region_memory.enter(
+            5.0, 4.0, now=1.0, component=explorer.active_frontier_component,
+        )
+        explorer.region_memory.endpoint_observed(
+            5.0,
+            4.0,
+            now=2.0,
+            component=explorer.active_frontier_component,
+            region_id=source["id"],
+        )
+        explorer.place_departure.region_id = source["id"]
+        ledger = PortalHypothesisLedger()
+        explorer.portal_hypothesis_ledger = ledger
+        far, _created = ledger.certify(
+            source["id"], (1.0, 1.0), (1.0, 1.8), now=2.0,
+        )
+        ledger.crossed(far["id"], now=2.0)
+        ledger.bind_destination(far["id"], 9, now=2.0)
+        edge, _created = ledger.certify(
+            source["id"],
+            explorer.active_portal_gate_odom_xy,
+            explorer.active_portal_destination_odom_xy,
+            now=3.0,
+        )
+        explorer.last_portal_hypothesis_id = edge["id"]
+        transaction = PortalTransaction()
+        transaction.start(
+            explorer.active_route_id,
+            portal_id=edge["id"],
+            source_place_id=source["id"],
+            gate_xy=explorer.active_portal_gate_odom_xy,
+            destination_xy=explorer.active_portal_destination_odom_xy,
+            source_side_proven=True,
+        )
+        transaction.crossing_verified(explorer.active_route_id)
+        explorer.portal_transaction = transaction
+
+        entered = explorer.record_portal_place_arrival(
+            (10, 20, 8.0, 4.0), now=4.0,
+        )
+
+        self.assertIsNotNone(entered)
+        self.assertNotEqual(entered["id"], source["id"])
+        self.assertEqual(len(explorer.region_memory.regions), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

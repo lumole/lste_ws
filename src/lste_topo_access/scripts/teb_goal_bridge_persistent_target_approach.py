@@ -4,6 +4,56 @@ import rospy
 
 
 class TebGoalBridgePersistentTargetApproachMixin:
+    def _target_terminal_contract_locked(self):
+        """Build a semantic target contract for a non-frontier terminal.
+
+        Persistent target segments reuse the native MoveBase action that may
+        have been created for a frontier route.  Its immutable transport
+        contract must not be reused for the semantic target observation
+        boundary: doing so publishes the target terminal as a frontier ACK and
+        leaves Global Frontier waiting for a release that this path does not
+        own.
+        """
+        base = getattr(self, "active_action_contract", None)
+        contract = dict(base) if hasattr(base, "items") else {}
+        latest_source = str(
+            getattr(self, "latest_intent_source", "") or "target_follow"
+        )
+        if not latest_source.startswith("target_"):
+            latest_source = "target_follow"
+        contract.update(
+            {
+                "route_id": 0,
+                "transaction_id": int(
+                    getattr(self, "latest_goal_transaction_id", 0) or 0
+                ),
+                "graph_transaction_id": int(
+                    getattr(self, "latest_graph_transaction_id", 0) or 0
+                ),
+                "route_kind": "direct_goal",
+                "mission_route_kind": "direct_goal",
+                "graph_action": "reinspect_target",
+                "graph_obligation_kind": "target_observation",
+                "source": latest_source,
+                "priority": max(
+                    2, int(getattr(self, "latest_intent_priority", 0) or 0)
+                ),
+                "target_epoch": int(getattr(self, "latest_target_epoch", 0) or 0),
+                "target_track_id": str(
+                    getattr(self, "latest_target_track_id", "") or ""
+                ),
+                "target_viewpoint_candidate_id": str(
+                    getattr(self, "latest_target_viewpoint_candidate_id", "")
+                    or ""
+                ),
+                "target_viewpoint_attempt_id": str(
+                    getattr(self, "latest_target_viewpoint_attempt_id", "")
+                    or ""
+                ),
+            }
+        )
+        return contract
+
     def _handle_persistent_target_approach_locked(self, transaction_id, message):
         """Forward an identity-bound persistent target arrival to GoalManager."""
         if not self.persistent_execution or self.task_done:
@@ -65,7 +115,11 @@ class TebGoalBridgePersistentTargetApproachMixin:
         # transaction here would revoke the action generation and leave the
         # successor blocked behind a controller-release ACK that target routes
         # do not produce.
-        terminal_goal = self._publish_execution_terminal_locked(self.latest_goal)
+        terminal_contract = self._target_terminal_contract_locked()
+        terminal_goal = self._publish_execution_terminal_locked(
+            self.latest_goal,
+            action_contract=terminal_contract,
+        )
         if terminal_goal is None:
             return
         self.persistent_target_approach_reported_transaction = int(
@@ -91,14 +145,42 @@ class TebGoalBridgePersistentTargetApproachMixin:
             ],
             lifecycle="single_action_target_approach",
         )
-        arm_watchdog = getattr(
-            self, "_arm_route_lease_watchdog_locked", None
-        )
-        if callable(arm_watchdog):
-            arm_watchdog(
-                reason="persistent_target_approach_terminal",
-                action_contract=getattr(self, "active_action_contract", None),
+        # The persistent target reuses the MoveBase action that was originally
+        # opened for a frontier route.  Its semantic terminal is non-frontier,
+        # but Global Frontier still needs an idempotent release ACK for that
+        # predecessor route before it can plan the next room/work item.
+        predecessor = getattr(self, "active_action_contract", None)
+        if hasattr(predecessor, "get"):
+            try:
+                predecessor_route_id = int(predecessor.get("route_id", 0) or 0)
+            except (TypeError, ValueError):
+                predecessor_route_id = 0
+            predecessor_source = str(
+                predecessor.get("source", "") or ""
+            ).strip().lower()
+            release_ack = getattr(
+                self, "_publish_frontier_release_ack_locked", None
             )
+            identity_builder = getattr(
+                self, "_route_lease_watchdog_identity_locked", None
+            )
+            if (
+                predecessor_route_id > 0
+                and predecessor_source == "global_slam_frontier"
+                and callable(release_ack)
+                and callable(identity_builder)
+            ):
+                release_ack(
+                    predecessor_route_id,
+                    identity_builder(predecessor),
+                    str(predecessor.get("route_kind", "") or ""),
+                    release_phase="target_terminal_semantic_boundary",
+                )
+                self.publish_bridge_status(
+                    "target_terminal_frontier_predecessor_released",
+                    released_route_id=predecessor_route_id,
+                    release_phase="target_terminal_semantic_boundary",
+                )
         rospy.loginfo(
             "TEB goal bridge forwarded persistent target approach: "
             "transaction=%d received=%d track=%s",

@@ -247,6 +247,20 @@ class GlobalFrontierObservationCoverageMixin:
                 float(self.pose_odom.x),
                 float(self.pose_odom.y),
             )
+        detect_post_hoc = getattr(
+            self, "detect_and_commit_post_hoc_place_transition", None
+        )
+        if callable(detect_post_hoc):
+            post_hoc_region = detect_post_hoc(
+                x,
+                y,
+                physical_xy=physical_xy,
+                component=component,
+                source_place_id=region_id,
+                now=now,
+            )
+            if post_hoc_region is not None:
+                region_id = post_hoc_region["id"]
         region = self.region_memory.endpoint_observed(
             x,
             y,
@@ -302,7 +316,19 @@ class GlobalFrontierObservationCoverageMixin:
             # certified.
             settle = getattr(self, "settle_active_work_item", None)
             if settle is not None and not source_probe_active:
-                settle(now, "resolved", "endpoint_coverage_recorded")
+                if self.active_work_item_support_is_observed():
+                    settle(now, "resolved", "endpoint_coverage_recorded")
+                else:
+                    # The endpoint was reached, but the item's unknown patch
+                    # is still unseen from this pose: record a failed attempt
+                    # and keep the obligation so a nearer viewpoint is
+                    # dispatched.  Resolving here would mark never-observed
+                    # space as covered and make it undispatchable forever.
+                    settle(
+                        now,
+                        "deferred",
+                        "endpoint_reached_support_unobserved",
+                    )
         if not self.frontier_is_completed(x, y):
             self.completed_frontiers.append((x, y))
             rospy.loginfo(

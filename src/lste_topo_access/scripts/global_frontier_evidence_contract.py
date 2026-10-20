@@ -25,6 +25,11 @@ OWNER_WORK_ITEM = "work_item"
 OWNER_TARGET = "target"
 
 EVIDENCE_PLACE_VIEW = "place_view"
+# ``work_item_open`` is the *state* that creates an observation gap (see
+# ``requirements_for``, which derives ``work_item_viewpoint`` for an unresolved
+# item).  It is deliberately not a required observation: nothing in the
+# lifecycle produces it, so declaring it made the contract unsatisfiable and
+# left the planner re-planning an action it could never retire.
 EVIDENCE_WORK_ITEM_OPEN = "work_item_open"
 EVIDENCE_WORK_ITEM_VIEWPOINT = "work_item_viewpoint"
 EVIDENCE_PORTAL_CERTIFIED = "portal_certified"
@@ -87,6 +92,14 @@ def _owner_id(value):
     except (TypeError, ValueError):
         return _text(value)
     return number if number > 0 else _text(value)
+
+
+def _first_present(*values):
+    """Return the first value a publisher actually filled in."""
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
 
 
 def _owner_kind(value):
@@ -703,7 +716,13 @@ def action_contract_for(
             "place_identity_available",
             OWNER_PLACE,
             place_id,
-            (EvidenceRequirement(OWNER_PLACE, place_id, "place_identity"),),
+            # The bootstrap action is *selected* by a ``place_view`` gap; the
+            # Place's own identity is the state the planner asserts before it
+            # can name one, and no lifecycle event reports it as an
+            # observation.  Declaring it here left a requirement that nothing
+            # could ever close, so the contract never emptied even after the
+            # frontier reported no reachable unknown.
+            (),
             (EvidenceRequirement(OWNER_PLACE, place_id, EVIDENCE_PLACE_VIEW, REQUIREMENT_RESOLVED),),
         )
     if action in (ACTION_OBSERVE_LOCAL_WORK, ACTION_RETRY_VIEWPOINT):
@@ -712,10 +731,15 @@ def action_contract_for(
             "owned_work_item_viewpoint",
             OWNER_WORK_ITEM,
             work_id,
-            (
-                EvidenceRequirement(OWNER_PLACE, place_id, EVIDENCE_PLACE_VIEW),
-                EvidenceRequirement(OWNER_WORK_ITEM, work_id, EVIDENCE_WORK_ITEM_OPEN),
-            ),
+            # Only the place's own view is an outstanding observation here.
+            # "The work item is open" is the state that produced this gap, not
+            # a fact a later observation can produce -- ``requirements_for``
+            # derives the same gap as ``work_item_viewpoint`` for exactly an
+            # unresolved item.  Requiring ``work_item_open`` as well made the
+            # contract permanently unsatisfiable: its gap survived every
+            # observation, so the planner kept selecting an action it could
+            # never retire while the frontier reported no reachable unknown.
+            (EvidenceRequirement(OWNER_PLACE, place_id, EVIDENCE_PLACE_VIEW),),
             (EvidenceRequirement(OWNER_WORK_ITEM, work_id, EVIDENCE_WORK_ITEM_VIEWPOINT, REQUIREMENT_RESOLVED),),
         )
     if action == ACTION_REINSPECT_TARGET:
@@ -894,7 +918,18 @@ def observation_for_event(event, fields=None):
     context = fields.get("goal_context")
     context = context if isinstance(context, dict) else {}
     if owner_kind == OWNER_PLACE:
-        owner_id = fields.get("place_id", fields.get("active_region_id", context.get("owner_place_id")))
+        # Every event that *defines* a Place names it ``region_id`` -- the
+        # frontier's bootstrap, close, entry and covered-arrival publishers all
+        # use it, and its own reducer documents the same convention.  Reading
+        # only place_id/active_region_id silently dropped those facts, so a
+        # Place that had demonstrably been viewed stayed ``place_view``
+        # pending forever and the graph kept planning a route back to it.
+        owner_id = _first_present(
+            fields.get("place_id"),
+            fields.get("active_region_id"),
+            fields.get("region_id"),
+            context.get("owner_place_id"),
+        )
     elif owner_kind == OWNER_WORK_ITEM:
         owner_id = fields.get("work_item_id", fields.get("active_work_item_id", context.get("work_item_id")))
     elif owner_kind == OWNER_PORTAL:

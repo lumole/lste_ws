@@ -787,6 +787,15 @@ class GlobalFrontierEventCallbacksMixin:
             return False
         if not isinstance(payload, dict):
             return False
+        # The bridge is the last hop before move_base, so its own dispatch
+        # bookkeeping is part of the actuator boundary: a route it is holding
+        # has not reached the controller and this node's clock is not evidence
+        # about it.
+        observe_dispatch = getattr(
+            getattr(self, "route_actuator", None), "observe_dispatch", None
+        )
+        if callable(observe_dispatch):
+            observe_dispatch(payload)
         dispatch_contract = self._remember_bridge_dispatch_contract(payload)
         if dispatch_contract is not None:
             retry = getattr(self, "_retry_terminals_after_dispatch", None)
@@ -1017,6 +1026,33 @@ class GlobalFrontierEventCallbacksMixin:
                 )
                 return
         old_goal = self.active_frontier
+        # A replan is also a controller ownership boundary.  Clearing the
+        # graph route alone leaves persistent TEB in terminal hold, where its
+        # retry watchdog can resurrect the rejected endpoint.  Release the
+        # physical lease before clearing the semantic route, and let the
+        # exact bridge ACK gate successor planning.  Portal transactions are
+        # handled by the deferral above; ordinary frontier/egress routes can
+        # be cancelled safely here.
+        controller_release_pending = False
+        release_active = getattr(self, "release_active_frontier", None)
+        if old_goal is not None and callable(release_active):
+            controller_release_pending = bool(
+                release_active(
+                    discard_prefetch=True,
+                    preserve_place_departure=False,
+                    queue_successor=False,
+                    await_controller_release_ack=True,
+                )
+            )
+            self.publish_status(
+                "replan_controller_lease_release_requested",
+                request_id=request_id,
+                route_id=int(getattr(self, "last_released_route_id", 0) or 0),
+                awaiting_controller_lease_release_ack=bool(
+                    controller_release_pending
+                ),
+                reason=str(payload.get("reason", "replan")),
+            )
         # ``on_replan_request`` is also an execution boundary. Target-route
         # failures can release the bridge lease before this callback runs, so
         # ``release_active_frontier`` is not guaranteed to have cleared the
@@ -1202,6 +1238,9 @@ class GlobalFrontierEventCallbacksMixin:
             target_reinspection=target_reinspection,
             target_room_claim_release=target_room_claim_release,
             target_track_id=target_track_id or None,
+            awaiting_controller_lease_release_ack=bool(
+                controller_release_pending
+            ),
         )
         rospy.loginfo(
             "Global frontier accepted replan request id=%d reason=%s old=%s hint=%s target_pursuit=%s target_room_claim=%s release=%s track=%s",
@@ -1230,6 +1269,19 @@ class GlobalFrontierEventCallbacksMixin:
         return GlobalFrontierEventCallbacksMixin._enqueue_or_apply(
             self, EventType.TURN_STATUS, message, self.apply_turn_status
         )
+
+    def on_route_actuator_status(self, message):
+        """Receive one decision from the command mux at the actuator boundary.
+
+        The frontier plans routes but never publishes /cmd_vel, so this stream
+        is what separates "my route is stalled" from "another owner is driving
+        the vehicle".  It is a gate on the frontier's own failure authority,
+        not a command source: nothing here is ever planned from or forwarded.
+        """
+        status = getattr(self, "route_actuator", None)
+        if status is None:
+            return
+        status.apply(message.data)
 
     def on_turn_status(self, message):
         """Receive the execution adapter's atomic-turn state."""

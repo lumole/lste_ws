@@ -4,12 +4,20 @@
 
 import rospy
 
+from global_frontier_route_actuator import RouteActuatorStatus
+
 
 class GlobalFrontierNavigationConfigurationMixin:
     """Load constraints and timings for Navfn/TEB route execution."""
 
     def _load_navigation_parameters(self, gp):
         """Resolve route validation, handoff, and progress-watchdog settings."""
+        # Which mux mode carries this node's route commands. Under the teb
+        # mode the goal manager hands the frontier's route to TEB, whose
+        # output is the source the mux forwards as "teb".
+        self.route_actuator = RouteActuatorStatus(
+            source=gp("~route_actuator_source", "teb")
+        )
         self.costmap_max_age = max(0.5, float(gp("~costmap_max_age", 3.0)))
         # ``clearance`` is the route clearance, not merely a preference.  It
         # must cover the robot footprint and TEB's minimum obstacle distance;

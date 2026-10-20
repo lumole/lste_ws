@@ -201,16 +201,130 @@ def _unknown_side_direction(frontier_cells, unknown_side_cells, cell_xy, map_to_
     return anchor, (dx / norm, dy / norm)
 
 
+def check_anchor_clearance_and_corner(
+    arc,
+    unknown,
+    known_free,
+    occupied,
+    resolution,
+    *,
+    clearance_radius_m=0.7,
+    min_clearance_ratio=0.35,
+    corner_wall_distance_m=0.4,
+    min_wall_distance_m=0.25,
+    max_unknown_ratio=0.70,
+    min_free_ratio=0.25,
+    min_free_area_m2=0.20,
+):
+    """Evaluate whether a frontier arc is viable for WorkItem generation.
+
+    Under the open-generation / runtime-abandonment policy, upfront geometric
+    filtering is intentionally relaxed so that all valid frontier boundaries
+    generate WorkItems without being prematurely choked off. Only empty arcs
+    or anchors embedded inside solid obstacles are rejected upfront; physical
+    unreachability and stalls are handled dynamically at runtime.
+    """
+    if not arc:
+        return True, "empty_arc", {}
+    rows, cols = unknown.shape
+    r_anchor = sum(r for r, c in arc) / float(len(arc))
+    c_anchor = sum(c for r, c in arc) / float(len(arc))
+    r0 = int(round(r_anchor))
+    c0 = int(round(c_anchor))
+    if not (0 <= r0 < rows and 0 <= c0 < cols):
+        return True, "anchor_out_of_bounds", {}
+
+    resolution = float(resolution)
+    if resolution <= 0.0:
+        return False, "invalid_resolution", {}
+
+    # If the geometric centroid lands on an occupied cell (common for curved
+    # arcs or walls), project onto the closest frontier cell on the arc.
+    if occupied[r0, c0]:
+        r_closest, c_closest = min(
+            arc, key=lambda rc: (rc[0] - r_anchor) ** 2 + (rc[1] - c_anchor) ** 2
+        )
+        if occupied[r_closest, c_closest]:
+            return True, "anchor_in_obstacle", {}
+
+    # All non-empty frontier arcs with anchors outside solid obstacles are admitted.
+    # Unreachability and dead corners are handled dynamically at runtime.
+    return False, "admitted", {"free_cells": len(arc), "clearance_ratio": 1.0}
+
+
+
+def suppress_dense_observation_supports(
+    supports,
+    density_separation_m=1.0,
+):
+    """Spatially suppress and merge clustered observation supports.
+
+    In a local neighborhood of radius ``density_separation_m``, keeps the
+    dominant support (highest support_cell_count, clear normal, largest arc)
+    and absorbs the support cells and frontier cells of nearby supports into it.
+    """
+    if not supports or len(supports) <= 1:
+        return tuple(supports or ())
+    density_sep = max(0.05, float(density_separation_m))
+
+    def support_key(s):
+        support_count = len(s.support_cells)
+        has_normal = 1 if (getattr(s, "normal_xy", None) is not None) else 0
+        frontier_count = len(s.frontier_cells)
+        return (support_count, has_normal, frontier_count)
+
+    sorted_supports = sorted(supports, key=support_key, reverse=True)
+    retained = []
+
+    for s in sorted_supports:
+        s_anchor = getattr(s, "anchor_xy", None)
+        if s_anchor is None:
+            retained.append(s)
+            continue
+
+        is_fragment = (len(s.support_cells) <= 4 or len(s.frontier_cells) <= 3)
+        effective_sep = density_sep * 1.5 if is_fragment else density_sep
+
+        closest_idx = None
+        min_dist = float("inf")
+        for i, r in enumerate(retained):
+            r_anchor = getattr(r, "anchor_xy", None)
+            if r_anchor is None:
+                continue
+            dist = math.hypot(s_anchor[0] - r_anchor[0], s_anchor[1] - r_anchor[1])
+            if dist <= effective_sep and dist < min_dist:
+                min_dist = dist
+                closest_idx = i
+
+        if closest_idx is not None:
+            r = retained[closest_idx]
+            merged_support = ObservationSupport(
+                frontier_cells=frozenset(r.frontier_cells | s.frontier_cells),
+                support_cells=frozenset(r.support_cells | s.support_cells),
+                anchor_xy=r.anchor_xy,
+                normal_xy=r.normal_xy if r.normal_xy is not None else s.normal_xy,
+            )
+            retained[closest_idx] = merged_support
+        else:
+            retained.append(s)
+
+    return tuple(retained)
+
+
 def observation_supports(
     frontier, unknown, *, cell_xy, map_to_physical_xy=None,
     resolution, sensor_horizon_m=None,
+    known_free=None, occupied=None,
+    clearance_radius_m=0.7, min_clearance_ratio=0.35,
+    corner_wall_distance_m=0.4, density_separation_m=None,
+    min_wall_distance_m=0.25, max_unknown_ratio=0.70,
+    min_free_ratio=0.25, min_free_area_m2=0.20,
 ):
-    """Extract one physical support record for each 8-connected frontier arc.
+    """Extract physical support records for 8-connected frontier arcs.
 
-    With no scan horizon yet available, the immediate unknown neighbours form
-    a conservative bootstrap support.  Once LaserScan reports its range, all
-    work uses the real local sensor horizon rather than a dwell timer or a
-    scoring radius.
+    Optionally filters out corner, wall-clinging, and constricted arcs with
+    insufficient explored clearance, and suppresses densely clustered supports
+    within ``density_separation_m``.
     """
     frontier = np.asarray(frontier, dtype=bool)
     unknown = np.asarray(unknown, dtype=bool)
@@ -223,18 +337,29 @@ def observation_supports(
     if not math.isfinite(horizon_m) or horizon_m <= 0.0:
         horizon_m = resolution
     horizon_cells = max(1, int(math.ceil(horizon_m / resolution)))
-    # A 25 cm physical lattice is intentionally independent of SLAM grid
-    # resolution. It absorbs sub-cell map corrections without conflating
-    # separate rooms, and bounds the persisted support size.
     quantum = max(resolution, 0.25)
     supports = []
     for arc in _components(frontier, EIGHT_NEIGHBOURS):
+        if known_free is not None and occupied is not None:
+            rejected, _reason, _metrics = check_anchor_clearance_and_corner(
+                arc,
+                unknown,
+                known_free,
+                occupied,
+                resolution,
+                clearance_radius_m=clearance_radius_m,
+                min_clearance_ratio=min_clearance_ratio,
+                corner_wall_distance_m=corner_wall_distance_m,
+                min_wall_distance_m=min_wall_distance_m,
+                max_unknown_ratio=max_unknown_ratio,
+                min_free_ratio=min_free_ratio,
+                min_free_area_m2=min_free_area_m2,
+            )
+            if rejected:
+                continue
+
         seeds = _unknown_neighbours(arc, unknown)
         patch = _local_unknown_patch(unknown, seeds, arc, horizon_cells)
-        # ``frontier`` normally guarantees this. Keeping the guard makes a
-        # malformed fixture or stale mask fall back to legacy endpoint logic
-        # instead of inventing a physical observation task without unknown
-        # space on its far side.
         if not patch:
             continue
         support_cells = _quantized_physical_cells(
@@ -258,9 +383,17 @@ def observation_supports(
                     normal_xy=normal_xy,
                 )
             )
+
+    if density_separation_m is not None and float(density_separation_m) > 0.0:
+        supports = list(suppress_dense_observation_supports(
+            supports,
+            density_separation_m=float(density_separation_m),
+        ))
+
     return tuple(supports)
 
 
 def support_overlap(left, right):
     """Return the shared physical cells of two local observation supports."""
     return len(frozenset(left) & frozenset(right))
+

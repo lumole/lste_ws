@@ -24,6 +24,8 @@ _GRAPH_ROUTE_MATERIALIZATION_MAX_EPOCH_SPAN = 2
 _GRAPH_ROUTE_MATERIALIZATION_EXCLUSION_EPOCHS = 8
 _GRAPH_ROUTE_MATERIALIZATION_INVALIDATED_MAX = 128
 _GRAPH_ROUTE_MATERIALIZATION_TRACKERS_MAX = 128
+_GRAPH_ROUTE_WORK_ITEM_DEFER_EPOCHS = 3
+_GRAPH_ROUTE_WORK_ITEM_DEFER_HISTORY_MAX = 32
 _GRAPH_ROUTE_FSM_SEARCHING = "SEARCHING"
 _GRAPH_ROUTE_FSM_PLANNING = "PLANNING"
 _GRAPH_ROUTE_FSM_WAITING = "WAITING_MATERIALIZATION"
@@ -597,11 +599,135 @@ class GlobalFrontierGraphRouteAdapterMixin:
                 portal_ids.add(identity)
             elif kind in {"portal_edge", "unbound_portal"}:
                 portal_ids.add(identity)
+        # This is a bounded exploration fallback, not semantic completion:
+        # keep an unresolved WorkItem in the ledger while allowing a raw
+        # frontier or a certified Portal to make progress after repeated
+        # no-viewpoint snapshots.  A later visible candidate removes it from
+        # this set before the next graph plan is built.
+        deferred_work = getattr(self, "graph_route_deferred_work_item_ids", ())
+        if isinstance(deferred_work, (set, tuple, list)):
+            for value in deferred_work:
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    work_item_ids.add(value)
         return (
             tuple(sorted(portal_ids)),
             tuple(sorted(work_item_ids)),
             tuple(sorted(probe_ids)),
         )
+
+    def _record_graph_work_item_projection_miss(self, map_epoch=None):
+        """Bound repeated no-viewpoint WorkItem waits by map epoch.
+
+        A WorkItem remains unresolved until observation evidence settles it. If
+        all of its safe viewpoints fail for several distinct map projections,
+        however, holding the whole frontier graph is not useful: the robot
+        must be allowed to discover another boundary or use a certified edge.
+        """
+        report = getattr(self, "last_local_work_item_rehydration_report", None)
+        if not isinstance(report, dict) or int(report.get("candidate_count", 0) or 0) > 0:
+            return ()
+        try:
+            epoch = int(
+                report.get("map_epoch") if map_epoch is None else map_epoch
+            )
+        except (TypeError, ValueError):
+            return ()
+        item_ids = set()
+        for audit in report.get("item_audit", ()) or ():
+            if not isinstance(audit, dict):
+                continue
+            try:
+                item_id = int(audit.get("work_item_id"))
+            except (TypeError, ValueError):
+                continue
+            if item_id > 0:
+                item_ids.add(item_id)
+        if not item_ids:
+            return ()
+        histories = getattr(self, "graph_route_deferred_work_item_epochs", None)
+        if not isinstance(histories, dict):
+            histories = {}
+            self.graph_route_deferred_work_item_epochs = histories
+        deferred = getattr(self, "graph_route_deferred_work_item_ids", None)
+        if not isinstance(deferred, set):
+            deferred = set()
+            self.graph_route_deferred_work_item_ids = deferred
+        newly_deferred = []
+        for item_id in sorted(item_ids):
+            epochs = histories.setdefault(item_id, set())
+            if not isinstance(epochs, set):
+                epochs = set(epochs or ())
+                histories[item_id] = epochs
+            epochs.add(epoch)
+            if len(epochs) > _GRAPH_ROUTE_WORK_ITEM_DEFER_HISTORY_MAX:
+                histories[item_id] = set(
+                    sorted(epochs)[-_GRAPH_ROUTE_WORK_ITEM_DEFER_HISTORY_MAX:]
+                )
+                epochs = histories[item_id]
+            if (
+                len(epochs) >= _GRAPH_ROUTE_WORK_ITEM_DEFER_EPOCHS
+                and item_id not in deferred
+            ):
+                deferred.add(item_id)
+                newly_deferred.append(item_id)
+        if newly_deferred:
+            signature = (epoch, tuple(newly_deferred))
+            if signature != getattr(
+                self, "last_graph_work_item_deferred_signature", None
+            ):
+                self.last_graph_work_item_deferred_signature = signature
+                publish = getattr(self, "publish_status", None)
+                if callable(publish):
+                    publish(
+                        "graph_work_item_materialization_deferred",
+                        work_item_ids=list(newly_deferred),
+                        map_epoch=epoch,
+                        observed_epochs={
+                            str(item_id): sorted(
+                                histories.get(item_id, ())
+                            )
+                            for item_id in newly_deferred
+                        },
+                        reason="no_safe_viewpoint_after_bounded_map_epochs",
+                        semantic_state="unresolved",
+                        fallback_policy="continue_other_frontier_or_graph_work",
+                    )
+        return tuple(sorted(deferred))
+
+    def _clear_graph_work_item_projection_deferrals(self, visible_ids):
+        """Reopen deferred WorkItems as soon as a safe viewpoint reappears."""
+        deferred = getattr(self, "graph_route_deferred_work_item_ids", None)
+        histories = getattr(self, "graph_route_deferred_work_item_epochs", None)
+        if not isinstance(deferred, set):
+            return ()
+        visible = set()
+        for value in visible_ids or ():
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                visible.add(value)
+        reopened = sorted(deferred.intersection(visible))
+        if not reopened:
+            return ()
+        for item_id in reopened:
+            deferred.discard(item_id)
+            if isinstance(histories, dict):
+                histories.pop(item_id, None)
+        publish = getattr(self, "publish_status", None)
+        if callable(publish):
+            publish(
+                "graph_work_item_materialization_reopened",
+                work_item_ids=reopened,
+                reason="safe_viewpoint_reprojected",
+                semantic_state="unresolved",
+            )
+        return tuple(reopened)
 
     def _remember_graph_route_materialization_invalidation(self, plan):
         """Keep an exhausted obligation out of the next graph-plan pass."""
@@ -1544,11 +1670,34 @@ class GlobalFrontierGraphRouteAdapterMixin:
             portal = self._positive_ids(
                 (getattr(plan, "first_portal_id", None),)
             )
-            return bool(
+            if bool(
                 ids is not None
                 and portal
                 and next(iter(portal)) in ids
-            )
+            ):
+                return True
+            # A PortalProbe's completed destination observation is durable
+            # graph evidence.  The doorway may have disappeared from the
+            # transient frontier projection after an earlier materialization
+            # miss, but that stronger evidence still makes the Portal edge
+            # visible to the graph contract.
+            if action == ACTION_CROSS_PORTAL and portal:
+                portal_id = next(iter(portal))
+                probe_ledger = getattr(self, "portal_probe_ledger", None)
+                snapshot = getattr(probe_ledger, "snapshot", None)
+                if callable(snapshot):
+                    for probe in snapshot() or ():
+                        try:
+                            bound_portal_id = int(probe.get("portal_id"))
+                        except (AttributeError, TypeError, ValueError):
+                            continue
+                        if (
+                            bound_portal_id == portal_id
+                            and str(probe.get("state", "")).strip().lower()
+                            in {"observed", "certified"}
+                        ):
+                            return True
+            return False
         if action == "reinspect_target":
             return bool(
                 self._positive_ids(visible_work_item_ids)
@@ -1620,7 +1769,35 @@ class GlobalFrontierGraphRouteAdapterMixin:
             return True
         if ids is None:
             return True
-        return obligation is not None and obligation in ids
+        if obligation is not None and obligation in ids:
+            return True
+        if action == ACTION_CROSS_PORTAL and obligation is not None:
+            probe_ledger = getattr(self, "portal_probe_ledger", None)
+            snapshot = getattr(probe_ledger, "snapshot", None)
+            if callable(snapshot):
+                return any(
+                    self._portal_probe_has_destination_evidence(
+                        probe, obligation
+                    )
+                    for probe in snapshot() or ()
+                )
+        return False
+
+    @staticmethod
+    def _portal_probe_has_destination_evidence(probe, portal_id):
+        """Return whether a probe proves the far side of one Portal."""
+        if not isinstance(probe, dict):
+            return False
+        try:
+            bound_portal_id = int(probe.get("portal_id"))
+            portal_id = int(portal_id)
+        except (TypeError, ValueError):
+            return False
+        return (
+            bound_portal_id == portal_id
+            and str(probe.get("state", "")).strip().lower()
+            in {"observed", "certified"}
+        )
 
     def _graph_plan_probe_phase_matches_durable_state(self, plan):
         """Reject a probe lease after its evidence transaction changes phase.
@@ -1885,6 +2062,7 @@ class GlobalFrontierGraphRouteAdapterMixin:
         self.graph_route_portal_id = None
         self.graph_route_probe_id = None
         self.graph_route_work_item_id = None
+        self.graph_route_work_item_tour = ()
         self.graph_route_work_item_filter = None
         if plan is None or plan.status != PLAN_READY:
             return
@@ -1906,6 +2084,7 @@ class GlobalFrontierGraphRouteAdapterMixin:
                 # every local WorkItem candidate is both redundant and costly
                 # once a long-running map has accumulated many boundaries.
                 self.graph_route_work_item_id = work_item_id
+                self.graph_route_work_item_tour = getattr(plan, "work_item_tour", ())
                 self.graph_route_work_item_filter = "selected"
                 return
         # A non-local graph plan (Portal/probe/target) does not need local
@@ -1927,6 +2106,7 @@ class GlobalFrontierGraphRouteAdapterMixin:
     def _set_graph_route_preference(
         self, map_epoch=None, visible_work_item_ids=None,
         visible_probe_ids=None, visible_portal_ids=None, stage_only=False,
+        robot_pose=None,
     ):
         """Replan after ledger reconciliation and install one edge identity.
 
@@ -1941,6 +2121,7 @@ class GlobalFrontierGraphRouteAdapterMixin:
             visible_probe_ids=visible_probe_ids,
             visible_portal_ids=visible_portal_ids,
             commit=not stage_only,
+            robot_pose=robot_pose,
         )
         if stage_only:
             # Do not let events emitted during candidate collection inherit a
@@ -1955,6 +2136,7 @@ class GlobalFrontierGraphRouteAdapterMixin:
     def _plan_durable_graph_route(
         self, map_epoch=None, visible_work_item_ids=None,
         visible_probe_ids=None, visible_portal_ids=None, commit=True,
+        robot_pose=None,
     ):
         if not getattr(self, "graph_route_planner_enabled", False):
             self.last_graph_route_plan = None
@@ -1970,6 +2152,40 @@ class GlobalFrontierGraphRouteAdapterMixin:
             self.graph_route_work_item_id = None
             self.graph_route_work_item_filter = None
             return None
+        if robot_pose is None:
+            robot_map = getattr(self, "robot_map", None)
+            robot_yaw = getattr(self, "robot_yaw_map", getattr(self, "robot_yaw", None))
+            if robot_map is not None:
+                robot_pose = (robot_map[0], robot_map[1], robot_yaw)
+            if robot_pose is None and hasattr(self, "planning_pose_snapshot"):
+                try:
+                    pose_snap = self.planning_pose_snapshot()
+                    if pose_snap is not None and len(pose_snap) >= 3:
+                        robot_map = pose_snap[1]
+                        robot_yaw = pose_snap[2]
+                        if robot_map is not None:
+                            robot_pose = (robot_map[0], robot_map[1], robot_yaw)
+                except Exception:
+                    pass
+            if robot_pose is None:
+                context = getattr(self, "last_selection_context", None)
+                if context is not None:
+                    context_map = getattr(context, "robot_map", None) or getattr(context, "route_anchor_xy", None)
+                    if context_map is not None:
+                        robot_pose = (context_map[0], context_map[1], getattr(context, "robot_yaw", None))
+            if robot_pose is None:
+                pose_odom = getattr(self, "pose_odom", None)
+                if pose_odom is not None and hasattr(pose_odom, "x") and hasattr(pose_odom, "y"):
+                    robot_pose = (
+                        pose_odom.x,
+                        pose_odom.y,
+                        getattr(pose_odom, "theta", getattr(pose_odom, "yaw", None)),
+                    )
+        elif len(robot_pose) == 2:
+            robot_yaw = getattr(self, "robot_yaw_map", getattr(self, "robot_yaw", None))
+            robot_pose = (robot_pose[0], robot_pose[1], robot_yaw)
+        v_max = float(getattr(self, "tsp_v_max", getattr(self, "max_vel_x", 0.4)) or 0.4)
+        omega_max = float(getattr(self, "tsp_omega_max", getattr(self, "max_vel_theta", 0.8)) or 0.8)
         resume_place_id = getattr(self, "pending_graph_resume_place_id", None)
         try:
             if resume_place_id is not None:
@@ -2057,6 +2273,14 @@ class GlobalFrontierGraphRouteAdapterMixin:
             excluded_portal_ids=excluded_portal_ids,
             excluded_work_item_ids=excluded_work_item_ids,
             excluded_probe_ids=excluded_probe_ids,
+            robot_pose=robot_pose,
+            v_max=v_max,
+            omega_max=omega_max,
+            enable_dedicated_portal_probe_transaction=bool(
+                getattr(self, "enable_dedicated_portal_probe_transaction", True)
+            ),
+            tsp_alpha=float(getattr(self, "tsp_alpha", 4.0)),
+            tsp_beta=float(getattr(self, "tsp_beta", 3.0)),
         )
         if getattr(plan, "map_epoch", None) != map_epoch:
             plan = replace(plan, map_epoch=map_epoch)
@@ -2124,7 +2348,7 @@ class GlobalFrontierGraphRouteAdapterMixin:
     def _prepare_graph_route_action(
         self, snapshot, *, visible_work_item_ids=None, visible_probe_ids=None,
         visible_portal_ids=None, reuse_existing_plan=False, stage_only=False,
-        map_epoch=None,
+        map_epoch=None, robot_pose=None,
     ):
         """Reserve a planner-selected edge for the next selection pass.
 
@@ -2135,6 +2359,52 @@ class GlobalFrontierGraphRouteAdapterMixin:
         """
         if map_epoch is None:
             map_epoch = self._graph_snapshot_map_epoch(snapshot)
+        if robot_pose is None:
+            robot_yaw = None
+            if snapshot is not None:
+                robot_pose = (
+                    getattr(snapshot, "robot_map", None)
+                    or getattr(snapshot, "route_anchor_xy", None)
+                )
+                robot_yaw = getattr(snapshot, "robot_yaw_map", getattr(snapshot, "robot_yaw", None))
+                if robot_pose is None:
+                    map_context = getattr(snapshot, "map_context", None)
+                    if map_context is not None:
+                        robot_pose = (
+                            getattr(map_context, "robot_map", None)
+                            or getattr(map_context, "route_anchor_xy", None)
+                        )
+                        if robot_yaw is None:
+                            robot_yaw = getattr(map_context, "robot_yaw_map", getattr(map_context, "robot_yaw", None))
+            if robot_pose is None:
+                context = getattr(self, "last_selection_context", None)
+                if context is not None:
+                    robot_pose = getattr(context, "robot_map", None) or getattr(context, "route_anchor_xy", None)
+                    if robot_yaw is None:
+                        robot_yaw = getattr(context, "robot_yaw_map", getattr(context, "robot_yaw", None))
+            if robot_pose is None:
+                robot_pose = getattr(self, "robot_map", None)
+                if robot_yaw is None:
+                    robot_yaw = getattr(self, "robot_yaw_map", getattr(self, "robot_yaw", None))
+            if robot_pose is None and hasattr(self, "planning_pose_snapshot"):
+                try:
+                    pose_snap = self.planning_pose_snapshot()
+                    if pose_snap is not None and len(pose_snap) > 1:
+                        robot_pose = pose_snap[1]
+                        if len(pose_snap) > 2 and robot_yaw is None:
+                            robot_yaw = pose_snap[2]
+                except Exception:
+                    pass
+            if robot_pose is None:
+                pose_odom = getattr(self, "pose_odom", None)
+                if pose_odom is not None and hasattr(pose_odom, "x") and hasattr(pose_odom, "y"):
+                    robot_pose = (float(pose_odom.x), float(pose_odom.y))
+                    if robot_yaw is None:
+                        robot_yaw = getattr(pose_odom, "theta", getattr(pose_odom, "yaw", None))
+            if robot_pose is not None and len(robot_pose) == 2:
+                if robot_yaw is None:
+                    robot_yaw = getattr(self, "robot_yaw_map", getattr(self, "robot_yaw", None))
+                robot_pose = (float(robot_pose[0]), float(robot_pose[1]), robot_yaw)
         # A live snapshot must first pass through the current candidate
         # projection. The dry-run path (snapshot=None) is used only after
         # selection has explicitly recorded that projection.
@@ -2221,6 +2491,7 @@ class GlobalFrontierGraphRouteAdapterMixin:
                 visible_probe_ids=visible_probe_ids,
                 visible_portal_ids=visible_portal_ids,
                 stage_only=stage_only,
+                robot_pose=robot_pose,
             )
         if plan is None or plan.status != PLAN_READY:
             self._clear_graph_route_plan_lease("plan_not_ready")
@@ -2399,12 +2670,31 @@ class GlobalFrontierGraphRouteAdapterMixin:
                         retry_on_new_map_epoch=True,
                     )
                 return plan, None
-        if (
+        record_destination = None
+        record_source = None
+        if isinstance(record, dict):
+            try:
+                record_destination = int(record.get("destination_place_id"))
+            except (TypeError, ValueError):
+                record_destination = None
+            try:
+                record_source = int(record.get("source_place_id"))
+            except (TypeError, ValueError):
+                record_source = None
+        current_place = getattr(self, "current_physical_place_id", None)
+        forward_bound = bool(
             isinstance(record, dict)
-            and record.get("destination_place_id") is None
-            and str(record.get("state", "")).strip().lower()
-            in ("certified", "selected")
-        ):
+            and record_destination is not None
+            and record_source is not None
+            and current_place is not None
+            and record_source == int(current_place)
+        )
+        unbound_forward = bool(
+            isinstance(record, dict)
+            and record_destination is None
+            and str(record.get("state", "")).strip().lower() in ("certified", "selected")
+        )
+        if unbound_forward or forward_bound:
             select_crossing = getattr(
                 self, "select_durable_portal_crossing", None,
             )
@@ -2465,7 +2755,7 @@ class GlobalFrontierGraphRouteAdapterMixin:
                     "mark_unbound_rejected",
                     None,
                 )
-                if callable(mark_rejected):
+                if callable(mark_rejected) and unbound_forward:
                     mark_rejected(first_id, current_epoch, reason)
                 record_miss = getattr(
                     self, "_record_graph_route_materialization_miss", None

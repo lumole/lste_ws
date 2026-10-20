@@ -53,6 +53,119 @@ class TebGoalBridgeFrontierStatusMixin:
             return None
         return pending
 
+    # Bounded like the other bridge tombstones: one entry per released route,
+    # and route ids stay monotonic, so this only ever holds recent history.
+    _FRONTIER_CONTROLLER_RELEASE_LIMIT = 128
+
+    @staticmethod
+    def _frontier_lease_int(value):
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _remember_frontier_controller_lease_release_locked(self, route_id, payload):
+        """Retain GlobalFrontier's statement that a route's lease is released.
+
+        GlobalFrontier publishes this statement for every route it releases,
+        including the ones it marks ``semantic_only`` because a successor is
+        already queued and it expects no acknowledgement.  The bridge's own
+        dispatch hold is armed against that same predecessor identity, so the
+        statement has to survive the branches below which refuse to read it as
+        a transport boundary -- otherwise the hold it answers can never be
+        cleared.
+
+        Only statements the upstream owner published without expecting an
+        acknowledgement can be retained-but-unapplied: a release reaches this
+        function unapplied only when it carries no transport terminal and no
+        forcing phase, and GlobalFrontier sets ``awaiting_transport_ack``
+        exactly when it does expect the acknowledgement back.  Ending a hold on
+        this record therefore cannot drop an acknowledgement the graph waits
+        for.
+        """
+        records = getattr(self, "frontier_controller_lease_releases", None)
+        if not isinstance(records, dict):
+            records = {}
+            self.frontier_controller_lease_releases = records
+        records[int(route_id)] = {
+            "route_id": int(route_id),
+            "action_generation": self._frontier_lease_int(
+                payload.get("action_generation")
+            ),
+            "transaction_id": self._frontier_lease_int(
+                payload.get("transaction_id")
+            ),
+            "lifecycle_transaction_id": self._frontier_lease_int(
+                payload.get("lifecycle_transaction_id")
+            ),
+            "graph_transaction_id": self._frontier_lease_int(
+                payload.get("graph_transaction_id")
+            ),
+            "release_phase": str(payload.get("release_phase", "") or ""),
+            "release_reason": str(payload.get("release_reason", "") or ""),
+            "terminal_received": bool(payload.get("terminal_received", False)),
+        }
+        while len(records) > self._FRONTIER_CONTROLLER_RELEASE_LIMIT:
+            records.pop(next(iter(records)))
+
+    def _frontier_controller_lease_release_for_locked(self, contract):
+        """Return the retained release that answers ``contract``, if any.
+
+        The route is the identity: GlobalFrontier route ids stay monotonic
+        across releases, while its release messages routinely carry
+        ``action_generation`` 0 because the generation is this bridge's own
+        counter.  A generation is therefore compared only when both sides
+        state one.
+        """
+        records = getattr(self, "frontier_controller_lease_releases", None)
+        if not isinstance(records, dict) or not hasattr(contract, "get"):
+            return None
+        route_id = self._frontier_lease_int(contract.get("route_id"))
+        if route_id <= 0:
+            return None
+        record = records.get(route_id)
+        if not isinstance(record, dict):
+            return None
+        contract_generation = self._frontier_lease_int(
+            contract.get("generation", contract.get("action_generation"))
+        )
+        record_generation = self._frontier_lease_int(
+            record.get("action_generation")
+        )
+        if (
+            record_generation > 0
+            and contract_generation > 0
+            and record_generation != contract_generation
+        ):
+            return None
+        return dict(record)
+
+    def _frontier_release_answers_dispatch_hold_locked(self, old_contract):
+        """Return the predecessor release that ends a dispatch hold, if any.
+
+        The hold exists so a released route cannot be dispatched again.  Once
+        GlobalFrontier has stated the release of that exact predecessor and a
+        strictly newer successor is pending (route ids stay monotonic across
+        releases), there is nothing left to wait for: waiting instead holds the
+        successor until GlobalFrontier's own lifecycle timeout -- measured live
+        at 120 s, its DISPATCHED timeout -- and then aborts the portal
+        transaction that was never allowed to start.
+        """
+        lookup = getattr(
+            self, "_frontier_controller_lease_release_for_locked", None
+        )
+        if not callable(lookup):
+            return None
+        record = lookup(old_contract)
+        if not isinstance(record, dict):
+            return None
+        successor_route_id = self._frontier_lease_int(
+            getattr(self, "latest_route_id", 0)
+        )
+        if successor_route_id <= self._frontier_lease_int(record.get("route_id")):
+            return None
+        return record
+
     def _apply_controller_lease_release_locked(self, payload):
         """Apply an identity-checked terminal release from GlobalFrontier."""
         released = payload.get("released_controller_route")
@@ -73,8 +186,6 @@ class TebGoalBridgeFrontierStatusMixin:
             == "awaiting_transport_ack"
             or bool(payload.get("force_controller_lease_release", False))
         )
-        if (not terminal_received and not forced_controller_release) or not controller_pending:
-            return False
         try:
             route_id = max(
                 0,
@@ -112,6 +223,56 @@ class TebGoalBridgeFrontierStatusMixin:
         # with a successor's route and produce a false identity rejection.
         def mapping(value):
             return value if hasattr(value, "get") else None
+
+        # Bound before the first gate so a rejection there can still report
+        # the identity context it has; the resolution below overwrites them.
+        expected_contract_source = ""
+        candidate_route_ids = []
+        expected_route_id = 0
+        pending_release_matches = False
+        active_route_id = int(getattr(self, "active_route_id", 0) or 0)
+        latest_route_id = int(getattr(self, "latest_route_id", 0) or 0)
+
+        def report_ignored(reason, **extra):
+            """Say why a release was ignored instead of dropping it silently.
+
+            A withheld successor dispatch and a stalled robot look identical on
+            the wire: the vehicle simply does not move.  The branch that
+            discards the release is the only place that knows which side
+            withheld it and why, so it has to publish that fact -- otherwise
+            the hold can only be diagnosed by re-reading source.
+            """
+            publish = getattr(self, "publish_bridge_status", None)
+            if not callable(publish):
+                return
+            publish(
+                "controller_lease_release_ignored",
+                reason=str(reason),
+                route_id=route_id,
+                active_route_id=active_route_id,
+                latest_route_id=latest_route_id,
+                expected_contract_source=expected_contract_source,
+                expected_route_id=expected_route_id,
+                pending_release_matches=bool(pending_release_matches),
+                candidate_route_ids=candidate_route_ids,
+                **extra
+            )
+
+        # Keep the statement itself, before any branch decides what may be done
+        # with it: this is the report of the boundary, not the boundary
+        # handling.
+        self._remember_frontier_controller_lease_release_locked(route_id, payload)
+        if (
+            not terminal_received and not forced_controller_release
+        ) or not controller_pending:
+            report_ignored(
+                "release_without_transport_terminal",
+                release_phase=str(payload.get("release_phase", "") or ""),
+                release_reason=str(payload.get("release_reason", "") or ""),
+                terminal_received=bool(terminal_received),
+                controller_pending=bool(controller_pending),
+            )
+            return False
 
         contract_candidates = []
         pending_prepare = getattr(self, "pending_terminal_prepare", None)
@@ -164,8 +325,6 @@ class TebGoalBridgeFrontierStatusMixin:
             )
 
         expected_contract = {}
-        expected_contract_source = ""
-        candidate_route_ids = []
         for source, candidate in contract_candidates:
             if candidate is None:
                 continue
@@ -265,12 +424,14 @@ class TebGoalBridgeFrontierStatusMixin:
         if active_route_id > route_id or (
             latest_route_id > route_id and not pending_release_matches
         ):
+            report_ignored("release_superseded_by_newer_route")
             return False
         if active_route_id != route_id and expected_route_id != route_id:
             # The action-health clear path intentionally removes active route
             # state after publishing a terminal. The pending tombstone is the
             # only valid identity in that short release window; a different
             # active/latest route must never be cancelled by this ACK.
+            report_ignored("release_route_is_not_the_active_contract")
             return False
         if not expected_contract:
             self.publish_bridge_status(
@@ -295,11 +456,17 @@ class TebGoalBridgeFrontierStatusMixin:
             expected_source != "global_slam_frontier"
             and active_source != "global_slam_frontier"
         ):
+            report_ignored(
+                "release_is_not_a_frontier_route",
+                expected_source=expected_source,
+                active_source=active_source,
+            )
             return False
         release = getattr(
             self, "_release_frontier_controller_lease_locked", None
         )
         if not callable(release):
+            report_ignored("release_handler_unavailable")
             return False
         incoming_lifecycle = contract_int(
             released.get("lifecycle_transaction_id"),
@@ -570,6 +737,11 @@ class TebGoalBridgeFrontierStatusMixin:
         # action tombstones for duplicate rejection, but no longer use this
         # predecessor as the expected contract for a later unrelated message.
         self.pending_lease_release_contract = None
+        cancel_release_watchdog = getattr(
+            self, "_cancel_pending_lease_release_watchdog_locked", None
+        )
+        if callable(cancel_release_watchdog):
+            cancel_release_watchdog("controller_lease_release_applied")
         self._clear_frontier_intent_after_release_locked()
         self.publish_bridge_status(
             "controller_lease_release_applied",

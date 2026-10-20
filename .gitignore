@@ -44,3 +44,11 @@ model/**/*.onnx
 
 # SA-PPO policies are runtime artifacts; keep acquisition instructions only.
 rl_navigation/policy/*.pth
+
+# Local tools and temporary artifacts
+.claude/
+temp/
+literature/
+*.mkv
+docs/reporting/assets/*.mp4
+docs/testing/assets/

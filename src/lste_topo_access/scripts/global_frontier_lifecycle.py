@@ -243,12 +243,28 @@ class GlobalFrontierLifecycleMixin:
         # planning snapshot obsolete before enqueueing so a slow candidate
         # pass yields before the bridge's handoff watchdog can expire.  Route
         # state remains exclusively owned by LifecycleManager.tick().
+        # A controller terminal can arrive after an explicit replan has
+        # already released the semantic route.  It is then transport cleanup,
+        # not a new planning boundary; marking the planner preempted here
+        # would leave a stale request behind when lifecycle filtering drops
+        # the late terminal.
+        try:
+            terminal_route_id = int(getattr(message, "route_id", 0) or 0)
+        except (TypeError, ValueError):
+            terminal_route_id = 0
+        active_route_id = int(getattr(self, "active_route_id", 0) or 0)
+        live_route = bool(
+            getattr(self, "active_frontier", None) is not None
+            and terminal_route_id > 0
+            and terminal_route_id == active_route_id
+        )
         request_preempt = getattr(self, "request_planning_preempt", None)
-        if callable(request_preempt):
-            request_preempt("execution_terminal")
-        else:
-            self.planning_preempt_requested = True
-            self.planning_preempt_reason = "execution_terminal"
+        if live_route:
+            if callable(request_preempt):
+                request_preempt("execution_terminal")
+            else:
+                self.planning_preempt_requested = True
+                self.planning_preempt_reason = "execution_terminal"
         accepted = self._enqueue_lifecycle_event(
             EventType.EXECUTION_TERMINAL, deepcopy(message)
         )
@@ -909,7 +925,11 @@ class GlobalFrontierLifecycleMixin:
 
     def _apply_replan_request_event(self, message):
         if isinstance(message, dict):
-            if message.get("event") in ("immediate_plan", "terminal_replan"):
+            if message.get("event") in (
+                "immediate_plan",
+                "terminal_replan",
+                "terminal_replan_after_lease_ack",
+            ):
                 self.last_planning_wall = 0.0
             return None
         self.lifecycle_manager.begin_transaction(State.IDLE)
