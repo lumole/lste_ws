@@ -363,6 +363,41 @@ class ActiveRouteCommandTest(unittest.TestCase):
         self.assertEqual(command.route_kind, "portal_transition")
         self.assertEqual(lifecycle.active_route_kind, "portal_transition")
 
+    def test_work_item_endpoint_preserves_path_terminal_heading_without_spin(self):
+        class WorkItemCommandLifecycle(LocalEgressCommandLifecycle):
+            def __init__(self):
+                super().__init__()
+                self.active_route_kind = "frontier_endpoint"
+                self.active_mission_route_kind = "frontier_endpoint"
+                self.active_work_item_id = 11
+
+            @staticmethod
+            def route_headings(*_args):
+                return -1.07, -1.07
+
+            @staticmethod
+            def maybe_insert_turn_connector(*_args):
+                return (12.05, -2.55), -1.07, "frontier_endpoint", False
+
+            def _active_work_item_normal(self, _item_id):
+                return [-0.8954, -0.4452]
+
+        lifecycle = WorkItemCommandLifecycle()
+        message = type("Message", (), {"info": type("Info", (), {"resolution": 0.1})})()
+        steps = np.zeros((4, 5), dtype=np.int32)
+
+        command = lifecycle.resolve_active_route_command(
+            message,
+            (1, 2, 12.05, -2.55),
+            None,
+            steps,
+            (0, 0),
+            (12.25, -0.82),
+            -1.07,
+        )
+
+        self.assertAlmostEqual(command.command_yaw, -1.07)
+
     def test_local_endpoint_expands_coverage_without_preparing_departure(self):
         lifecycle = LifecyclePreparation()
         local = SelectedFrontier(

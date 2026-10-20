@@ -55,7 +55,7 @@
        positioned beyond this success circle, so a TEB SUCCEEDED terminal is
        still provably on the destination side of the door. Keeping the value
        in this launch contract avoids depending on process start order. -->
-  <arg name="teb_xy_goal_tolerance" default="0.20"/>
+  <arg name="teb_xy_goal_tolerance" default="0.50"/>
   <!-- Strict clearance is the normal complete route topology. Recovery may
        use loose topology only between strict-clearance endpoints; the live
        costmap and exact Navfn plan remain hard executability gates. -->

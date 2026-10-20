@@ -6,7 +6,7 @@
   <arg name="odom_topic" default="/pro3/wheel_odom"/>
   <arg name="global_frame" default="map"/>
   <arg name="max_linear_speed" default="0.50"/>
-  <arg name="teb_xy_goal_tolerance" default="0.20"/>
+  <arg name="teb_xy_goal_tolerance" default="0.50"/>
   <arg name="controller_mode" default="teb"/>
   <arg name="goal_topic" default="/lste/final_goal"/>
   <arg name="intent_topic" default="/lste/goal_intent"/>
@@ -385,9 +385,10 @@
          action. TEB therefore completes endpoint actions on XY arrival. The
          separate turn supervisor keeps its own 0.35-rad tolerance for the
          rare explicit in-place turn transaction. -->
-    <param name="TebLocalPlannerROS/yaw_goal_tolerance" value="0.20"/>
-    <!-- Come to a clean complete stop and accurate heading at the goal pose. -->
-    <param name="TebLocalPlannerROS/free_goal_vel" value="false"/>
+    <param name="TebLocalPlannerROS/yaw_goal_tolerance" value="3.14159"/>
+    <!-- Short visual/frontier segments should not force a full stop at every
+         handoff. The task_done mux gate still performs the final stop. -->
+    <param name="TebLocalPlannerROS/free_goal_vel" value="true"/>
     <param name="TebLocalPlannerROS/min_obstacle_dist" value="0.22"/>
     <param name="TebLocalPlannerROS/inflation_dist" value="0.55"/>
     <!-- Official TEB velocity limiter: slow continuously near furniture,
@@ -431,7 +432,7 @@
          order to recover around a stale or incomplete online map. -->
     <param name="TebLocalPlannerROS/viapoints_all_candidates" value="false"/>
     <param name="TebLocalPlannerROS/weight_kinematics_nh" value="1000.0"/>
-    <param name="TebLocalPlannerROS/weight_kinematics_forward_drive" value="5000.0"/>
+    <param name="TebLocalPlannerROS/weight_kinematics_forward_drive" value="1000.0"/>
     <param name="TebLocalPlannerROS/weight_obstacle" value="45.0"/>
     <param name="TebLocalPlannerROS/weight_inflation" value="0.20"/>
     <param name="TebLocalPlannerROS/footprint_model/type" value="circular"/>
@@ -531,7 +532,7 @@
     <param name="command_frequency" value="20.0"/>
     <param name="max_vel_theta" value="0.65"/>
     <param name="acc_lim_theta" value="0.90"/>
-    <param name="yaw_goal_tolerance" value="0.20"/>
+    <param name="yaw_goal_tolerance" value="0.35"/>
     <!-- Anti-spin protections: wait until the managed action is stable before
          starting a pre-route turn, cap a single turn's swept rotation so it
          can never wind up a full circle, and hold the achieved heading briefly

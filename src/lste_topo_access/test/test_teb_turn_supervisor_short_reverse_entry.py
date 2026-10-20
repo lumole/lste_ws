@@ -71,6 +71,9 @@ class ShortReverseEntryFixture(
         )
         self.latest_trajectory_command = twist(-0.01, 0.05)
         self.latest_trajectory_command_wall = time.monotonic()
+        self.latest_planner_command = twist(-0.01, 0.05)
+        self.latest_planner_command_wall = time.monotonic()
+        self.planner_command_timeout = 0.30
         self.trajectory_feedback_period_ema = None
         self.trajectory_feedback_timeout = 0.35
         self.trajectory_feedback_timeout_cap = 0.60
@@ -116,6 +119,7 @@ class TebTurnSupervisorShortReverseEntryTest(unittest.TestCase):
     def test_short_route_plain_zero_command_keeps_the_original_gate(self):
         fixture = ShortReverseEntryFixture()
         fixture.latest_trajectory_command = twist(0.0, 0.05)
+        fixture.latest_planner_command = twist(0.0, 0.05)
 
         self.assertIsNone(
             fixture._stalled_route_reorientation_locked(
