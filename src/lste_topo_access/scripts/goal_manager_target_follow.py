@@ -13,6 +13,8 @@ import rospy
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 
+from goal_manager_modes import STATE_LOCKED
+
 CATCH_TARGET_MODE = "catch_target_mode"
 EXPLORE_SUS_C_MODE = "explore_sus_c_mode"
 
@@ -255,6 +257,9 @@ class GoalManagerTargetFollowMixin:
         self, now: float
     ) -> Tuple[bool, Optional[PoseStamped]]:
         """Keep a single detector frame from taking over a safe frontier route."""
+        if getattr(self, "current_state", None) == STATE_LOCKED:
+            self.target_follow_confirmed = True
+            return False, None
         parallax = self._target_parallax_observation_goal(now)
         if parallax is not None:
             self.goal_source = "target_parallax"

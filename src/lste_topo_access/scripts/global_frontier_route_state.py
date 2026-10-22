@@ -733,6 +733,27 @@ class GlobalFrontierRouteStateMixin:
         self.active_portal_probe_id = None
         self.active_portal_probe_phase = ""
         self.active_frontier_region_id = None
+        active_work_id = getattr(self, "active_work_item_id", None)
+        active_attempt_id = getattr(self, "active_work_item_attempt_id", None)
+        if (
+            active_work_id is not None
+            and hasattr(self, "place_work_items")
+            and self.place_work_items is not None
+        ):
+            item = getattr(self.place_work_items, "_items", {}).get(int(active_work_id))
+            if item is not None and item.get("active_attempt_id") is not None:
+                try:
+                    import rospy
+                    now_sec = rospy.Time.now().to_sec()
+                except Exception:
+                    now_sec = 0.0
+                self.place_work_items.fail_attempt(
+                    int(active_work_id),
+                    now_sec,
+                    "preempted_by_route_release",
+                    state="failed",
+                    attempt_id=active_attempt_id,
+                )
         self.active_work_item_id = None
         self.active_work_item_attempt_id = None
         self.active_work_item_place_id = None

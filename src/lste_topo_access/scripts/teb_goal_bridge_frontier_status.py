@@ -323,6 +323,13 @@ class TebGoalBridgeFrontierStatusMixin:
                     mapping(latest_frontier_contract(route_id)),
                 )
             )
+        tombstones = getattr(self, "terminal_action_tombstones", None)
+        if isinstance(tombstones, dict):
+            for t_record in tombstones.values():
+                if isinstance(t_record, dict):
+                    c = mapping(t_record.get("old_contract") or t_record)
+                    if c:
+                        contract_candidates.append(("terminal_action_tombstone", c))
 
         expected_contract = {}
         for source, candidate in contract_candidates:
@@ -431,8 +438,24 @@ class TebGoalBridgeFrontierStatusMixin:
             # state after publishing a terminal. The pending tombstone is the
             # only valid identity in that short release window; a different
             # active/latest route must never be cancelled by this ACK.
-            report_ignored("release_route_is_not_the_active_contract")
-            return False
+            # If the bridge is completely idle (active_route_id == 0) and no newer
+            # route is active/dispatched (route_id >= latest_route_id), this route
+            # is already stopped and released. Synthesize an ACK contract to unblock
+            # the upstream planner rather than deadlocking in controller_lease_release_wait.
+            if active_route_id == 0 and route_id >= latest_route_id:
+                expected_contract = {
+                    "route_id": route_id,
+                    "action_generation": incoming_generation or 0,
+                    "transaction_id": incoming_transaction or 0,
+                    "lifecycle_transaction_id": incoming_lifecycle or 0,
+                    "graph_transaction_id": incoming_graph or 0,
+                    "source": "global_slam_frontier",
+                }
+                expected_contract_source = "idle_controller_released"
+                expected_route_id = route_id
+            else:
+                report_ignored("release_route_is_not_the_active_contract")
+                return False
         if not expected_contract:
             self.publish_bridge_status(
                 "controller_lease_release_rejected",

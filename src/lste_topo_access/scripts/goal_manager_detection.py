@@ -406,6 +406,17 @@ def _update_target_heading(manager, evidence):
                         else "latest_pose_fallback"
                     ),
                 )
+                request_replan = getattr(manager, "request_global_frontier_replan", None)
+                if callable(request_replan):
+                    request_replan(
+                        "target_hypothesis_updated",
+                        target_pursuit=True,
+                        semantic_hint_map=[
+                            round(float(estimate.point_xy[0]), 4),
+                            round(float(estimate.point_xy[1]), 4),
+                        ],
+                        target_track_id=manager.target_track_id,
+                    )
     elif raw_heading is not None and manager.target_filtered_heading is None:
         manager.target_filtered_heading = raw_heading
         manager.target_last_heading = raw_heading

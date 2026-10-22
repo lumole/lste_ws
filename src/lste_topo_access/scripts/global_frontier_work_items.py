@@ -37,7 +37,13 @@ ATTEMPT_SUCCEEDED = "succeeded"
 class PlaceWorkItemLedger:
     """Keep a small lifecycle ledger for frontier observations per Place."""
 
-    def __init__(self, merge_radius, viewpoint_merge_radius=None, density_radius=None):
+    def __init__(
+        self,
+        merge_radius,
+        viewpoint_merge_radius=None,
+        density_radius=None,
+        spawn_odom_xy=None,
+    ):
         self.merge_radius = max(0.05, float(merge_radius))
         # ``merge_radius`` identifies one physical unknown boundary across
         # SLAM snapshots.  It must not also collapse distinct recovery poses:
@@ -60,7 +66,8 @@ class PlaceWorkItemLedger:
         self._next_id = 1
         self._next_attempt_id = 1
         self._items = {}
-        self.spawn_odom_xy = (0.0, 0.0)
+        self.spawn_odom_xy = self._normalise_xy(spawn_odom_xy)
+        self._applied_spawn_xy = self.spawn_odom_xy
 
     @staticmethod
     def _normalise_support(support_cells):
@@ -123,7 +130,7 @@ class PlaceWorkItemLedger:
             self._dead_corners.append((float(xy[0]), float(xy[1])))
         # Also ensure any other unresolved item in this dead corner pocket is resolved
         for it in list(self._items.values()):
-            if it.get("state") == WORK_UNRESOLVED:
+            if it.get("state") == WORK_UNRESOLVED and not it.get("is_target"):
                 it_anchor = self._normalise_xy(it.get("anchor_xy"))
                 if it_anchor is not None and math.hypot(xy[0] - it_anchor[0], xy[1] - it_anchor[1]) <= 0.6:
                     it["state"] = WORK_RESOLVED
@@ -196,6 +203,8 @@ class PlaceWorkItemLedger:
         for item in list(self._items.values()):
             if item.get("state") != WORK_UNRESOLVED:
                 continue
+            if item.get("is_target") or item.get("kind") == "target_observation":
+                continue
             # Do NOT apply to the active target being executed
             if active_work_item_id is not None and int(item.get("id", -1)) == int(active_work_item_id):
                 continue
@@ -249,7 +258,7 @@ class PlaceWorkItemLedger:
             else getattr(self, "spawn_odom_xy", None)
         )
         if spawn_xy is None:
-            spawn_xy = (0.0, 0.0)
+            return None
 
         anchor = self._normalise_xy(item.get("anchor_xy"))
         if anchor is None:
@@ -321,6 +330,64 @@ class PlaceWorkItemLedger:
         if item.get("spawn_distance") is None and getattr(self, "spawn_odom_xy", None) is not None:
             self._bind_spawn_distance(item)
         return item
+
+    def register_target_work_item(
+        self,
+        place_id,
+        anchor_xy,
+        now,
+        target_track_id=None,
+        kind="target_observation",
+    ):
+        """Register or update a high-priority physical Target WorkItem.
+
+        Target WorkItems represent the primary mission goal (e.g., visual
+        suspicion or confirmation of the target object). They must never be
+        pruned as transient frontier boundary noise or density-suppressed.
+        """
+        anchor = self._normalise_xy(anchor_xy)
+        if anchor is None:
+            return None
+
+        # Check if an unresolved target item already exists
+        for item in self._items.values():
+            if (
+                item.get("is_target") or item.get("kind") == "target_observation"
+            ) and item.get("state") == WORK_UNRESOLVED:
+                item["anchor_xy"] = anchor
+                item["x"] = anchor[0]
+                item["y"] = anchor[1]
+                item["updated_at"] = float(now)
+                if target_track_id:
+                    item["target_track_id"] = str(target_track_id)
+                return item
+
+        # Create a new Target WorkItem
+        item = self._new_item(
+            place_id=place_id or 1,
+            support_cells=frozenset(),
+            now=now,
+            xy=anchor,
+            anchor_xy=anchor,
+            normal_xy=None,
+            reason="target_observation_registered",
+            spawn_distance=0.0,
+        )
+        item["is_target"] = True
+        item["kind"] = str(kind or "target_observation")
+        item["target_track_id"] = str(target_track_id or "")
+        return item
+
+    def resolve_target_work_items(self, now, reason="target_confirmed"):
+        """Resolve all unresolved target work items upon task completion."""
+        resolved_ids = []
+        for item in list(self._items.values()):
+            if (
+                item.get("is_target") or item.get("kind") == "target_observation"
+            ) and item.get("state") == WORK_UNRESOLVED:
+                self.resolve(item["id"], now, reason)
+                resolved_ids.append(int(item["id"]))
+        return resolved_ids
 
     @staticmethod
     def _active_attempt(item):
@@ -416,7 +483,13 @@ class PlaceWorkItemLedger:
         if place_id is None:
             return {}, {}
         if spawn_odom_xy is not None:
-            self.spawn_odom_xy = self._normalise_xy(spawn_odom_xy)
+            norm_spawn = self._normalise_xy(spawn_odom_xy)
+            if self._applied_spawn_xy is not None and norm_spawn != self._applied_spawn_xy:
+                for it in self._items.values():
+                    if not it.get("is_target", False):
+                        it["spawn_distance"] = None
+            self.spawn_odom_xy = norm_spawn
+            self._applied_spawn_xy = norm_spawn
         resolved_spawn_xy = getattr(self, "spawn_odom_xy", None)
 
         geodesic_field = None
@@ -432,6 +505,18 @@ class PlaceWorkItemLedger:
             except Exception:
                 geodesic_field = None
 
+        if resolved_spawn_xy is not None:
+            for it in self._items.values():
+                if it.get("spawn_distance") is None and not it.get("is_target", False):
+                    self._bind_spawn_distance(
+                        it,
+                        resolved_spawn_xy,
+                        free,
+                        map_msg,
+                        physical_to_map,
+                        geodesic_field,
+                    )
+
         cell_to_item = {}
         details = {}
         for support in supports:
@@ -445,6 +530,8 @@ class PlaceWorkItemLedger:
                 continue
             matches = []
             for item in self._items.values():
+                if item.get("is_target") or item.get("kind") == "target_observation":
+                    continue
                 prior_state = item["state"]
                 overlap = support_overlap(support_cells, item.get("support_cells", ()))
                 if not self._directions_compatible(
@@ -516,6 +603,8 @@ class PlaceWorkItemLedger:
                     effective_density = self.density_radius * 1.5 if is_fragment else self.density_radius
                     for cand_item in self._items.values():
                         if cand_item["state"] != WORK_UNRESOLVED:
+                            continue
+                        if cand_item.get("is_target") or cand_item.get("kind") == "target_observation":
                             continue
                         item_anchor = self._normalise_xy(cand_item.get("anchor_xy"))
                         if item_anchor is None:
@@ -609,6 +698,8 @@ class PlaceWorkItemLedger:
             item for item in self._items.values()
             if (place_id is None or int(item["place_id"]) == int(place_id))
             and item["state"] == WORK_UNRESOLVED
+            and not item.get("is_target")
+            and item.get("kind") != "target_observation"
             and self._normalise_xy(item.get("anchor_xy")) is not None
         ]
         unresolved.sort(
@@ -891,6 +982,29 @@ class PlaceWorkItemLedger:
             return item
         raise ValueError("resolved work item or deferred attempt required")
 
+    def get(self, item_id):
+        """Return the WorkItem record by ID or None."""
+        return self._items.get(item_id)
+
+    def unresolved(self, place_id=None):
+        """Return all unresolved WorkItem records, optionally filtered by place_id."""
+        if place_id is None:
+            return [
+                dict(item)
+                for item in self._items.values()
+                if item.get("state") == WORK_UNRESOLVED
+            ]
+        try:
+            target_place = int(place_id)
+        except (TypeError, ValueError):
+            return []
+        return [
+            dict(item)
+            for item in self._items.values()
+            if int(item.get("place_id", -1)) == target_place
+            and item.get("state") == WORK_UNRESOLVED
+        ]
+
     def unresolved_count(self, place_id):
         """Return work still eligible for this physical place."""
         return sum(
@@ -1032,6 +1146,26 @@ class PlaceWorkItemLedger:
                 reattributed.append(int(item["id"]))
         return reattributed
 
+    def reconcile_orphaned_attempts(self, now, active_work_item_id=None):
+        """Fail and clear any active attempt whose route is no longer actively executing.
+
+        Prevents ledger desynchronization from blocking graph route planning.
+        """
+        reconciled = []
+        for item in self._items.values():
+            active_id = item.get("active_attempt_id")
+            if active_id is not None:
+                if active_work_item_id is None or int(item["id"]) != int(active_work_item_id):
+                    self.fail_attempt(
+                        item["id"],
+                        now,
+                        "orphaned_attempt_cleared_no_active_route",
+                        state=ATTEMPT_FAILED,
+                        attempt_id=active_id,
+                    )
+                    reconciled.append(int(item["id"]))
+        return reconciled
+
     def snapshot(self):
         """Return a read-only, JSON-safe view for graph-level planning.
 
@@ -1043,6 +1177,15 @@ class PlaceWorkItemLedger:
         result = []
         for item_id in sorted(self._items):
             item = self._items[item_id]
+            # Ensure consistency: if active_attempt_id points to an attempt that is no longer active, clear it
+            active_id = item.get("active_attempt_id")
+            if active_id is not None:
+                active_match = any(
+                    int(a.get("id", 0)) == int(active_id) and a.get("state") == ATTEMPT_ACTIVE
+                    for a in item.get("attempts", ())
+                )
+                if not active_match:
+                    item["active_attempt_id"] = None
             attempts = []
             for attempt in item.get("attempts", ()):
                 attempts.append(
@@ -1124,6 +1267,9 @@ class PlaceWorkItemLedger:
                     "route_rejection_count": len(route_rejections),
                     "route_rejections": route_rejections,
                     "spawn_distance": item.get("spawn_distance"),
+                    "is_target": bool(item.get("is_target", False)),
+                    "kind": str(item.get("kind", "frontier")),
+                    "target_track_id": str(item.get("target_track_id", "")),
                 }
             )
         return result
@@ -1798,6 +1944,22 @@ class GlobalFrontierWorkItemLifecycleMixin:
                     item_id, now, reason, attempt_id=attempt_id,
                 )
                 if item is not None:
+                    if item.get("is_target") or item.get("kind") == "target_observation":
+                        rospy.loginfo(
+                            "GlobalFrontier: target reached! Approached within standoff distance, locking in place permanently."
+                        )
+                        if hasattr(self, "pub_task_done"):
+                            try:
+                                from std_msgs.msg import Bool
+                                self.pub_task_done.publish(Bool(data=True))
+                            except Exception:
+                                pass
+                        if hasattr(self, "pub_navigation_hold"):
+                            try:
+                                from std_msgs.msg import Bool
+                                self.pub_navigation_hold.publish(Bool(data=True))
+                            except Exception:
+                                pass
                     self.publish_status(
                         "work_item_settled",
                         work_item_id=int(item_id),
@@ -1812,6 +1974,22 @@ class GlobalFrontierWorkItemLifecycleMixin:
                     item_id, now, reason, attempt_id=attempt_id,
                 )
                 if item is not None:
+                    if item.get("is_target") or item.get("kind") == "target_observation":
+                        rospy.loginfo(
+                            "GlobalFrontier: target reached! Approached within standoff distance, locking in place permanently."
+                        )
+                        if hasattr(self, "pub_task_done"):
+                            try:
+                                from std_msgs.msg import Bool
+                                self.pub_task_done.publish(Bool(data=True))
+                            except Exception:
+                                pass
+                        if hasattr(self, "pub_navigation_hold"):
+                            try:
+                                from std_msgs.msg import Bool
+                                self.pub_navigation_hold.publish(Bool(data=True))
+                            except Exception:
+                                pass
                     self.publish_status(
                         "work_item_settled",
                         work_item_id=int(item_id),

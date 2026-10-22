@@ -446,6 +446,13 @@ def two_opt_open_tsp(
     )
 
 
+def is_target_work_item(item: Any) -> bool:
+    """Return whether a WorkItem represents target observation / pursuit."""
+    if isinstance(item, dict):
+        return bool(item.get("is_target") or item.get("kind") == "target_observation")
+    return bool(getattr(item, "is_target", False) or getattr(item, "kind", None) == "target_observation")
+
+
 def order_work_items_open_tsp(
     robot_pose: Any,
     work_items: Sequence[Any],
@@ -460,13 +467,44 @@ def order_work_items_open_tsp(
 
     Balances linear translation distance with turning angles using v_max and
     omega_max, incorporating spawn distance penalties (alpha for backtracking,
-    beta for initial spawn proximity). Items without valid 2D coordinates are
-    safely appended at the end preserving their original relative order.
+    beta for initial spawn proximity). Target WorkItems are given absolute
+    precedence and placed strictly at the beginning of the sequence. Items
+    without valid 2D coordinates are safely appended at the end preserving
+    their original relative order.
     """
     if not work_items:
         return []
     if len(work_items) == 1:
         return list(work_items)
+
+    # Prioritize Target WorkItems: target discovery is the overarching mission
+    target_items = [it for it in work_items if is_target_work_item(it)]
+    if target_items:
+        non_target_items = [it for it in work_items if not is_target_work_item(it)]
+        start_pt = extract_work_item_coordinates(robot_pose)
+        if start_pt is not None:
+            def _target_dist(it):
+                coord = extract_work_item_coordinates(it)
+                return euclidean_distance(start_pt, coord) if coord is not None else float("inf")
+            ordered_targets = sorted(target_items, key=_target_dist)
+        else:
+            ordered_targets = list(target_items)
+
+        if not non_target_items:
+            return ordered_targets
+
+        last_target_pose = extract_work_item_pose(ordered_targets[-1])
+        next_start = last_target_pose if last_target_pose is not None else robot_pose
+        ordered_non_targets = order_work_items_open_tsp(
+            next_start,
+            non_target_items,
+            max_iterations=max_iterations,
+            v_max=v_max,
+            omega_max=omega_max,
+            alpha=alpha,
+            beta=beta,
+        )
+        return ordered_targets + ordered_non_targets
 
     start_pose = extract_work_item_pose(robot_pose)
     if start_pose is None:

@@ -11,10 +11,23 @@ from global_frontier_route_command_geometry import (
 )
 
 
+def nearest_equivalent_yaw(target_yaw, current_yaw):
+    """Return target_yaw mapped to the equivalent angle (target_yaw + 2*k*pi) closest to current_yaw."""
+    if target_yaw is None or current_yaw is None:
+        return target_yaw
+    diff = math.atan2(
+        math.sin(float(target_yaw) - float(current_yaw)),
+        math.cos(float(target_yaw) - float(current_yaw)),
+    )
+    return float(current_yaw) + diff
+
+
 class GlobalFrontierRouteCommandResolutionMixin(
     GlobalFrontierRouteCommandGeometryMixin,
 ):
     """Apply command-lease state while preserving mission route semantics."""
+
+    nearest_equivalent_yaw = staticmethod(nearest_equivalent_yaw)
 
     def should_hold_active_waypoint(self, robot_map):
         """Decide whether an already-published command must remain frozen."""
@@ -162,6 +175,42 @@ class GlobalFrontierRouteCommandResolutionMixin(
             )
         else:
             inserted_turn_connector = False
+
+        # Ensure that an endpoint for an active WorkItem points directly towards the
+        # anchor so front sensors face the WorkItem feature squarely, or falls back
+        # to the WorkItem's outward normal_xy.
+        work_item_id = getattr(self, "active_work_item_id", None)
+        if work_item_id is not None and not inserted_turn_connector:
+            try:
+                anchor = None
+                if hasattr(self, "_active_work_item_anchor"):
+                    anchor = self._active_work_item_anchor(work_item_id)
+                elif hasattr(self, "place_work_items") and hasattr(self.place_work_items, "anchor_for"):
+                    anchor = self.place_work_items.anchor_for(work_item_id)
+                desired_yaw = None
+                if anchor is not None:
+                    dx = float(anchor[0]) - float(command_xy[0])
+                    dy = float(anchor[1]) - float(command_xy[1])
+                    if math.hypot(dx, dy) > 1e-3:
+                        desired_yaw = math.atan2(dy, dx)
+                if desired_yaw is None:
+                    normal = None
+                    if hasattr(self, "_active_work_item_normal"):
+                        normal = self._active_work_item_normal(work_item_id)
+                    elif hasattr(self, "place_work_items") and hasattr(self.place_work_items, "normal_for"):
+                        normal = self.place_work_items.normal_for(work_item_id)
+                    if normal is not None and math.hypot(normal[0], normal[1]) > 1e-3:
+                        desired_yaw = math.atan2(float(normal[1]), float(normal[0]))
+
+                if desired_yaw is not None:
+                    # Option A: Adjust goal angle to the nearest equivalent angle relative to
+                    # current robot orientation so turning to goal is the shortest arc on S1
+                    # (never a 360-degree winding loop).
+                    command_yaw = nearest_equivalent_yaw(desired_yaw, robot_yaw_map)
+            except Exception:
+                pass
+        else:
+            command_yaw = nearest_equivalent_yaw(command_yaw, robot_yaw_map)
 
         self.active_last_waypoint_map = command_xy
         self.active_last_waypoint_yaw = command_yaw

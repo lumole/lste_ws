@@ -99,6 +99,9 @@ def candidate_matches_graph_plan(plan, candidate):
         # evidence lease is unresolved.
         if len(route) <= 17 or len(route) <= 12:
             return False
+        candidate_work_item_id = _positive_id(route[12])
+        if obligation_id is not None and candidate_work_item_id != obligation_id:
+            return False
         try:
             # Reinspection is a same-Place action. A missing hop fact is not
             # equivalent to zero: accepting it would let a geometry-only

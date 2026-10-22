@@ -477,7 +477,7 @@ class GoalManagerFrontierMixin:
         ):
             # The status topic mirrors route decisions for observability, but
             # the atomic route-command topic is the only identity authority.
-            if self.global_frontier_command_enabled:
+            if getattr(self, "global_frontier_command_enabled", False):
                 return
         route_id = int(payload.get("route_id", 0) or 0)
         command_goal = payload.get("command_goal")
@@ -567,10 +567,12 @@ class GoalManagerFrontierMixin:
         target_room_claim_release = bool(
             fields.get("target_room_claim_release", False)
         )
+        target_pursuit = bool(fields.get("target_pursuit", False))
         if (
             self.frontier_replan_pending_id > 0
             and self.frontier_replan_ready_id != self.frontier_replan_pending_id
             and not target_room_claim_release
+            and not target_pursuit
         ):
             return self.frontier_replan_pending_id
         self.frontier_replan_request_id += 1

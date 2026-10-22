@@ -1747,6 +1747,12 @@ class GlobalFrontierGraphRouteAdapterMixin:
             )
         ):
             return True
+        if (
+            getattr(self, "frontier_validation_pending", False)
+        ) and not bool(
+            getattr(self, "graph_route_materialization_invalidated", False)
+        ):
+            return True
         if action in {"bootstrap_observation", "observe_local_work", "retry_viewpoint"}:
             ids = self._positive_ids(visible_work_item_ids)
             obligation = self._positive_ids((getattr(plan, "obligation_id", None),))
@@ -2036,6 +2042,12 @@ class GlobalFrontierGraphRouteAdapterMixin:
         """
         if plan is None:
             return False
+        if (
+            getattr(self, "frontier_validation_pending", False)
+        ) and not bool(
+            getattr(self, "graph_route_materialization_invalidated", False)
+        ):
+            return True
         current_epoch = self._normalise_graph_map_epoch(map_epoch)
         if current_epoch is None:
             current_epoch = self._normalise_graph_map_epoch(
@@ -2205,6 +2217,15 @@ class GlobalFrontierGraphRouteAdapterMixin:
                 )
             resume_place_id = None
         work_ledger = getattr(self, "place_work_items", None)
+        if work_ledger is not None and hasattr(work_ledger, "reconcile_orphaned_attempts"):
+            try:
+                import rospy
+                now_sec = rospy.Time.now().to_sec()
+            except Exception:
+                now_sec = 0.0
+            work_ledger.reconcile_orphaned_attempts(
+                now_sec, active_work_item_id=getattr(self, "active_work_item_id", None)
+            )
         probe_ledger = getattr(self, "portal_probe_ledger", None)
         portal_ledger = getattr(self, "portal_hypothesis_ledger", None)
         target_work = getattr(self, "target_observation_work", None)
@@ -2410,6 +2431,7 @@ class GlobalFrontierGraphRouteAdapterMixin:
         # selection has explicitly recorded that projection.
         if (
             snapshot is not None
+            and map_epoch is not None
             and not self._graph_snapshot_projection_is_current(map_epoch)
         ):
             return getattr(self, "last_graph_route_plan", None), None
@@ -2445,6 +2467,29 @@ class GlobalFrontierGraphRouteAdapterMixin:
             # through Navfn/materialization waits even if this pass did not
             # project that WorkItem.
             plan = existing
+            if map_epoch is not None and getattr(plan, "map_epoch", None) != map_epoch:
+                try:
+                    plan = replace(plan, map_epoch=map_epoch)
+                except Exception:
+                    try:
+                        plan.map_epoch = map_epoch
+                    except Exception:
+                        pass
+                self.last_graph_route_plan = plan
+                transaction = getattr(self, "graph_route_action_transaction", None)
+                if transaction is not None and getattr(transaction, "phase", "") == "prepared":
+                    try:
+                        self.graph_route_action_transaction = replace(
+                            transaction,
+                            plan=plan,
+                            map_epoch=map_epoch,
+                            projection_epoch=(
+                                getattr(self, "last_graph_snapshot_epoch", None)
+                                or map_epoch
+                            ),
+                        )
+                    except Exception:
+                        pass
             self._install_graph_route_preference(plan)
         else:
             if reuse_existing_plan:

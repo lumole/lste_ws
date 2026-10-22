@@ -88,6 +88,8 @@ class GoalManagerTargetCompletionMixin:
         that safe viewpoint while the remaining frames arrive.  Context labels
         are deliberately absent from this decision.
         """
+        if getattr(self, "current_state", None) == 2 and getattr(self, "target_track_id", ""):
+            return True
         approach_terminal = bool(
             self.target_completed_segments >= 1
             and self.target_track_id

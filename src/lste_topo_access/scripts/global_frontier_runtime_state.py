@@ -123,7 +123,7 @@ class GlobalFrontierRuntimeStateMixin:
             self.navfn_make_plan_service, GetPlan
         )
         self.pose_odom = None
-        self.spawn_odom_xy = None
+        self.spawn_odom_xy = getattr(self, "spawn_odom_xy", None)
         # Recovery arbitration uses the forward lidar arc, not the global
         # minimum: a corridor wall close to either side is normal, while an
         # obstacle directly in front means a new global endpoint cannot make

@@ -35,7 +35,11 @@ class GlobalFrontierCandidateWorkItemMixin:
             work_item_approach,
             resolution,
         )
-        return math.sqrt(2.0) * depth + 2.0 * resolution
+        reassociation_radius = float(getattr(self, "active_reassociation_radius", 1.0))
+        return max(
+            math.sqrt(2.0) * depth + 2.0 * resolution,
+            depth + reassociation_radius,
+        )
 
     def _work_item_viewpoint_distance(self, request, anchor, x, y):
         """Measure a candidate endpoint against a durable physical anchor."""
@@ -130,6 +134,137 @@ class GlobalFrontierCandidateWorkItemMixin:
         # contract by providing the inverse TF projector above.
         return anchor if request.map_to_physical_xy is None else None
 
+    def _find_safe_viewpoint_cell(
+        self,
+        request,
+        steps,
+        desired,
+        anchor,
+        distance_limit,
+        item_id,
+        map_epoch,
+        ledger,
+        depth=0.55,
+    ):
+        """Find a reachable viewpoint cell in safe, un-inflated free space."""
+        message = request.message
+        resolution = max(1e-6, float(message.info.resolution))
+        reassociate = getattr(self, "nearest_reachable_cell", None)
+
+        preferred_mask = getattr(request, "preferred_mask", None)
+        validation = getattr(request, "validation", None)
+        occupied = getattr(request, "occupied", None)
+
+        # In pure unit test fixtures where neither preferred_mask nor occupied
+        # is supplied, preserve the legacy single-cell contract.
+        if preferred_mask is None and occupied is None:
+            if callable(reassociate):
+                return reassociate(message, steps, desired[0], desired[1])
+            return None
+
+        search_radius = max(
+            float(getattr(self, "active_reassociation_radius", 1.0)),
+            1.2,
+        )
+        target_col = int((desired[0] - message.info.origin.position.x) / resolution)
+        target_row = int((desired[1] - message.info.origin.position.y) / resolution)
+        cell_radius = max(1, int(math.ceil(search_radius / resolution)))
+
+        r0 = max(0, target_row - cell_radius)
+        r1 = min(steps.shape[0], target_row + cell_radius + 1)
+        c0 = max(0, target_col - cell_radius)
+        c1 = min(steps.shape[1], target_col + cell_radius + 1)
+
+        reachable = np.argwhere(steps[r0:r1, c0:c1] >= 0)
+        if reachable.size == 0:
+            if callable(reassociate):
+                return reassociate(message, steps, desired[0], desired[1])
+            return None
+
+        reachable[:, 0] += r0
+        reachable[:, 1] += c0
+
+        # Anchor in grid coordinates for line-of-sight checks
+        r_anchor = int(round((anchor[1] - message.info.origin.position.y) / resolution))
+        c_anchor = int(round((anchor[0] - message.info.origin.position.x) / resolution))
+
+        def has_line_of_sight(r, c):
+            if occupied is None:
+                return True
+            dr = abs(r_anchor - r)
+            dc = abs(c_anchor - c)
+            steps_count = max(dr, dc)
+            if steps_count <= 1:
+                return True
+            rows, cols = occupied.shape
+            for i in range(1, steps_count):
+                rr = int(round(r + (r_anchor - r) * i / float(steps_count)))
+                cc = int(round(c + (c_anchor - c) * i / float(steps_count)))
+                if 0 <= rr < rows and 0 <= cc < cols:
+                    if occupied[rr, cc]:
+                        return False
+            return True
+
+        tier1_candidates = []
+        tier2_candidates = []
+        min_standoff = max(0.20, min(0.35, depth * 0.5))
+
+        costmap_checker = getattr(self, "candidate_costmap_distance", None)
+
+        for r, c in reachable:
+            cx, cy = self.cell_xy(message, r, c)
+            d_anchor = math.hypot(cx - anchor[0], cy - anchor[1])
+            if distance_limit is not None and d_anchor > distance_limit:
+                continue
+            if d_anchor < min_standoff:
+                continue
+
+            physical = (
+                (cx, cy)
+                if request.map_to_physical_xy is None
+                else request.map_to_physical_xy(cx, cy)
+            )
+            if ledger is not None and not ledger.viewpoint_is_available(
+                item_id, physical, map_epoch=map_epoch
+            ):
+                continue
+
+            if not has_line_of_sight(r, c):
+                continue
+
+            # Check costmap validation if available
+            if validation is not None and callable(costmap_checker):
+                costmap_dist = costmap_checker(validation, cx, cy)
+                if costmap_dist is None:
+                    continue
+
+            d_desired_sq = (cx - desired[0]) ** 2 + (cy - desired[1]) ** 2
+
+            # Check preferred mask
+            in_preferred = (
+                preferred_mask is not None
+                and 0 <= r < preferred_mask.shape[0]
+                and 0 <= c < preferred_mask.shape[1]
+                and bool(preferred_mask[r, c])
+            )
+
+            if in_preferred:
+                tier1_candidates.append((d_desired_sq, int(r), int(c)))
+            else:
+                tier2_candidates.append((d_desired_sq, int(r), int(c)))
+
+        if tier1_candidates:
+            tier1_candidates.sort(key=lambda item: item[0])
+            best = tier1_candidates[0]
+            return best[1], best[2]
+
+        if tier2_candidates:
+            tier2_candidates.sort(key=lambda item: item[0])
+            best = tier2_candidates[0]
+            return best[1], best[2]
+
+        return None
+
     def pending_local_work_item_candidates(
         self, request, context, frontier, approach_cells,
     ):
@@ -192,6 +327,11 @@ class GlobalFrontierCandidateWorkItemMixin:
             "item_audit": [],
         }
         candidates = []
+        target_item_ids = {
+            int(r["id"])
+            for r in records
+            if "id" in r and (r.get("is_target") or r.get("kind") == "target_observation")
+        }
 
         def reject(reason):
             report["rejection_reasons"][reason] = (
@@ -270,7 +410,17 @@ class GlobalFrontierCandidateWorkItemMixin:
                 view_audit["desired_viewpoint"] = [
                     round(float(desired[0]), 3), round(float(desired[1]), 3),
                 ]
-                cell = reassociate(message, steps, desired[0], desired[1])
+                cell = self._find_safe_viewpoint_cell(
+                    request=request,
+                    steps=steps,
+                    desired=desired,
+                    anchor=anchor,
+                    distance_limit=distance_limit,
+                    item_id=item_id,
+                    map_epoch=map_epoch,
+                    ledger=ledger,
+                    depth=depth,
+                )
                 if cell is None or steps[cell] < 0:
                     view_audit["reason"] = "no_reachable_observation_viewpoint"
                     report["item_audit"].append(view_audit)
@@ -344,45 +494,25 @@ class GlobalFrontierCandidateWorkItemMixin:
                 )
                 break
             if selected is None:
-                now_sec = 0.0
-                stamp = getattr(getattr(message, "header", None), "stamp", None)
-                if stamp is not None and hasattr(stamp, "to_sec"):
-                    now_sec = float(stamp.to_sec())
-                elif rospy is not None and hasattr(rospy, "Time"):
-                    try:
-                        now_sec = float(rospy.Time.now().to_sec())
-                    except Exception:
-                        now_sec = 0.0
-
-                record_unreachable = getattr(ledger, "record_unreachable_viewpoint", None)
-                if callable(record_unreachable):
-                    abandoned = record_unreachable(item_id, now=now_sec, threshold=2)
-                    if abandoned:
-                        audit["reason"] = "dead_corner_unreachable"
-                        report["item_audit"].append(audit)
-                        reject("dead_corner_unreachable")
                 continue
-            else:
-                reset_unreachable = getattr(ledger, "reset_unreachable_viewpoint", None)
-                if callable(reset_unreachable):
-                    reset_unreachable(item_id)
             row, col, x, y, costmap_distance, path_distance, physical, strategy, retry = selected
+            cand_is_target = int(item_id) in target_item_ids
             candidate = FrontierCandidateRoute(
                 row=int(row),
                 col=int(col),
-                action_tier="local",
+                action_tier="target" if cand_is_target else "local",
                 place_hops=0,
                 x=float(x),
                 y=float(y),
                 path_distance=path_distance,
-                score_path_distance=path_distance,
+                score_path_distance=0.0 if cand_is_target else path_distance,
                 work_item_id=item_id,
                 work_item_match="rehydrated_work_item",
                 work_item_support_cells=int(item.get("support_cell_count", 0)),
                 work_item_normal_xy=normal,
                 viewpoint_retry=retry,
-                graph_action="retry_viewpoint" if retry else "observe_local_work",
-                graph_action_reason="durable_work_item_rehydrated_%s" % strategy,
+                graph_action="reinspect_target" if cand_is_target else ("retry_viewpoint" if retry else "observe_local_work"),
+                graph_action_reason="target_observation_approach" if cand_is_target else ("durable_work_item_rehydrated_%s" % strategy),
             )
             candidates.append((int(row), int(col), candidate))
             report["candidate_count"] += 1
@@ -398,12 +528,17 @@ class GlobalFrontierCandidateWorkItemMixin:
         if len(candidates) > 1 and density_sep > 0.0:
             candidates.sort(
                 key=lambda entry: (
+                    0 if int(getattr(entry[2], "work_item_id", 0) or 0) in target_item_ids else 1,
                     -int(getattr(entry[2], "work_item_support_cells", 0)),
                     float(getattr(entry[2], "path_distance", 0.0)),
                 )
             )
             filtered_candidates = []
             for r, c, cand in candidates:
+                cand_is_target = int(getattr(cand, "work_item_id", 0) or 0) in target_item_ids
+                if cand_is_target:
+                    filtered_candidates.append((r, c, cand))
+                    continue
                 cand_xy = (cand.x, cand.y)
                 suppressed = False
                 for _fr, _fc, accepted in filtered_candidates:

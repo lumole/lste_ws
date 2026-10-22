@@ -363,6 +363,32 @@ class GlobalFrontierEventCallbacksMixin:
                         work=record,
                     )
             return
+        if event == "target_geometry_hypothesis_updated":
+            pt = payload.get("point_odom")
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                try:
+                    px, py = float(pt[0]), float(pt[1])
+                    if math.isfinite(px) and math.isfinite(py):
+                        place_items = getattr(self, "place_work_items", None)
+                        if place_items is not None:
+                            current_place = getattr(self, "current_physical_place_id", 1) or 1
+                            track_id = payload.get("target_track_id", "")
+                            registered = place_items.register_target_work_item(
+                                current_place,
+                                (px, py),
+                                rospy.Time.now().to_sec(),
+                                target_track_id=track_id,
+                            )
+                            if registered is not None:
+                                rospy.loginfo(
+                                    "GlobalFrontier: target hypothesis updated target work item id=%s at (%.2f, %.2f)",
+                                    str(registered.get("id")),
+                                    px,
+                                    py,
+                                )
+                except (TypeError, ValueError):
+                    pass
+            return
         if place_id is None:
             return
         if event not in ("target_segment_committed",):
@@ -464,6 +490,11 @@ class GlobalFrontierEventCallbacksMixin:
                     reason="task_done",
                 )
             self.clear_target_region_claim("task_done")
+            place_items = getattr(self, "place_work_items", None)
+            if place_items is not None:
+                place_items.resolve_target_work_items(
+                    rospy.Time.now().to_sec(), reason="task_done"
+                )
             transaction = getattr(self, "portal_transaction", None)
             if transaction is not None and transaction.active:
                 aborted = transaction.abort("task_done")
@@ -1154,6 +1185,25 @@ class GlobalFrontierEventCallbacksMixin:
         self.pending_replan_reason = str(payload.get("reason", "unknown"))
         self.pending_semantic_hint_map = semantic_hint
         self.pending_semantic_pursuit = target_pursuit
+        if semantic_hint is not None:
+            place_items = getattr(self, "place_work_items", None)
+            if place_items is not None:
+                current_place = getattr(self, "current_physical_place_id", 1) or 1
+                now_sec = rospy.Time.now().to_sec()
+                registered = place_items.register_target_work_item(
+                    current_place,
+                    semantic_hint,
+                    now_sec,
+                    target_track_id=target_track_id,
+                )
+                if registered is not None:
+                    rospy.loginfo(
+                        "GlobalFrontier: registered target work item id=%s at (%.2f, %.2f) reason=%s",
+                        str(registered.get("id")),
+                        float(semantic_hint[0]),
+                        float(semantic_hint[1]),
+                        self.pending_replan_reason,
+                    )
         # A release is a terminal ownership transition.  An asynchronous
         # replan may carry stale ``target_room_claim=true`` metadata from the
         # failed target request, but that must never recreate the claim in the
@@ -1412,3 +1462,43 @@ class GlobalFrontierEventCallbacksMixin:
 
     def apply_turn_status(self, message):
         return GlobalFrontierEventCallbacksMixin.on_turn_status(self, message)
+
+    def on_state(self, message):
+        """Preempt non-target exploration routes when perception detects target suspicion or locked state."""
+        state = getattr(message, "state", None)
+        subtype = str(getattr(message, "subtype", "") or "").strip()
+        is_target_lead = (state == 2) or (state == 1 and subtype == "Sus-A")
+        if not is_target_lead:
+            return
+        # If currently executing an active frontier or ordinary work item route, preempt it
+        active_route_kind = getattr(self, "active_route_kind", "")
+        active_work_id = getattr(self, "active_work_item_id", None)
+        is_active_target_item = False
+        if active_work_id is not None and hasattr(self, "place_work_items") and self.place_work_items is not None:
+            item = getattr(self.place_work_items, "_items", {}).get(int(active_work_id))
+            if item is not None and (item.get("is_target") or item.get("kind") == "target_observation"):
+                is_active_target_item = True
+        if self.active_frontier is not None and not is_active_target_item:
+            rospy.loginfo(
+                "GlobalFrontier: target state=%s subtype=%s detected! Immediately braking non-target route=%s work_item=%s to prioritize target!",
+                str(state),
+                subtype,
+                str(active_route_kind),
+                str(active_work_id),
+            )
+            if hasattr(self, "pub_navigation_hold"):
+                try:
+                    self.pub_navigation_hold.publish(Bool(data=True))
+                except Exception:
+                    pass
+            release_active = getattr(self, "release_active_frontier", None)
+            if callable(release_active):
+                release_active(
+                    discard_prefetch=True,
+                    preserve_place_departure=False,
+                    queue_successor=False,
+                    await_controller_release_ack=True,
+                )
+
+    def apply_state(self, message):
+        return GlobalFrontierEventCallbacksMixin.on_state(self, message)

@@ -276,6 +276,8 @@ class GlobalFrontierExecutionResolutionMixin:
         """Choose the single lifecycle reason for a stalled route lease."""
         if watchdog.recovery_pending:
             return self.recovery_pending_reason or "move_base_terminal_failure"
+        if getattr(watchdog, "hard_stalled", False):
+            return getattr(watchdog, "hard_stall_reason", "hard_controller_stall_timeout") or "hard_controller_stall_timeout"
         if watchdog.post_turn_stalled:
             return "post_turn_no_progress"
         if getattr(watchdog, "portal_edge_expired", False):
@@ -452,7 +454,12 @@ class GlobalFrontierExecutionResolutionMixin:
             getattr(self, "controller_owned_route_failure", False)
             and int(getattr(self, "active_route_id", 0) or 0) > 0
             and isinstance(terminal_contract, dict)
+            and str(reason) != "hard_controller_stall_timeout"
         )
+        if str(reason) == "hard_controller_stall_timeout" or is_dead_corner_failure:
+            clear_costmaps = getattr(self, "clear_move_base_costmaps", None)
+            if callable(clear_costmaps):
+                clear_costmaps()
         self.release_active_frontier(
             queue_successor=not await_controller_release_ack,
             await_controller_release_ack=await_controller_release_ack,

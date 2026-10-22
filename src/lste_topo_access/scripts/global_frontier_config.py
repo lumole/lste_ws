@@ -45,6 +45,15 @@ class GlobalFrontierConfigurationMixin(
         # parameter. In target-room-entry mode the explorer must not turn a
         # detector candidate into a target reinspection route.
         self.target_done_policy = target_done_policy
+        spawn_x = gp("~spawn_x", None)
+        spawn_y = gp("~spawn_y", None)
+        if spawn_x is not None and spawn_y is not None:
+            try:
+                self.spawn_odom_xy = (float(spawn_x), float(spawn_y))
+            except (TypeError, ValueError):
+                self.spawn_odom_xy = None
+        else:
+            self.spawn_odom_xy = None
         self._load_topic_parameters(gp)
         self._load_navigation_parameters(gp)
         self._load_exploration_parameters(gp)

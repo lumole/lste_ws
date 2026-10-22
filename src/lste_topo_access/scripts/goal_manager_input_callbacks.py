@@ -51,16 +51,24 @@ class GoalManagerInputCallbacksMixin:
         if self.current_state == STATE_LOCKED:
             if self.locked_enter_time is None:
                 self.locked_enter_time = now
+            # Target is confirmed locked by perception: confirm target follow immediately
+            self.target_follow_confirmed = True
+            if getattr(self, "target_track_id", ""):
+                self.target_approach_track_id = self.target_track_id
         else:
             self.locked_enter_time = None
             if self.target_done_require_locked:
                 self.reset_target_close_confirmation()
 
         new_base = self.mode_from_state(self.current_state, self.current_subtype)
-        # Preserve a recently confirmed target through a transient context-only
-        # classification rather than switching to an unrelated context midpoint.
         target_recent = self.target_tracking_active(now)
-        if new_base == CATCH_CTX_MODE and target_recent:
+        if new_base == CATCH_TARGET_MODE:
+            # Target seen or suspected (STATE_LOCKED or Sus-A):
+            # Target discovery is the overarching mission - break any context hold immediately!
+            self.ctx_state_hold_until = 0.0
+            if getattr(self, "target_last_seen", None) is None:
+                self.target_last_seen = now
+        elif new_base == CATCH_CTX_MODE and target_recent:
             new_base = CATCH_TARGET_MODE
         elif new_base == CATCH_CTX_MODE:
             self.ctx_state_hold_until = max(
@@ -91,6 +99,31 @@ class GoalManagerInputCallbacksMixin:
             )
         self.base_mode = new_base
         self.effective_mode = new_base
+
+        if new_base == CATCH_TARGET_MODE:
+            # Preempt any ordinary frontier exploration route and request target pursuit replan
+            target_xy = None
+            hyp = getattr(self, "target_hypothesis_xy", None)
+            if hyp is not None:
+                target_xy = hyp
+            elif getattr(self, "target_last_heading", None) is not None and getattr(self, "latest_pose", None) is not None:
+                try:
+                    import math
+                    rx = float(self.latest_pose.x)
+                    ry = float(self.latest_pose.y)
+                    th = float(self.target_last_heading)
+                    target_xy = (rx + 1.5 * math.cos(th), ry + 1.5 * math.sin(th))
+                except Exception:
+                    target_xy = None
+            if target_xy is not None:
+                request_replan = getattr(self, "request_global_frontier_replan", None)
+                if callable(request_replan):
+                    request_replan(
+                        "target_suspicion_preemption",
+                        target_pursuit=True,
+                        semantic_hint_map=[round(float(target_xy[0]), 3), round(float(target_xy[1]), 3)],
+                        target_track_id=str(getattr(self, "target_track_id", "") or ""),
+                    )
 
         if (
             self.last_state is None

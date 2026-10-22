@@ -1127,14 +1127,21 @@ class TebGoalBridgeActionHealthMixin:
             route_id,
         )
         self.frontier_lease_released_reason = str(reason)
-        self._commit_termination(
-            "frontier_controller_release",
-            source_goal=getattr(self, "last_dispatched_goal", None),
-            action_contract=release_contract,
-            watchdog_reason="frontier_controller_release",
-            publish_terminal=False,
-            arm_watchdog=False,
-        )
+        commit = getattr(self, "_commit_termination", None)
+        if callable(commit):
+            commit(
+                "frontier_controller_release",
+                source_goal=getattr(self, "last_dispatched_goal", None),
+                action_contract=release_contract,
+                watchdog_reason="frontier_controller_release",
+                publish_terminal=False,
+                arm_watchdog=False,
+            )
+        else:
+            self.action_generation += 1
+            if getattr(self, "action_active", False) and hasattr(self, "action_client"):
+                self.action_client.cancel_goal()
+            self.action_active = False
         # This method is the Bridge-side application of the upstream semantic
         # release request. The transport prepare may remain pending until
         # MoveBase reports terminal, but the separate semantic tombstone has
@@ -1248,18 +1255,24 @@ class TebGoalBridgeActionHealthMixin:
         if callable(cancel_watchdog):
             cancel_watchdog("cancel:%s" % reason)
         was_active = bool(self.action_active)
-        self._commit_termination(
-            "cancel:%s" % reason,
-            source_goal=getattr(self, "last_dispatched_goal", None),
-            action_contract=getattr(self, "active_action_contract", None),
-            watchdog_reason="cancel:%s" % reason,
-            publish_terminal=False,
-            arm_watchdog=False,
-        )
+        commit = getattr(self, "_commit_termination", None)
+        if callable(commit):
+            commit(
+                "cancel:%s" % reason,
+                source_goal=getattr(self, "last_dispatched_goal", None),
+                action_contract=getattr(self, "active_action_contract", None),
+                watchdog_reason="cancel:%s" % reason,
+                publish_terminal=False,
+                arm_watchdog=False,
+            )
         self._cancel_pending_lease_release_watchdog_locked(
             "explicit_cancel"
         )
-        self.pending_lease_release_contract = None
+        # When cancelled due to a frontier route invalidation/observation, retain
+        # pending_lease_release_contract so the upcoming controller_lease_released
+        # from GlobalFrontier can be properly matched and ACKed.
+        if "frontier" not in str(reason):
+            self.pending_lease_release_contract = None
         self.handoff_requested = False
         self.persistent_frontier_endpoint_pending = None
         self.persistent_target_terminal_boundary_transaction = 0

@@ -191,6 +191,16 @@ class CmdVelMuxNode:
         angular = float(command.angular.z)
         magnitude = abs(angular)
         if self.teb_angular_deadband > 0.0 and magnitude <= self.teb_angular_deadband:
+            if (
+                allow_turn_entry_reversal
+                and abs(self.teb_last_output_angular) > self.teb_angular_deadband
+            ):
+                # TEB is entering an in-place turn, but this sample's angular
+                # velocity is in the deadband. Preserve the ongoing turn direction
+                # rather than braking both linear and angular axes to zero.
+                command.angular.z = self.teb_last_output_angular
+                self.teb_last_filter_reason = "turn_entry_angular_sustained"
+                return command
             command.angular.z = 0.0
             self.teb_last_output_angular = 0.0
             self.teb_micro_hold_cycles = 0
@@ -834,7 +844,7 @@ class CmdVelMuxNode:
             with self.lock:
                 hint_fresh = (
                     self.teb_turn_hint != 0.0
-                    and rospy.get_time() - self.teb_turn_hint_wall <= 0.25
+                    and rospy.get_time() - self.teb_turn_hint_wall <= 0.80
                 )
                 if hint_fresh and abs(command.angular.z) <= self.teb_angular_deadband:
                     command.angular.z = self.teb_turn_hint
@@ -861,10 +871,9 @@ class CmdVelMuxNode:
             allow_turn_entry_reversal=(
                 self.teb_forward_only
                 and float(message.linear.x) < 0.0
-                and abs(float(command.angular.z)) > self.teb_angular_deadband
             ),
         )
-        if self.teb_last_filter_reason != "none":
+        if filter_reason == "none" and self.teb_last_filter_reason != "none":
             filter_reason = self.teb_last_filter_reason
         self.forward(
             "teb",

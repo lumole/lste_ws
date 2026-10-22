@@ -276,6 +276,7 @@ class GoalManagerSchedulingMixin:
             or target_segment_active
             or target_terminal_pending
             or target_takeover_deferred
+            or self.effective_mode == CATCH_TARGET_MODE
         ):
             # A validated parallax side-step owns the controller until its
             # matching terminal.  Viewpoint diversity is expected during the

@@ -14,10 +14,12 @@ WS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEMO_SCRIPT="$WS/temp/manual_teleop/demo.sh"
 
 export CONTROLLER_MODE="teb"
+export WITH_SEMANTICS="true"
 
 ACTION="${1:-restart}"
 
 echo "[run_demo_teb] Controller mode set to: $CONTROLLER_MODE"
+echo "[run_demo_teb] Semantics enabled: $WITH_SEMANTICS"
 echo "[run_demo_teb] Executing action: $ACTION"
 
 exec "$DEMO_SCRIPT" "$ACTION" "${@:2}"

@@ -6,7 +6,7 @@
   <arg name="odom_topic" default="/pro3/wheel_odom"/>
   <arg name="global_frame" default="map"/>
   <arg name="max_linear_speed" default="0.50"/>
-  <arg name="teb_xy_goal_tolerance" default="0.50"/>
+  <arg name="teb_xy_goal_tolerance" default="0.45"/>
   <arg name="controller_mode" default="teb"/>
   <arg name="goal_topic" default="/lste/final_goal"/>
   <arg name="intent_topic" default="/lste/goal_intent"/>
@@ -378,17 +378,10 @@
          Confirmed visual targets still receive their own close-range evidence
          gate in GoalManager before task completion. -->
     <param name="TebLocalPlannerROS/xy_goal_tolerance" value="$(arg teb_xy_goal_tolerance)"/>
-    <!-- A frontier endpoint's yaw is a path tangent, not an arrival contract.
-         Requiring a circular base to meet that yaw after it reaches the XY
-         point creates a zero-speed terminal rotation, and the bridge can
-         eventually mistake that legitimate orientation phase for a stalled
-         action. TEB therefore completes endpoint actions on XY arrival. The
-         separate turn supervisor keeps its own 0.35-rad tolerance for the
-         rare explicit in-place turn transaction. -->
-    <param name="TebLocalPlannerROS/yaw_goal_tolerance" value="3.14159"/>
-    <!-- Short visual/frontier segments should not force a full stop at every
-         handoff. The task_done mux gate still performs the final stop. -->
-    <param name="TebLocalPlannerROS/free_goal_vel" value="true"/>
+    <!-- Align heading with the goal (WorkItem / frontier orientation) on arrival (~31 deg tolerance covers camera FoV). -->
+    <param name="TebLocalPlannerROS/yaw_goal_tolerance" value="0.55"/>
+    <!-- Come to a clean complete stop and accurate heading at the goal pose. -->
+    <param name="TebLocalPlannerROS/free_goal_vel" value="false"/>
     <param name="TebLocalPlannerROS/min_obstacle_dist" value="0.22"/>
     <param name="TebLocalPlannerROS/inflation_dist" value="0.55"/>
     <!-- Official TEB velocity limiter: slow continuously near furniture,
@@ -432,7 +425,7 @@
          order to recover around a stale or incomplete online map. -->
     <param name="TebLocalPlannerROS/viapoints_all_candidates" value="false"/>
     <param name="TebLocalPlannerROS/weight_kinematics_nh" value="1000.0"/>
-    <param name="TebLocalPlannerROS/weight_kinematics_forward_drive" value="1000.0"/>
+    <param name="TebLocalPlannerROS/weight_kinematics_forward_drive" value="1.0"/>
     <param name="TebLocalPlannerROS/weight_obstacle" value="45.0"/>
     <param name="TebLocalPlannerROS/weight_inflation" value="0.20"/>
     <param name="TebLocalPlannerROS/footprint_model/type" value="circular"/>

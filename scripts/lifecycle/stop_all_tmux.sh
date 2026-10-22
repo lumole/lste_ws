@@ -58,6 +58,9 @@ collect_residual_pids() {
     pgrep -f "$WS/scripts/tests/rl_fixed_goal/sappo_test.py" || true
     pgrep -f "$WS/scripts/tools/teleop_with_reset.py" || true
     pgrep -f "$WS/scripts/lifecycle/switch_controller.sh" || true
+    pgrep -f "$WS/temp/manual_teleop/place_portal_markers.py" || true
+    pgrep -f "$WS/temp/manual_teleop/fsm_panel.py" || true
+    pgrep -f "$WS/temp/manual_teleop/pause_panel.py" || true
   } | sort -nu
 }
 

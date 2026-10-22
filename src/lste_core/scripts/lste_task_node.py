@@ -34,8 +34,12 @@ def build_msg_from_json(json_path):
     msg.task_id = rospy.get_param("~task_id", "task_0001")
 
     if not os.path.isfile(json_path):
-        rospy.logwarn("JSON file '%s' not found. Falling back to params.", json_path)
-        return build_msg_from_params()
+        ws = os.environ.get("LSTE_WS") or os.environ.get("WS")
+        if ws and os.path.isfile(os.path.join(ws, json_path)):
+            json_path = os.path.join(ws, json_path)
+        else:
+            rospy.logwarn("JSON file '%s' not found. Falling back to params.", json_path)
+            return build_msg_from_params()
 
     try:
         with open(json_path, "r", encoding="utf-8") as f:

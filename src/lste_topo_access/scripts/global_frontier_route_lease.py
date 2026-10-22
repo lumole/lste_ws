@@ -35,6 +35,7 @@ def route_lease_failure_decision(
     post_turn_stalled=False,
     portal_edge_expired=False,
     active_timeout=False,
+    hard_stalled=False,
 ):
     """Return the only admissible failure transition for an active lease.
 
@@ -62,17 +63,23 @@ def route_lease_failure_decision(
             authority,
             "controller_terminal_failure",
         )
-    if controller_owns_failure:
-        return RouteLeaseDecision(
-            False,
-            authority,
-            "controller_owns_failure_terminal",
-        )
     if not actuator_forwarding:
         return RouteLeaseDecision(
             False,
             authority,
             "actuator_not_forwarding",
+        )
+    if hard_stalled:
+        return RouteLeaseDecision(
+            True,
+            AUTHORITY_GLOBAL_WATCHDOG,
+            "hard_controller_stall_timeout",
+        )
+    if controller_owns_failure:
+        return RouteLeaseDecision(
+            False,
+            authority,
+            "controller_owns_failure_terminal",
         )
     if portal_edge_expired:
         return RouteLeaseDecision(True, authority, "portal_edge_deadline")

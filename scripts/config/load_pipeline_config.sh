@@ -36,5 +36,5 @@ if overlay_path != base_path:
 
 for key, value in merged.items():
     if isinstance(value, (str, int, float)):
-        print("CFG_%s=%s" % (key, shlex.quote(str(value))))
+        print("export CFG_%s=%s" % (key, shlex.quote(str(value))))
 PY

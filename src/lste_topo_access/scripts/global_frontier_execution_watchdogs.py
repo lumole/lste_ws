@@ -92,6 +92,12 @@ class GlobalFrontierExecutionWatchdogMixin:
             not turn_phase_active
             and now - self.active_progress_time > self.stall_timeout
         )
+        hard_stall_timeout = getattr(self, "hard_stall_timeout", None)
+        observed_hard_stall = (
+            not turn_phase_active
+            and hard_stall_timeout is not None
+            and now - self.active_progress_time > hard_stall_timeout
+        )
         # Route progress is only attributable to this node while the actuator
         # boundary carries its commands.  Someone else on /cmd_vel (a human on
         # teleop, a navigation hold, a finished task, a slice reset) is not
@@ -163,6 +169,7 @@ class GlobalFrontierExecutionWatchdogMixin:
         active_timeout = (
             now - self.active_since > self.active_timeout and stalled
         )
+        hard_stalled = bool(observed_hard_stall and not suppress_elapsed_evidence)
         lease_decision = route_lease_failure_decision(
             controller_owns_failure=bool(
                 getattr(self, "controller_owned_route_failure", False)
@@ -173,6 +180,7 @@ class GlobalFrontierExecutionWatchdogMixin:
             post_turn_stalled=post_turn_stalled,
             portal_edge_expired=portal_edge_expired,
             active_timeout=active_timeout,
+            hard_stalled=hard_stalled,
         )
         expired = lease_decision.release
         suppressed_stall = (
@@ -248,6 +256,8 @@ class GlobalFrontierExecutionWatchdogMixin:
             expired=expired,
             actuator_forwarding=bool(actuator_forwarding),
             stall_suppressed_by_actuator=bool(suppressed_stall),
+            hard_stalled=bool(hard_stalled),
+            hard_stall_reason=str(lease_decision.reason) if hard_stalled else "",
         )
 
     def update_post_turn_watchdog(self, x, y, now):

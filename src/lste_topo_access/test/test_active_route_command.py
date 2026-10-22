@@ -24,6 +24,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from global_frontier_models import ActiveRouteCommand, SelectedFrontier
+from global_frontier_route_command_resolution import nearest_equivalent_yaw
 
 
 def load_hold_predicate():
@@ -150,6 +151,7 @@ def load_command_resolver():
     namespace = {
         "ActiveRouteCommand": ActiveRouteCommand,
         "math": math,
+        "nearest_equivalent_yaw": nearest_equivalent_yaw,
         "rospy": type("Ros", (), {"loginfo": staticmethod(lambda *_args: None)}),
     }
     exec(
@@ -363,7 +365,7 @@ class ActiveRouteCommandTest(unittest.TestCase):
         self.assertEqual(command.route_kind, "portal_transition")
         self.assertEqual(lifecycle.active_route_kind, "portal_transition")
 
-    def test_work_item_endpoint_preserves_path_terminal_heading_without_spin(self):
+    def test_work_item_endpoint_aligns_with_work_item_normal(self):
         class WorkItemCommandLifecycle(LocalEgressCommandLifecycle):
             def __init__(self):
                 super().__init__()
@@ -396,7 +398,61 @@ class ActiveRouteCommandTest(unittest.TestCase):
             -1.07,
         )
 
-        self.assertAlmostEqual(command.command_yaw, -1.07)
+        expected_yaw = math.atan2(-0.4452, -0.8954)
+        self.assertAlmostEqual(command.command_yaw, expected_yaw, places=4)
+
+    def test_nearest_equivalent_yaw_unwraps_shortest_arc(self):
+        # When current is +3.10 and target is -3.10, direct difference is -6.20 (-355 deg).
+        # Nearest equivalent angle must be ~3.183 so difference is only +0.083 rad (+4.8 deg).
+        unwrapped = nearest_equivalent_yaw(-3.10, 3.10)
+        self.assertAlmostEqual(unwrapped, 3.10 + math.atan2(math.sin(-6.20), math.cos(-6.20)), places=4)
+        self.assertLess(abs(unwrapped - 3.10), 0.1)
+        self.assertAlmostEqual(math.sin(unwrapped), math.sin(-3.10), places=4)
+        self.assertAlmostEqual(math.cos(unwrapped), math.cos(-3.10), places=4)
+
+        # Opposite direction: current is -3.10 and target is +3.10.
+        unwrapped_rev = nearest_equivalent_yaw(3.10, -3.10)
+        self.assertLess(abs(unwrapped_rev - (-3.10)), 0.1)
+        self.assertAlmostEqual(math.sin(unwrapped_rev), math.sin(3.10), places=4)
+
+    def test_work_item_endpoint_nearest_equivalent_yaw_prevents_360_winding(self):
+        class WindingWorkItemLifecycle(LocalEgressCommandLifecycle):
+            def __init__(self):
+                super().__init__()
+                self.active_route_kind = "frontier_endpoint"
+                self.active_mission_route_kind = "frontier_endpoint"
+                self.active_work_item_id = 99
+
+            @staticmethod
+            def route_headings(*_args):
+                return 3.10, 3.10
+
+            @staticmethod
+            def maybe_insert_turn_connector(*_args):
+                return (10.0, 5.0), 3.10, "frontier_endpoint", False
+
+            def _active_work_item_anchor(self, _item_id):
+                # Anchor placed directly behind the endpoint at 180 degrees opposite (+X vs -X)
+                return (9.0, 5.0)
+
+        lifecycle = WindingWorkItemLifecycle()
+        message = type("Message", (), {"info": type("Info", (), {"resolution": 0.1})})()
+        steps = np.zeros((4, 5), dtype=np.int32)
+
+        # Car current heading is +3.10. Anchor dx=-1.0, dy=0.0 -> target yaw = pi (~3.14159).
+        # Target angle is practically aligned with car heading (diff ~ 0.04 rad), no 360 spin.
+        command = lifecycle.resolve_active_route_command(
+            message,
+            (1, 2, 10.0, 5.0),
+            None,
+            steps,
+            (0, 0),
+            (10.5, 5.0),
+            3.10,
+        )
+
+        self.assertLess(abs(command.command_yaw - 3.10), 0.1)
+        self.assertAlmostEqual(math.cos(command.command_yaw), -1.0, places=4)
 
     def test_local_endpoint_expands_coverage_without_preparing_departure(self):
         lifecycle = LifecyclePreparation()

@@ -871,7 +871,7 @@ class GlobalFrontierSelectionPlannerMixin:
         is_work_item_plan = bool(
             plan is not None
             and getattr(plan, "action", None)
-            in ("bootstrap_observation", "observe_local_work", "retry_viewpoint")
+            in ("bootstrap_observation", "observe_local_work", "retry_viewpoint", "reinspect_target")
             and planned_obligation_id is not None
         )
         if is_work_item_plan:

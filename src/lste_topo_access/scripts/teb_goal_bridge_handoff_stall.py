@@ -154,6 +154,10 @@ class TebGoalBridgeHandoffStallMixin:
         physical_progress_time = float(
             getattr(self, "active_motion_progress_monotonic", 0.0) or 0.0
         )
+        if physical_progress_time <= 0.0:
+            physical_progress_time = float(
+                getattr(self, "last_dispatch_monotonic", 0.0) or 0.0
+            )
         physical_stalled = bool(
             physical_progress_time > 0.0
             and now - physical_progress_time >= self.progress_timeout

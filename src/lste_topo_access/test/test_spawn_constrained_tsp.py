@@ -268,6 +268,86 @@ class SpawnConstrainedTspTest(unittest.TestCase):
         self.assertGreater(ordered_ids.index(11), ordered_ids.index(12))
         self.assertGreater(ordered_ids.index(15), ordered_ids.index(12))
 
+    def test_spawn_not_assumed_as_zero_zero(self):
+        """Verify that when spawn is not (0,0), distances are calculated relative to actual spawn, not (0,0)."""
+        actual_spawn = (15.8, -11.79)
+        ledger = PlaceWorkItemLedger(merge_radius=0.5, spawn_odom_xy=actual_spawn)
+        self.assertEqual(ledger.spawn_odom_xy, actual_spawn)
+
+        # WorkItem A is close to actual spawn: (16.0, -11.0) -> dist approx 0.81m
+        # WorkItem B is close to (0, 0): (0.5, 0.5) -> dist to actual spawn > 19m!
+        support_a = MagicMock()
+        support_a.support_cells = frozenset([(1, 1)])
+        support_a.frontier_cells = [(1, 1)]
+        support_a.anchor_xy = (16.0, -11.0)
+        support_a.normal_xy = (0.0, 1.0)
+
+        support_b = MagicMock()
+        support_b.support_cells = frozenset([(2, 2)])
+        support_b.frontier_cells = [(2, 2)]
+        support_b.anchor_xy = (0.5, 0.5)
+        support_b.normal_xy = (1.0, 0.0)
+
+        cells, details = ledger.reconcile(1, (support_a, support_b), now=1.0)
+        item_a = [item for item in ledger._items.values() if item["anchor_xy"] == (16.0, -11.0)][0]
+        item_b = [item for item in ledger._items.values() if item["anchor_xy"] == (0.5, 0.5)][0]
+
+        expected_dist_a = math.hypot(16.0 - 15.8, -11.0 - (-11.79))
+        expected_dist_b = math.hypot(0.5 - 15.8, 0.5 - (-11.79))
+
+        self.assertAlmostEqual(item_a["spawn_distance"], expected_dist_a, places=2)
+        self.assertAlmostEqual(item_b["spawn_distance"], expected_dist_b, places=2)
+        self.assertLess(item_a["spawn_distance"], 2.0)
+        self.assertGreater(item_b["spawn_distance"], 15.0)
+
+        # Open TSP from actual spawn must choose Item A first, NOT Item B!
+        ordered = order_work_items_open_tsp(actual_spawn, [item_b, item_a], alpha=1.5, beta=0.8)
+        self.assertEqual(ordered[0]["id"], item_a["id"])
+
+    def test_uninitialized_spawn_does_not_default_to_zero_zero(self):
+        """Ledger with None spawn does not compute bogus (0,0) distance until spawn is known."""
+        ledger = PlaceWorkItemLedger(merge_radius=0.5)
+        self.assertIsNone(ledger.spawn_odom_xy)
+
+        support = MagicMock()
+        support.support_cells = frozenset([(1, 1)])
+        support.frontier_cells = [(1, 1)]
+        support.anchor_xy = (10.0, 10.0)
+        support.normal_xy = (1.0, 0.0)
+
+        cells, details = ledger.reconcile(1, (support,), now=1.0)
+        item = next(iter(ledger._items.values()))
+        # Distance must be None, NOT hypot(10.0, 10.0) = 14.14
+        self.assertIsNone(item.get("spawn_distance"))
+
+        # Once spawn is locked to (15.8, -11.79), subsequent reconciliation or bind computes it correctly
+        ledger.spawn_odom_xy = (15.8, -11.79)
+        cells2, details2 = ledger.reconcile(1, (support,), now=2.0)
+        expected = math.hypot(10.0 - 15.8, 10.0 - (-11.79))
+        self.assertAlmostEqual(item["spawn_distance"], expected, places=2)
+
+    def test_spawn_origin_dynamic_update_recomputes_distances(self):
+        """When spawn origin changes dynamically, ledger invalidates and updates distances."""
+        spawn1 = (0.0, 0.0)
+        ledger = PlaceWorkItemLedger(merge_radius=0.5, spawn_odom_xy=spawn1)
+
+        support = MagicMock()
+        support.support_cells = frozenset([(1, 1)])
+        support.frontier_cells = [(1, 1)]
+        support.anchor_xy = (3.0, 4.0)
+        support.normal_xy = (1.0, 0.0)
+
+        cells, details = ledger.reconcile(1, (support,), now=1.0, spawn_odom_xy=spawn1)
+        item = next(iter(ledger._items.values()))
+        self.assertAlmostEqual(item["spawn_distance"], 5.0, places=2)
+
+        # Now spawn point changes to (10.0, 4.0)
+        spawn2 = (10.0, 4.0)
+        cells2, details2 = ledger.reconcile(1, (support,), now=2.0, spawn_odom_xy=spawn2)
+        # Expected new distance: hypot(3.0 - 10.0, 4.0 - 4.0) = 7.0
+        self.assertAlmostEqual(item["spawn_distance"], 7.0, places=2)
+        self.assertEqual(ledger.spawn_odom_xy, spawn2)
+
 
 if __name__ == "__main__":
     unittest.main()

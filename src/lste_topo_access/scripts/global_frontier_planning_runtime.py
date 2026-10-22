@@ -111,23 +111,48 @@ class GlobalFrontierPlanningRuntimeMixin:
             )
             if release_blocks_current_route:
                 now = time.monotonic()
-                last_report = float(
-                    getattr(self, "last_controller_lease_wait_report_wall", 0.0)
-                    or 0.0
-                )
-                if now - last_report >= 1.0:
-                    self.last_controller_lease_wait_report_wall = now
-                    self.publish_status(
-                        "controller_lease_release_wait",
-                        active_route_id=current_route_id,
-                        pending_controller_lease_releases=getattr(
-                            self, "pending_controller_lease_releases", None
-                        ),
-                        pending_controller_lease_release=getattr(
-                            self, "pending_controller_lease_release", None
-                        ),
+                wait_start = getattr(self, "_controller_lease_wait_start_wall", None)
+                if wait_start is None:
+                    self._controller_lease_wait_start_wall = now
+                    wait_start = now
+                elif now - wait_start > 3.0:
+                    rospy.logwarn(
+                        "Global frontier: controller lease release wait timed out after %.1fs for route %s; auto-releasing barrier",
+                        now - wait_start,
+                        current_route_id,
                     )
-                return None, True
+                    self.publish_status(
+                        "controller_lease_release_wait_timeout",
+                        active_route_id=current_route_id,
+                        waited_seconds=now - wait_start,
+                    )
+                    self.awaiting_controller_lease_release_ack = False
+                    self._controller_lease_wait_start_wall = None
+                    releases = getattr(self, "pending_controller_lease_releases", None)
+                    if isinstance(releases, dict):
+                        releases.clear()
+                    self.pending_controller_lease_release = None
+                    release_blocks_current_route = False
+                else:
+                    last_report = float(
+                        getattr(self, "last_controller_lease_wait_report_wall", 0.0)
+                        or 0.0
+                    )
+                    if now - last_report >= 1.0:
+                        self.last_controller_lease_wait_report_wall = now
+                        self.publish_status(
+                            "controller_lease_release_wait",
+                            active_route_id=current_route_id,
+                            pending_controller_lease_releases=getattr(
+                                self, "pending_controller_lease_releases", None
+                            ),
+                            pending_controller_lease_release=getattr(
+                                self, "pending_controller_lease_release", None
+                            ),
+                        )
+                    return None, True
+            else:
+                self._controller_lease_wait_start_wall = None
             decision_wake = None
             decision_scheduler = getattr(self, "decision_wake_scheduler", None)
             event_driven = bool(
@@ -180,6 +205,88 @@ class GlobalFrontierPlanningRuntimeMixin:
             )
             self.planning_cycle_token = token
             return token, False
+
+    def _evaluate_planning_stall_watchdog(self, now):
+        """Detect and recover when planning is idle/blocked despite pending work items."""
+        if getattr(self, "active_frontier", None) is not None:
+            self._last_active_frontier_seen_wall = time.monotonic()
+            self._planning_stall_count = 0
+            return
+        forwarding_check = getattr(self, "route_actuator_is_forwarding", None)
+        if callable(forwarding_check) and not forwarding_check():
+            self._last_active_frontier_seen_wall = time.monotonic()
+            return
+        work_ledger = getattr(self, "place_work_items", None)
+        unresolved = (
+            getattr(work_ledger, "unresolved", lambda: ())()
+            if work_ledger is not None
+            else ()
+        )
+        if not unresolved:
+            self._last_active_frontier_seen_wall = time.monotonic()
+            self._planning_stall_count = 0
+            return
+        now_mono = time.monotonic()
+        last_seen = getattr(self, "_last_active_frontier_seen_wall", None)
+        if last_seen is None:
+            self._last_active_frontier_seen_wall = now_mono
+            return
+        timeout = float(getattr(self, "planning_stall_timeout", 8.0))
+        if now_mono - last_seen < timeout:
+            return
+        stall_count = int(getattr(self, "_planning_stall_count", 0)) + 1
+        self._planning_stall_count = stall_count
+        self._last_active_frontier_seen_wall = now_mono
+        rospy.logwarn(
+            "Global frontier: planning stall watchdog triggered (count=%d, idle=%.1fs, unresolved=%d); "
+            "auto-recovering orphaned state and costmaps",
+            stall_count,
+            now_mono - last_seen,
+            len(unresolved),
+        )
+        publish = getattr(self, "publish_status", None)
+        if callable(publish):
+            publish(
+                "planning_stall_watchdog_triggered",
+                stall_count=stall_count,
+                idle_seconds=round(now_mono - last_seen, 2),
+                unresolved_count=len(unresolved),
+                unresolved_ids=[
+                    item.get("id")
+                    for item in unresolved
+                    if isinstance(item, dict) and item.get("id") is not None
+                ],
+            )
+        if hasattr(work_ledger, "reconcile_orphaned_attempts"):
+            work_ledger.reconcile_orphaned_attempts(
+                now, active_work_item_id=getattr(self, "active_work_item_id", None)
+            )
+        clear_deferred = getattr(
+            self, "_clear_target_observation_materialization_deferred", None
+        )
+        if callable(clear_deferred):
+            clear_deferred(reason="planning_stall_watchdog")
+        clear_costmaps = getattr(self, "clear_move_base_costmaps", None)
+        if callable(clear_costmaps):
+            clear_costmaps()
+        if stall_count >= 2 and unresolved:
+            oldest = min(
+                unresolved,
+                key=lambda it: it.get("id", 0) if isinstance(it, dict) else 0,
+            )
+            oldest_id = oldest.get("id") if isinstance(oldest, dict) else None
+            if oldest_id is not None:
+                rospy.logwarn(
+                    "Global frontier: persistent planning stall count=%d; resolving stuck work item %s as dead corner",
+                    stall_count,
+                    oldest_id,
+                )
+                work_ledger.resolve(
+                    oldest_id, now, "dead_corner_planning_stall_exhausted"
+                )
+        scheduler = getattr(self, "decision_wake_scheduler", None)
+        if scheduler is not None:
+            scheduler.request("planning_stall_watchdog_recovery")
 
     def on_timer(self, _event):
         cycle_lock = getattr(self, "planning_cycle_lock", None)
@@ -277,6 +384,7 @@ class GlobalFrontierPlanningRuntimeMixin:
                         ),
                     )
             return
+        self._evaluate_planning_stall_watchdog(now)
         if self.active_route_planning_is_deferred(robot_map, now):
             live_portal_scan = getattr(
                 self, "observe_live_portal_openings_from_map", None

@@ -13,7 +13,7 @@ from move_base_msgs.msg import RecoveryStatus
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, String
-from lste_msgs.msg import LsteDetections, LsteTask
+from lste_msgs.msg import LsteDetections, LsteState, LsteTask
 
 from experiment_reset_contract import HARD_RESET_ACK_TOPIC, HARD_RESET_TOPIC
 
@@ -33,6 +33,12 @@ class GlobalFrontierRosInterfacesMixin:
         self.hard_reset_ack_publisher = rospy.Publisher(
             HARD_RESET_ACK_TOPIC, String, queue_size=20
         )
+        self.pub_navigation_hold = rospy.Publisher(
+            "/lste/navigation_hold", Bool, queue_size=1
+        )
+        self.pub_task_done = rospy.Publisher(
+            "/lste/task_done", Bool, queue_size=1, latch=True
+        )
         rospy.Subscriber(self.map_topic, OccupancyGrid, self.on_map, queue_size=1)
         rospy.Subscriber(self.costmap_topic, OccupancyGrid, self.on_costmap, queue_size=1)
         rospy.Subscriber(
@@ -44,6 +50,7 @@ class GlobalFrontierRosInterfacesMixin:
         rospy.Subscriber(self.pose_topic, Pose2D, self.on_pose, queue_size=1)
         rospy.Subscriber(self.scan_topic, LaserScan, self.on_scan, queue_size=1)
         rospy.Subscriber(self.task_topic, LsteTask, self.on_task, queue_size=1)
+        rospy.Subscriber("/lste/state", LsteState, self.on_state, queue_size=1)
         rospy.Subscriber(
             self.detections_topic,
             LsteDetections,
@@ -137,3 +144,17 @@ class GlobalFrontierRosInterfacesMixin:
             self.region_failure_limit,
             self.place_furniture_max_span_m,
         )
+
+    def clear_move_base_costmaps(self):
+        """Call /move_base/clear_costmaps non-blockingly to clear sensor inflation artifacts."""
+        try:
+            from std_srvs.srv import Empty
+            service_name = "/move_base/clear_costmaps"
+            rospy.wait_for_service(service_name, timeout=0.2)
+            proxy = rospy.ServiceProxy(service_name, Empty)
+            proxy()
+            rospy.loginfo("Global frontier: successfully called /move_base/clear_costmaps on stall recovery")
+            return True
+        except Exception as exc:
+            rospy.logdebug("Global frontier: /move_base/clear_costmaps unavailable or failed: %s", exc)
+            return False

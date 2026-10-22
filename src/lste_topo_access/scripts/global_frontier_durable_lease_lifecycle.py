@@ -82,6 +82,18 @@ class GlobalFrontierDurableLeaseLifecycleMixin:
                     "state": None if item is None else item.get("state"),
                 }
             )
+        elif hasattr(self, "place_work_items") and self.place_work_items is not None:
+            reconciled = self.place_work_items.reconcile_orphaned_attempts(
+                now, active_work_item_id=None
+            )
+            for r_id in reconciled:
+                settled.append(
+                    {
+                        "kind": "work_item",
+                        "id": int(r_id),
+                        "state": "orphaned_attempt_cleared",
+                    }
+                )
 
         self.publish_status(
             "durable_route_lease_reconciled",

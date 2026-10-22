@@ -127,6 +127,12 @@ class GlobalFrontierNavigationConfigurationMixin:
         )
         self.active_timeout = max(2.0, float(gp("~active_timeout", 18.0)))
         self.stall_timeout = max(2.0, float(gp("~stall_timeout", 8.0)))
+        self.hard_stall_timeout = max(
+            self.stall_timeout, float(gp("~hard_stall_timeout", self.stall_timeout * 1.5))
+        )
+        self.planning_stall_timeout = max(
+            3.0, float(gp("~planning_stall_timeout", 8.0))
+        )
         # Once a committed pre-route turn has completed, a route that never
         # physically launches is usually an unusable local plan. This is a
         # *launch* watchdog, not a shorter version of the general progress

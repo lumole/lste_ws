@@ -3,6 +3,8 @@
   <arg name="scan_topic" default="/pro3/rlscan"/>
   <arg name="odom_topic" default="/pro3/wheel_odom"/>
   <arg name="pose_topic" default="/rbt_pose"/>
+  <arg name="spawn_x" default="$(optenv CFG_PRO3_SPAWN_X 0.0)"/>
+  <arg name="spawn_y" default="$(optenv CFG_PRO3_SPAWN_Y 0.0)"/>
   <!-- Task/detection streams feed the task-conditioned Place belief. They
        never publish goals or alter controller parameters. -->
   <arg name="task_topic" default="/lste/task"/>
@@ -86,6 +88,8 @@
   <arg name="early_handoff_distance" default="2.0"/>
   <arg name="active_timeout" default="45.0"/>
   <arg name="stall_timeout" default="12.0"/>
+  <arg name="hard_stall_timeout" default="16.0"/>
+  <arg name="planning_stall_timeout" default="8.0"/>
   <!-- A completed pre-route alignment proves yaw is no longer the reason an
        endpoint is stationary. Retire this exact endpoint sooner when it has
        no subsequent route/goal/odom progress. Set <= 0 to disable. -->
@@ -214,6 +218,8 @@
     <param name="exploration_startup_warmup_seconds" value="$(arg exploration_startup_warmup_seconds)"/>
     <param name="navfn_startup_probe_distance" value="$(arg navfn_startup_probe_distance)"/>
     <param name="pose_topic" value="$(arg pose_topic)"/>
+    <param name="spawn_x" value="$(arg spawn_x)"/>
+    <param name="spawn_y" value="$(arg spawn_y)"/>
     <param name="scan_topic" value="$(arg scan_topic)"/>
     <param name="task_topic" value="$(arg task_topic)"/>
     <param name="detections_topic" value="$(arg detections_topic)"/>
@@ -240,6 +246,8 @@
     <param name="early_handoff_distance" value="$(arg early_handoff_distance)"/>
     <param name="active_timeout" value="$(arg active_timeout)"/>
     <param name="stall_timeout" value="$(arg stall_timeout)"/>
+    <param name="hard_stall_timeout" value="$(arg hard_stall_timeout)"/>
+    <param name="planning_stall_timeout" value="$(arg planning_stall_timeout)"/>
     <param name="post_turn_stall_timeout" value="$(arg post_turn_stall_timeout)"/>
     <param name="odom_novel_cell_size" value="$(arg odom_novel_cell_size)"/>
     <param name="unreachable_grace" value="$(arg unreachable_grace)"/>

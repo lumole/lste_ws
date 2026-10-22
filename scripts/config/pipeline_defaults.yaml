@@ -12,8 +12,8 @@ TASK_ID: yellow_cup
 # YAW is radians, counter-clockwise about +Z. The default yaw (+pi/2) makes the
 # Pro3 forward axis face the world +Y direction. Edit these four values before
 # starting the robot; an already-spawned robot keeps its existing pose.
-PRO3_SPAWN_X: 3.4
-PRO3_SPAWN_Y: 0
+PRO3_SPAWN_X: 0.0
+PRO3_SPAWN_Y: 0.0
 PRO3_SPAWN_Z: 0.1
 PRO3_SPAWN_YAW: 0
 

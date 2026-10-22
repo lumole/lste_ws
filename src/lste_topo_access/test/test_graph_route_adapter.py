@@ -679,6 +679,65 @@ class GraphRouteAdapterTest(unittest.TestCase):
         )
         self.assertEqual(fixture.events, [])
 
+    def test_lease_retained_during_navfn_validation_across_map_epoch_advancement(self):
+        fixture = AdapterFixture(
+            work_items=[
+                {"id": 33, "place_id": 1, "state": "unresolved", "support_cells": 10},
+            ]
+        )
+        plan = GraphRoutePlan(
+            PLAN_READY,
+            "observe_local_work",
+            current_place_id=1,
+            obligation_kind="work_item",
+            obligation_id=33,
+            map_epoch=10,
+        )
+        fixture.last_graph_route_plan = plan
+        fixture._retain_graph_route_plan_lease(plan, "navfn_validation_pending")
+        fixture.frontier_validation_pending = True
+
+        reused, candidate = fixture._prepare_graph_route_action(
+            None,
+            visible_work_item_ids=[33],
+            reuse_existing_plan=True,
+            map_epoch=11,
+        )
+        self.assertIsNotNone(reused)
+        self.assertEqual(reused.obligation_id, 33)
+        self.assertTrue(fixture.graph_route_plan_lease_active)
+        self.assertFalse(any(event[0] == "graph_route_plan_rebase_required" for event in fixture.events))
+
+    def test_lease_retained_when_visible_candidates_temporarily_empty_during_validation(self):
+        fixture = AdapterFixture(
+            work_items=[
+                {"id": 33, "place_id": 1, "state": "unresolved", "support_cells": 10},
+            ]
+        )
+        plan = GraphRoutePlan(
+            PLAN_READY,
+            "observe_local_work",
+            current_place_id=1,
+            obligation_kind="work_item",
+            obligation_id=33,
+            map_epoch=10,
+        )
+        fixture.last_graph_route_plan = plan
+        fixture._retain_graph_route_plan_lease(plan, "navfn_validation_pending")
+        fixture.frontier_validation_pending = True
+
+        reused, candidate = fixture._prepare_graph_route_action(
+            None,
+            visible_work_item_ids=[],
+            reuse_existing_plan=True,
+            map_epoch=11,
+        )
+        self.assertIsNotNone(reused)
+        self.assertEqual(reused.obligation_id, 33)
+        self.assertTrue(fixture.graph_route_plan_lease_active)
+        self.assertFalse(any(event[0] == "graph_route_plan_rebase_required" for event in fixture.events))
+
+
 
 class GraphRouteSelectionFixture(GlobalFrontierPlanningSelectionMixin):
     def __init__(self, plan):

@@ -66,6 +66,17 @@ class CmdVelMuxTurnEntryTest(unittest.TestCase):
         self.assertEqual(fixture.teb_last_filter_reason, "none")
         self.assertEqual(fixture.teb_last_angular_sign, -1)
 
+    def test_turn_entry_deadband_sustains_ongoing_turn(self):
+        fixture = MuxFilterFixture()
+        fixture.teb_last_output_angular = 0.20
+        result = fixture.filter_teb_angular(
+            self.command(0.01), allow_turn_entry_reversal=True
+        )
+        self.assertAlmostEqual(result.angular.z, 0.20)
+        self.assertEqual(
+            fixture.teb_last_filter_reason, "turn_entry_angular_sustained"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

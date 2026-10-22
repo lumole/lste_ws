@@ -93,5 +93,14 @@ lste_gazebo_exec() {
   xvfb-run -a -s "-screen 0 1920x1080x24" "$@"
 }
 
+export DISPLAY="${DISPLAY:-:0}"
+export DISABLE_ROS1_EOL_WARNINGS=1
+
 # 统一 ROS master URI，避免 lste-env 和 lste session 各连不同的 roscore
 export ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311/}
+
+# 统一参数源 (SSOT): 自动加载 pipeline_defaults.yaml 配置并导出 CFG_* 环境变量
+PIPELINE_CONFIG="${PIPELINE_CONFIG:-$WS/scripts/config/pipeline_defaults.yaml}"
+if [[ -f "$PIPELINE_CONFIG" && -f "$WS/scripts/config/load_pipeline_config.sh" ]]; then
+  eval "$("$WS/scripts/config/load_pipeline_config.sh" "$PIPELINE_CONFIG")"
+fi

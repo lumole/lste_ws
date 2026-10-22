@@ -98,6 +98,29 @@ class RouteLeaseAuthorityTest(unittest.TestCase):
         self.assertTrue(decision.release)
         self.assertEqual(decision.reason, "stall")
 
+    def test_hard_stall_breaks_controller_owned_persistent_lease(self):
+        """Hard controller stall timeout breaks persistent lease even when controller owns failure."""
+        decision = route_lease_failure_decision(
+            controller_owns_failure=True,
+            hard_stalled=True,
+            actuator_forwarding=True,
+        )
+
+        self.assertTrue(decision.release)
+        self.assertEqual(decision.authority, AUTHORITY_GLOBAL_WATCHDOG)
+        self.assertEqual(decision.reason, "hard_controller_stall_timeout")
+
+    def test_hard_stall_suppressed_by_foreign_actuator(self):
+        """Foreign actuator still suppresses hard stall (e.g. manual teleop or hold)."""
+        decision = route_lease_failure_decision(
+            controller_owns_failure=True,
+            hard_stalled=True,
+            actuator_forwarding=False,
+        )
+
+        self.assertFalse(decision.release)
+        self.assertEqual(decision.reason, "actuator_not_forwarding")
+
 
 if __name__ == "__main__":
     unittest.main()

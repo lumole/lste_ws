@@ -97,6 +97,12 @@ class GlobalFrontierRouteCommandPublicationMixin:
             command.route_kind,
             command.mission_route_kind,
         )
+        if hasattr(self, "pub_navigation_hold"):
+            try:
+                from std_msgs.msg import Bool
+                self.pub_navigation_hold.publish(Bool(data=False))
+            except Exception:
+                pass
         self.publisher.publish(goal)
         # WorkItem ownership begins at this execution boundary, not when a
         # frontier candidate was merely selected.  A later connector refresh

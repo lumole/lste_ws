@@ -338,23 +338,17 @@ class WorkItemDensityAndCornerRejectionTest(unittest.TestCase):
         req = MockRequest()
         ctx = MockContext()
 
-        # Tick 1: unreachable
+        # Candidates cannot be generated right now (e.g. outside local costmap),
+        # but item must REMAIN unresolved and NOT be prematurely abandoned.
         candidates1 = tester.pending_local_work_item_candidates(req, ctx, None, None)
         self.assertEqual(len(candidates1), 0)
         self.assertEqual(it["state"], WORK_UNRESOLVED)
-        self.assertEqual(it.get("unreachable_viewpoint_count"), 1)
 
-        # Tick 2: unreachable again -> triggers abandonment
+        # Subsequent evaluation: item still remains unresolved, waiting for robot to get closer
         candidates2 = tester.pending_local_work_item_candidates(req, ctx, None, None)
         self.assertEqual(len(candidates2), 0)
-        self.assertEqual(it["state"], WORK_RESOLVED)
-        self.assertEqual(it["last_reason"], "dead_corner_unreachable")
-        self.assertTrue(tester.place_work_items.is_dead_corner((0.5, 0.5)))
-
-        # Tick 3: item is now resolved, ignored during rehydration
-        candidates3 = tester.pending_local_work_item_candidates(req, ctx, None, None)
-        self.assertEqual(len(candidates3), 0)
-        self.assertEqual(tester.place_work_items.unresolved_count(1), 0)
+        self.assertEqual(it["state"], WORK_UNRESOLVED)
+        self.assertEqual(tester.place_work_items.unresolved_count(1), 1)
 
     def test_candidate_work_items_spatial_nms_suppression(self):
         """Candidates within density_separation distance are suppressed, keeping the denser one."""

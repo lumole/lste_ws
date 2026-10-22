@@ -229,14 +229,15 @@ class TebTurnSupervisorRoutesMixin:
                     )
                     return None
             transformed.append(candidate)
-        if len(transformed) < 2:
-            return None
-        first = transformed[0].pose.position
-        for candidate in transformed[1:]:
-            point = candidate.pose.position
-            distance = math.hypot(point.x - first.x, point.y - first.y)
-            if distance >= 0.12:
-                return normalize_angle(math.atan2(point.y - first.y, point.x - first.x))
+        if len(transformed) >= 2:
+            first = transformed[0].pose.position
+            for candidate in transformed[1:]:
+                point = candidate.pose.position
+                distance = math.hypot(point.x - first.x, point.y - first.y)
+                if distance >= 0.12:
+                    return normalize_angle(math.atan2(point.y - first.y, point.x - first.x))
+        if self.active_action_goal is not None:
+            return self._goal_yaw_in_pose_frame_locked(self.active_action_goal)
         return None
 
     def _sharp_navfn_entry_heading_error_locked(self):

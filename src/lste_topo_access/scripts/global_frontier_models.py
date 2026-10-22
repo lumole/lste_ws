@@ -40,6 +40,8 @@ class ActiveRouteWatchdogState:
     # the lease survived on the boundary fact alone.
     actuator_forwarding: bool = True
     stall_suppressed_by_actuator: bool = False
+    hard_stalled: bool = False
+    hard_stall_reason: str = ""
 
 
 @dataclass

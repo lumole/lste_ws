@@ -766,6 +766,22 @@ class GraphRoutePlanner:
         local_probe = probe_by_place.get(current, ())
         local_unbound = unbound_by_place.get(current, ())
 
+        # Target reinspection is the highest-priority mission action. It owns
+        # the current Place until its evidence transaction resolves; ordinary
+        # place bootstrap, local WorkItems and doorway probes are not equivalent substitutes.
+        target_work_items = [
+            it for it in local_work
+            if it.get("is_target") or it.get("kind") == "target_observation"
+        ]
+        if target_observation_pending or target_work_items:
+            target_item_id = _positive_id(target_work_items[0].get("id")) if target_work_items else None
+            return self._target(
+                current,
+                "target_observation_required",
+                item_id=target_item_id,
+                tour=(target_item_id,) if target_item_id is not None else (),
+            )
+
         # A newly entered Place must be observed before it can issue an
         # outward graph action.  This is a state invariant, not a score.
         if not current_covered:
@@ -808,14 +824,6 @@ class GraphRoutePlanner:
                 current_place_id=current,
                 reason="portal_probe_attempt_active",
             )
-
-        # Target reinspection is a first-class information action. It owns
-        # the current Place until its evidence transaction resolves; ordinary
-        # local WorkItems and doorway probes are not equivalent substitutes.
-        # Geometry still comes from the current map below, but the discrete
-        # action class is fixed here so the graph cannot silently depart.
-        if target_observation_pending:
-            return self._target(current, "target_observation_required")
 
         # A branch-first Portal can turn out to be a second doorway into an
         # already-known Place.  Preserve the source Place as a one-shot graph
@@ -897,7 +905,7 @@ class GraphRoutePlanner:
         # structural probe from the source Place. This makes the graph edge
         # executable as soon as its evidence contract is complete.
         explicit_target = _positive_id(target_place_id)
-        if branch_first and local_unbound:
+        if local_unbound:
             promoted = next(
                 (
                     portal for portal in local_unbound
@@ -1193,6 +1201,8 @@ class GraphRoutePlanner:
     @staticmethod
     def _target_work_pending(explicit_target, current, local_work):
         """Keep a target-owned local obligation ahead of branch-first."""
+        if any(item.get("is_target") or item.get("kind") == "target_observation" for item in local_work):
+            return True
         return explicit_target is not None and explicit_target == current and bool(local_work)
 
     @staticmethod
@@ -1225,7 +1235,7 @@ class GraphRoutePlanner:
         )
 
     @staticmethod
-    def _target(place_id, reason):
+    def _target(place_id, reason, item_id=None, tour=()):
         """Represent one unresolved target-place evidence transaction."""
         return GraphRoutePlan(
             PLAN_READY,
@@ -1233,8 +1243,9 @@ class GraphRoutePlanner:
             current_place_id=place_id,
             target_place_id=place_id,
             obligation_kind="target_observation",
-            obligation_id=None,
+            obligation_id=item_id,
             reason=reason,
+            work_item_tour=tuple(tour),
         )
 
     @staticmethod

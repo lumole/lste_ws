@@ -104,9 +104,27 @@ start_navigation_metrics_window() {
     "$WAIT_ROSCORE; $metrics_command"
 }
 
+DEMO_UI_ENABLED=${DEMO_UI_ENABLED:-${CFG_DEMO_UI_ENABLED:-false}}
+
+start_demo_ui_windows() {
+  if [[ "${DEMO_UI_ENABLED,,}" != "true" && "$DEMO_UI_ENABLED" != "1" ]]; then
+    return 0
+  fi
+  echo "[nodes] Starting demo UI windows (markers, FSM panel, pause panel, place_portal.rviz)..."
+  tmux_new_window 18 "$WS" "markers" \
+    "$WAIT_ROSCORE; python3 $WS/temp/manual_teleop/place_portal_markers.py _legend_width:=344 _legend_font_size:=19"
+  tmux_new_window 19 "$WS" "fsmpanel" \
+    "$WAIT_ROSCORE; python3 $WS/temp/manual_teleop/fsm_panel.py _fsm_width:=560"
+  tmux_new_window 20 "$WS" "pausepanel" \
+    "$WAIT_ROSCORE; python3 $WS/temp/manual_teleop/pause_panel.py"
+  tmux_new_window 21 "$WS" "rviz_place_portal" \
+    "$WAIT_ROSCORE; rviz -d $WS/temp/manual_teleop/place_portal.rviz"
+}
+
 start_observability_and_controller() {
   mkdir -p "$WS/runtime/navigation"
   start_navigation_metrics_window
+  start_demo_ui_windows
 
   # Keep controller configuration as data. This avoids a fragile shell command
   # with dozens of inline assignments and makes each forwarded setting explicit.

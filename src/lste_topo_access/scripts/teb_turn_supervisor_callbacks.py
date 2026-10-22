@@ -246,13 +246,9 @@ class TebTurnSupervisorCallbacksMixin:
             return None
         now = now_for(self)
         status_wall = float(getattr(self, "latest_mux_status_wall", 0.0) or 0.0)
-        if status_wall <= 0.0 or now - status_wall > 0.50:
+        if status_wall <= 0.0 or now - status_wall > 1.20:
             return None
         if not self._mux_status_identity_matches_action_locked(status):
-            return None
-        if str(status.get("filter_reason", "") or "").strip().lower() != (
-            "forward_only_reverse_clamp"
-        ):
             return None
         input_command = status.get("input")
         output_command = status.get("output")
@@ -265,6 +261,13 @@ class TebTurnSupervisorCallbacksMixin:
         except (TypeError, ValueError):
             return None
         if input_linear >= -0.002 or abs(output_linear) > 0.001:
+            return None
+        filter_reason = str(status.get("filter_reason", "") or "").strip().lower()
+        if (
+            filter_reason != "forward_only_reverse_clamp"
+            and "reverse_clamp" not in filter_reason
+            and not (input_linear < -0.002 and abs(output_linear) <= 0.001)
+        ):
             return None
         if action_identity is not None:
             expected_identity = getattr(self, "active_action_identity", None)
@@ -1035,7 +1038,23 @@ class TebTurnSupervisorCallbacksMixin:
                     )
                 self.pre_turn_checked_identity = None
                 self.completed_turn_key = None
-                self.latest_navfn_plan = None
+                if self.latest_navfn_plan is not None and self.active_action_goal is not None:
+                    last_pose = (
+                        self.latest_navfn_plan.poses[-1]
+                        if self.latest_navfn_plan.poses
+                        else None
+                    )
+                    if last_pose is not None:
+                        gx = float(self.active_action_goal.pose.position.x)
+                        gy = float(self.active_action_goal.pose.position.y)
+                        px = float(last_pose.pose.position.x)
+                        py = float(last_pose.pose.position.y)
+                        if math.hypot(px - gx, py - gy) > 0.50:
+                            self.latest_navfn_plan = None
+                    else:
+                        self.latest_navfn_plan = None
+                else:
+                    self.latest_navfn_plan = None
                 self.trajectory_continuity_sharp_entry_identity = None
                 self.stalled_route_candidate_identity = None
                 self.stalled_route_candidate_since_wall = 0.0
@@ -1187,6 +1206,7 @@ class TebTurnSupervisorCallbacksMixin:
                 getattr(self, "planner_command_sequence", 0) or 0
             )
             self.planner_command_action_identity = self.active_action_identity
+            self.trajectory_feedback_requires_fresh_planner_command = False
             if (
                 abs(float(message.linear.x)) <= 0.001
                 and abs(float(message.angular.z)) <= 0.01

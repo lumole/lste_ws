@@ -95,4 +95,48 @@ class GlobalFrontierPlanningRouteMixin:
         selected = reachable[int(np.argmin(distance))]
         return int(selected[0]), int(selected[1])
 
+    def nearest_safe_reachable_cell(
+        self,
+        message,
+        steps,
+        x,
+        y,
+        preferred_mask=None,
+        validation=None,
+        occupied=None,
+        anchor_xy=None,
+        distance_limit=None,
+    ):
+        """Find a reachable cell with obstacle clearance, outside inflation."""
+        if steps is None:
+            return None
+        resolution = float(message.info.resolution)
+        target_col = int((x - message.info.origin.position.x) / resolution)
+        target_row = int((y - message.info.origin.position.y) / resolution)
+        search_radius = max(float(self.active_reassociation_radius), 1.2)
+        radius = max(1, int(math.ceil(search_radius / resolution)))
+        r0 = max(0, target_row - radius)
+        r1 = min(steps.shape[0], target_row + radius + 1)
+        c0 = max(0, target_col - radius)
+        c1 = min(steps.shape[1], target_col + radius + 1)
+        reachable = np.argwhere(steps[r0:r1, c0:c1] >= 0)
+        if reachable.size == 0:
+            return None
+        reachable[:, 0] += r0
+        reachable[:, 1] += c0
+
+        # Prioritize cells in preferred_mask (strict_free clearance)
+        if preferred_mask is not None:
+            mask_valid = preferred_mask[reachable[:, 0], reachable[:, 1]]
+            if np.any(mask_valid):
+                preferred_reachable = reachable[mask_valid]
+                dist = (preferred_reachable[:, 0] - target_row) ** 2 + (preferred_reachable[:, 1] - target_col) ** 2
+                selected = preferred_reachable[int(np.argmin(dist))]
+                return int(selected[0]), int(selected[1])
+
+        distance = (reachable[:, 0] - target_row) ** 2 + (reachable[:, 1] - target_col) ** 2
+        selected = reachable[int(np.argmin(distance))]
+        return int(selected[0]), int(selected[1])
+
+
 
