@@ -155,12 +155,12 @@ def build_world() -> ET.ElementTree:
     add_floor_zone(structure, "floor_room_a", 3.0, 8.0, 6.0, 5.0, (0.70, 0.76, 0.82, 1))
     add_floor_zone(structure, "floor_room_b", 9.0, 8.0, 6.0, 5.0, (0.82, 0.72, 0.74, 1))
 
-    # Walls Definition
+    # Walls Definition - Clean White (白色墙面)
     wall = WALL_THICKNESS
     h = WALL_HEIGHT
-    gray = (0.68, 0.70, 0.74, 1)
-    dark = (0.42, 0.45, 0.50, 1)
-    door_lintel_color = (0.30, 0.38, 0.45, 1)
+    gray = (0.92, 0.92, 0.92, 1.0)       # Clean bright white for outer & boundary walls
+    dark = (0.88, 0.88, 0.88, 1.0)       # Soft off-white for interior partition walls
+    door_lintel_color = (0.85, 0.85, 0.85, 1.0)
 
     # 1. Outer North wall: y = 10.5, x: 0 to 12
     add_box_link(structure, "wall_outer_north", 6.0, 10.5, (12.0, wall, h), rgba=gray)
@@ -205,8 +205,14 @@ def build_world() -> ET.ElementTree:
     add_box_link(structure, "target_room_occluder", 7.8, 7.0, (1.6, 0.25, 1.6), z=0.8, rgba=(0.45, 0.28, 0.18, 1))
 
     # Furniture & Semantics Models
+    # Lower furniture down into the floor by 0.15m (z_offset = -0.15) so table top and
+    # objects are well-positioned within camera line-of-sight without being occluded by table edges.
+    z_desk = -0.15
+    z_monitor = 0.57   # 0.72 - 0.15
+    z_cup = 0.60       # 0.75 - 0.15
+
     # --- Room A (Discussion / Left Room) ---
-    add_include(world, "table_conference_2", "room_a_conference_table", 3.0, 8.2, 0.0, 0.0)
+    add_include(world, "table_conference_2", "room_a_conference_table", 3.0, 8.2, -0.15, 0.0)
     add_include(world, "bookshelf", "room_a_bookshelf", 0.5, 7.8, 0.0, 0.0)
     # Fire hydrants in Room A tucked into true wall corners (墙脚)
     add_include(world, "fire_hydrant", "fire_hydrant_1", 0.35, 5.85, 0.0, 0.0)
@@ -214,23 +220,24 @@ def build_world() -> ET.ElementTree:
     add_include(world, "fire_hydrant", "fire_hydrant_3", 5.65, 10.15, 0.0, 0.0)
 
     # --- Room B (Target Office / Right Room) ---
-    # Target Desk against the left partition wall (x=6.0)
-    add_include(world, "desk_brown", "target_desk", 6.6, 8.5, 0.0, math.pi / 2)
-    # Two monitors flanking the yellow cup on the target desk
-    add_include(world, "monitor_1", "target_monitor_left", 6.6, 8.0, 0.72, math.pi / 2)
-    add_include(world, "monitor_2", "target_monitor_right", 6.6, 9.0, 0.72, math.pi / 2)
+    # Target Desk against the left partition wall (x=6.0) - natural light wood
+    add_include(world, "desk_wood_light", "target_desk", 6.6, 8.5, z_desk, math.pi / 2)
+    # Two monitors flanking the yellow cup on the target desk (scaled up by 1.35x for clear observation)
+    add_include(world, "monitor_1", "target_monitor_left", 6.6, 7.95, z_monitor, math.pi / 2, scale=(1.35, 1.35, 1.35))
+    add_include(world, "monitor_2", "target_monitor_right", 6.6, 9.05, z_monitor, math.pi / 2, scale=(1.35, 1.35, 1.35))
     add_include(world, "file_cabinet_large", "room_b_cabinet", 11.2, 8.5, 0.0, math.pi / 2)
     add_include(world, "bookshelf", "room_b_bookshelf", 11.2, 6.5, 0.0, math.pi / 2)
 
-    # ★ PRIMARY TARGET: Yellow Cup on target desk flanked by monitors
+    # ★ PRIMARY TARGET: Yellow Cup on target desk flanked by monitors (scaled up to 3.2x, rotated 90 deg along Z)
     add_include(
         world,
         "cup_yellow",
         "cup_yellow",
         6.6,
         8.5,
-        0.75,
-        scale=(1.5, 1.5, 1.5),
+        z_cup,
+        yaw=math.pi / 2,
+        scale=(3.2, 3.2, 3.2),
     )
 
     # Near-top-down GUI camera

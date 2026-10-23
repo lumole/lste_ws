@@ -1470,7 +1470,44 @@ class GlobalFrontierEventCallbacksMixin:
         is_target_lead = (state == 2) or (state == 1 and subtype == "Sus-A")
         if not is_target_lead:
             return
-        # If currently executing an active frontier or ordinary work item route, preempt it
+
+        # 1. Immediately register or update a high-priority Target WorkItem in front of the robot
+        place_items = getattr(self, "place_work_items", None)
+        pose_msg = getattr(self, "pose_odom", None)
+        if place_items is not None and pose_msg is not None:
+            try:
+                rx = float(getattr(pose_msg, "x", 0.0))
+                ry = float(getattr(pose_msg, "y", 0.0))
+                ryaw = float(getattr(pose_msg, "theta", getattr(pose_msg, "yaw", 0.0)))
+                # Project 1.8m directly ahead along current heading
+                ahead_dist = 1.8
+                anchor_x = rx + ahead_dist * math.cos(ryaw)
+                anchor_y = ry + ahead_dist * math.sin(ryaw)
+                current_place = getattr(self, "current_physical_place_id", 1) or 1
+                now_sec = rospy.Time.now().to_sec()
+                target_item = place_items.register_target_work_item(
+                    place_id=current_place,
+                    anchor_xy=(anchor_x, anchor_y),
+                    now=now_sec,
+                    target_track_id=str(getattr(self, "current_task_id", "") or "target"),
+                    kind="target_observation",
+                )
+                if target_item is not None:
+                    # Explicit normal pointing from anchor back towards robot or along heading
+                    target_item["normal_xy"] = (math.cos(ryaw), math.sin(ryaw))
+                    self.target_reinspection_pending = True
+                    rospy.loginfo(
+                        "GlobalFrontier: [Sus-A / Locked] Injected immediate Target WorkItem id=%s at (%.2f, %.2f) directly ahead (dist=%.1fm, heading=%.1f deg)",
+                        str(target_item.get("id")),
+                        anchor_x,
+                        anchor_y,
+                        ahead_dist,
+                        math.degrees(ryaw),
+                    )
+            except Exception as e:
+                rospy.logwarn_throttle(2.0, "GlobalFrontier: failed to inject forward target work item: %s", str(e))
+
+        # 2. If currently executing an active frontier or ordinary work item route, preempt it
         active_route_kind = getattr(self, "active_route_kind", "")
         active_work_id = getattr(self, "active_work_item_id", None)
         is_active_target_item = False
